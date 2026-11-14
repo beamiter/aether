@@ -1,0 +1,11 @@
+target/
+node_modules/
+.npm-cache/
+src-tauri/target/
+session/target/
+
+session-target/
+native-deps/root/
+native-deps/cache/
+native-deps/lists/
+native-deps/runtime/

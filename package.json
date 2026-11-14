@@ -1,0 +1,1 @@
+{"name":"terminal-frame-lab","private":true,"type":"module","scripts":{"test":"node --test tests/*.test.js","tauri":"tauri"},"devDependencies":{"@tauri-apps/cli":"^2"}}

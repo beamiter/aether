@@ -1,0 +1,13 @@
+[package]
+name = "tauri-terminal-frame-bridge"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+jterm_engine = { git = "https://github.com/beamiter/jterm_core", rev = "2b37583ab1a833176e88145e67243146f99c309a" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+jterm-headless-session-spike = { path = "../session" }
+
+[workspace]
