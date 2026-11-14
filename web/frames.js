@@ -1,3 +1,7 @@
+// One Unicode scalar occupies at most two UTF-16 units. Check the bound before
+// decoding so malformed oversized cells never allocate a scalar array.
+const singleScalar = text => typeof text === 'string' &&
+  (text.length === 1 || (text.length === 2 && text.codePointAt(0) > 0xffff));
 const uint = x => Number.isInteger(x) && x >= 1 && x <= 0xffffffff;
 export function acceptFull(previous, incoming, expected = { session: 'frame-demo', epoch: 1 }) {
   const f = incoming;
@@ -12,7 +16,7 @@ export function acceptFull(previous, incoming, expected = { session: 'frame-demo
   const rows = f.rows.map(row => {
     if (!Array.isArray(row) || row.length !== f.cols) throw new Error('row bounds');
     return Object.freeze(row.map(c => {
-      if (!c || !Number.isInteger(c.width) || c.width<0 || c.width>2 || !Number.isInteger(c.style) || c.style<0 || c.style>31 || typeof c.text !== 'string' || [...c.text].length !== 1 || /[\x00-\x1f\x7f-\x9f\ud800-\udfff]/u.test(c.text) ||
+      if (!c || !Number.isInteger(c.width) || c.width<0 || c.width>2 || !Number.isInteger(c.style) || c.style<0 || c.style>31 || !singleScalar(c.text) || /[\x00-\x1f\x7f-\x9f\ud800-\udfff]/u.test(c.text) ||
         !/^#[a-f0-9]{6}$/i.test(c.foreground) || !/^#[a-f0-9]{6}$/i.test(c.background)) throw new Error('cell');
       return Object.freeze({text:c.text,foreground:c.foreground,background:c.background,width:c.width,style:c.style});
     }));

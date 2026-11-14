@@ -27,3 +27,15 @@ test('actual Rust Unicode frame keeps two-column paint and styled colors',()=>{
 });
 test('reject inconsistent wide-pair geometry atomically',()=>{for(const mutate of [f=>f.rows[0][0].width=0,f=>f.rows[0][0].width=2,f=>f.rows[0][63].width=2,f=>f.rows[0][0].style=32]){const f=demo();mutate(f);assert.throws(()=>acceptFull(null,f));}});
 test('Rust cursor shapes paint at exact cell geometry and invalid shapes reject',()=>{const raw=demo();raw.cursor_row=2;raw.cursor_col=3;for(const shape of ['block','beam','underline']){const fills=[],strokes=[];const g={scale(){},fillRect(...x){fills.push(x)},save(){},beginPath(){},rect(){},clip(){},fillText(){},restore(){},strokeRect(...x){strokes.push(x)}};paint({style:{},getContext:()=>g},acceptFull(null,{...raw,cursor_shape:shape}));if(shape==='block')assert.deepEqual(strokes.at(-1),[36.5,48.5,11,23]);if(shape==='beam')assert.deepEqual(fills.at(-1),[36,48,2,24]);if(shape==='underline')assert.deepEqual(fills.at(-1),[36,70,12,2]);}assert.throws(()=>acceptFull(null,{...raw,cursor_shape:'invalid'}));assert.throws(()=>acceptFull(null,{...raw,pending_wrap:1}));});
+
+
+test('oversized cell text is rejected before Unicode iteration and leaves old frame intact',()=>{
+ const old=acceptFull(null,demo());
+ const raw=demo();raw.revision=2;raw.rows[0][0].text='x'.repeat(1_000_000);
+ const original=String.prototype[Symbol.iterator];let visited=0;
+ String.prototype[Symbol.iterator]=function*(){visited+=this.length;yield* original.call(this);};
+ try {assert.throws(()=>acceptFull(old,raw),/cell/);} finally {String.prototype[Symbol.iterator]=original;}
+ assert.equal(visited,0,'invalid text must be rejected without a scalar array');
+ assert.equal(old.revision,1);
+ assert.equal(acceptFull(old,{...demo(),revision:2}).revision,2);
+});
