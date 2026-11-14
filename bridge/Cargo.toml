@@ -4,7 +4,7 @@ version = "0.0.1"
 edition = "2021"
 
 [dependencies]
-jterm_engine = { git = "https://github.com/beamiter/jterm_core", rev = "2b37583ab1a833176e88145e67243146f99c309a" }
+jterm_engine = { git = "https://github.com/beamiter/jterm_core", rev = "8d0c0aafa06468b3935712fa477a971bc3cd8eae" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

@@ -1,7 +1,7 @@
 # Headless session spike (Linux only)
 
 This is an isolated local prototype, not a production terminal/session manager.
-It uses the exact published `jterm_engine@57ed89a` parser, screen and local VT
+It uses the exact pinned `jterm_engine@8d0c0aa` parser, screen and local VT
 semantic dispatcher. No byte parsing is performed in JavaScript.
 
 ## API
@@ -35,7 +35,13 @@ The consumer must authorize session identity, focus and input ownership; this
 crate alone has no multi-window authority. A caller must poll and retain output
 until drained; shell exit does not mean all buffered output was consumed.
 
-## Validation performed
+## Historical validation
+
+Current Aether checkout validation: 57 session tests; see
+[core upgrade verification](../docs/CORE-UPGRADE.md). The counts below describe
+earlier laboratory stages.
+
+### Initial validation
 
 `cargo test --locked`: 25 tests pass (23 unit + 2 integration), including one actual fixed `/bin/sh` PTY
 round trip with printf, resize, exit, output drain and idempotent close.

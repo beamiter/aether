@@ -62,7 +62,7 @@ dependencies = [
 [[package]]
 name = "jterm_engine"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core?rev=2b37583ab1a833176e88145e67243146f99c309a#2b37583ab1a833176e88145e67243146f99c309a"
+source = "git+https://github.com/beamiter/jterm_core?rev=8d0c0aafa06468b3935712fa477a971bc3cd8eae#8d0c0aafa06468b3935712fa477a971bc3cd8eae"
 dependencies = [
  "smallvec",
 ]

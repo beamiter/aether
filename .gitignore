@@ -2,6 +2,7 @@ target/
 node_modules/
 .npm-cache/
 src-tauri/target/
+src-tauri/gen/
 session/target/
 
 session-target/
