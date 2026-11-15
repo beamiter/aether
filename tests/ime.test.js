@@ -19,3 +19,26 @@ test('reset rejects late commit; next intentional key accepts identical text',()
 test('next ordinary key is not mistaken for duplicate composition commit',()=>{
  const h=setup();h.event('compositionstart');h.event('compositionend',{data:'a'});h.event('keydown',{key:'a'});h.event('input',{data:'a',inputType:'insertText'});assert.deepEqual(h.sent,[[1,'a'],[1,'a']]);
 });
+
+test('clipboard, drop, replacement and history edits cannot bypass paste review',()=>{
+ for(const inputType of ['insertFromPaste','insertFromPasteAsQuotation','insertFromDrop','insertReplacementText','historyUndo','historyRedo','insertLineBreak','insertParagraph',undefined]){
+  for(const data of ['echo first\necho second',null]){
+   const h=setup();h.el.value='echo first\necho second';
+   h.event('input',{inputType,data});
+   assert.deepEqual(h.sent,[],String(inputType));assert.equal(h.el.value,'');
+   h.event('keydown',{key:'a'});h.event('input',{inputType:'insertText',data:'a'});
+   assert.deepEqual(h.sent,[[1,'a']]);
+  }
+ }
+});
+test('ordinary typed Unicode and null-data text fallback remain exact',()=>{
+ const h=setup();h.event('input',{inputType:'insertText',data:'é'});
+ h.el.value='👩‍💻';h.event('input',{inputType:'insertText',data:null});
+ assert.deepEqual(h.sent,[[1,'é'],[1,'👩‍💻']]);assert.equal(h.el.value,'');
+});
+test('unrelated browser edit cannot consume composition duplicate suppression',()=>{
+ const h=setup();h.event('compositionstart');h.event('compositionend',{data:'中'});
+ h.event('input',{inputType:'insertFromDrop',data:'unreviewed\n'});
+ h.event('input',{inputType:'insertText',data:'中'});
+ assert.deepEqual(h.sent,[[1,'中']]);
+});

@@ -18,8 +18,11 @@ export function installIme(element,{getEpoch,commit}){
    if(active||event.isComposing)return;
    const text=event.data??element.value;clear();
    if(discard)return;
+   // Clipboard insertion belongs to paste review, never this typing channel.
+   // Drop, replacement, undo/redo and unknown browser edits are not keystrokes.
+   // Composition commits are delivered exclusively by compositionend above.
+   if(event.inputType!=='insertText')return;
    if(duplicate!==null){const previous=duplicate;duplicate=null;if(text===previous)return;}
-   if(event.inputType==='insertCompositionText'||event.inputType==='insertFromComposition')return;
    const epoch=getEpoch();if(epoch!==null&&text)commit(text,epoch);
  });
  element.addEventListener('blur',reset);
