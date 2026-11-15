@@ -2140,6 +2140,67 @@ mod tests {
             &["zero-width scalar / grapheme composition unsupported"]
         );
     }
+    // Feed the production parser rather than calling UnicodeWidthChar directly:
+    // FF9E/FF9F changed from zero to one cell in unicode-width 0.2.3. These
+    // assertions cover host geometry, not WebView glyph shaping or IME input.
+    #[test]
+    fn unicode_023_halfwidth_marks_keep_four_cells_at_every_utf8_split() {
+        let input = "ﾊﾟｸﾞ".as_bytes();
+        for cut in 0..=input.len() {
+            let mut t = Terminal::new(2, 8).unwrap();
+            t.feed(&input[..cut]).unwrap();
+            t.feed(&input[cut..]).unwrap();
+            for (col, character) in ['ﾊ', 'ﾟ', 'ｸ', 'ﾞ'].into_iter().enumerate() {
+                let cell = &t.screen.grid[0][col];
+                assert_eq!(cell.character, character, "cut={cut}, col={col}");
+                assert!(!cell.flags.wide() && !cell.flags.wide_continuation());
+            }
+            let frame = t.frame().unwrap();
+            assert_eq!((frame.cursor().row, frame.cursor().col), (0, 4));
+            assert!(!frame.cursor().pending_wrap);
+            assert_eq!(t.unsupported_count(), 0);
+        }
+    }
+    #[test]
+    fn unicode_023_halfwidth_marks_wrap_and_backspace_after_bytewise_feed() {
+        let mut t = Terminal::new(3, 4).unwrap();
+        for byte in "abcﾟ".as_bytes() {
+            t.feed(&[*byte]).unwrap();
+        }
+        let frame = t.frame().unwrap();
+        assert_eq!((frame.cursor().row, frame.cursor().col), (0, 3));
+        assert!(frame.cursor().pending_wrap);
+        assert_eq!(frame.rows()[0].cells[3].character, 'ﾟ');
+        for byte in "ﾞX".as_bytes() {
+            t.feed(&[*byte]).unwrap();
+        }
+        assert_eq!(t.screen.grid[1][0].character, 'ﾞ');
+        assert_eq!(t.screen.grid[1][1].character, 'X');
+        t.feed(b"\x08Y").unwrap();
+        let frame = t.frame().unwrap();
+        assert_eq!(frame.rows()[1].cells[1].character, 'Y');
+        assert_eq!((frame.cursor().row, frame.cursor().col), (1, 2));
+        assert!(!frame.cursor().pending_wrap);
+        assert_eq!(t.unsupported_count(), 0);
+    }
+    #[test]
+    fn unicode_023_zero_width_rejection_is_preserved_between_halfwidth_marks() {
+        let input = "ﾟ\u{301}\u{200d}ﾞ".as_bytes();
+        for cut in 0..=input.len() {
+            let mut t = Terminal::new(2, 4).unwrap();
+            t.feed(&input[..cut]).unwrap();
+            t.feed(&input[cut..]).unwrap();
+            assert_eq!(t.screen.grid[0][0].character, 'ﾟ', "cut={cut}");
+            assert_eq!(t.screen.grid[0][1].character, 'ﾞ', "cut={cut}");
+            assert_eq!(t.screen.cursor_col, 2);
+            assert_eq!(t.unsupported_count(), 2);
+            assert_eq!(
+                t.unsupported_events(),
+                &["zero-width scalar / grapheme composition unsupported"]
+            );
+            t.frame().unwrap();
+        }
+    }
     #[test]
     #[cfg(target_os = "linux")]
     fn real_pty_chinese_wide_overwrite_and_wrap_frame() {
