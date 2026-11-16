@@ -32,3 +32,25 @@ test('UTF-8 byte bound is exact and rejection clears old review',()=>{
 test('unsupported controls and empty clipboard never send or retain old review',()=>{
  for(const text of ['\x1b[31m','a\x00','a\x7f','a\x0b','']){const h=harness();h.offer('pending\n');h.offer(text);h.confirm.handlers.click();assert.deepEqual(h.sent,[]);assert.equal(h.panel.hidden,true);}
 });
+
+test('oversized clipboard rejects before encoding and clears pending review',()=>{
+ const OriginalEncoder=globalThis.TextEncoder;let encodedUnits=[];
+ globalThis.TextEncoder=class extends OriginalEncoder{encode(text){encodedUnits.push(text.length);assert.ok(text.length<=4096);return super.encode(text);}};
+ try{
+  for(const text of ['x'.repeat(1_000_000),'界'.repeat(4097),'😀'.repeat(2049)]){
+   const h=harness();h.offer('pending\n');encodedUnits=[];h.offer(text);
+   assert.deepEqual(encodedUnits,[]);assert.equal(h.errors.length,1);
+   assert.equal(h.panel.hidden,true);assert.equal(h.preview.value,'');assert.equal(h.confirm.disabled,true);
+   h.confirm.handlers.click();assert.deepEqual(h.sent,[]);
+   h.offer('ok');assert.deepEqual(h.sent,[{text:'ok',owner:1}]);
+  }
+ }finally{globalThis.TextEncoder=OriginalEncoder;}
+});
+test('bounded encoding preserves exact ASCII astral and replacement byte limits',()=>{
+ for(const text of ['x'.repeat(4096),'😀'.repeat(1024),'\ud800'.repeat(1365)+'x']){
+  const h=harness();h.offer(text);assert.deepEqual(h.sent,[{text,owner:1}]);assert.deepEqual(h.errors,[]);
+ }
+ for(const text of ['x'.repeat(4097),'😀'.repeat(1024)+'x','\ud800'.repeat(1365)+'xx']){
+  const h=harness();h.offer(text);assert.deepEqual(h.sent,[]);assert.equal(h.errors.length,1);
+ }
+});
