@@ -12,10 +12,16 @@ export function resizeQueue({getEpoch,invoke,onDone,onError}) {
     const current=group;current.pending=size;
     if(current.promise)return current.promise;
     current.promise=(async()=>{
-      while(current.pending && getEpoch()===epoch){
+      while(current.pending && group===current && getEpoch()===epoch){
         const next=current.pending;current.pending=null;
-        try {await invoke('resize_shell',{epoch,...next});if(getEpoch()===epoch&&!current.pending)await onDone(next);}
-        catch(e){if(getEpoch()===epoch){current.pending=null;onError(e);}break;}
+        try {await invoke('resize_shell',{epoch,...next});if(group===current&&getEpoch()===epoch&&!current.pending)await onDone(next);}
+        catch(e){
+          if(group!==current||getEpoch()!==epoch)break;
+          onError(e);
+          // Do not retry an uncertain resize or its failed completion callback.
+          // A newer explicit absolute size is independent intent, not a retry.
+          if(!current.pending)break;
+        }
       }
     })().finally(()=>{current.promise=null;});
     return current.promise;
