@@ -4,3 +4,5 @@ form{display:flex;gap:12px;align-items:center;margin-top:16px}label{flex:1}input
 textarea{display:block;box-sizing:border-box;width:100%;background:#111820;color:#d9e5ef;border:1px solid #52627a;margin-top:8px;padding:8px;font:16px monospace}
 
 .viewport{position:relative;max-height:480px;overscroll-behavior:contain}#cols,#rows{width:6em}#cursor-status{font:13px monospace}
+
+#paste-escaped{white-space:pre-wrap;overflow-wrap:anywhere;max-height:12em;overflow:auto;border:1px solid #52627a;padding:8px}#paste-escaped:focus-visible{outline:2px solid #a5c7fa;outline-offset:2px}

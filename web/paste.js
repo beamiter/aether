@@ -1,8 +1,8 @@
 // Clipboard text is untrusted. Review multiline text before enqueueing it; Rust
 // remains the authority for paste encoding and protocol state at delivery time.
-export function installPasteReview({panel,preview,confirm,cancel,getEpoch,send,onError}) {
+export function installPasteReview({panel,preview,escaped,confirm,cancel,getEpoch,send,onError}) {
   let pending=null;
-  function reset(){pending=null;preview.value='';panel.hidden=true;confirm.disabled=true;}
+  function reset(){pending=null;preview.value='';escaped.textContent='';panel.hidden=true;confirm.disabled=true;}
   reset();
   function offer(text){
     // A new clipboard event supersedes an earlier review, including invalid data.
@@ -15,7 +15,10 @@ export function installPasteReview({panel,preview,confirm,cancel,getEpoch,send,o
     if(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(text)){onError('Paste contains unsupported control characters; nothing sent.');return;}
     if(!text)return;
     if(!/[\r\n]/.test(text)){send(text,epoch);return;}
-    pending={text,epoch};preview.value=text;panel.hidden=false;confirm.disabled=false;
+    // Textarea value normalizes CR/CRLF. Keep an escaped original separately,
+    // using textContent (never HTML), and never send either rendered preview.
+    // The original has already passed the 4096-byte guard above.
+    pending={text,epoch};preview.value=text;escaped.textContent=JSON.stringify(text);panel.hidden=false;confirm.disabled=false;
   }
   confirm.addEventListener('click',()=>{
     const item=pending;reset();
