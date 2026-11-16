@@ -42,3 +42,41 @@ test('unrelated browser edit cannot consume composition duplicate suppression',(
  h.event('input',{inputType:'insertText',data:'中'});
  assert.deepEqual(h.sent,[[1,'中']]);
 });
+
+for(const text of ['x'.repeat(1000000),'😀'.repeat(2049)]){
+ test(`oversized composition quarantines repeated final input (${text.length} units)`,()=>{
+  const h=setup();h.event('compositionstart');h.event('compositionend',{data:text});
+  // The consumer receives the first commit to report its existing byte-bound error.
+  assert.equal(h.sent.length,1);
+  for(let i=0;i<3;i++)h.event('input',{inputType:'insertText',data:text});
+  h.el.value=text;h.event('input',{inputType:'insertText',data:null});
+  assert.equal(h.sent.length,1);assert.equal(h.el.value,'');
+  h.event('keydown',{key:'Process'});h.event('input',{inputType:'insertText',data:text});
+  assert.equal(h.sent.length,1);
+  h.event('keydown',{key:'a'});h.event('input',{inputType:'insertText',data:'a'});
+  assert.deepEqual(h.sent,[[1,text],[1,'a']]);
+ });
+}
+test('oversized composition quarantine clears for a new composition',()=>{
+ const h=setup();h.event('compositionstart');h.event('compositionend',{data:'x'.repeat(4097)});
+ h.event('compositionstart');h.event('compositionend',{data:'中文'});
+ h.event('input',{inputType:'insertText',data:'中文'});
+ assert.equal(h.sent.length,2);assert.deepEqual(h.sent[1],[1,'中文']);
+});
+test('oversized composition cannot cross blur or epoch reset',()=>{
+ for(const reset of [h=>h.event('blur'),h=>h.ime.reset()]){
+  const h=setup(),text='x'.repeat(4097);
+  h.event('compositionstart');h.event('compositionend',{data:text});reset(h);h.setEpoch(2);
+  h.event('input',{inputType:'insertText',data:text});
+  h.event('compositionend',{data:text});
+  assert.equal(h.sent.length,1);
+  h.event('keydown',{key:'b'});h.event('input',{inputType:'insertText',data:'b'});
+  assert.deepEqual(h.sent[1],[2,'b']);
+ }
+});
+test('maximum bounded composition still commits exactly once',()=>{
+ for(const text of ['x'.repeat(4096),'😀'.repeat(1024)]){
+  const h=setup();h.event('compositionstart');h.event('compositionend',{data:text});
+  h.event('input',{inputType:'insertText',data:text});assert.deepEqual(h.sent,[[1,text]]);
+ }
+});

@@ -7,7 +7,12 @@ export function installIme(element,{getEpoch,commit}){
  element.addEventListener('compositionstart',()=>{active=true;owner=getEpoch();duplicate=null;discard=false;});
  element.addEventListener('compositionend',event=>{
    if(!active){clear();return;}
-   active=false;const epoch=owner;owner=null;const text=event.data||'';duplicate=text;clear();
+   active=false;const epoch=owner;owner=null;const text=event.data||'';
+   // The typing channel cannot accept more than 4096 UTF-8 bytes. Do not
+   // retain an unbounded rejected composition just to recognize its duplicate.
+   // A boolean quarantine drops late input until a new key/composition/reset.
+   if(text.length>4096){duplicate=null;discard=true;}else duplicate=text;
+   clear();
    if(epoch!==null&&epoch===getEpoch()&&text)commit(text,epoch);
    else discard=true;
  });
