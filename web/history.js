@@ -31,7 +31,10 @@ export function installHistory({older,newer,refresh,output,label,invoke,getEpoch
           label.textContent=`Snapshot ${snapshot.revision}: ${end>0?`archived rows ${start}–${end}`:'no archived rows'} of ${snapshot.total_rows}; ${snapshot.offset} newer rows skipped. Select text and copy normally. Refresh for new output.`;
         }catch(e){
           if(group===current&&getEpoch()===epoch){
-            current.pending=null;current.desired=current.offset;label.textContent=String(e?.message??e);
+            // A failed superseded request must not erase newer user intent.
+            // Consume only that queued target, never retry this failure itself.
+            if(current.pending!==null)continue;
+            current.desired=current.offset;label.textContent=String(e?.message??e);
           }
           return;
         }

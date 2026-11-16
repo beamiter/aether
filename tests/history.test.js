@@ -31,8 +31,8 @@ test('rapid opposite navigation coalesces to the requested offset',async()=>{
  h.requests[0].resolve(page(1,'old',20,200));await tick();assert.equal(h.requests[1].args.offset,20);
  h.requests[1].resolve(page(1,'latest',20,200));await pending;assert.equal(h.output.value,'latest');
 });
-test('history failure preserves selected text, drops queued request and allows explicit retry',async()=>{
- const h=setup();h.output.value='selected';const pending=h.click('refresh');h.click('older');
+test('history failure without newer intent preserves selected text and allows explicit retry',async()=>{
+ const h=setup();h.output.value='selected';const pending=h.click('refresh');
  h.requests[0].reject(Error('transport lost'));await pending;
  assert.equal(h.requests.length,1);assert.equal(h.output.value,'selected');assert.match(h.label.textContent,/transport lost/);
  const retry=h.click('refresh');assert.equal(h.requests[1].args.offset,0);h.requests[1].resolve(page());await retry;
@@ -62,4 +62,43 @@ test('oversized history response preserves selected text and permits a valid ref
  assert.equal(h.output.value,'selected');assert.match(h.label.textContent,/invalid history snapshot/);
  const retry=h.click('refresh');h.requests[1].resolve(page(1,'valid'));await retry;
  assert.equal(h.output.value,'valid');
+});
+
+for(const failure of ['reject','invalid']){
+ const fail=request=>failure==='reject'?request.reject(Error('transport lost')):request.resolve(page(1,'\x1b'));
+ test(`history ${failure} of superseded IPC preserves the newest navigation intent`,async()=>{
+  const h=setup();h.output.value='selected';h.label.textContent='previous snapshot';
+  const pending=h.click('older');h.click('older');h.click('newer');
+  fail(h.requests[0]);await tick();
+  assert.equal(h.requests.length,2);assert.equal(h.requests[1].args.offset,20);
+  assert.equal(h.output.value,'selected');assert.equal(h.label.textContent,'previous snapshot');
+  h.requests[1].resolve(page(1,'latest',20,200));await pending;
+  assert.equal(h.output.value,'latest');assert.equal(h.requests.length,2);
+ });
+ test(`history ${failure} stops after the bounded latest target also fails`,async()=>{
+  const h=setup();h.output.value='selected';const pending=h.click('refresh');
+  for(let i=0;i<200;i++)h.click('older');
+  fail(h.requests[0]);await tick();
+  assert.equal(h.requests.length,2);assert.equal(h.requests[1].args.offset,1024);
+  fail(h.requests[1]);await pending;await tick();
+  assert.equal(h.requests.length,2);assert.equal(h.output.value,'selected');
+  assert.match(h.label.textContent,/transport lost|invalid history snapshot/);
+  const retry=h.click('older');assert.equal(h.requests[2].args.offset,20);
+  h.requests[2].resolve(page(1,'retry',20,200));await retry;assert.equal(h.output.value,'retry');
+ });
+ test(`history stale ${failure} cannot dispatch queued work or alter a new epoch`,async()=>{
+  const h=setup();const old=h.click('refresh');h.click('older');
+  h.reset();h.setEpoch(2);const fresh=h.click('older');h.click('older');
+  fail(h.requests[0]);await old;assert.equal(h.requests.length,2);
+  assert.equal(h.output.value,'');assert.match(h.label.textContent,/Snapshot cleared/);
+  h.requests[1].resolve(page(2,'intermediate',20,200));await tick();
+  assert.equal(h.requests.length,3);assert.deepEqual(h.requests[2].args,{epoch:2,offset:40});
+  h.requests[2].resolve(page(2,'fresh',40,200));await fresh;assert.equal(h.output.value,'fresh');
+ });
+}
+test('history newer refresh is preserved even when its target equals the failed request',async()=>{
+ const h=setup();const pending=h.click('refresh');h.click('refresh');
+ h.requests[0].reject(Error('lost'));await tick();
+ assert.equal(h.requests.length,2);assert.equal(h.requests[1].args.offset,0);
+ h.requests[1].resolve(page());await pending;assert.equal(h.output.value,'hello\nworld');
 });
