@@ -5,11 +5,11 @@ import {installHistory} from '../web/history.js';
 import {acceptFull} from '../web/frames.js'; import {installIme} from '../web/ime.js';
 const tick=()=>new Promise(r=>setImmediate(r));
 const deferred=()=>{let resolve,reject;const promise=new Promise((a,b)=>{resolve=a;reject=b});return {promise,resolve,reject};};
-function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsupported:"0"})){
+function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsupported:"0"}), Encoder=TextEncoder){
  const invoke=(name,args)=>name==='shell_status'?Promise.resolve(health(args)).then(s=>({drained:false,write_error:null,dropped_reply_bytes:'0',...s})):rawInvoke(name,args);
  const elements=new Map(),timers=new Map();let id=0;
  const el=selector=>{if(!elements.has(selector))elements.set(selector,{disabled:false,value:'',textContent:'',style:{},handlers:{},focus(){},addEventListener(name,fn){this.handlers[name]=fn}});return elements.get(selector)};
- const context={document:{querySelector:el},__TAURI__:{core:{invoke}},acceptFull,installIme,installHistory,installPasteReview,resizeQueue,cursorTarget,paint(){},TextEncoder,TextDecoder,
+ const context={document:{querySelector:el},__TAURI__:{core:{invoke}},acceptFull,installIme,installHistory,installPasteReview,resizeQueue,cursorTarget,paint(){},TextEncoder:Encoder,TextDecoder,
  setInterval(fn){timers.set(++id,fn);return id},clearInterval(i){timers.delete(i)},setTimeout};
  vm.runInNewContext(fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8').replace(/^import .*\n/gm,''),context);
  return {el,timers,click:s=>el(s).handlers.click(),submit:()=>el('#command').handlers.submit({preventDefault(){}})};
@@ -180,4 +180,37 @@ test('stuck old recovery neither blocks new epoch nor releases its in-flight gua
  assert.equal(requests,2);pending[0].reject(Error('old'));await old;await h.click('#recover');assert.equal(requests,2);
  const frame=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));frame.session='pty-demo';frame.epoch=2;
  pending[1].resolve(frame);await fresh;assert.equal(h.timers.size,1);assert.match(h.el('#status').textContent,/snapshot recovered/);
+});
+
+test('oversized committed text is rejected before encoding without locking input',async()=>{
+ const lengths=[],seen=[];
+ class BoundedEncoder extends TextEncoder{encode(text){lengths.push(text.length);assert.ok(text.length<=4096);return super.encode(text);}}
+ const h=harness(async(name,args)=>{if(name==='open_shell')return 1;if(name==='text_shell')seen.push(args.text);return null;},undefined,BoundedEncoder);
+ await h.click('#open');const ime=h.el('#ime-input');
+ for(const text of ['x'.repeat(1_000_000),'😀'.repeat(2049)]){
+  ime.handlers.compositionstart();ime.handlers.compositionend({data:text});await tick();
+  assert.deepEqual(lengths,[]);assert.deepEqual(seen,[]);assert.equal(h.el('#input').disabled,false);
+  assert.match(h.el('#status').textContent,/4096-byte limit/);
+ }
+ for(const text of ['é'.repeat(2048),'😀'.repeat(1024)]){
+  ime.handlers.compositionstart();ime.handlers.compositionend({data:text});await tick();
+  assert.equal(seen.at(-1),text);
+ }
+ ime.handlers.compositionstart();ime.handlers.compositionend({data:'é'.repeat(2048)+'x'});await tick();
+ assert.equal(seen.length,2);assert.equal(h.el('#input').disabled,false);
+});
+test('command byte bound reserves newline before encoding and permits correction',async()=>{
+ const lengths=[],writes=[];
+ class BoundedEncoder extends TextEncoder{encode(text){lengths.push(text.length);assert.ok(text.length<=4096);return super.encode(text);}}
+ const h=harness(async(name,args)=>{if(name==='open_shell')return 1;if(name==='write_shell'){writes.push(args.bytes);return args.bytes.length;}return null;},undefined,BoundedEncoder);
+ await h.click('#open');
+ for(const text of ['x'.repeat(1_000_000),'x'.repeat(4096)]){
+  h.el('#input').value=text;await h.submit();assert.deepEqual(lengths,[]);assert.deepEqual(writes,[]);
+  assert.equal(h.el('#input').value,text);assert.equal(h.el('#input').disabled,false);assert.equal(h.el('#send').disabled,false);
+ }
+ for(const text of ['x'.repeat(4095),'é'.repeat(2047)+'x','😀'.repeat(1023)+'xxx']){
+  h.el('#input').value=text;await h.submit();
+  assert.equal(writes.at(-1).length,4096);assert.equal(new TextDecoder().decode(Uint8Array.from(writes.at(-1))),text+'\n');
+ }
+ h.el('#input').value='é'.repeat(2048);await h.submit();assert.equal(writes.length,3);assert.equal(h.el('#input').disabled,false);
 });

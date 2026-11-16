@@ -6,7 +6,7 @@ const canvas=document.querySelector('canvas'),status=document.querySelector('#st
 const open=document.querySelector('#open'),close=document.querySelector('#close'),input=document.querySelector('#input'),send=document.querySelector('#send');
 let state=null,epoch=null,timer=null,polling=null,generation=0,transport=0,recovery=null;
 const imeInput=document.querySelector('#ime-input');
-const ime=installIme(imeInput,{getEpoch:()=>epoch!==null&&!input.disabled?epoch:null,commit:(text,owner)=>{if(owner!==epoch)return;if(new TextEncoder().encode(text).length>4096){status.textContent='Committed text exceeds 4096-byte limit; nothing sent.';return;}enqueueLogical('text_shell',{text});}});
+const ime=installIme(imeInput,{getEpoch:()=>epoch!==null&&!input.disabled?epoch:null,commit:(text,owner)=>{if(owner!==epoch)return;if(text.length>4096||new TextEncoder().encode(text).length>4096){status.textContent='Committed text exceeds 4096-byte limit; nothing sent.';return;}enqueueLogical('text_shell',{text});}});
 canvas.addEventListener('click',()=>imeInput.focus());
 const resize=document.querySelector('#resize');
 const invoke=globalThis.__TAURI__?.core?.invoke;
@@ -57,6 +57,8 @@ close.addEventListener('click',async()=>{
 });
 document.querySelector('#command').addEventListener('submit',async event=>{
   event.preventDefault();if(epoch===null)return;
+  // Reserve one byte for the appended newline before creating an encoded copy.
+  if(input.value.length>4095){status.textContent='Input exceeds 4096-byte bound';return;}
   const bytes=new TextEncoder().encode(input.value+'\n');if(bytes.length>4096){status.textContent='Input exceeds 4096-byte bound';return;}
   send.disabled=true;input.disabled=true;const current=epoch;let at=0;let failed=false;
   try{await keyQueue.chain;if(epoch!==current||keyQueue.locked)throw new Error('input unavailable');for(let attempts=0;at<bytes.length&&attempts<128;attempts++){
