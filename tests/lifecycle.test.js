@@ -214,3 +214,33 @@ test('command byte bound reserves newline before encoding and permits correction
  }
  h.el('#input').value='é'.repeat(2048);await h.submit();assert.equal(writes.length,3);assert.equal(h.el('#input').disabled,false);
 });
+
+test('old completed command cannot erase a reopened session draft',async()=>{
+ let epoch=0;const old=deferred(),writes=[];
+ const h=harness(async(name,args)=>{if(name==='open_shell')return ++epoch;if(name==='write_shell'){writes.push(args);return old.promise;}return null;});
+ await h.click('#open');h.el('#input').value='old';const submit=h.submit();await tick();
+ await h.click('#close');await h.click('#open');h.el('#input').value='new unsent draft';
+ old.resolve(writes[0].bytes.length);await submit;
+ assert.equal(h.el('#input').value,'new unsent draft');assert.equal(h.el('#input').disabled,false);
+ assert.equal(writes.length,1);assert.equal(writes[0].epoch,1);assert.match(h.el('#status').textContent,/Experimental/);
+});
+
+test('stale partial command acknowledgement sends no suffix into reopened session',async()=>{
+ let epoch=0;const old=deferred(),writes=[];
+ const h=harness(async(name,args)=>{if(name==='open_shell')return ++epoch;if(name==='write_shell'){writes.push(args);return old.promise;}return null;});
+ await h.click('#open');h.el('#input').value='old command';const submit=h.submit();await tick();
+ await h.click('#close');await h.click('#open');h.el('#input').value='fresh';old.resolve(1);await submit;
+ assert.equal(writes.length,1);assert.equal(h.el('#input').value,'fresh');assert.equal(h.el('#input').disabled,false);
+});
+test('stale command rejection leaves reopened draft and input unlocked',async()=>{
+ let epoch=0;const old=deferred();
+ const h=harness(async name=>{if(name==='open_shell')return ++epoch;if(name==='write_shell')return old.promise;return null;});
+ await h.click('#open');h.el('#input').value='old';const submit=h.submit();await tick();
+ await h.click('#close');await h.click('#open');h.el('#input').value='fresh';old.reject(Error('closed old writer'));await submit;
+ assert.equal(h.el('#input').value,'fresh');assert.equal(h.el('#input').disabled,false);assert.match(h.el('#status').textContent,/Experimental/);
+});
+test('current command success still clears draft after exact accepted suffixes',async()=>{
+ const writes=[];const h=harness(async(name,args)=>{if(name==='open_shell')return 1;if(name==='write_shell'){writes.push(Array.from(args.bytes));return Math.min(2,args.bytes.length);}return null;});
+ await h.click('#open');h.el('#input').value='abc';await h.submit();
+ assert.deepEqual(writes,[[97,98,99,10],[99,10]]);assert.equal(h.el('#input').value,'');assert.equal(h.el('#input').disabled,false);
+});

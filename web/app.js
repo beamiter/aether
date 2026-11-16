@@ -65,6 +65,8 @@ document.querySelector('#command').addEventListener('submit',async event=>{
     if(epoch!==current)throw new Error('session changed');
     if(keyQueue.locked)throw new Error('input became unavailable');
     const n=await invoke('write_shell',{epoch:current,bytes:Array.from(bytes.subarray(at))});
+    // A final old-epoch acknowledgement must not clear a reopened session's draft.
+    if(epoch!==current)return;
     if(!Number.isInteger(n)||n<0||n>bytes.length-at)throw new Error('invalid write count');at+=n;
     if(n===0)await new Promise(resolve=>setTimeout(resolve,10));
   }if(at!==bytes.length)throw new Error('write blocked; do not resend automatically');input.value='';}
