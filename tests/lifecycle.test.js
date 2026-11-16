@@ -244,3 +244,28 @@ test('current command success still clears draft after exact accepted suffixes',
  await h.click('#open');h.el('#input').value='abc';await h.submit();
  assert.deepEqual(writes,[[97,98,99,10],[99,10]]);assert.equal(h.el('#input').value,'');assert.equal(h.el('#input').disabled,false);
 });
+
+test('Shift+Insert leaves browser paste available and multiline text still needs review',async()=>{
+ const seen=[];let prevented=0;
+ const h=harness(async(name,args)=>{if(name==='open_shell')return 1;if(name==='key_shell'||name==='paste_shell')seen.push([name,args]);return null;});
+ await h.click('#open');
+ for(const selector of ['canvas','#ime-input']){
+  h.el(selector).handlers.keydown({key:'Insert',shiftKey:true,ctrlKey:false,altKey:false,preventDefault(){prevented++;}});
+  await tick();assert.equal(prevented,0);assert.deepEqual(seen,[]);
+  h.el(selector).handlers.paste({clipboardData:{getData:()=> 'echo first\necho second'},preventDefault(){}});
+  await tick();assert.deepEqual(seen,[]);assert.equal(h.el('#paste-review').hidden,false);
+  await h.click('#paste-cancel');
+ }
+ h.el('canvas').handlers.paste({clipboardData:{getData:()=> 'echo first\necho second'},preventDefault(){}});
+ await h.click('#paste-confirm');await tick();
+ assert.equal(seen.length,1);assert.equal(seen[0][0],'paste_shell');assert.equal(seen[0][1].text,'echo first\necho second');
+});
+
+test('plain Insert and modified non-paste Insert keep terminal key semantics',async()=>{
+ const seen=[];let prevented=0;
+ const h=harness(async(name,args)=>{if(name==='open_shell')return 1;if(name==='key_shell')seen.push(args);return null;});await h.click('#open');
+ for(const modifiers of [{shiftKey:false,ctrlKey:false,altKey:false},{shiftKey:true,ctrlKey:true,altKey:false},{shiftKey:true,ctrlKey:false,altKey:true}]){
+  h.el('canvas').handlers.keydown({key:'Insert',...modifiers,preventDefault(){prevented++;}});
+ }
+ await tick();assert.equal(prevented,3);assert.equal(seen.length,3);assert.deepEqual(seen.map(x=>[x.name,x.shift,x.ctrl,x.alt]),[['Insert',false,false,false],['Insert',true,true,false],['Insert',true,false,true]]);
+});

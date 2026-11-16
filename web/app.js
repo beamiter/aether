@@ -99,6 +99,9 @@ function keydown(event){
   if(epoch===null||input.disabled||ime.isComposing()||event.isComposing||event.keyCode===229||event.getModifierState?.('AltGraph')||event.metaKey||event.key==='Dead'||event.key==='Process')return;
   // Leave browser paste shortcut alone; the paste event carries clipboard text.
   if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==='v')return;
+  // Linux browser paste must reach the same review path as Ctrl+V.
+  // Preserve plain Insert and modified Insert combinations for terminal apps.
+  if(event.key==='Insert'&&event.shiftKey&&!event.ctrlKey&&!event.altKey)return;
   const named=/^(Arrow(Up|Down|Left|Right)|Home|End|Insert|Delete|PageUp|PageDown|F([1-9]|1[0-2])|Enter|Escape|Backspace|Tab)$/;
   if(!named.test(event.key)&&[...event.key].length!==1)return;
   if(event.currentTarget===imeInput&&!named.test(event.key)&&!event.ctrlKey&&!event.altKey)return;
