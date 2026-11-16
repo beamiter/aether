@@ -75,3 +75,30 @@ test('escaped view distinguishes literal escapes and remains bounded at input li
  const text='\t'.repeat(4095)+'\n';h.offer(text);assert.equal(JSON.parse(h.escaped.textContent),text);assert.ok(h.escaped.textContent.length<=6*4096+2);
  h.offer(text+'x');assert.equal(h.escaped.textContent,'');assert.equal(h.confirm.disabled,true);
 });
+
+
+test('format controls are visible in quoted review without changing multilingual payload',()=>{
+ const formats=['\u061c','\u200e','\u200f','\u202a','\u202b','\u202c','\u202d','\u202e','\u2066','\u2067','\u2068','\u2069','\u200b','\u200c','\u200d','\u2060','\ufeff','\u{e0001}'];
+ for(const format of formats){
+  const h=harness(),text='中文 עברית العربية '+format+'text\r\n';h.offer(text);
+  assert.equal(h.preview.value,text);assert.ok(!h.escaped.textContent.includes(format));
+  assert.ok(h.escaped.textContent.includes('\\u'));assert.equal(JSON.parse(h.escaped.textContent),text);
+  h.confirm.handlers.click();assert.deepEqual(h.sent,[{text,owner:1}]);
+ }
+});
+test('literal format escapes remain distinct and normal multilingual text remains readable',()=>{
+ const h=harness(),text='literal \\u202e actual \u202e 中文 עברית العربية 👩‍💻\n';h.offer(text);
+ assert.ok(h.escaped.textContent.includes('literal \\\\u202e actual \\u202e'));
+ assert.ok(h.escaped.textContent.includes('中文 עברית العربية'));assert.ok(h.escaped.textContent.includes('👩\\u200d💻'));
+ assert.equal(JSON.parse(h.escaped.textContent),text);
+});
+test('format review still obeys input bound cancellation and stale ownership',()=>{
+ const text='\u202e'.repeat(1365)+'\n',h=harness();h.offer(text);
+ assert.equal(JSON.parse(h.escaped.textContent),text);assert.ok(h.escaped.textContent.length<=6*4096+2);
+ h.cancel.handlers.click();assert.equal(h.escaped.textContent,'');h.confirm.handlers.click();assert.deepEqual(h.sent,[]);
+ h.offer(text);h.setEpoch(2);h.confirm.handlers.click();assert.deepEqual(h.sent,[]);
+ h.offer(text+'x');assert.equal(h.errors.length,1);assert.equal(h.escaped.textContent,'');
+});
+test('single-line format characters retain existing direct paste policy',()=>{
+ const h=harness(),text='עברית\u202e\u200d';h.offer(text);assert.deepEqual(h.sent,[{text,owner:1}]);assert.equal(h.panel.hidden,true);
+});

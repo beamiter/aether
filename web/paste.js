@@ -1,5 +1,13 @@
 // Clipboard text is untrusted. Review multiline text before enqueueing it; Rust
 // remains the authority for paste encoding and protocol state at delivery time.
+// JSON alone leaves format characters (including bidi controls) invisible.
+// Escape those code points as JSON UTF-16 units in the secondary review only;
+// keep the readable preview and the original delivery payload untouched.
+function quotedOriginal(text) {
+  return JSON.stringify(text).replace(/\p{Cf}/gu, character =>
+    character.split('').map(unit => '\\u'+unit.charCodeAt(0).toString(16).padStart(4,'0')).join(''));
+}
+
 export function installPasteReview({panel,preview,escaped,confirm,cancel,getEpoch,send,onError}) {
   let pending=null;
   function reset(){pending=null;preview.value='';escaped.textContent='';panel.hidden=true;confirm.disabled=true;}
@@ -18,7 +26,7 @@ export function installPasteReview({panel,preview,escaped,confirm,cancel,getEpoc
     // Textarea value normalizes CR/CRLF. Keep an escaped original separately,
     // using textContent (never HTML), and never send either rendered preview.
     // The original has already passed the 4096-byte guard above.
-    pending={text,epoch};preview.value=text;escaped.textContent=JSON.stringify(text);panel.hidden=false;confirm.disabled=false;
+    pending={text,epoch};preview.value=text;escaped.textContent=quotedOriginal(text);panel.hidden=false;confirm.disabled=false;
   }
   confirm.addEventListener('click',()=>{
     const item=pending;reset();
