@@ -42,3 +42,24 @@ test('clamped backend offset becomes the next navigation base',async()=>{
  const h=setup();const first=h.click('older');h.requests[0].resolve(page(1,'short',3,3));await first;
  const next=h.click('newer');assert.equal(h.requests[1].args.offset,0);h.requests[1].resolve(page());await next;
 });
+
+test('history rejects oversized strings before encoding and keeps exact UTF-8 limits',()=>{
+ const Encoder=globalThis.TextEncoder;const encoded=[];
+ globalThis.TextEncoder=class extends Encoder{encode(text){encoded.push(text.length);return super.encode(text)}};
+ try {
+  assert.throws(()=>acceptHistory(page(1,'x'.repeat(1000000)),1),/invalid history snapshot/);
+  assert.deepEqual(encoded,[]);
+  for(const text of ['x'.repeat(131200),'é'.repeat(65600),'😀'.repeat(32800)])
+   assert.equal(acceptHistory(page(1,text),1).text,text);
+  for(const text of ['é'.repeat(65600)+'x','😀'.repeat(32800)+'x','\ud800'.repeat(43734)])
+   assert.throws(()=>acceptHistory(page(1,text),1),/invalid history snapshot/);
+  assert.ok(encoded.every(length=>length<=131200));
+ }finally{globalThis.TextEncoder=Encoder;}
+});
+test('oversized history response preserves selected text and permits a valid refresh',async()=>{
+ const h=setup();h.output.value='selected';const first=h.click('refresh');
+ h.requests[0].resolve(page(1,'x'.repeat(1000000)));await first;
+ assert.equal(h.output.value,'selected');assert.match(h.label.textContent,/invalid history snapshot/);
+ const retry=h.click('refresh');h.requests[1].resolve(page(1,'valid'));await retry;
+ assert.equal(h.output.value,'valid');
+});

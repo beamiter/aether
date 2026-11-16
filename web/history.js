@@ -1,9 +1,11 @@
 // Bounded immutable text snapshots. No ANSI parsing or clipboard privilege.
+// UTF-16 length is a lower bound on UTF-8 bytes. Reject oversized strings
+// before encoding so validation never allocates an unbounded second copy.
 export function acceptHistory(value, epoch) {
   if (!value || value.epoch !== epoch || typeof value.revision !== 'string' || !/^\d{1,20}$/.test(value.revision) ||
       !Number.isInteger(value.offset) || value.offset < 0 || value.offset > 1024 ||
       !Number.isInteger(value.total_rows) || value.total_rows < 0 || value.total_rows > 1024 || value.offset > value.total_rows ||
-      typeof value.text !== 'string' || new TextEncoder().encode(value.text).length > 131200 || /[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(value.text)) throw new Error('invalid history snapshot');
+      typeof value.text !== 'string' || value.text.length > 131200 || new TextEncoder().encode(value.text).length > 131200 || /[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(value.text)) throw new Error('invalid history snapshot');
   return Object.freeze({...value});
 }
 export function installHistory({older,newer,refresh,output,label,invoke,getEpoch}) {
