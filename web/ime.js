@@ -17,7 +17,9 @@ export function installIme(element,{getEpoch,commit}){
    else discard=true;
  });
  element.addEventListener('keydown',event=>{
-   if(!active&&!event.isComposing&&event.key!=='Process'&&event.key!=='Dead'){duplicate=null;discard=false;}
+   // Some IMEs report keyCode 229 without isComposing or a Process key.
+   // It is not a new ordinary key and must not release late-input guards.
+   if(!active&&!event.isComposing&&event.keyCode!==229&&event.key!=='Process'&&event.key!=='Dead'){duplicate=null;discard=false;}
  });
  element.addEventListener('input',event=>{
    if(active||event.isComposing)return;
@@ -33,3 +35,4 @@ export function installIme(element,{getEpoch,commit}){
  element.addEventListener('blur',reset);
  return {reset,isComposing:()=>active};
 }
+

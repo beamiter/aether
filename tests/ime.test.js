@@ -80,3 +80,28 @@ test('maximum bounded composition still commits exactly once',()=>{
   h.event('input',{inputType:'insertText',data:text});assert.deepEqual(h.sent,[[1,text]]);
  }
 });
+
+
+test('legacy IME 229 keydown preserves commit duplicate suppression',()=>{
+ for(const key of ['Unidentified','Enter','a']){
+  const h=setup();h.event('compositionstart');h.event('compositionend',{data:'中'});
+  h.event('keydown',{key,keyCode:229,isComposing:false});
+  h.event('input',{inputType:'insertText',data:'中'});
+  assert.deepEqual(h.sent,[[1,'中']]);
+  h.event('keydown',{key:'a',keyCode:65});h.event('input',{inputType:'insertText',data:'中'});
+  assert.deepEqual(h.sent,[[1,'中'],[1,'中']]);
+ }
+});
+test('legacy IME 229 cannot release stale or oversized composition quarantine',()=>{
+ for(const stale of [true,false]){
+  const h=setup(),text=stale?'旧':'x'.repeat(4097);
+  h.event('compositionstart');
+  if(stale)h.setEpoch(2);
+  h.event('compositionend',{data:text});const before=h.sent.length;
+  h.event('keydown',{key:'Unidentified',keyCode:229,isComposing:false});
+  h.event('input',{inputType:'insertText',data:text});
+  assert.equal(h.sent.length,before);
+  h.event('keydown',{key:'b',keyCode:66});h.event('input',{inputType:'insertText',data:'b'});
+  assert.deepEqual(h.sent.at(-1),[stale?2:1,'b']);
+ }
+});
