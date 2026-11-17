@@ -128,3 +128,30 @@ test('replacement review restores only its own origin and direct paste never cha
  h.offer('old\n',h.origin);h.offer('new\n',other);h.document.activeElement=h.confirm;h.confirm.handlers.click();
  assert.equal(h.focused(),0);assert.equal(otherFocus,1);assert.equal(h.sent.at(-1).text,'new\n');
 });
+
+function reviewKey(h,extra={}){
+ let prevented=0,stopped=0;
+ h.panel.handlers.keydown({key:'Escape',target:h.preview,preventDefault(){prevented++;},stopPropagation(){stopped++;},...extra});
+ return {prevented,stopped};
+}
+test('Escape cancels focused paste review once without sending and restores its origin',()=>{
+ const h=focusHarness();h.offer('review\n',h.origin);h.document.activeElement=h.preview;
+ assert.deepEqual(reviewKey(h),{prevented:1,stopped:1});
+ assert.equal(h.panel.hidden,true);assert.equal(h.preview.value,'');assert.equal(h.escaped.textContent,'');
+ assert.equal(h.focused(),1);h.confirm.handlers.click();assert.deepEqual(h.sent,[]);
+ assert.deepEqual(reviewKey(h),{prevented:0,stopped:0});assert.equal(h.focused(),1);
+});
+test('review Escape leaves composing handled modified and outside key events alone',()=>{
+ for(const extra of [{isComposing:true},{keyCode:229},{defaultPrevented:true},{ctrlKey:true},{altKey:true},{shiftKey:true},{metaKey:true},{key:'Enter'},{target:{}}]){
+  const h=focusHarness();h.offer('review\n',h.origin);h.document.activeElement=h.preview;
+  assert.deepEqual(reviewKey(h,extra),{prevented:0,stopped:0});assert.equal(h.panel.hidden,false);assert.equal(h.focused(),0);
+  h.confirm.handlers.click();assert.deepEqual(h.sent,[{text:'review\n',owner:1}]);
+ }
+});
+test('Escape discards stale review without moving focus to old session',()=>{
+ for(const epoch of [2,null]){
+  const h=focusHarness();h.offer('review\n',h.origin);h.document.activeElement=h.preview;h.setEpoch(epoch);
+  assert.deepEqual(reviewKey(h),{prevented:1,stopped:1});assert.equal(h.panel.hidden,true);assert.equal(h.focused(),0);assert.deepEqual(h.sent,[]);
+ }
+});
+
