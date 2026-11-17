@@ -17,6 +17,8 @@ export function installIme(element,{getEpoch,commit}){
    else discard=true;
  });
  element.addEventListener('keydown',event=>{
+   // A consumed shortcut is not fresh typing and cannot release late input.
+   if(event.defaultPrevented)return;
    // Some IMEs report keyCode 229 without isComposing or a Process key.
    // It is not a new ordinary key and must not release late-input guards.
    if(!active&&!event.isComposing&&event.keyCode!==229&&event.key!=='Process'&&event.key!=='Dead'){duplicate=null;discard=false;}

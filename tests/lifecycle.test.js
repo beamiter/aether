@@ -292,3 +292,13 @@ test('review Escape at canvas or IME origin cancels rather than reaching shell',
   await tick();assert.equal(seen.length,1);assert.equal(seen[0][0],'key_shell');assert.equal(seen[0][1].name,'Escape');
  }
 });
+test('already consumed terminal keys never reach shell or dismiss paste review',async()=>{
+ for(const selector of ['canvas','#ime-input']){
+  const sent=[];const h=harness(async(name,args)=>{if(name==='open_shell')return 1;if(name==='key_shell')sent.push(args);return null;});await h.click('#open');
+  const origin=h.el(selector),panel=h.el('#paste-review');panel.ownerDocument={activeElement:origin};
+  origin.handlers.paste({currentTarget:origin,clipboardData:{getData:()=> 'review\n'},preventDefault(){}});
+  for(const key of ['Escape','Enter','ArrowUp','c'])origin.handlers.keydown({key,ctrlKey:key==='c',defaultPrevented:true,currentTarget:origin,target:origin,preventDefault(){},stopPropagation(){}});
+  await tick();assert.deepEqual(sent,[]);assert.equal(panel.hidden,false);
+  origin.handlers.keydown({key:'ArrowUp',currentTarget:origin,target:origin,preventDefault(){}});await tick();assert.equal(sent.length,1);
+ }
+});

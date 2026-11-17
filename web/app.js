@@ -96,6 +96,8 @@ function enqueueLogical(command,payload){
   }).finally(()=>{queue.pending--;});
 }
 function keydown(event){
+  // Respect an earlier control or capture handler that already owns this key.
+  if(event.defaultPrevented)return;
   if(epoch===null||input.disabled||ime.isComposing()||event.isComposing||event.keyCode===229||event.getModifierState?.('AltGraph')||event.metaKey||event.key==='Dead'||event.key==='Process')return;
   if(pasteReview.dismissFromOrigin(event))return;
   // Leave browser paste shortcut alone; the paste event carries clipboard text.

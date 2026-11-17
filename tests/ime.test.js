@@ -105,3 +105,10 @@ test('legacy IME 229 cannot release stale or oversized composition quarantine',(
   assert.deepEqual(h.sent.at(-1),[stale?2:1,'b']);
  }
 });
+test('already consumed keys preserve composition duplicate and stale-input guards',()=>{
+ for(const stale of [false,true]){
+  const h=setup();h.event('compositionstart');if(stale)h.setEpoch(2);h.event('compositionend',{data:'中'});const count=h.sent.length;
+  h.event('keydown',{key:'Escape',defaultPrevented:true});h.event('input',{inputType:'insertText',data:'中'});assert.equal(h.sent.length,count);
+  h.event('keydown',{key:'a'});h.event('input',{inputType:'insertText',data:'a'});assert.deepEqual(h.sent.at(-1),[stale?2:1,'a']);
+ }
+});
