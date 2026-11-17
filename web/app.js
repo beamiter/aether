@@ -97,6 +97,7 @@ function enqueueLogical(command,payload){
 }
 function keydown(event){
   if(epoch===null||input.disabled||ime.isComposing()||event.isComposing||event.keyCode===229||event.getModifierState?.('AltGraph')||event.metaKey||event.key==='Dead'||event.key==='Process')return;
+  if(pasteReview.dismissFromOrigin(event))return;
   // Leave browser paste shortcut alone; the paste event carries clipboard text.
   if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==='v')return;
   // Linux browser paste must reach the same review path as Ctrl+V.

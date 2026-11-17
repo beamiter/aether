@@ -155,3 +155,21 @@ test('Escape discards stale review without moving focus to old session',()=>{
  }
 });
 
+test('plain Escape at the still-focused origin cancels review without moving focus',()=>{
+ const h=focusHarness();h.document.activeElement=h.origin;h.offer('review\n',h.origin);
+ let prevented=0,stopped=0;
+ assert.equal(h.dismissFromOrigin({key:'Escape',target:h.origin,currentTarget:h.origin,preventDefault(){prevented++;},stopPropagation(){stopped++;}}),true);
+ assert.equal(prevented,1);assert.equal(stopped,1);assert.equal(h.panel.hidden,true);assert.equal(h.focused(),0);
+ h.confirm.handlers.click();assert.deepEqual(h.sent,[]);
+});
+test('origin dismissal preserves modifiers IME focus and epoch ownership',()=>{
+ for(const change of [e=>e.isComposing=true,e=>e.keyCode=229,e=>e.defaultPrevented=true,e=>e.ctrlKey=true,e=>e.altKey=true,e=>e.shiftKey=true,e=>e.metaKey=true,e=>e.getModifierState=()=>true,e=>e.key='Enter',e=>e.target={},e=>e.currentTarget={}]){
+  const h=focusHarness();h.document.activeElement=h.origin;h.offer('review\n',h.origin);
+  const e={key:'Escape',target:h.origin,currentTarget:h.origin,preventDefault(){assert.fail('consumed');},stopPropagation(){assert.fail('stopped');}};change(e);
+  assert.equal(h.dismissFromOrigin(e),false);assert.equal(h.panel.hidden,false);assert.deepEqual(h.sent,[]);
+ }
+ for(const change of [h=>h.document.activeElement={},h=>h.setEpoch(2),h=>h.setEpoch(null)]){
+  const h=focusHarness();h.document.activeElement=h.origin;h.offer('review\n',h.origin);change(h);
+  assert.equal(h.dismissFromOrigin({key:'Escape',target:h.origin,currentTarget:h.origin}),false);assert.equal(h.panel.hidden,false);
+ }
+});

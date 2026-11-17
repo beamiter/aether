@@ -41,14 +41,22 @@ export function installPasteReview({panel,preview,escaped,confirm,cancel,getEpoc
   }
   confirm.addEventListener('click',()=>finish(true));
   cancel.addEventListener('click',()=>finish(false));
-  panel.addEventListener('keydown',event=>{
+  function dismissKey(event,fromOrigin=false){
     // Cancel only this review's plain Escape. Composition cancellation and
     // modified shortcuts belong to the input method or focused control.
     if(!pending||panel.hidden||event.key!=='Escape'||event.defaultPrevented||
       event.isComposing||event.keyCode===229||event.ctrlKey||event.altKey||
-      event.shiftKey||event.metaKey||!panel.contains?.(event.target))return;
-    event.preventDefault();event.stopPropagation();finish(false);
-  });
-  return {offer,reset};
+      event.shiftKey||event.metaKey||event.getModifierState?.('AltGraph'))return false;
+    if(fromOrigin){
+      // The review opens without stealing focus. Its originating terminal may
+      // therefore still own Escape, but another input or session must not.
+      if(pending.epoch!==getEpoch()||!pending.returnFocus||
+        event.currentTarget!==pending.returnFocus||event.target!==pending.returnFocus||
+        panel.ownerDocument?.activeElement!==pending.returnFocus)return false;
+    }else if(!panel.contains?.(event.target))return false;
+    event.preventDefault();event.stopPropagation();finish(false);return true;
+  }
+  panel.addEventListener('keydown',event=>dismissKey(event));
+  return {offer,reset,dismissFromOrigin:event=>dismissKey(event,true)};
 }
 

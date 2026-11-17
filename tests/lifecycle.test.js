@@ -280,3 +280,15 @@ test('paste review dismissal returns focus through the production paste event or
  }
  assert.deepEqual(sent,['review\n','review\n']);
 });
+test('review Escape at canvas or IME origin cancels rather than reaching shell',async()=>{
+ for(const selector of ['canvas','#ime-input']){
+  const seen=[];const h=harness(async(name,args)=>{if(name==='open_shell')return 1;if(name==='key_shell'||name==='paste_shell')seen.push([name,args]);return null;});await h.click('#open');
+  const origin=h.el(selector),panel=h.el('#paste-review');panel.ownerDocument={activeElement:origin};
+  origin.handlers.paste({currentTarget:origin,clipboardData:{getData:()=> 'echo a\necho b'},preventDefault(){}});
+  let prevented=0;origin.handlers.keydown({key:'Escape',target:origin,currentTarget:origin,preventDefault(){prevented++;},stopPropagation(){}});
+  await tick();assert.equal(panel.hidden,true);assert.equal(prevented,1);assert.deepEqual(seen,[]);
+  h.click('#paste-confirm');await tick();assert.deepEqual(seen,[]);
+  origin.handlers.keydown({key:'Escape',target:origin,currentTarget:origin,preventDefault(){}});
+  await tick();assert.equal(seen.length,1);assert.equal(seen[0][0],'key_shell');assert.equal(seen[0][1].name,'Escape');
+ }
+});
