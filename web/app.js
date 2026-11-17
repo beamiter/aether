@@ -111,7 +111,7 @@ canvas.addEventListener('keydown',keydown);imeInput.addEventListener('keydown',k
 function paste(event){
   if(epoch===null||input.disabled)return;
   event.preventDefault();const text=event.clipboardData?.getData('text/plain')||'';
-  pasteReview.offer(text);
+  pasteReview.offer(text,event.currentTarget);
 }
 canvas.addEventListener('paste',paste);imeInput.addEventListener('paste',paste);
 

@@ -12,7 +12,7 @@ export function installPasteReview({panel,preview,escaped,confirm,cancel,getEpoc
   let pending=null;
   function reset(){pending=null;preview.value='';escaped.textContent='';panel.hidden=true;confirm.disabled=true;}
   reset();
-  function offer(text){
+  function offer(text,returnFocus=null){
     // A new clipboard event supersedes an earlier review, including invalid data.
     reset();
     const epoch=getEpoch();if(epoch===null)return;
@@ -26,13 +26,20 @@ export function installPasteReview({panel,preview,escaped,confirm,cancel,getEpoc
     // Textarea value normalizes CR/CRLF. Keep an escaped original separately,
     // using textContent (never HTML), and never send either rendered preview.
     // The original has already passed the 4096-byte guard above.
-    pending={text,epoch};preview.value=text;escaped.textContent=quotedOriginal(text);panel.hidden=false;confirm.disabled=false;
+    pending={text,epoch,returnFocus};preview.value=text;escaped.textContent=quotedOriginal(text);panel.hidden=false;confirm.disabled=false;
   }
-  confirm.addEventListener('click',()=>{
-    const item=pending;reset();
+  function finish(deliver){
+    const item=pending;
+    // Only return focus that still belongs to this review. Lifecycle resets,
+    // an explicit move elsewhere, and old sessions must never steal focus.
+    const ownedFocus=panel.contains?.(panel.ownerDocument?.activeElement)===true;
+    reset();
     if(!item||item.epoch!==getEpoch())return;
-    send(item.text,item.epoch);
-  });
-  cancel.addEventListener('click',reset);
+    if(deliver)send(item.text,item.epoch);
+    if(ownedFocus&&item.epoch===getEpoch()&&item.returnFocus?.isConnected)
+      item.returnFocus.focus();
+  }
+  confirm.addEventListener('click',()=>finish(true));
+  cancel.addEventListener('click',()=>finish(false));
   return {offer,reset};
 }

@@ -102,3 +102,29 @@ test('format review still obeys input bound cancellation and stale ownership',()
 test('single-line format characters retain existing direct paste policy',()=>{
  const h=harness(),text='עברית\u202e\u200d';h.offer(text);assert.deepEqual(h.sent,[{text,owner:1}]);assert.equal(h.panel.hidden,true);
 });
+
+function focusHarness(){
+ const h=harness(),document={activeElement:null};let focused=0;
+ const origin={isConnected:true,focus(){focused++;document.activeElement=this;}};
+ h.panel.ownerDocument=document;h.panel.contains=target=>[h.preview,h.escaped,h.confirm,h.cancel].includes(target);
+ return {...h,document,origin,focused:()=>focused};
+}
+test('confirm and cancel restore the originating terminal focus only after explicit review action',()=>{
+ for(const action of ['confirm','cancel']){
+  const h=focusHarness();h.offer('review\n',h.origin);h.document.activeElement=h[action];h[action].handlers.click();
+  assert.equal(h.focused(),1);assert.equal(h.document.activeElement,h.origin);assert.equal(h.sent.length,action==='confirm'?1:0);
+  h[action].handlers.click();assert.equal(h.focused(),1);
+ }
+});
+test('review never steals unrelated focus or focuses detached and stale session targets',()=>{
+ for(const change of [h=>{h.document.activeElement={};},h=>{h.origin.isConnected=false;},h=>h.setEpoch(2),h=>h.setEpoch(null)]){
+  const h=focusHarness();h.offer('review\n',h.origin);h.document.activeElement=h.confirm;change(h);h.confirm.handlers.click();assert.equal(h.focused(),0);
+ }
+ const h=focusHarness();h.offer('review\n',h.origin);h.document.activeElement=h.cancel;h.reset();assert.equal(h.focused(),0);h.cancel.handlers.click();assert.equal(h.focused(),0);
+});
+test('replacement review restores only its own origin and direct paste never changes focus',()=>{
+ const h=focusHarness();let otherFocus=0;const other={isConnected:true,focus(){otherFocus++;}};
+ h.offer('direct',h.origin);assert.equal(h.focused(),0);
+ h.offer('old\n',h.origin);h.offer('new\n',other);h.document.activeElement=h.confirm;h.confirm.handlers.click();
+ assert.equal(h.focused(),0);assert.equal(otherFocus,1);assert.equal(h.sent.at(-1).text,'new\n');
+});

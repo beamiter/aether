@@ -269,3 +269,14 @@ test('plain Insert and modified non-paste Insert keep terminal key semantics',as
  }
  await tick();assert.equal(prevented,3);assert.equal(seen.length,3);assert.deepEqual(seen.map(x=>[x.name,x.shift,x.ctrl,x.alt]),[['Insert',false,false,false],['Insert',true,true,false],['Insert',true,false,true]]);
 });
+
+test('paste review dismissal returns focus through the production paste event origin',async()=>{
+ const sent=[];const h=harness(async(name,args)=>{if(name==='open_shell')return 1;if(name==='paste_shell')sent.push(args.text);return null;});await h.click('#open');
+ const panel=h.el('#paste-review'),document={activeElement:null};panel.ownerDocument=document;panel.contains=target=>target===h.el('#paste-confirm')||target===h.el('#paste-cancel');
+ for(const selector of ['canvas','#ime-input']){
+  let focused=0;const origin=h.el(selector);origin.isConnected=true;origin.focus=()=>{focused++;document.activeElement=origin;};
+  origin.handlers.paste({currentTarget:origin,clipboardData:{getData:()=> 'review\n'},preventDefault(){}});
+  document.activeElement=h.el('#paste-confirm');await h.click('#paste-confirm');await tick();assert.equal(focused,1);assert.equal(document.activeElement,origin);
+ }
+ assert.deepEqual(sent,['review\n','review\n']);
+});
