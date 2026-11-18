@@ -39,7 +39,10 @@ export function installFilePreviewPanel(document,{getFrame=()=>null,getEpoch=()=
   const rect=event.currentTarget.getBoundingClientRect();
   if(!rect.width||!rect.height)return;
   const column=Math.floor((event.clientX-rect.left)/rect.width*frame.cols),row=Math.floor((event.clientY-rect.top)/rect.height*frame.rows.length);
-  const path=selectedPathAtCell(frame,row,column,paths);if(!path)return;
+  // Include unsupported names when detecting ambiguity, but never offer
+  // them as preview candidates. Single-file mode has no terminal authority.
+  if(!paths.length)return;
+  const path=selectedPathAtCell(frame,row,column,preview.authorizedPaths());if(!path||!paths.includes(path))return;
   event.preventDefault();preview.dismiss();origin=epoch;choices.value=path;
   // Output cannot assert local/remote identity. Require an explicit local
   // confirmation before reading a same-named selected file, even after Ctrl-click.

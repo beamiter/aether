@@ -52,7 +52,7 @@ export function createFilePreview({render,onError}){
   finally{reading=false;}
  }
  function dismiss(){generation++;render(null);}
- return {select,selectFile,show,dismiss,clear};
+ return {select,selectFile,show,dismiss,clear,authorizedPaths:()=>[...files.keys()]};
 }
 
 // Match only exact names in the explicitly selected snapshot. This is not a
@@ -65,7 +65,7 @@ export function selectedPathAtCell(frame,row,column,paths){
  let text='',at=-1;
  frame.rows[row].forEach((cell,col)=>{if(cell.width===0){if(col===column)at=Math.max(0,text.length-1);return;}if(col===column)at=text.length;text+=cell.text;});
  if(at<0)return null;
- const boundary=char=>char===undefined||/[\s`'"()[\]{}]/u.test(char);
+ const boundary=char=>char===undefined||/[\s`'"()[\]{}「」『』“”‘’《》]/u.test(char);
  const matches=[];
  for(const path of paths){
   if(!localSnapshotPath(path))continue;
@@ -79,9 +79,18 @@ export function selectedPathAtCell(frame,row,column,paths){
      if(!location||Number(location[1])>4294967295||(location[2]&&Number(location[2])>4294967295))continue;
      end+=location[0].length;
     }
-    if(at>=start&&at<end&&boundary(text[start-1])&&boundary(text[end]))matches.push(path);
+    // A punctuation suffix is prose only when the whole run reaches a
+    // boundary. Never peel a prefix from README.md.js or README.md,backup.
+    let contextEnd=end;
+    while(contextEnd<text.length&&/[.,;!?，。；！？、]/u.test(text[contextEnd]))contextEnd++;
+    if(at>=start&&at<contextEnd&&boundary(text[start-1])&&boundary(text[contextEnd]))
+     matches.push({path,end});
+
    }
   }
  }
- return new Set(matches).size===1?matches[0]:null;
+ // Literal authorized names may themselves include punctuation. Reject
+ // competing interpretations even when clicking their punctuation, rather
+ // than choosing the shorter prose interpretation or longest filename.
+ return new Set(matches.map(m=>m.path)).size===1&&matches.some(m=>at<m.end)?matches[0].path:null;
 }

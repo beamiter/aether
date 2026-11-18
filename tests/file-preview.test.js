@@ -143,3 +143,49 @@ test('panel location click still requires local confirmation and honors epoch',a
  h.setEpoch(2);await h.el('#preview-confirm-local').handlers.click();assert.equal(reads,0);
  h.setEpoch(1);h.click({clientX:112});await h.el('#preview-confirm-local').handlers.click();assert.equal(reads,1);
 });
+test('sentence punctuation resolves complete authorized candidates conservatively',()=>{
+ for(const token of ['README.md,','README.md.','README.md:12,','README.md:12:3。','README.md！？','README.md；','README.md，']){
+  const f=frame('see '+token+' then');
+  assert.equal(selectedPathAtCell(f,0,5,['README.md']),'README.md',token);
+ }
+ for(const text of ['「README.md」。','“README.md:12”，','《README.md》']){
+  assert.equal(selectedPathAtCell(frame(text),0,2,['README.md']),'README.md',text);
+ }
+});
+test('punctuation is not a license for partial token or URI matching',()=>{
+ for(const text of ['README.md.js','README.md,backup','README.md，备份','README.md../secret','README.md:12,backup','https://host/README.md,','file:///README.md.','xREADME.md,']){
+  assert.equal(selectedPathAtCell(frame(text),0,text.indexOf('README')+2,['README.md']),null,text);
+ }
+});
+test('literal punctuation names remain exact and competing candidates fail closed',()=>{
+ for(const name of ['README.md,','README.md.','README.md，']){
+  const f=frame(name);
+  assert.equal(selectedPathAtCell(f,0,2,[name]),name);
+  assert.equal(selectedPathAtCell(f,0,2,['README.md',name]),null);
+  assert.equal(selectedPathAtCell(f,0,name.length-1,['README.md',name]),null);
+  assert.equal(selectedPathAtCell(f,0,name.length-1,['README.md']),null);
+ }
+ assert.equal(selectedPathAtCell(frame('a,b.md'),0,2,['a,b.md']),'a,b.md');
+});
+
+test('panel punctuation candidate requires confirmation and rejects ambiguous authorized names',async()=>{
+ const h=panelHarness();let reads=0;
+ const f=file('root/README.md','source');f.arrayBuffer=async()=>{reads++;return bytes('source');};
+ h.el('#preview-folder').files=[f];h.el('#preview-folder').handlers.change();
+ h.setFrame({...frame('README.md:12,'),session:'pty-demo',epoch:1});
+ h.click({clientX:20});assert.equal(h.el('#preview-title').textContent,'README.md');assert.equal(reads,0);
+ h.setEpoch(2);await h.el('#preview-confirm-local').handlers.click();assert.equal(reads,0);
+ h.setEpoch(1);h.click({clientX:20});await h.el('#preview-confirm-local').handlers.click();assert.equal(reads,1);
+ h.el('#preview-folder').files=[f,file('root/README.md,','literal')];h.el('#preview-folder').handlers.change();
+ h.setFrame({...frame('README.md,'),session:'pty-demo',epoch:1});
+ h.click({clientX:20});assert.equal(h.el('#file-preview').hidden,true);assert.equal(reads,1);
+});
+
+test('wide punctuation continuation does not become a prose filename hit',()=>{
+ const f={cols:11,rows:[ [...'README.md'].map(text=>({text,width:1})).concat([{text:'。',width:2},{text:'',width:0}]) ]};
+ assert.equal(selectedPathAtCell(f,0,2,['README.md']),'README.md');
+ for(const col of [9,10]){
+  assert.equal(selectedPathAtCell(f,0,col,['README.md']),null);
+  assert.equal(selectedPathAtCell(f,0,col,['README.md','README.md。']),null);
+ }
+});

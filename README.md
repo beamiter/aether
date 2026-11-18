@@ -96,6 +96,17 @@ selected directly from the local dropdown. Positive decimal location suffixes su
 as `src/App.tsx:12` and `src/App.tsx:12:3` also select that same file; each
 number must fit a nonzero 32-bit unsigned integer without leading zeroes. Clicking the suffix works too.
 This opens source preview only, not an editor jump or line highlighting.
+Sentence-ending ASCII/Chinese punctuation is accepted only when the full
+punctuation run ends at whitespace, a supported quote/bracket, or the row end.
+For example, `README.md,` and `README.md:12。` resolve, but
+`README.md.js` and `README.md,backup` do not partially resolve.
+Literal punctuation in filenames is not stripped. If multiple authorized names
+could explain the clicked reference (such as `README.md` and `README.md,`),
+the click is rejected rather than guessed. Unsupported extensions participate
+in this ambiguity check but cannot be previewed: `README.md,` is not an
+enabled source extension, while `notes,draft.md` is. Clicking prose punctuation alone does
+not select a file. Chinese quote/bracket wrappers are supported; unspaced
+punctuation followed by more prose remains conservatively unmatched.
 
 Only selected files are accessible, with a 256 KiB UTF-8 text bound. Markdown,
 TSX, HTML and SVG are displayed as literal source via `textContent`, never rendered
