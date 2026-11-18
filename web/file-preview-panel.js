@@ -29,7 +29,7 @@ export function installFilePreviewPanel(document,{getFrame=()=>null,getEpoch=()=
   if(!selectionError)notice.textContent=selected.length?'One explicit local file selected. Use Preview selected file. Ctrl-click matching requires a bounded folder snapshot.':'No single file selected.';
  });
  choices.addEventListener('change',()=>{origin=null;preview.dismiss();});
- async function show(){if(origin!==null&&origin!==getEpoch()){preview.dismiss();notice.textContent='Terminal session changed. Select a local file explicitly again.';origin=null;return;}notice.textContent='';await preview.show(choices.value);}
+ async function show(){if(origin!==null&&origin!==getEpoch()){preview.dismiss();notice.textContent='Terminal session changed. Select a local file explicitly again.';return;}notice.textContent='';await preview.show(choices.value);}
  document.querySelector('#preview-show').addEventListener('click',show);
  document.querySelector('#preview-confirm-local').addEventListener('click',show);
  document.querySelector('#preview-close').addEventListener('click',()=>preview.dismiss());

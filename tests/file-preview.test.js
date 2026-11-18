@@ -189,3 +189,13 @@ test('wide punctuation continuation does not become a prose filename hit',()=>{
   assert.equal(selectedPathAtCell(f,0,col,['README.md','README.md。']),null);
  }
 });
+test('repeated stale terminal confirmations never become manual file authorization',async()=>{
+ const h=panelHarness();let reads=0;
+ const f=file('root/src/App.tsx','source');f.arrayBuffer=async()=>{reads++;return bytes('source');};
+ h.el('#preview-folder').files=[f];h.el('#preview-folder').handlers.change();h.click();h.setEpoch(2);
+ for(let i=0;i<3;i++){await h.el('#preview-confirm-local').handlers.click();await h.el('#preview-show').handlers.click();}
+ assert.equal(reads,0);
+ // Only an explicit manual selection change clears terminal provenance.
+ h.el('#preview-files').handlers.change();await h.el('#preview-show').handlers.click();
+ assert.equal(reads,1);
+});
