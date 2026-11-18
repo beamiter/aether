@@ -16,7 +16,7 @@ test('root replacement is fail closed for traversal absolute remote ambiguous an
  }
 });
 test('oversize and unsupported files are rejected before reads; UTF-8 and NUL checked',async()=>{
- for(const [path,size] of [['root/x.md',262145],['root/x.png',12]]){
+ for(const [path,size] of [['root/x.md',262145],['root/x.gif',12]]){
   const h=setup();h.select([{webkitRelativePath:path,size,arrayBuffer(){assert.fail('unbounded read');}}]);await h.show(path.slice(5));assert.equal(h.errors.length,1);
  }
  for(const content of [new Uint8Array([0xff]).buffer,bytes('nul\0text')]){

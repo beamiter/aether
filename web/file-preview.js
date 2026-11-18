@@ -1,3 +1,4 @@
+import {MAX_IMAGE_BYTES,rasterInfo,decodeRaster} from './raster-preview.js';
 // Host-owned, opt-in local snapshot preview. No terminal output grants access:
 // only File objects supplied by the user's directory picker may be read.
 const MAX_FILES=2048, MAX_TEXT_BYTES=256*1024;
@@ -6,7 +7,8 @@ export function localSnapshotPath(path){
  if(typeof path!=='string'||path.length>4096||!path||path.startsWith('/')||path.includes('\\')||path.includes(':')||/[\p{Cc}\p{Cf}]/u.test(path))return null;
  const parts=path.split('/');return parts.every(p=>p&&p!=='.'&&p!=='..')?path:null;
 }
-export function createFilePreview({render,onError}){
+const IMAGE_EXT=/\.(?:png|jpe?g)$/i;
+export function createFilePreview({render,onError,decodeImage=decodeRaster}){
  let files=new Map(),root=null,generation=0,reading=false;
  function clear(){generation++;files=new Map();root=null;render(null);}
  function select(list){
@@ -20,7 +22,7 @@ export function createFilePreview({render,onError}){
    if((chosen!==null&&chosen!==name)||next.has(relative)){onError('Ambiguous directory selection; nothing is authorized.');return [];}
    chosen=name;next.set(relative,file);
   }
-  files=next;root=chosen;return [...files.keys()].filter(p=>TEXT_EXT.test(p)).sort();
+  files=next;root=chosen;return [...files.keys()].filter(p=>TEXT_EXT.test(p)||IMAGE_EXT.test(p)).sort();
  }
  // A single explicit file needs no directory enumeration. Its basename is
  // only a display key, never a terminal-relative path or filesystem authority.
@@ -37,13 +39,24 @@ export function createFilePreview({render,onError}){
   const ticket=++generation;
   if(!localSnapshotPath(path)||!files.has(path)){render(null);onError('Not in the explicitly selected local folder snapshot.');return;}
   const file=files.get(path),owner=root;
-  if(!TEXT_EXT.test(path)){render(null);onError('This slice supports source text only; image decoding is not enabled.');return;}
-  if(!Number.isSafeInteger(file.size)||file.size<0||file.size>MAX_TEXT_BYTES){render(null);onError('Preview exceeds the 256 KiB text limit.');return;}
+  const image=IMAGE_EXT.test(path),limit=image?MAX_IMAGE_BYTES:MAX_TEXT_BYTES;
+  if(!TEXT_EXT.test(path)&&!image){render(null);onError('Unsupported preview type.');return;}
+  if(!Number.isSafeInteger(file.size)||file.size<0||file.size>limit){render(null);onError(image?'Image exceeds 2 MiB.':'Preview exceeds the 256 KiB text limit.');return;}
   reading=true;render({path,text:'Loading local source…',root:owner});
   try{
    const bytes=await file.arrayBuffer();
    if(ticket!==generation||owner!==root)return;
-   if(bytes.byteLength>MAX_TEXT_BYTES)throw Error('Preview exceeds the 256 KiB text limit.');
+   if(bytes.byteLength>limit)throw Error(image?'Image exceeds 2 MiB.':'Preview exceeds the 256 KiB text limit.');
+   if(image){
+    const info=rasterInfo(bytes,path);
+    const bitmap=await decodeImage(bytes,info);
+    try{
+     if(ticket!==generation||owner!==root)return;
+     if(bitmap.width!==info.width||bitmap.height!==info.height)throw Error('Decoded image dimensions do not match the admitted header.');
+     render({path,root:owner,bitmap,...info});
+    }finally{bitmap.close();}
+    return;
+   }
    const text=new TextDecoder('utf-8',{fatal:true}).decode(bytes);
    if(text.includes('\0'))throw Error('Binary content is not a text preview.');
    // The renderer uses textContent, including for Markdown, TSX, HTML and SVG.

@@ -108,17 +108,29 @@ enabled source extension, while `notes,draft.md` is. Clicking prose punctuation 
 not select a file. Chinese quote/bracket wrappers are supported; unspaced
 punctuation followed by more prose remains conservatively unmatched.
 
-Only selected files are accessible, with a 256 KiB UTF-8 text bound. Markdown,
+Only selected files are accessible, with a 256 KiB UTF-8 text bound.
+Static PNG and single-scan baseline JPEG are also previewable, capped at 2 MiB
+encoded bytes, 4096 pixels per side and 4 megapixels. Container admission runs
+before native decoding; PNG uses a strict chunk allowlist (no animation,
+compressed text/ICC or EXIF metadata), and JPEG rejects progressive/multiscan,
+EXIF/ICC/multipicture extensions and concatenated images. Some otherwise valid
+images are deliberately unsupported. PNG/JPEG extensions must match their magic.
+Only one file read or decode may be pending at a time, including across close or
+source changes. Late bitmaps are discarded and closed; canvas content is cleared
+on dismissal. A WebView without createImageBitmap fails closed. These are byte,
+dimension and concurrency limits, not a hard codec CPU timeout or replacement
+for the browser's native decoder security. Native image decoding remains to be
+validated in WebKit. Markdown,
 TSX, HTML and SVG are displayed as literal source via `textContent`, never rendered
 as HTML, executed, or opened with a shell. Closing, clearing/replacing the folder,
 and newer requests invalidate pending reads; session changes invalidate terminal
 candidates. There is no arbitrary filesystem path reader or shell command helper.
 The directory chooser's snapshot is not live disk data; choose it again to refresh.
 
-This first slice does **not** support raster image decoding, remote file reads,
+This slice does **not** support other image formats or remote file reads,
 absolute paths, OSC 8/file URLs, wrapped filenames, or
 editor navigation. It does not claim every Codex CLI output format is recognized.
-Node tests cover the actual controller with a model DOM and File objects; native
+Node tests cover container admission and the actual controller with a model DOM, mocked decoder and File objects; native
 WebKit directory chooser, physical Ctrl-click and screen-reader acceptance remain
 unverified. A browser without directory selection fails closed instead of guessing
 a root. Shared-core candidate parsing is a follow-up, not an API this slice assumes.

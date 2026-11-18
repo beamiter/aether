@@ -8,3 +8,6 @@ textarea{display:block;box-sizing:border-box;width:100%;background:#111820;color
 #paste-escaped{white-space:pre-wrap;overflow-wrap:anywhere;max-height:12em;overflow:auto;border:1px solid #52627a;padding:8px}#paste-escaped:focus-visible{outline:2px solid #a5c7fa;outline-offset:2px}
 
 #file-preview{position:fixed;right:0;top:0;bottom:0;box-sizing:border-box;width:min(45vw,640px);padding:16px;background:#111820;border-left:1px solid #52627a;overflow:auto;z-index:2}#preview-source{white-space:pre-wrap;overflow-wrap:anywhere;unicode-bidi:plaintext}#preview-title{overflow-wrap:anywhere}#preview-files{max-width:90%}@media(max-width:700px){#file-preview{width:90vw}}
+
+#preview-raster { max-width:100%; height:auto; }
+#preview-raster[hidden] { display:none; }

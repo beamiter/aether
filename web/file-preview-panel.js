@@ -4,8 +4,11 @@ import {createFilePreview,selectedPathAtCell} from './file-preview.js';
 export function installFilePreviewPanel(document,{getFrame=()=>null,getEpoch=()=>null}={}){
  let paths=[],origin=null,selectionError=false;
  const picker=document.querySelector('#preview-folder'),choices=document.querySelector('#preview-files'),panel=document.querySelector('#file-preview'),title=document.querySelector('#preview-title'),body=document.querySelector('#preview-source'),notice=document.querySelector('#preview-notice');
+ const raster=document.querySelector('#preview-raster');
  const preview=createFilePreview({render(item){
-  panel.hidden=!item;title.textContent=item?item.path:'';body.textContent=item?item.text:'';
+  raster.width=1;raster.height=1;raster.hidden=true;
+  if(item?.bitmap){raster.width=item.width;raster.height=item.height;const context=raster.getContext('2d');if(!context)throw Error('Image canvas unavailable.');context.drawImage(item.bitmap,0,0);raster.hidden=false;}
+  panel.hidden=!item;title.textContent=item?item.path:'';body.textContent=item?.bitmap?'Local image preview':item?item.text:'';
  },onError(message){selectionError=true;notice.textContent=message;}});
  const single=document.querySelector('#preview-single');
  function populate(selected){
@@ -15,7 +18,7 @@ export function installFilePreviewPanel(document,{getFrame=()=>null,getEpoch=()=
  }
  picker.addEventListener('change',()=>{
   selectionError=false;single.value='';paths=preview.select(picker.files);populate(paths);
-  if(!selectionError)notice.textContent=paths.length?`${paths.length} local text files available. Contents are a selected snapshot, not live disk or remote session data.`:'No supported local text files selected. Raster images are not enabled in this slice.';
+  if(!selectionError)notice.textContent=paths.length?`${paths.length} local preview files available. Contents are a selected snapshot, not live disk or remote session data.`:'No supported local source or PNG/JPEG files selected.';
  });
  single.addEventListener('change',()=>{
   selectionError=false;picker.value='';paths=[];
@@ -23,7 +26,7 @@ export function installFilePreviewPanel(document,{getFrame=()=>null,getEpoch=()=
   // is manual-only and cannot be selected by untrusted terminal references.
   const selected=single.files?.length===1?preview.selectFile(single.files[0]):(preview.clear(),[]);
   populate(selected);
-  if(!selectionError)notice.textContent=selected.length?'One explicit local file selected. Use Preview selected source. Ctrl-click matching requires a bounded folder snapshot.':'No single file selected.';
+  if(!selectionError)notice.textContent=selected.length?'One explicit local file selected. Use Preview selected file. Ctrl-click matching requires a bounded folder snapshot.':'No single file selected.';
  });
  choices.addEventListener('change',()=>{origin=null;preview.dismiss();});
  async function show(){if(origin!==null&&origin!==getEpoch()){preview.dismiss();notice.textContent='Terminal session changed. Select a local file explicitly again.';origin=null;return;}notice.textContent='';await preview.show(choices.value);}
@@ -47,7 +50,7 @@ export function installFilePreviewPanel(document,{getFrame=()=>null,getEpoch=()=
   // Output cannot assert local/remote identity. Require an explicit local
   // confirmation before reading a same-named selected file, even after Ctrl-click.
   panel.hidden=false;title.textContent=path;body.textContent='';
-  notice.textContent='Terminal reference selected. Verify it refers to this local folder, not a remote host. Use Preview selected source to confirm the local file; no bytes have been read.';
+  notice.textContent='Terminal reference selected. Verify it refers to this local folder, not a remote host. Use Preview selected file to confirm the local file; no bytes have been read.';
   document.querySelector('#preview-confirm-local').focus();
  });
  return preview;
