@@ -1,3 +1,4 @@
+import {installFilePreviewPanel} from './file-preview-panel.js';
 import {installPasteReview} from './paste.js';
 import {resizeQueue,cursorTarget} from './viewport.js';
 import {installHistory} from './history.js';
@@ -5,9 +6,10 @@ import {acceptFull,paint} from './frames.js'; import {installIme} from './ime.js
 const canvas=document.querySelector('canvas'),status=document.querySelector('#status'),button=document.querySelector('#demo');
 const open=document.querySelector('#open'),close=document.querySelector('#close'),input=document.querySelector('#input'),send=document.querySelector('#send');
 let state=null,epoch=null,timer=null,polling=null,generation=0,transport=0,recovery=null;
+const filePreview=installFilePreviewPanel(document,{getFrame:()=>state,getEpoch:()=>epoch});
 const imeInput=document.querySelector('#ime-input');
 const ime=installIme(imeInput,{getEpoch:()=>epoch!==null&&!input.disabled?epoch:null,commit:(text,owner)=>{if(owner!==epoch)return;if(text.length>4096||new TextEncoder().encode(text).length>4096){status.textContent='Committed text exceeds 4096-byte limit; nothing sent.';return;}enqueueLogical('text_shell',{text});}});
-canvas.addEventListener('click',()=>imeInput.focus());
+canvas.addEventListener('click',event=>{if(!event.ctrlKey)imeInput.focus();});
 const resize=document.querySelector('#resize');
 const invoke=globalThis.__TAURI__?.core?.invoke;
 const pasteReview=installPasteReview({panel:document.querySelector('#paste-review'),preview:document.querySelector('#paste-preview'),escaped:document.querySelector('#paste-escaped'),confirm:document.querySelector('#paste-confirm'),cancel:document.querySelector('#paste-cancel'),getEpoch:()=>epoch!==null&&!input.disabled?epoch:null,send:(text,owner)=>{if(owner===epoch)enqueueLogical('paste_shell',{text});},onError:message=>{status.textContent=message;}});
@@ -46,12 +48,12 @@ async function poll(){
   finally{if(polling===ticket)polling=null;}
 }
 open.addEventListener('click',async()=>{
-  generation++;pasteReview.reset();history.reset();open.disabled=true;button.disabled=true;
+  generation++;filePreview.dismiss();pasteReview.reset();history.reset();open.disabled=true;button.disabled=true;
   try{epoch=await invoke('open_shell');keyQueue={chain:Promise.resolve(),pending:0,locked:false};state=null;resize.disabled=close.disabled=input.disabled=send.disabled=false;status.textContent='Experimental /bin/sh; TERM=dumb. Focus terminal for experimental keyboard input; no native GUI/IME acceptance.';timer=setInterval(poll,50);await poll();}
   catch(e){status.textContent=String(e?.message??e);open.disabled=false;}
 });
 close.addEventListener('click',async()=>{
-  generation++;pasteReview.reset();ime.reset();history.reset();clearInterval(timer);const old=epoch;epoch=null;resize.disabled=close.disabled=input.disabled=send.disabled=true;
+  generation++;filePreview.dismiss();pasteReview.reset();ime.reset();history.reset();clearInterval(timer);const old=epoch;epoch=null;resize.disabled=close.disabled=input.disabled=send.disabled=true;
   try{const result=await invoke('close_shell',{epoch:old});status.textContent=result?.cleanup_pending===false?'Terminal closed; direct child reaped. Descendant containment is not provided.':'Terminal closed; direct-child cleanup handed to bounded supervisor and may still be pending. Descendant containment is not provided.';state=null;open.disabled=false;button.disabled=false;}
   catch(e){epoch=old;close.disabled=false;status.textContent=`Close error: ${String(e?.message??e)}. Retry Close to finish cleanup.`;}
 });

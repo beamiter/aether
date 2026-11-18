@@ -9,7 +9,7 @@ function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsuppo
  const invoke=(name,args)=>name==='shell_status'?Promise.resolve(health(args)).then(s=>({drained:false,write_error:null,dropped_reply_bytes:'0',...s})):rawInvoke(name,args);
  const elements=new Map(),timers=new Map();let id=0;
  const el=selector=>{if(!elements.has(selector))elements.set(selector,{disabled:false,value:'',textContent:'',style:{},handlers:{},focus(){},addEventListener(name,fn){this.handlers[name]=fn}});return elements.get(selector)};
- const context={document:{querySelector:el},__TAURI__:{core:{invoke}},acceptFull,installIme,installHistory,installPasteReview,resizeQueue,cursorTarget,paint(){},TextEncoder:Encoder,TextDecoder,
+ const context={installFilePreviewPanel:()=>({dismiss(){}}),document:{querySelector:el},__TAURI__:{core:{invoke}},acceptFull,installIme,installHistory,installPasteReview,resizeQueue,cursorTarget,paint(){},TextEncoder:Encoder,TextDecoder,
  setInterval(fn){timers.set(++id,fn);return id},clearInterval(i){timers.delete(i)},setTimeout};
  vm.runInNewContext(fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8').replace(/^import .*\n/gm,''),context);
  return {el,timers,click:s=>el(s).handlers.click(),submit:()=>el('#command').handlers.submit({preventDefault(){}})};

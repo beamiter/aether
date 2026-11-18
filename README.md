@@ -77,3 +77,28 @@ environment failures and archive-only log references are retained in
 [import notes](PUBLISHING.md). They do not override the current pin, build commands,
 CI result or acceptance limits above. The old Library archive is not the maintained
 source; this repository is.
+
+## Experimental local source preview
+
+Choose a trusted local directory in the page to authorize a browser `File` snapshot
+(up to 2048 files). Ctrl+left-click an exact visible relative name such as
+`src/App.tsx` or `README.md` to select it in the sidebar, then confirm **Preview
+selected local file**. This confirmation is intentional: terminal output cannot
+prove that a reference belongs to the selected local folder rather than a remote
+host. No file bytes are read on hover or Ctrl-click alone. Files may also be
+selected directly from the local dropdown.
+
+Only selected files are accessible, with a 256 KiB UTF-8 text bound. Markdown,
+TSX, HTML and SVG are displayed as literal source via `textContent`, never rendered
+as HTML, executed, or opened with a shell. Closing, clearing/replacing the folder,
+and newer requests invalidate pending reads; session changes invalidate terminal
+candidates. There is no arbitrary filesystem path reader or shell command helper.
+The directory chooser's snapshot is not live disk data; choose it again to refresh.
+
+This first slice does **not** support raster image decoding, remote file reads,
+absolute paths, OSC 8/file URLs, wrapped filenames, `:line:column` suffixes, or
+editor navigation. It does not claim every Codex CLI output format is recognized.
+Node tests cover the actual controller with a model DOM and File objects; native
+WebKit directory chooser, physical Ctrl-click and screen-reader acceptance remain
+unverified. A browser without directory selection fails closed instead of guessing
+a root. Shared-core candidate parsing is a follow-up, not an API this slice assumes.
