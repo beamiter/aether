@@ -11,7 +11,7 @@ export function createFilePreview({render,onError}){
  function clear(){generation++;files=new Map();root=null;render(null);}
  function select(list){
   clear();
-  if(!list||!Number.isInteger(list.length)||list.length>MAX_FILES){onError('Choose a local folder containing at most 2048 files.');return [];}
+  if(!list||!Number.isInteger(list.length)||list.length>MAX_FILES){onError('Folder exceeds the 2048-file limit. Choose a smaller folder or use Select one source file without enumerating the project.');return [];}
   const next=new Map();let chosen=null;
   for(const file of list){
    const path=localSnapshotPath(file.webkitRelativePath),split=path?.indexOf('/')??-1;
@@ -21,6 +21,16 @@ export function createFilePreview({render,onError}){
    chosen=name;next.set(relative,file);
   }
   files=next;root=chosen;return [...files.keys()].filter(p=>TEXT_EXT.test(p)).sort();
+ }
+ // A single explicit file needs no directory enumeration. Its basename is
+ // only a display key, never a terminal-relative path or filesystem authority.
+ function selectFile(file){
+  clear();
+  if(!file||!localSnapshotPath(file.name)||file.name.includes('/')){
+   onError('Select one source file with a safe basename.');return [];
+  }
+  root='Explicit single-file snapshot';files.set(file.name,file);
+  return [file.name];
  }
  async function show(path){
   if(reading){onError('A preview read is still in progress. Retry when it finishes.');return;}
@@ -42,7 +52,7 @@ export function createFilePreview({render,onError}){
   finally{reading=false;}
  }
  function dismiss(){generation++;render(null);}
- return {select,show,dismiss,clear};
+ return {select,selectFile,show,dismiss,clear};
 }
 
 // Match only exact names in the explicitly selected snapshot. This is not a

@@ -82,3 +82,39 @@ test('repeated confirmation does not discard the admitted read or remain loading
  const first=h.show('x.md');await h.show('x.md');resolve(bytes('x'));await first;
  assert.equal(reads,1);assert.equal(h.shown.at(-1).text,'x');
 });
+test('large folder fails before enumeration and clears previous authority',async()=>{
+ const h=setup();h.select([file('root/old.md','old')]);
+ const huge={length:2049,[Symbol.iterator](){assert.fail('must not enumerate oversized selection');}};
+ assert.deepEqual(h.select(huge),[]);assert.match(h.errors.at(-1),/Select one source file/);
+ await h.show('old.md');assert.equal(h.shown.at(-1),null);
+});
+test('single-file snapshots avoid directory enumeration and retain bounded reads',async()=>{
+ const h=setup();let reads=0;
+ assert.deepEqual(h.selectFile({name:'App.tsx',size:3,arrayBuffer:async()=>{reads++;return bytes('src');}}),['App.tsx']);
+ assert.equal(reads,0);await h.show('App.tsx');assert.equal(h.shown.at(-1).text,'src');
+ for(const name of ['../x.md','src/x.md','/x.md','x\u202e.md']){
+  assert.deepEqual(h.selectFile({name,size:1}),[]);await h.show('App.tsx');assert.equal(h.shown.at(-1),null);
+ }
+ h.selectFile({name:'big.md',size:262145,arrayBuffer(){assert.fail('oversize read');}});
+ await h.show('big.md');assert.match(h.errors.at(-1),/256 KiB/);
+});
+test('actual panel preserves folder rejection and offers manual-only single file',async()=>{
+ const h=panelHarness();
+ h.el('#preview-folder').files={length:2049};h.el('#preview-folder').handlers.change();
+ assert.match(h.el('#preview-notice').textContent,/2048-file/);
+ let reads=0;
+ h.el('#preview-single').files=[{name:'src.md',size:3,arrayBuffer:async()=>{reads++;return bytes('src');}}];
+ h.el('#preview-single').handlers.change();
+ h.setFrame({...frame('src.md'),session:'pty-demo',epoch:1});h.click();
+ assert.equal(h.el('#file-preview').hidden,true);assert.equal(reads,0);
+ h.el('#preview-files').value='src.md';await h.el('#preview-show').handlers.click();
+ assert.equal(reads,1);assert.equal(h.el('#preview-source').textContent,'src');
+ h.el('#preview-clear').handlers.click();assert.equal(h.el('#preview-single').value,'');
+});
+test('switching from pending directory read to single file invalidates late content',async()=>{
+ let finish;const h=setup(),pending=new Promise(r=>finish=r);
+ h.select([{webkitRelativePath:'root/old.md',size:3,arrayBuffer:()=>pending}]);
+ const old=h.show('old.md');h.selectFile({name:'new.md',size:3,arrayBuffer:async()=>bytes('new')});
+ finish(bytes('old'));await old;assert.equal(h.shown.at(-1),null);
+ await h.show('new.md');assert.equal(h.shown.at(-1).text,'new');
+});

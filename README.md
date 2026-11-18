@@ -81,7 +81,13 @@ source; this repository is.
 ## Experimental local source preview
 
 Choose a trusted local directory in the page to authorize a browser `File` snapshot
-(up to 2048 files). Ctrl+left-click an exact visible relative name such as
+(up to 2048 files total, checked before iterating the FileList). For larger projects,
+use **Select one source file** to select the desired file directly without
+enumerating its directory. Single-file mode supports manual preview only: its
+basename does not establish a project-relative path and is not matched by
+terminal Ctrl-click. Selection replaces previous access; Clear removes both modes.
+The folder limit remains unchanged, including unsupported file types. Select a
+smaller subtree if terminal-relative matching is needed. Ctrl+left-click an exact visible relative name such as
 `src/App.tsx` or `README.md` to select it in the sidebar, then confirm **Preview
 selected local file**. This confirmation is intentional: terminal output cannot
 prove that a reference belongs to the selected local folder rather than a remote
