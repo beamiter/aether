@@ -199,3 +199,45 @@ test('repeated stale terminal confirmations never become manual file authorizati
  h.el('#preview-files').handlers.change();await h.el('#preview-show').handlers.click();
  assert.equal(reads,1);
 });
+test('authorized literal numeric suffix wins over location without read fallback',async()=>{
+ assert.equal(localSnapshotPath('root/a.md:12:3'),'root/a.md:12:3');
+ for(const p of ['C:/a.md','ssh://host/a.md','root:a/a.md','root/a.md:evil'])assert.equal(localSnapshotPath(p),null);
+ for(const token of ['a.md:12','./a.md:12','a.md:12,']){
+  assert.equal(selectedPathAtCell(frame(token),0,2,['a.md','a.md:12']),'a.md:12');
+  assert.equal(selectedPathAtCell(frame(token),0,2,['a.md']),'a.md');
+ }
+ const h=setup();let fallback=0;
+ h.select([file('root/a.md:12','literal'),{...file('root/a.md','base'),arrayBuffer:async()=>{fallback++;return bytes('base');}}]);
+ await h.show('a.md:12');assert.equal(h.shown.at(-1).text,'literal');assert.equal(fallback,0);
+ h.select([{...file('root/a.md:12',''),arrayBuffer:async()=>{throw new Error('NotReadableError');}},{...file('root/a.md','base'),arrayBuffer:async()=>{fallback++;return bytes('base');}}]);
+ await h.show('a.md:12');assert.equal(h.shown.at(-1),null);assert.equal(fallback,0);assert.match(h.errors.at(-1),/NotReadable/);
+});
+test('real Linux numeric-colon files remain distinct and missing literal never reads sibling',async()=>{
+ const fs=await import('node:fs/promises'),os=await import('node:os'),path=await import('node:path');
+ const dir=await fs.mkdtemp(path.join(os.tmpdir(),'aether-literal-'));
+ try{
+  await fs.writeFile(path.join(dir,'a.md'),'base');await fs.writeFile(path.join(dir,'a.md:12'),'literal');
+  const wrap=async name=>({webkitRelativePath:'root/'+name,size:(await fs.stat(path.join(dir,name))).size,arrayBuffer:async()=>{const b=await fs.readFile(path.join(dir,name));return Uint8Array.from(b).buffer;}});
+  const h=setup();h.select([await wrap('a.md'),await wrap('a.md:12')]);
+  await h.show('a.md:12');assert.equal(h.shown.at(-1).text,'literal');
+  await fs.unlink(path.join(dir,'a.md:12'));await h.show('a.md:12');
+  assert.equal(h.shown.at(-1),null);assert.match(h.errors.at(-1),/ENOENT/);
+ }finally{await fs.rm(dir,{recursive:true,force:true});}
+});
+test('panel confirms literal filename, preserves epoch and never reads location sibling',async()=>{
+ const h=panelHarness();let literal=0,base=0;
+ const a=file('root/a.md:12','literal'),b=file('root/a.md','base');
+ a.arrayBuffer=async()=>{literal++;return bytes('literal');};b.arrayBuffer=async()=>{base++;return bytes('base');};
+ h.el('#preview-folder').files=[a,b];h.el('#preview-folder').handlers.change();
+ h.setFrame({...frame('a.md:12'),session:'pty-demo',epoch:1});h.click({clientX:20});
+ assert.equal(h.el('#preview-title').textContent,'a.md:12');assert.equal(literal,0);assert.equal(base,0);
+ h.setEpoch(2);await h.el('#preview-confirm-local').handlers.click();assert.equal(literal,0);
+ h.setEpoch(1);h.click({clientX:20});await h.el('#preview-confirm-local').handlers.click();
+ assert.equal(literal,1);assert.equal(base,0);
+});
+
+test('drive-relative prefixes are rejected before numeric filename suffix parsing',()=>{
+ for(const value of ['C:12','c:0','D:12:3','Z:/file.md','C:12/file.md'])assert.equal(localSnapshotPath(value),null,value);
+ assert.equal(localSnapshotPath('root/a.md:12'),'root/a.md:12');
+ assert.equal(localSnapshotPath('root/C:12'),'root/C:12');
+});

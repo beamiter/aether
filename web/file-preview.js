@@ -2,10 +2,14 @@ import {MAX_IMAGE_BYTES,rasterInfo,decodeRaster} from './raster-preview.js';
 // Host-owned, opt-in local snapshot preview. No terminal output grants access:
 // only File objects supplied by the user's directory picker may be read.
 const MAX_FILES=2048, MAX_TEXT_BYTES=256*1024;
-const TEXT_EXT=/\.(?:txt|md|markdown|tsx?|jsx?|json|css|rs|toml|ya?ml|svg|html?|xml|sh|py|c|h|cpp)$/i;
+const TEXT_EXT=/\.(?:txt|md|markdown|tsx?|jsx?|json|css|rs|toml|ya?ml|svg|html?|xml|sh|py|c|h|cpp)(?::[0-9]+){0,2}$/i;
 export function localSnapshotPath(path){
- if(typeof path!=='string'||path.length>4096||!path||path.startsWith('/')||path.includes('\\')||path.includes(':')||/[\p{Cc}\p{Cf}]/u.test(path))return null;
- const parts=path.split('/');return parts.every(p=>p&&p!=='.'&&p!=='..')?path:null;
+ if(typeof path!=='string'||path.length>4096||!path||/^[A-Za-z]:/.test(path)||path.startsWith('/')||path.includes('\\')||/[\p{Cc}\p{Cf}]/u.test(path))return null;
+ const parts=path.split('/');
+ // Only a numeric suffix on the final filename is a literal colon name.
+ // Never admit schemes, drive letters or colon-bearing directories.
+ if(parts.some((p,i)=>p.includes(':')&&(i!==parts.length-1||!/^[^:]+(?::[0-9]+){1,2}$/.test(p))))return null;
+ return parts.every(p=>p&&p!=='.'&&p!=='..')?path:null;
 }
 const IMAGE_EXT=/\.(?:png|jpe?g)$/i;
 export function createFilePreview({render,onError,decodeImage=decodeRaster}){
@@ -71,8 +75,7 @@ export function createFilePreview({render,onError,decodeImage=decodeRaster}){
 // Match only exact names in the explicitly selected snapshot. This is not a
 // generic path parser or OSC 8 resolver. Numeric location suffixes select the
 // same authorized file, not a filesystem fallback or an editor navigation.
-// Colons are forbidden in selected snapshot paths, so exact-name ambiguity
-// cannot occur. Wrapped paths still wait for trusted source identity.
+// Authorized literal numeric-colon filenames win over location interpretations. Wrapped paths still wait for trusted source identity.
 export function selectedPathAtCell(frame,row,column,paths){
  if(!frame||!Number.isInteger(row)||!Number.isInteger(column)||row<0||column<0||column>=frame.cols||!frame.rows[row])return null;
  let text='',at=-1;
@@ -84,20 +87,20 @@ export function selectedPathAtCell(frame,row,column,paths){
   if(!localSnapshotPath(path))continue;
   for(const token of [path,'./'+path]){
    for(let start=text.indexOf(token);start!==-1;start=text.indexOf(token,start+1)){
-    let end=start+token.length;
+    let end=start+token.length,hasLocation=false;
     if(text[end]===':'){
      // Keep location parsing bounded and reject partial matches such as
      // :0, :12:bad, :12:3:4, huge integers, or URI-like suffixes.
      const location=/^:([1-9][0-9]{0,9})(?::([1-9][0-9]{0,9}))?/.exec(text.slice(end,end+22));
      if(!location||Number(location[1])>4294967295||(location[2]&&Number(location[2])>4294967295))continue;
-     end+=location[0].length;
+     end+=location[0].length;hasLocation=true;
     }
     // A punctuation suffix is prose only when the whole run reaches a
     // boundary. Never peel a prefix from README.md.js or README.md,backup.
     let contextEnd=end;
     while(contextEnd<text.length&&/[.,;!?，。；！？、]/u.test(text[contextEnd]))contextEnd++;
     if(at>=start&&at<contextEnd&&boundary(text[start-1])&&boundary(text[contextEnd]))
-     matches.push({path,end});
+     matches.push({path,end,hasLocation,start,contextEnd});
 
    }
   }
@@ -105,5 +108,6 @@ export function selectedPathAtCell(frame,row,column,paths){
  // Literal authorized names may themselves include punctuation. Reject
  // competing interpretations even when clicking their punctuation, rather
  // than choosing the shorter prose interpretation or longest filename.
- return new Set(matches.map(m=>m.path)).size===1&&matches.some(m=>at<m.end)?matches[0].path:null;
+ const candidates=matches.filter(m=>!m.hasLocation||!matches.some(exact=>!exact.hasLocation&&exact.start===m.start&&exact.end===m.end));
+ return new Set(candidates.map(m=>m.path)).size===1&&candidates.some(m=>at<m.end)?candidates[0].path:null;
 }

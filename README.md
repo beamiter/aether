@@ -96,6 +96,13 @@ selected directly from the local dropdown. Positive decimal location suffixes su
 as `src/App.tsx:12` and `src/App.tsx:12:3` also select that same file; each
 number must fit a nonzero 32-bit unsigned integer without leading zeroes. Clicking the suffix works too.
 This opens source preview only, not an editor jump or line highlighting.
+A literal numeric-colon filename in the selected snapshot (for example
+`a.md:12`) takes priority over interpreting `:12` as a location for `a.md`.
+Only one or two numeric colon suffixes on the final filename are admitted;
+schemes, drive prefixes, colon-bearing directories and other colon forms remain
+rejected. Supported text extensions may carry these literal suffixes. An unreadable
+or disappeared literal file produces an error, never a read of its unsuffixed
+sibling. Image names with literal colon suffixes remain unsupported.
 Sentence-ending ASCII/Chinese punctuation is accepted only when the full
 punctuation run ends at whitespace, a supported quote/bracket, or the row end.
 For example, `README.md,` and `README.md:12。` resolve, but
