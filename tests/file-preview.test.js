@@ -44,7 +44,7 @@ test('Ctrl-click candidate lookup matches selected exact tokens only',()=>{
  const f=frame('open `src/App.tsx` and README.md');
  assert.equal(selectedPathAtCell(f,0,8,['src/App.tsx']), 'src/App.tsx');
  assert.equal(selectedPathAtCell(f,0,23,['README.md']), 'README.md');
- for(const text of ['ssh://host/src/App.tsx','/src/App.tsx','prefixsrc/App.tsx','src/App.tsx:12','src/App.tsxmore'])assert.equal(selectedPathAtCell(frame(text),0,Math.min(8,text.length-1),['src/App.tsx']),null);
+ for(const text of ['ssh://host/src/App.tsx','/src/App.tsx','prefixsrc/App.tsx','src/App.tsxmore'])assert.equal(selectedPathAtCell(frame(text),0,Math.min(8,text.length-1),['src/App.tsx']),null);
  assert.equal(selectedPathAtCell(frame('./src/App.tsx'),0,4,['src/App.tsx']), 'src/App.tsx');
  assert.equal(selectedPathAtCell(f,1,8,['src/App.tsx']),null);
 });
@@ -117,4 +117,29 @@ test('switching from pending directory read to single file invalidates late cont
  const old=h.show('old.md');h.selectFile({name:'new.md',size:3,arrayBuffer:async()=>bytes('new')});
  finish(bytes('old'));await old;assert.equal(h.shown.at(-1),null);
  await h.show('new.md');assert.equal(h.shown.at(-1).text,'new');
+});
+
+test('location suffixes select only the explicitly authorized exact file',()=>{
+ for(const token of ['src/App.tsx:12','./src/App.tsx:12:3','src/App.tsx:4294967295:4294967295']){
+  const f=frame('see '+token+' next');
+  for(let col=4;col<4+token.length;col++)assert.equal(selectedPathAtCell(f,0,col,['src/App.tsx']),'src/App.tsx',token+' cell '+col);
+  assert.equal(selectedPathAtCell(f,0,4,[]),null);
+ }
+});
+test('malformed and remote location references never partially resolve',()=>{
+ for(const suffix of [':0',':01',':-1',':+1',':1:0',':1:02',':1:',':1:bad',':1:2:3',':4294967296',':1:4294967296',':99999999999999999999999',':12x',':12/path']){
+  const token='src/App.tsx'+suffix;
+  assert.equal(selectedPathAtCell(frame(token),0,5,['src/App.tsx']),null,token);
+ }
+ for(const token of ['/src/App.tsx:12','ssh://host/src/App.tsx:12','file:///src/App.tsx:12','prefixsrc/App.tsx:12'])
+  assert.equal(selectedPathAtCell(frame(token),0,token.indexOf('App'),['src/App.tsx']),null,token);
+});
+test('panel location click still requires local confirmation and honors epoch',async()=>{
+ const h=panelHarness();let reads=0;
+ const f=file('root/src/App.tsx','source');f.arrayBuffer=async()=>{reads++;return bytes('source');};
+ h.el('#preview-folder').files=[f];h.el('#preview-folder').handlers.change();
+ h.setFrame({...frame('src/App.tsx:12:3'),session:'pty-demo',epoch:1});
+ h.click({clientX:112});assert.equal(h.el('#preview-title').textContent,'src/App.tsx');assert.equal(reads,0);
+ h.setEpoch(2);await h.el('#preview-confirm-local').handlers.click();assert.equal(reads,0);
+ h.setEpoch(1);h.click({clientX:112});await h.el('#preview-confirm-local').handlers.click();assert.equal(reads,1);
 });

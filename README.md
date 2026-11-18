@@ -92,7 +92,10 @@ smaller subtree if terminal-relative matching is needed. Ctrl+left-click an exac
 selected local file**. This confirmation is intentional: terminal output cannot
 prove that a reference belongs to the selected local folder rather than a remote
 host. No file bytes are read on hover or Ctrl-click alone. Files may also be
-selected directly from the local dropdown.
+selected directly from the local dropdown. Positive decimal location suffixes such
+as `src/App.tsx:12` and `src/App.tsx:12:3` also select that same file; each
+number must fit a nonzero 32-bit unsigned integer without leading zeroes. Clicking the suffix works too.
+This opens source preview only, not an editor jump or line highlighting.
 
 Only selected files are accessible, with a 256 KiB UTF-8 text bound. Markdown,
 TSX, HTML and SVG are displayed as literal source via `textContent`, never rendered
@@ -102,7 +105,7 @@ candidates. There is no arbitrary filesystem path reader or shell command helper
 The directory chooser's snapshot is not live disk data; choose it again to refresh.
 
 This first slice does **not** support raster image decoding, remote file reads,
-absolute paths, OSC 8/file URLs, wrapped filenames, `:line:column` suffixes, or
+absolute paths, OSC 8/file URLs, wrapped filenames, or
 editor navigation. It does not claim every Codex CLI output format is recognized.
 Node tests cover the actual controller with a model DOM and File objects; native
 WebKit directory chooser, physical Ctrl-click and screen-reader acceptance remain

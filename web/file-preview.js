@@ -56,8 +56,10 @@ export function createFilePreview({render,onError}){
 }
 
 // Match only exact names in the explicitly selected snapshot. This is not a
-// generic path parser or OSC 8 resolver. Wrapped paths and :line suffixes wait
-// for the shared-core candidate contract and trusted source identity.
+// generic path parser or OSC 8 resolver. Numeric location suffixes select the
+// same authorized file, not a filesystem fallback or an editor navigation.
+// Colons are forbidden in selected snapshot paths, so exact-name ambiguity
+// cannot occur. Wrapped paths still wait for trusted source identity.
 export function selectedPathAtCell(frame,row,column,paths){
  if(!frame||!Number.isInteger(row)||!Number.isInteger(column)||row<0||column<0||column>=frame.cols||!frame.rows[row])return null;
  let text='',at=-1;
@@ -69,7 +71,14 @@ export function selectedPathAtCell(frame,row,column,paths){
   if(!localSnapshotPath(path))continue;
   for(const token of [path,'./'+path]){
    for(let start=text.indexOf(token);start!==-1;start=text.indexOf(token,start+1)){
-    const end=start+token.length;
+    let end=start+token.length;
+    if(text[end]===':'){
+     // Keep location parsing bounded and reject partial matches such as
+     // :0, :12:bad, :12:3:4, huge integers, or URI-like suffixes.
+     const location=/^:([1-9][0-9]{0,9})(?::([1-9][0-9]{0,9}))?/.exec(text.slice(end,end+22));
+     if(!location||Number(location[1])>4294967295||(location[2]&&Number(location[2])>4294967295))continue;
+     end+=location[0].length;
+    }
     if(at>=start&&at<end&&boundary(text[start-1])&&boundary(text[end]))matches.push(path);
    }
   }
