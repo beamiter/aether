@@ -32,7 +32,19 @@ export function installFilePreviewPanel(document,{getFrame=()=>null,getEpoch=()=
  async function show(){if(origin!==null&&origin!==getEpoch()){preview.dismiss();notice.textContent='Terminal session changed. Select a local file explicitly again.';return;}notice.textContent='';await preview.show(choices.value);}
  document.querySelector('#preview-show').addEventListener('click',show);
  document.querySelector('#preview-confirm-local').addEventListener('click',show);
- document.querySelector('#preview-close').addEventListener('click',()=>preview.dismiss());
+ function closeFromPanel(fromEscape=false){
+  if(panel.hidden)return;
+  preview.dismiss();notice.textContent='Preview closed. No terminal input sent.';
+  // Escape stays away from the terminal so held-key repeat cannot send PTY
+  // input. Explicit Close may restore only the same terminal session.
+  const target=!fromEscape&&origin!==null&&origin===getEpoch()?document.querySelector('canvas'):document.querySelector('#preview-show');
+  target.focus();
+ }
+ document.querySelector('#preview-close').addEventListener('click',()=>closeFromPanel());
+ panel.addEventListener('keydown',event=>{
+  if(panel.hidden||!panel.contains(document.activeElement)||event.key!=='Escape'||event.defaultPrevented||event.isComposing||event.keyCode===229||event.ctrlKey||event.altKey||event.shiftKey||event.metaKey||event.getModifierState?.('AltGraph'))return;
+  event.preventDefault();event.stopPropagation();closeFromPanel(true);
+ });
  document.querySelector('#preview-clear').addEventListener('click',()=>{
   preview.clear();paths=[];origin=null;picker.value='';single.value='';choices.replaceChildren();choices.disabled=true;document.querySelector('#preview-show').disabled=true;notice.textContent='Local file access cleared.';
  });

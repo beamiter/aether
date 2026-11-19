@@ -51,7 +51,7 @@ test('Ctrl-click candidate lookup matches selected exact tokens only',()=>{
 import {installFilePreviewPanel} from '../web/file-preview-panel.js';
 function panelHarness(){
  const elements=new Map();let epoch=1,current={...frame('src/App.tsx'),session:'pty-demo',epoch:1};
- const el=selector=>{if(!elements.has(selector))elements.set(selector,{value:'',textContent:'',hidden:false,handlers:{},addEventListener(n,fn){this.handlers[n]=fn;},replaceChildren(){this.children=[];},append(x){this.children.push(x);},focus(){this.focused=true;},getBoundingClientRect(){return {left:0,top:0,width:120,height:24};}});return elements.get(selector);};
+ const el=selector=>{if(!elements.has(selector))elements.set(selector,{value:'',textContent:'',hidden:false,handlers:{},addEventListener(n,fn){this.handlers[n]=fn;},replaceChildren(){this.children=[];},append(x){this.children.push(x);},focus(){this.focused=true;doc.activeElement=this;},contains(node){return ['#preview-close','#preview-confirm-local','#preview-source','#preview-raster'].some(id=>elements.get(id)===node);},getBoundingClientRect(){return {left:0,top:0,width:120,height:24};}});return elements.get(selector);};
  const doc={querySelector:el,createElement:()=>({})};
  const api=installFilePreviewPanel(doc,{getFrame:()=>current,getEpoch:()=>epoch});
  const click=(extra={})=>el('canvas').handlers.click({button:0,ctrlKey:true,currentTarget:el('canvas'),clientX:30,clientY:10,preventDefault(){},...extra});
@@ -240,4 +240,33 @@ test('drive-relative prefixes are rejected before numeric filename suffix parsin
  for(const value of ['C:12','c:0','D:12:3','Z:/file.md','C:12/file.md'])assert.equal(localSnapshotPath(value),null,value);
  assert.equal(localSnapshotPath('root/a.md:12'),'root/a.md:12');
  assert.equal(localSnapshotPath('root/C:12'),'root/C:12');
+});
+test('preview Escape dismisses only plain unhandled non-IME keys and restores safe focus',()=>{
+ const h=panelHarness();h.el('#preview-folder').files=[file('root/src/App.tsx','text')];h.el('#preview-folder').handlers.change();h.click();
+ const panel=h.el('#file-preview');
+ assert.equal(typeof panel.handlers.keydown,'function');
+ for(const extra of [{isComposing:true},{keyCode:229},{ctrlKey:true},{altKey:true},{shiftKey:true},{metaKey:true},{defaultPrevented:true}]){
+  panel.handlers.keydown({key:'Escape',...extra,preventDefault(){assert.fail('must not consume');},stopPropagation(){assert.fail('must not consume');}});
+  assert.equal(panel.hidden,false);
+ }
+ h.el('canvas').focus();
+ panel.handlers.keydown({key:'Escape',preventDefault(){assert.fail('terminal-focused Escape must remain terminal-owned');},stopPropagation(){assert.fail('outside focus');}});
+ assert.equal(panel.hidden,false);
+ h.el('#preview-confirm-local').focus();
+ let stopped=false;
+ panel.handlers.keydown({key:'Escape',preventDefault(){},stopPropagation(){stopped=true;}});
+ assert.equal(panel.hidden,true);assert.equal(stopped,true);assert.equal(h.el('#preview-show').focused,true);assert.equal(h.el('#preview-notice').textContent,'Preview closed. No terminal input sent.');
+ panel.handlers.keydown({key:'Escape',repeat:true,preventDefault(){assert.fail('hidden repeat must remain on preview button');},stopPropagation(){assert.fail('hidden repeat');}});
+ h.click();h.el('#preview-close').handlers.click();assert.equal(h.el('canvas').focused,true);
+ h.click();h.setEpoch(2);h.el('#preview-close').handlers.click();
+ assert.equal(h.el('#preview-show').focused,true);
+});
+test('Escape invalidates pending preview and late text cannot reopen sidebar',async()=>{
+ const h=panelHarness();let finish;const pending=new Promise(r=>finish=r);
+ const f=file('root/src/App.tsx','text');f.arrayBuffer=()=>pending;
+ h.el('#preview-folder').files=[f];h.el('#preview-folder').handlers.change();h.click();
+ const reading=h.el('#preview-confirm-local').handlers.click();
+ h.el('#file-preview').handlers.keydown({key:'Escape',preventDefault(){},stopPropagation(){}});
+ finish(bytes('text'));await reading;
+ assert.equal(h.el('#file-preview').hidden,true);assert.equal(h.el('#preview-source').textContent,'');
 });
