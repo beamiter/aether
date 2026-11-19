@@ -30,6 +30,7 @@ pub struct LiveBridge {
     flight: Option<u32>,
     delivered: u32,
     input: VecDeque<u8>,
+    stable: Option<jterm_engine::frame::CellFrame>,
 }
 impl LiveBridge {
     pub fn open(&mut self, rows: usize, cols: usize) -> Result<u32, String> {
@@ -38,6 +39,7 @@ impl LiveBridge {
         }
         let epoch = self.epoch.checked_add(1).ok_or("epoch exhausted")?;
         let session = Session::spawn(rows, cols)?;
+        self.stable = Some(session.terminal().frame()?);
         self.epoch = epoch;
         self.session = Some(session);
         self.flight = None;
@@ -55,7 +57,7 @@ impl LiveBridge {
     pub fn poll(&mut self, epoch: u32) -> Result<Option<WireFrame>, String> {
         self.check(epoch)?;
         let session = self.session.as_mut().unwrap();
-        session.poll()?;
+        session.poll_with_sync_capture(self.flight.is_none())?;
         if !self.input.is_empty() && !session.is_exited() && session.write_error().is_none() {
             let limit = 4096.min(self.input.len());
             // A sticky writer failure must not stop read-side draining.
@@ -69,22 +71,42 @@ impl LiveBridge {
         if self.flight.is_some() {
             return Ok(None);
         }
-        let frame = session.terminal().frame()?;
+        let completed = session.take_completed_sync_frame();
+        let frame = if !session.is_drained() && session.terminal().publication_held() {
+            match completed {
+                Some(frame) => frame,
+                None => return Ok(None),
+            }
+        } else {
+            session.terminal().frame()?
+        };
         let revision = u32::try_from(frame.stamp().revision).map_err(|_| "revision exhausted")?;
         if revision == self.delivered {
             return Ok(None);
         }
         let wire = from_engine(&frame, "pty-demo", epoch)?;
         self.flight = Some(revision);
+        self.stable = Some(frame);
         Ok(Some(wire))
     }
     /// Explicit full-snapshot recovery after lost delivery/ACK. Never changes PTY or input.
     /// Caller must discard older outstanding transport callbacks before applying this frame.
     pub fn recover_frame(&mut self, epoch: u32) -> Result<WireFrame, String> {
         self.check(epoch)?;
-        let frame = self.session.as_ref().unwrap().terminal().frame()?;
+        let session = self.session.as_ref().unwrap();
+        if !session.is_drained() && session.terminal().publication_held() {
+            let wire = from_engine(
+                self.stable.as_ref().ok_or("missing stable frame")?,
+                "pty-demo",
+                epoch,
+            )?;
+            self.flight = Some(wire.revision);
+            return Ok(wire);
+        }
+        let frame = session.terminal().frame()?;
         let wire = from_engine(&frame, "pty-demo", epoch)?;
         self.flight = Some(wire.revision);
+        self.stable = Some(frame);
         Ok(wire)
     }
     /// Independent immutable history snapshot; does not consume or acknowledge a live frame.
@@ -193,6 +215,7 @@ impl LiveBridge {
         self.session.as_mut().unwrap().close()?;
         let cleanup_pending = self.session.as_ref().unwrap().cleanup_pending();
         self.session.take();
+        self.stable = None;
         self.input.clear();
         self.flight = None;
         Ok(CloseStatus { cleanup_pending })
@@ -201,6 +224,134 @@ impl LiveBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_owned_line(bridge: &mut LiveBridge, epoch: u32, line: &[u8]) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut remaining = line;
+        while !remaining.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "test PTY write stalled"
+            );
+            let written = bridge.write(epoch, remaining).unwrap();
+            remaining = &remaining[written..];
+            if written == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+    #[test]
+    fn real_pty_completed_cycle_publishes_before_next_hold_timeout() {
+        use std::time::{Duration, Instant};
+        let mut bridge = LiveBridge::default();
+        let epoch = bridge.open(4, 80).unwrap();
+        let first = bridge.poll(epoch).unwrap().unwrap();
+        bridge.acknowledge(epoch, first.revision).unwrap();
+        let command=b"stty -echo; printf '\\033[2J\\033[H\\033[?2026h\\101\\033[?2026l\\033[?2026h\\102'; read release; exit\n";
+        write_owned_line(&mut bridge, epoch, command);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let complete = loop {
+            assert!(Instant::now() < deadline);
+            if let Some(frame) = bridge.poll(epoch).unwrap() {
+                if bridge
+                    .session
+                    .as_ref()
+                    .unwrap()
+                    .terminal()
+                    .publication_held()
+                {
+                    break frame;
+                }
+                bridge.acknowledge(epoch, frame.revision).unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(complete.rows[0][0].text, "A");
+        assert_eq!(complete.rows[0][1].text, " ");
+        assert!(bridge
+            .session
+            .as_ref()
+            .unwrap()
+            .terminal()
+            .visible_text()
+            .contains("AB"));
+        assert!(bridge.poll(epoch).unwrap().is_none());
+        let recovered = bridge.recover_frame(epoch).unwrap();
+        assert_eq!(complete.revision, recovered.revision);
+        bridge.acknowledge(epoch, recovered.revision).unwrap();
+        let live = loop {
+            assert!(Instant::now() < deadline);
+            if let Some(frame) = bridge.poll(epoch).unwrap() {
+                break frame;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert!(live.revision > complete.revision);
+        assert_eq!(live.rows[0][1].text, "B");
+        assert!(bridge.acknowledge(epoch, complete.revision).is_err());
+        bridge.acknowledge(epoch, live.revision).unwrap();
+        bridge.close(epoch).unwrap();
+    }
+    #[test]
+    fn real_pty_sync_holds_publication_but_drains_and_recovers_stable() {
+        use std::time::{Duration, Instant};
+        let mut bridge = LiveBridge::default();
+        let epoch = bridge.open(8, 64).unwrap();
+        let first = bridge.poll(epoch).unwrap().unwrap();
+        bridge.acknowledge(epoch, first.revision).unwrap();
+        let command =
+            b"stty -echo; printf '\\033[?2026h\\123\\131\\116\\103\\137\\120\\101\\122\\124'; read release; printf '\\123\\131\\116\\103\\137\\105\\116\\104\\033[?2026l'; exit\n";
+        write_owned_line(&mut bridge, epoch, command);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !bridge
+            .session
+            .as_ref()
+            .unwrap()
+            .terminal()
+            .publication_held()
+        {
+            assert!(Instant::now() < deadline);
+            if let Some(frame) = bridge.poll(epoch).unwrap() {
+                bridge.acknowledge(epoch, frame.revision).unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(bridge
+            .session
+            .as_ref()
+            .unwrap()
+            .terminal()
+            .visible_text()
+            .contains("SYNC_PART"));
+        let stable = bridge.stable.as_ref().unwrap().stamp().revision as u32;
+        assert!(bridge.poll(epoch).unwrap().is_none());
+        let recovered = bridge.recover_frame(epoch).unwrap();
+        assert_eq!(recovered.revision, stable);
+        assert!(!recovered.rows.iter().any(|r| r
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<String>()
+            .contains("SYNC_PART")));
+        bridge.acknowledge(epoch, recovered.revision).unwrap();
+        assert!(bridge.recover_frame(epoch + 1).is_err());
+        write_owned_line(&mut bridge, epoch, b"done\n");
+        let mut released = false;
+        while !bridge.status(epoch).unwrap().drained {
+            assert!(Instant::now() < deadline);
+            if let Some(frame) = bridge.poll(epoch).unwrap() {
+                released |= frame.rows.iter().any(|r| {
+                    r.iter()
+                        .map(|c| c.text.as_str())
+                        .collect::<String>()
+                        .contains("SYNC_PARTSYNC_END")
+                });
+                bridge.acknowledge(epoch, frame.revision).unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(released);
+        bridge.close(epoch).unwrap();
+    }
     #[test]
     fn real_pty_pressure_lost_ack_and_full_recovery() {
         use std::time::{Duration, Instant};
@@ -233,6 +384,93 @@ mod tests {
         bridge.acknowledge(epoch, recovered.revision).unwrap();
         assert!(bridge.poll(epoch).unwrap().is_none());
         assert!(bridge.recover_frame(epoch + 1).is_err());
+        bridge.close(epoch).unwrap();
+    }
+    #[test]
+    fn real_pty_begin_before_first_publication_recovers_initial_frame() {
+        use std::time::{Duration, Instant};
+        let mut bridge = LiveBridge::default();
+        let epoch = bridge.open(4, 40).unwrap();
+        let cmd = b"printf '\\033[?2026h'; read release; exit\n";
+        write_owned_line(&mut bridge, epoch, cmd);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !bridge
+            .session
+            .as_ref()
+            .unwrap()
+            .terminal()
+            .publication_held()
+        {
+            assert!(Instant::now() < deadline);
+            bridge.session.as_mut().unwrap().poll().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(bridge.poll(epoch).unwrap().is_none());
+        let frame = bridge.recover_frame(epoch).unwrap();
+        assert_eq!(frame.revision, 1);
+        bridge.acknowledge(epoch, frame.revision).unwrap();
+        bridge.close(epoch).unwrap();
+    }
+    #[test]
+    fn real_pty_final_drain_releases_unclosed_hold() {
+        use std::time::{Duration, Instant};
+        let mut bridge = LiveBridge::default();
+        let epoch = bridge.open(4, 40).unwrap();
+        let command = b"printf '\\033[?2026h\\104\\122\\101\\111\\116'; exit\n";
+        write_owned_line(&mut bridge, epoch, command);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut drain_published = false;
+        while !bridge.status(epoch).unwrap().drained {
+            assert!(Instant::now() < deadline);
+            if let Some(frame) = bridge.poll(epoch).unwrap() {
+                let has_final = frame.rows.iter().any(|r| {
+                    r.iter()
+                        .map(|c| c.text.as_str())
+                        .collect::<String>()
+                        .contains("DRAIN")
+                });
+                if has_final {
+                    assert!(bridge.status(epoch).unwrap().drained);
+                    drain_published = true;
+                }
+                bridge.acknowledge(epoch, frame.revision).unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            drain_published,
+            "the final poll must paint before the client stops polling"
+        );
+        bridge.close(epoch).unwrap();
+    }
+    #[test]
+    fn real_pty_missing_end_releases_while_child_still_running() {
+        use std::time::{Duration, Instant};
+        let mut bridge = LiveBridge::default();
+        let epoch = bridge.open(4, 48).unwrap();
+        let start = Instant::now();
+        write_owned_line(
+            &mut bridge,
+            epoch,
+            b"printf '\\033[?2026h\\124\\111\\115\\105\\117\\125\\124'; read release; exit\n",
+        );
+        loop {
+            assert!(start.elapsed() < Duration::from_secs(3));
+            if let Some(frame) = bridge.poll(epoch).unwrap() {
+                bridge.acknowledge(epoch, frame.revision).unwrap();
+                if frame.rows.iter().any(|r| {
+                    r.iter()
+                        .map(|c| c.text.as_str())
+                        .collect::<String>()
+                        .contains("TIMEOUT")
+                }) {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(start.elapsed() >= Duration::from_millis(250));
+        assert!(!bridge.status(epoch).unwrap().exited);
         bridge.close(epoch).unwrap();
     }
     #[test]

@@ -97,6 +97,9 @@ pub struct Terminal {
     unsupported_events: Vec<String>,
     negative_query_replies: u64,
     history: VecDeque<ScrollbackLine>,
+    sync_started: Option<std::time::Instant>,
+    capture_sync_end: bool,
+    completed_sync_frame: Option<CellFrame>,
 }
 impl Terminal {
     pub fn new(rows: usize, cols: usize) -> Result<Self, String> {
@@ -120,7 +123,16 @@ impl Terminal {
             unsupported_events: Vec::new(),
             negative_query_replies: 0,
             history: VecDeque::new(),
+            sync_started: None,
+            capture_sync_end: false,
+            completed_sync_frame: None,
         })
+    }
+    /// Paint publication only; parsing, PTY draining and replies remain live.
+    /// Repeated begin does not extend the first-begin 250ms safety deadline.
+    pub fn publication_held(&self) -> bool {
+        self.sync_started
+            .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(250))
     }
     /// Legacy and xterm modifyOtherKeys encoding; Kitty remains unsupported. `name` is a logical browser key or exactly
     /// one already layout-resolved printable Unicode scalar (not a physical key).
@@ -523,6 +535,15 @@ impl Terminal {
                                         self.screen.pending_wrap = false;
                                     }
                                 }
+                                2026 => {
+                                    if set {
+                                        self.sync_started
+                                            .get_or_insert_with(std::time::Instant::now);
+                                    } else {
+                                        self.sync_started = None;
+                                    }
+                                    continue;
+                                }
                                 1 | 25 | 2004 => (),
                                 _ => {
                                     self.unsupported();
@@ -652,7 +673,27 @@ impl Terminal {
                 self.record_unsupported_event(&event);
                 continue;
             }
-            match semantics::dispatch_local(&mut self.screen, &mut self.protocol, &event) {
+            // Reflect the effective hold only for the shared mode-query reducer;
+            // do not sample the clock or touch the mode set on ordinary output.
+            let sync_query = matches!(&event, Event::Csi {
+                params,
+                private_prefix: Some(b'?'),
+                intermediates,
+                final_byte: b'p',
+                ..
+            } if intermediates == b"$" && params.first() == Some(&2026));
+            if sync_query && self.publication_held() {
+                self.protocol.modes_mut().insert(2026);
+            }
+            let capture_end = self.capture_sync_end
+                && self.sync_started.is_some()
+                && matches!(&event, Event::Csi { private_prefix: Some(b'?'), intermediates, final_byte: b'l', params, .. }
+                    if intermediates.is_empty() && params.contains(&2026));
+            let dispatch = semantics::dispatch_local(&mut self.screen, &mut self.protocol, &event);
+            if sync_query {
+                self.protocol.modes_mut().remove(&2026);
+            }
+            match dispatch {
                 Dispatch::Handled(effects) => {
                     for effect in effects {
                         // Row edits are already applied by ScreenState. Effects
@@ -698,6 +739,14 @@ impl Terminal {
                         }
                     }
                 },
+            }
+            if capture_end {
+                // Exactly one bounded immutable frame per opted-in PTY poll.
+                // Reserve a distinct live revision even when no more bytes arrive.
+                let next = self.revision.checked_add(1).ok_or("revision exhausted")?;
+                self.completed_sync_frame = Some(self.frame()?);
+                self.revision = next;
+                self.capture_sync_end = false;
             }
         }
         Ok(replies)
@@ -1338,7 +1387,16 @@ impl Session {
             self.replies.extend(replies);
         }
     }
+    pub fn take_completed_sync_frame(&mut self) -> Option<CellFrame> {
+        self.terminal.completed_sync_frame.take()
+    }
     pub fn poll(&mut self) -> Result<usize, String> {
+        self.poll_with_sync_capture(false)
+    }
+    /// Opt-in bounded snapshot at first completed sync block. Parsing never stops.
+    pub fn poll_with_sync_capture(&mut self, capture: bool) -> Result<usize, String> {
+        self.terminal.completed_sync_frame = None;
+        self.terminal.capture_sync_end = capture;
         if self.closed {
             return Err("session is closed".into());
         }
@@ -2395,3 +2453,43 @@ mod tests {
 
 #[cfg(test)]
 mod bounded_tests;
+
+#[cfg(test)]
+mod sync_publication_tests {
+    use super::*;
+    #[test]
+    fn one_complete_frame_per_poll_budget_reserves_live_revision() {
+        let mut t = Terminal::new(2, 20).unwrap();
+        t.capture_sync_end = true;
+        t.feed(b"\x1b[?2026hA\x1b[?2026l\x1b[?2026hB\x1b[?2026l\x1b[?2026hC")
+            .unwrap();
+        assert!(t.publication_held());
+        let completed = t.completed_sync_frame.take().unwrap();
+        assert_eq!(completed.rows()[0].cells[0].character, 'A');
+        assert_eq!(completed.rows()[0].cells[1].character, ' ');
+        assert!(t.revision > completed.stamp().revision);
+        t.feed(b"\x1b[?2026l\x1b[?2026hD").unwrap();
+        assert!(t.completed_sync_frame.is_none());
+        t.sync_started = Some(std::time::Instant::now() - std::time::Duration::from_millis(251));
+        assert!(!t.publication_held());
+        assert!(t.frame().unwrap().stamp().revision > completed.stamp().revision);
+    }
+    #[test]
+    fn fragmented_hold_repeated_begin_deadline_and_release() {
+        let mut t = Terminal::new(2, 20).unwrap();
+        t.feed(b"\x1b[?202").unwrap();
+        assert!(!t.publication_held());
+        t.feed(b"6hpartial").unwrap();
+        assert!(t.publication_held());
+        t.sync_started = Some(std::time::Instant::now() - std::time::Duration::from_millis(251));
+        t.feed(b"\x1b[?2026h").unwrap();
+        assert!(!t.publication_held());
+        assert_eq!(t.feed(b"\x1b[?2026$p").unwrap(), b"\x1b[?2026;2$y");
+        t.feed(b"\x1b[?2026l\x1b[?2026h").unwrap();
+        assert!(t.publication_held());
+        assert_eq!(t.feed(b"\x1b[?2026$p").unwrap(), b"\x1b[?2026;1$y");
+        t.feed(b"\x1b[?2026l").unwrap();
+        assert!(!t.publication_held());
+        assert_eq!(t.feed(b"\x1b[?2026$p").unwrap(), b"\x1b[?2026;2$y");
+    }
+}
