@@ -270,3 +270,43 @@ test('Escape invalidates pending preview and late text cannot reopen sidebar',as
  finish(bytes('text'));await reading;
  assert.equal(h.el('#file-preview').hidden,true);assert.equal(h.el('#preview-source').textContent,'');
 });
+
+test('remote/local confirmation is pending-only and repeat cannot reread an admitted file',async()=>{
+ const h=panelHarness();let reads=0,finish;
+ const waiting=new Promise(resolve=>finish=resolve);
+ const f=file('root/src/App.tsx','owned');f.arrayBuffer=()=>{reads++;return waiting;};
+ h.el('#preview-folder').files=[f];h.el('#preview-folder').handlers.change();
+ assert.equal(h.el('#preview-confirmation').hidden,true);
+ await h.el('#preview-confirm-local').handlers.click();assert.equal(reads,0);
+ h.click();assert.equal(h.el('#preview-confirmation').hidden,false);
+ const first=h.el('#preview-confirm-local').handlers.click();
+ assert.equal(reads,1);assert.equal(h.el('#preview-confirmation').hidden,true);
+ assert.equal(h.el('#preview-source').focused,true);
+ await h.el('#preview-confirm-local').handlers.click();
+ finish(bytes('owned'));await first;
+ await h.el('#preview-confirm-local').handlers.click();
+ assert.equal(reads,1);assert.equal(h.el('#preview-source').textContent,'owned');
+ assert.equal(h.el('#preview-confirmation').hidden,true);
+});
+
+test('manual preview does not offer terminal-origin confirmation',async()=>{
+ const h=panelHarness();let reads=0;
+ const f=file('root/src/App.tsx','owned');f.arrayBuffer=async()=>{reads++;return bytes('owned');};
+ h.el('#preview-folder').files=[f];h.el('#preview-folder').handlers.change();
+ h.el('#preview-files').value='src/App.tsx';h.el('#preview-show').focus();
+ await h.el('#preview-show').handlers.click();
+ assert.equal(h.el('#file-preview').hidden,false);
+ assert.equal(h.el('#preview-confirmation').hidden,true);
+ assert.equal(h.el('#preview-source').focused,undefined);
+ await h.el('#preview-confirm-local').handlers.click();assert.equal(reads,1);
+});
+
+test('failed read returns focus to the preview button after confirmation',async()=>{
+ const h=panelHarness(),f=file('root/src/App.tsx','owned');
+ f.arrayBuffer=async()=>{throw Error('Owned fixture read failed.');};
+ h.el('#preview-folder').files=[f];h.el('#preview-folder').handlers.change();h.click();
+ await h.el('#preview-confirm-local').handlers.click();
+ assert.equal(h.el('#file-preview').hidden,true);assert.equal(h.el('#preview-confirmation').hidden,true);
+ assert.equal(h.el('#preview-show').focused,true);assert.equal(h.el('canvas').focused,undefined);
+ assert.equal(h.el('#preview-notice').textContent,'Owned fixture read failed.');
+});
