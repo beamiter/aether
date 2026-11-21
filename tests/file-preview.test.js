@@ -53,7 +53,7 @@ function panelHarness(){
  const elements=new Map();let epoch=1,current={...frame('src/App.tsx'),session:'pty-demo',epoch:1};
  const el=selector=>{if(!elements.has(selector))elements.set(selector,{value:'',textContent:'',hidden:false,handlers:{},addEventListener(n,fn){this.handlers[n]=fn;},replaceChildren(){this.children=[];},append(x){this.children.push(x);},focus(){this.focused=true;doc.activeElement=this;},contains(node){return ['#preview-close','#preview-confirm-local','#preview-source','#preview-raster'].some(id=>elements.get(id)===node);},getBoundingClientRect(){return {left:0,top:0,width:120,height:24};}});return elements.get(selector);};
  const doc={querySelector:el,createElement:()=>({})};
- const api=installFilePreviewPanel(doc,{getFrame:()=>current,getEpoch:()=>epoch});
+ const api=installFilePreviewPanel(doc,{getFrame:()=>current,getEpoch:()=>epoch,getSession:()=>'pty-demo'});
  const click=(extra={})=>el('canvas').handlers.click({button:0,ctrlKey:true,currentTarget:el('canvas'),clientX:30,clientY:10,preventDefault(){},...extra});
  return {el,api,click,setEpoch:e=>epoch=e,setFrame:f=>current=f};
 }

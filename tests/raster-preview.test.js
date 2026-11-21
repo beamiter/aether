@@ -44,7 +44,7 @@ test('panel image confirmation draws only admitted bitmap, clears canvas and rej
  const el=s=>{if(!elements.has(s))elements.set(s,{value:'',handlers:{},addEventListener(n,f){this.handlers[n]=f;},replaceChildren(){this.children=[];},append(x){this.children.push(x);},focus(){},getBoundingClientRect(){return {left:0,top:0,width:50,height:10};},getContext(){return {drawImage(){draws++;}};}});return elements.get(s);};
  const old=globalThis.createImageBitmap;globalThis.createImageBitmap=async()=>({width:1,height:1,close(){closed++;}});
  try{
-  const h=installFilePreviewPanel({querySelector:el,createElement:()=>({})},{getEpoch:()=>epoch,getFrame:()=>({session:'pty-demo',epoch,cols:5,rows:[ [...'x.png'].map(text=>({text,width:1})) ]})});
+  const h=installFilePreviewPanel({querySelector:el,createElement:()=>({})},{getEpoch:()=>epoch,getSession:()=>'pty-demo',getFrame:()=>({session:'pty-demo',epoch,cols:5,rows:[ [...'x.png'].map(text=>({text,width:1})) ]})});
   const f=file(png());f.arrayBuffer=async()=>{reads++;return png();};
   el('#preview-folder').files=[f];el('#preview-folder').handlers.change();
   const click=()=>el('canvas').handlers.click({button:0,ctrlKey:true,currentTarget:el('canvas'),clientX:20,clientY:2,preventDefault(){}});

@@ -1,5 +1,6 @@
 :root{color-scheme:dark;font:16px system-ui;background:#0b1118;color:#d9e5ef}body{margin:0}main{max-width:1000px;margin:32px auto;padding:0 24px}.tag{color:#94b5dd;font-size:12px;letter-spacing:.16em}h1{font-size:30px;margin:.4em 0}p{color:#acbacb;line-height:1.5}button{background:#a5c7fa;color:#0b1118;border:0;border-radius:7px;padding:10px 16px;font-weight:650}button:disabled{opacity:.6}.viewport{overflow:auto;border:1px solid #2d3c4f;border-radius:8px;padding:12px;background:#111820}canvas{display:block}.note{font-size:13px;max-width:800px}
 form{display:flex;gap:12px;align-items:center;margin-top:16px}label{flex:1}input{box-sizing:border-box;width:75%;background:#111820;color:#d9e5ef;border:1px solid #52627a;border-radius:5px;padding:9px}
+#ssh-terminal-form[hidden]{display:none}#ssh-terminal-form{margin:12px 0;flex-wrap:wrap}#ssh-terminal-form label{display:flex;gap:8px;align-items:center;flex:0 1 25rem}#ssh-terminal-host{flex:1;min-width:8rem}
 
 textarea{display:block;box-sizing:border-box;width:100%;background:#111820;color:#d9e5ef;border:1px solid #52627a;margin-top:8px;padding:8px;font:16px monospace}
 
@@ -11,3 +12,27 @@ textarea{display:block;box-sizing:border-box;width:100%;background:#111820;color
 
 #preview-raster { max-width:100%; height:auto; }
 #preview-raster[hidden] { display:none; }
+
+#workspace-nav, #remote-panel { max-width:1000px; margin:16px auto; padding:0 24px; }
+#remote-panel { margin-top:10px; }
+#remote-panel h1 { font-size:24px; margin:0 0 8px; }
+#workspace-nav:not([hidden]), .remote-modes, .remote-toolbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+#workspace-nav button[aria-pressed="false"] { background:#1b2b3e; color:#d9e5ef; }
+#remote-form { display:grid; gap:8px; margin-top:0; }
+#remote-form[data-embedded] :is(.remote-fields, .remote-control, #remote-connect) { display:none; }
+.remote-fields { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px 12px; }
+#remote-clipboard-options[hidden], #remote-clipboard-file-limit-row[hidden] { display:none; }
+#remote-clipboard-consent { grid-column:1 / -1; }
+.remote-fields label, .remote-toolbar label { display:grid; gap:4px; min-width:0; }
+.remote-fields input, .remote-fields select, .remote-toolbar select { width:100%; }
+#remote-panel select, #remote-panel input:not([type="checkbox"]) { box-sizing:border-box; min-height:32px; background:#111820; color:#d9e5ef; border:1px solid #52627a; border-radius:5px; padding:6px 9px; }
+.remote-toolbar { align-items:end; }
+.remote-toolbar label { flex:1 1 130px; }
+.remote-control input { width:auto; }
+#remote-panel p { margin:8px 0 4px; }
+.remote-result { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:0 12px; }
+.remote-session-status { display:flex; flex-wrap:wrap; column-gap:12px; }
+#remote-presentation { color:#a3b4c5; }
+#remote-metrics { margin:6px 0; font:12px monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
+#remote-feedback { overflow-wrap:anywhere; }
+@media(max-width:550px) { .remote-fields, .remote-result { grid-template-columns:minmax(0,1fr); } }

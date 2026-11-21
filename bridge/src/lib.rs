@@ -1,5 +1,8 @@
 //! Rust frame bridge and limited Linux PTY spike, not a full terminal.
 pub mod live;
+pub mod semantic;
+#[cfg(target_os = "linux")]
+pub mod terminal_transport;
 use jterm_engine::{
     frame::{CellFrame, Cursor, Limits, Row, Screen, Stamp},
     CursorShape, TerminalGrid,
@@ -33,6 +36,7 @@ pub struct WireFrame {
 }
 /// Resolve a host-owned immutable frame into paint-only values. No ANSI reaches JS.
 pub fn from_engine(frame: &CellFrame, session: &str, epoch: u32) -> Result<WireFrame, String> {
+    semantic::validate_grid(frame)?;
     let revision = u32::try_from(frame.stamp().revision).map_err(|_| "revision exhausted")?;
     let layout = u32::try_from(frame.stamp().layout).map_err(|_| "layout exhausted")?;
     Ok(WireFrame {
@@ -45,50 +49,54 @@ pub fn from_engine(frame: &CellFrame, session: &str, epoch: u32) -> Result<WireF
         rows: frame
             .rows()
             .iter()
-            .map(|r| {
-                r.cells
-                    .iter()
-                    .enumerate()
-                    .map(|(column, c)| {
-                        let mut fg = color(c.foreground, true);
-                        let mut bg = color(c.background, false);
-                        if c.flags.inverse() {
-                            std::mem::swap(&mut fg, &mut bg);
-                        }
-                        WireCell {
-                            text: c.character.to_string(),
-                            foreground: fg,
-                            background: bg,
-                            width: if c.flags.wide_continuation() {
-                                0
-                            } else if c.flags.wide() && column + 1 < frame.cols() {
-                                2
-                            } else {
-                                1
-                            },
-                            style: u8::from(c.flags.bold())
-                                | (u8::from(c.flags.italic()) << 1)
-                                | (u8::from(
-                                    c.flags.underline() != jterm_engine::UnderlineStyle::None,
-                                ) << 2)
-                                | (u8::from(c.flags.strikethrough()) << 3)
-                                | (u8::from(c.flags.dim()) << 4),
-                        }
-                    })
-                    .collect()
-            })
+            .map(|row| wire_row(row, frame.cols()))
             .collect(),
         cursor_row: frame.cursor().row,
         cursor_col: frame.cursor().col,
         cursor_visible: frame.cursor().visible,
-        cursor_shape: match frame.cursor().shape {
-            CursorShape::Block => "block",
-            CursorShape::Underline => "underline",
-            CursorShape::Beam => "beam",
-        },
+        cursor_shape: cursor_shape(frame.cursor().shape),
         pending_wrap: frame.cursor().pending_wrap,
     })
 }
+fn cursor_shape(shape: CursorShape) -> &'static str {
+    match shape {
+        CursorShape::Block => "block",
+        CursorShape::Underline => "underline",
+        CursorShape::Beam => "beam",
+    }
+}
+
+fn wire_row(row: &Row, cols: usize) -> Vec<WireCell> {
+    row.cells
+        .iter()
+        .enumerate()
+        .map(|(column, c)| {
+            let mut fg = color(c.foreground, true);
+            let mut bg = color(c.background, false);
+            if c.flags.inverse() {
+                std::mem::swap(&mut fg, &mut bg);
+            }
+            WireCell {
+                text: c.character.to_string(),
+                foreground: fg,
+                background: bg,
+                width: if c.flags.wide_continuation() {
+                    0
+                } else if c.flags.wide() && column + 1 < cols {
+                    2
+                } else {
+                    1
+                },
+                style: u8::from(c.flags.bold())
+                    | (u8::from(c.flags.italic()) << 1)
+                    | (u8::from(c.flags.underline() != jterm_engine::UnderlineStyle::None) << 2)
+                    | (u8::from(c.flags.strikethrough()) << 3)
+                    | (u8::from(c.flags.dim()) << 4),
+            }
+        })
+        .collect()
+}
+
 fn color(c: jterm_engine::Color, foreground: bool) -> String {
     use jterm_engine::Color::*;
     let index = match c {

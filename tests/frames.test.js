@@ -1,7 +1,29 @@
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';
-import {acceptFull,paint} from '../web/frames.js';
+import {acceptFull,acceptUpdate,paint} from '../web/frames.js';
 const demo=()=>JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
 test('accept actual Rust engine fixture and isolate external mutation',()=>{const raw=demo(),f=acceptFull(null,raw);raw.rows[0][0].text='X';assert.notEqual(f.rows[0][0].text,'X');assert.equal(f.cols,64);});
+
+test('semantic deltas update only validated rows and require the exact base',()=>{
+ const fixture=demo(),full=acceptUpdate(null,{kind:'snapshot',frame:fixture});
+ const changed=fixture.rows[0];changed[0].text='X';
+ const delta={kind:'delta',frame:{...fixture,base_revision:full.revision,revision:full.revision+1,
+  rows:[{index:0,cells:changed}]}};
+ const next=acceptUpdate(full,delta);
+ assert.equal(next.rows[0][0].text,'X');assert.notEqual(full.rows[0][0].text,'X');
+ assert.equal(next.rows[1],full.rows[1]);assert.notEqual(next.rows[0],full.rows[0]);
+ changed[0].text='Y';assert.equal(next.rows[0][0].text,'X');
+ for(const invalid of [
+  {base_revision:0},{layout:full.layout+1},{epoch:full.epoch+1},{session:'foreign'},
+  {rows:[...delta.frame.rows,...delta.frame.rows]}, {rows:[{index:128,cells:changed}]},
+  {rows:Array(full.rows.length+1).fill(null)}, {cursor_col:full.cols},
+ ]){
+  assert.throws(()=>acceptUpdate(full,{kind:'delta',frame:{...delta.frame,...invalid}}));
+  assert.equal(full.revision,fixture.revision);
+ }
+ assert.throws(()=>acceptUpdate(null,delta));
+ const cursorOnly=acceptUpdate(full,{kind:'delta',frame:{...delta.frame,rows:[],cursor_col:2}});
+ assert.equal(cursorOnly.cursor_col,2);assert.equal(cursorOnly.rows[0],full.rows[0]);
+});
 test('reject foreign session/epoch, stale revisions and invalid sizes atomically',()=>{const old=acceptFull(null,demo());for(const change of [{session:'other'},{epoch:2},{revision:0},{revision:1},{revision:2,cols:0},{revision:2,cursor_col:999}]){assert.throws(()=>acceptFull(old,{...demo(),...change}));assert.equal(old.revision,1);}});
 test('reject malformed cells and non-advanced layout resize',()=>{for(const text of ['\x1b','xx','']){const f=demo();f.rows[0][0].text=text;assert.throws(()=>acceptFull(null,f));}const f=demo();f.revision=2;f.rows.pop();assert.throws(()=>acceptFull(acceptFull(null,demo()),f));});
 test('paint uses cell-local canvas operations, no terminal interpretation',()=>{let texts=0;const g={scale(){},fillRect(){},save(){},beginPath(){},rect(){},clip(){},fillText(){texts++},restore(){},strokeRect(){}};const canvas={style:{},getContext:()=>g};paint(canvas,acceptFull(null,demo()),2);assert.equal(texts,512);assert.equal(canvas.width,1536);});

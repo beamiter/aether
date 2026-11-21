@@ -2,18 +2,101 @@ import {installPasteReview} from '../web/paste.js';
 import {resizeQueue,cursorTarget} from '../web/viewport.js';
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import vm from 'node:vm';
 import {installHistory} from '../web/history.js';
-import {acceptFull} from '../web/frames.js'; import {installIme} from '../web/ime.js';
+import {acceptFull,acceptUpdate} from '../web/frames.js'; import {installIme} from '../web/ime.js';
 const tick=()=>new Promise(r=>setImmediate(r));
 const deferred=()=>{let resolve,reject;const promise=new Promise((a,b)=>{resolve=a;reject=b});return {promise,resolve,reject};};
 function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsupported:"0"}), Encoder=TextEncoder){
- const invoke=(name,args)=>name==='shell_status'?Promise.resolve(health(args)).then(s=>({drained:false,write_error:null,dropped_reply_bytes:'0',...s})):rawInvoke(name,args);
+ const invoke=async(name,args)=>{
+  const {owner,...parameters}=args??{};
+  const legacy=owner?{epoch:owner.epoch,...parameters}:args;
+  if(name==='shell_status')return {drained:false,write_error:null,dropped_reply_bytes:'0',...await health(legacy)};
+  const result=await rawInvoke(name,legacy);
+  if(name==='open_shell'&&Number.isInteger(result)){
+   return {session:result.toString(16).padStart(32,'0'),epoch:result,generation:1};
+  }
+  if(name==='poll_shell'&&result&&!result.kind)return {kind:'snapshot',frame:{...result,session:owner.session}};
+  if(name==='recover_shell'&&result&&!result.owner){
+   return {owner:{...owner,generation:owner.generation+1},frame:{...result,session:owner.session}};
+  }
+  return result;
+ };
  const elements=new Map(),timers=new Map();let id=0;
  const el=selector=>{if(!elements.has(selector))elements.set(selector,{disabled:false,value:'',textContent:'',style:{},handlers:{},focus(){},addEventListener(name,fn){this.handlers[name]=fn}});return elements.get(selector)};
- const context={installFilePreviewPanel:()=>({dismiss(){}}),document:{querySelector:el},__TAURI__:{core:{invoke}},acceptFull,installIme,installHistory,installPasteReview,resizeQueue,cursorTarget,paint(){},TextEncoder:Encoder,TextDecoder,
+ const context={installFilePreviewPanel:()=>({dismiss(){}}),document:{querySelector:el},__TAURI__:{core:{invoke}},acceptFull,acceptUpdate,installIme,installHistory,installPasteReview,resizeQueue,cursorTarget,paint(){},TextEncoder:Encoder,TextDecoder,
  setInterval(fn){timers.set(++id,fn);return id},clearInterval(i){timers.delete(i)},setTimeout};
  vm.runInNewContext(fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8').replace(/^import .*\n/gm,''),context);
- return {el,timers,click:s=>el(s).handlers.click(),submit:()=>el('#command').handlers.submit({preventDefault(){}})};
+ return {el,timers,click:s=>el(s).handlers.click(),submit:()=>el('#command').handlers.submit({preventDefault(){}}),submitSsh:()=>el('#ssh-terminal-form').handlers.submit({preventDefault(){}})};
 }
+
+test('SSH terminal recovers the same grid on a new generation and reattaches read-only',async()=>{
+ const old={session:'a'.repeat(32),epoch:1,generation:1},next={...old,generation:2},readonly={...old,generation:4};
+ const frame={...JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8')),session:old.session,epoch:1};
+ const seen=[];let first=true,linkLost=false;
+ const h=harness(async(name,{action})=>{
+  assert.equal(name,'ssh_terminal');seen.push(action);
+  if(action.operation==='open'){assert.equal(action.destination,'ubuntu@192.0.2.10');return old;}
+  if(action.operation==='attach')return {owner:readonly,frame};
+  const c=action.command;
+  switch(c.kind){
+   case 'poll':if(linkLost)throw Error('SSH link ended');if(first){first=false;return {kind:'snapshot',frame};}return null;
+   case 'status':return {epoch:1,exited:false,drained:false,write_error:null,unsupported:'0',dropped_reply_bytes:'0'};
+   case 'ack':case 'detach':return null;
+   case 'close':return {cleanup_pending:false};
+   case 'recover':assert.equal(c.owner.generation,1);linkLost=false;return {owner:next,frame,input_allowed:true};
+   case 'write':assert.equal(c.owner.generation,2);return c.bytes.length;
+   default:throw Error(c.kind);
+  }
+ });
+ h.el('#ssh-terminal-host').value='ubuntu@192.0.2.10';await h.submitSsh();
+ assert.equal(h.el('#input').disabled,false);
+ linkLost=true;await [...h.timers.values()][0]();assert.equal(h.el('#input').disabled,true);
+ assert.match(h.el('#status').textContent,/SSH terminal paused/);
+ await h.click('#recover');assert.equal(h.el('#input').disabled,false);
+ h.el('#input').value='echo ready';await h.submit();
+ assert.equal(seen.filter(a=>a.command?.kind==='write').length,1);
+ await h.click('#detach');assert.equal(h.el('#open-ssh').disabled,true);
+ await h.click('#attach');assert.equal(h.el('#input').disabled,true);
+ assert.match(h.el('#status').textContent,/SSH shell in view-only mode/);
+ await h.click('#close');assert.equal(seen.at(-1).command.owner.generation,4);
+ assert.equal(h.el('#open-ssh').disabled,false);
+});
+
+test('SSH recovery preserves the lock after an uncertain write and never replays it',async()=>{
+ const owner={session:'b'.repeat(32),epoch:1,generation:1};
+ const frame={...JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8')),session:owner.session,epoch:1};
+ let writes=0;
+ const h=harness(async(name,{action})=>{
+  assert.equal(name,'ssh_terminal');
+  if(action.operation==='open')return owner;
+  switch(action.command.kind){
+   case 'poll':case 'ack':return null;
+   case 'status':return {epoch:1,exited:false,drained:false,write_error:null,unsupported:'0',dropped_reply_bytes:'0'};
+   case 'write':writes++;throw Error('SSH terminal disconnected');
+   case 'recover':return {owner:{...owner,generation:2},frame,input_allowed:false};
+   default:throw Error(action.command.kind);
+  }
+ });
+ h.el('#ssh-terminal-host').value='lab';await h.submitSsh();
+ h.el('#input').value='echo once';await h.submit();
+ await h.click('#recover');
+ assert.equal(h.el('#input').disabled,true);assert.equal(writes,1);
+});
+
+test('an expired detached SSH session frees the host field for a new connection',async()=>{
+ const owner={session:'c'.repeat(32),epoch:1,generation:1};
+ const h=harness(async(name,{action})=>{
+  assert.equal(name,'ssh_terminal');
+  if(action.operation==='open')return owner;
+  if(action.operation==='attach')return null;
+  switch(action.command.kind){
+   case 'poll':case 'detach':return null;
+   case 'status':return {epoch:1,exited:false,drained:false,write_error:null,unsupported:'0',dropped_reply_bytes:'0'};
+   default:throw Error(action.command.kind);
+  }
+ });
+ h.el('#ssh-terminal-host').value='lab';await h.submitSsh();await h.click('#detach');await h.click('#attach');
+ assert.equal(h.el('#open-ssh').disabled,false);assert.equal(h.el('#ssh-terminal-host').disabled,false);
+});
 test('late failed poll from old epoch cannot stop new session',async()=>{
  let epoch=0;const old=deferred();const h=harness(async(name,args)=>{
  if(name==='open_shell')return ++epoch;if(name==='close_shell')return;if(name==='poll_shell')return args.epoch===1?old.promise:null;throw Error(name);
@@ -61,6 +144,26 @@ test('only fully drained exited session stops polling',async()=>{
 test('failed close retains epoch so cleanup can be retried',async()=>{
  let closes=0;const seen=[];const h=harness(async(name,args)=>{if(name==='open_shell')return 1;if(name==='close_shell'){seen.push(args.epoch);if(++closes===1)throw Error('retry');}return null;});
  await h.click('#open');await h.click('#close');assert.equal(h.el('#close').disabled,false);assert.equal(h.el('#open').disabled,true);await h.click('#close');assert.deepEqual(seen,[1,1]);assert.equal(h.el('#open').disabled,false);
+});
+
+test('detach and reconnect restores the same shell only as a view',async()=>{
+ const frame=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+ frame.session='00000000000000000000000000000001';
+ const seen=[];
+ const h=harness(async(name,args)=>{
+  seen.push(name);
+  if(name==='open_shell')return 1;
+  if(name==='attach_shell')return {owner:{session:frame.session,epoch:1,generation:3},frame};
+  return null;
+ });
+ await h.click('#open');await h.click('#detach');
+ assert.equal(h.timers.size,0);assert.match(h.el('#status').textContent,/View detached/);
+ await h.click('#attach');
+ assert.equal(h.timers.size,1);assert.match(h.el('#status').textContent,/view-only/);
+ assert.equal(h.el('#input').disabled,true);assert.equal(h.el('#resize').disabled,true);
+ h.el('canvas').handlers.keydown({key:'a'});await tick();
+ assert.ok(seen.includes('detach_shell')&&seen.includes('ack_shell'));
+ assert.ok(!seen.includes('key_shell')&&!seen.includes('close_shell'));
 });
 
 test('logical key events are serialized and never ANSI encoded in JS',async()=>{

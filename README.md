@@ -13,9 +13,51 @@ session/bridge manifests and all three Cargo lockfiles. Run
 
 Compared with the imported `2b37583` checkpoint, this revision adds parser
 conformance coverage, corrects shared mouse report encoding and checks frame
-delta budgets before scratch allocations. Aether currently sends full frames and
-does not forward mouse reports, so those core fixes do not add mouse support or
-delta transport to this UI. No adapter API changes were required. See [upgrade verification](docs/CORE-UPGRADE.md).
+delta budgets before scratch allocations. Aether uses the shared frame delta API
+for live terminal updates and retains the existing logical keyboard input path.
+[Core upgrade verification](docs/CORE-UPGRADE.md)
+
+## Terminal session synchronization
+
+Open the experimental shell to start a semantic session. **Recover output
+snapshot** resynchronizes the current view. **Detach view** leaves the shell open
+for **Reconnect view**, which restores the output in read-only mode.
+
+For a remote PTY, run `aether-terminal-host serve` on the Linux host and use
+**Open SSH shell** with an OpenSSH host alias or `user@host`. The same terminal
+view displays local and SSH cell updates. After an SSH interruption, **Recover
+output snapshot** can reconnect to the current shell.
+[Session identity and wire contract](docs/TERMINAL-SEMANTIC-SESSION.md)
+
+## JWM remote desktop
+
+With `jwm-remote` installed on PATH, open **Remote Desktop** and enter the
+host address. Connections start in view-only mode. The X11 viewer accepts
+keyboard and pointer control when enabled explicitly and granted by the host.
+The Wayland viewer supports an explicitly granted one-shot keyboard and
+pointer lease per authorized window. Releasing it keeps the viewer open in
+read-only mode. Use **Source** to switch among the host's authorized sources.
+In a managed Wayland session with several authorized windows, a switch releases
+the current lease first. Once the new window has presented, **Request Input**
+can activate its unused grant. **Release Input** releases the X11 grab or the
+Wayland lease. **Disconnect** closes the viewer.
+
+Select **Modifier clicks and dragging** with Wayland control for host-approved
+compound gestures. Aether shows when a presented frame is ready to start a drag.
+
+When Aether runs on X11 and **Viewer** is set to **X11**, its native video pane
+uses the GTK XEmbed socket. Use a `jwm-remote` build that has
+`session --x11-parent-window`. The **Terminal** tab hides the pane and releases
+its input grab while keeping the connection open. Other display and viewer
+combinations use a separate native viewer window. The WebView receives control
+state and performance metrics. Closing Aether ends the connection. Recent
+hosts and results are held for the current window session.
+[GtkSocket reference](https://docs.gtk.org/gtk3/class.Socket.html)
+
+To check the X11 pane with private displays, run
+`python3 scripts/test-remote-desktop-x11.py PATH_TO_AETHER PATH_TO_JWM_REMOTE`.
+The check uses Xvfb, Metacity, xdotool, xwininfo, xprop, xsetroot, wmctrl,
+ImageMagick and Python Pillow.
 
 ## Build and check
 
@@ -62,8 +104,9 @@ commit; this link alone is not a claim that a particular commit passed.
   committed text is tested; a platform IME is not.
 - Linux compilation links a debug desktop executable; it does not launch a GUI.
 
-GUI pixels, native keyboard/clipboard/composition, Wayland, platform IME and
-candidate positioning remain unverified. Process ownership covers only the direct
+GUI acceptance for the terminal renderer, native keyboard and clipboard, and
+platform IME remains pending, including Wayland and candidate positioning.
+Process ownership covers only the direct
 shell, not descendant containment. The product shell uses `TERM=dumb`; the Vim
 smoke opts into `TERM=xterm`. Unsupported sequences and Unicode shaping limitations
 remain explicit. See [lifecycle policy](LIFECYCLE-POLICY.md) and

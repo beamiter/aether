@@ -1,5 +1,10 @@
 //! Linux-only limited PTY integration. Not a production process owner.
-use crate::{from_engine, WireFrame};
+use crate::{
+    from_engine,
+    semantic::{self, Attachment, Resume, Update},
+    WireFrame,
+};
+use jterm_engine::frame::CellFrame;
 use jterm_headless_session_spike::Session;
 use std::collections::VecDeque;
 #[derive(Debug, serde::Serialize)]
@@ -26,11 +31,15 @@ pub struct CloseStatus {
 #[derive(Default)]
 pub struct LiveBridge {
     session: Option<Session>,
+    id: String,
     epoch: u32,
-    flight: Option<u32>,
-    delivered: u32,
+    generation: u32,
+    input_attached: bool,
+    resumed_from: Option<u32>,
+    flight: Option<CellFrame>,
+    accepted: Option<CellFrame>,
     input: VecDeque<u8>,
-    stable: Option<jterm_engine::frame::CellFrame>,
+    stable: Option<CellFrame>,
 }
 impl LiveBridge {
     pub fn open(&mut self, rows: usize, cols: usize) -> Result<u32, String> {
@@ -38,12 +47,17 @@ impl LiveBridge {
             return Err("close the existing session first".into());
         }
         let epoch = self.epoch.checked_add(1).ok_or("epoch exhausted")?;
+        let id = semantic::session_id()?;
         let session = Session::spawn(rows, cols)?;
         self.stable = Some(session.terminal().frame()?);
         self.epoch = epoch;
+        self.id = id;
+        self.generation = 1;
+        self.input_attached = true;
+        self.resumed_from = None;
         self.session = Some(session);
         self.flight = None;
-        self.delivered = 0;
+        self.accepted = None;
         self.input.clear();
         Ok(epoch)
     }
@@ -54,7 +68,86 @@ impl LiveBridge {
             Ok(())
         }
     }
-    pub fn poll(&mut self, epoch: u32) -> Result<Option<WireFrame>, String> {
+    pub fn attachment(&self, epoch: u32) -> Result<Attachment, String> {
+        self.check(epoch)?;
+        Ok(Attachment {
+            session: self.id.clone(),
+            epoch,
+            generation: self.generation,
+        })
+    }
+
+    pub fn validate_session(&self, owner: &Attachment) -> Result<u32, String> {
+        self.check(owner.epoch)?;
+        if owner.session != self.id {
+            return Err("foreign terminal session".into());
+        }
+        Ok(owner.epoch)
+    }
+
+    pub fn validate_attachment(&self, owner: &Attachment) -> Result<u32, String> {
+        let epoch = self.validate_session(owner)?;
+        if owner.generation != self.generation {
+            return Err("stale terminal attachment".into());
+        }
+        Ok(epoch)
+    }
+
+    pub fn validate_input(&self, owner: &Attachment) -> Result<u32, String> {
+        let epoch = self.validate_attachment(owner)?;
+        if self.input_attached {
+            Ok(epoch)
+        } else {
+            Err("reconnected terminal view is read-only".into())
+        }
+    }
+
+    pub fn detach(&mut self, owner: &Attachment) -> Result<(), String> {
+        self.validate_attachment(owner)?;
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or("attachment exhausted")?;
+        self.input_attached = false;
+        self.flight = None;
+        self.accepted = None;
+        self.resumed_from = None;
+        Ok(())
+    }
+
+    /// A reconnect starts with a snapshot and no dependency on the old viewer's
+    /// data. A retry of an unacknowledged recovery gets the same attachment.
+    pub fn resume(&mut self, expected: Option<&Attachment>) -> Result<Option<Resume>, String> {
+        if let Some(owner) = expected {
+            self.validate_session(owner)?;
+            if self.resumed_from == Some(owner.generation) && self.accepted.is_none() {
+                if let Some(frame) = self.flight.as_ref() {
+                    return Ok(Some(Resume {
+                        owner: self.attachment(self.epoch)?,
+                        frame: from_engine(frame, &self.id, self.epoch)?,
+                    }));
+                }
+            }
+            self.validate_attachment(owner)?;
+        } else if self.session.is_none() {
+            return Ok(None);
+        }
+        let generation = self
+            .generation
+            .checked_add(1)
+            .ok_or("attachment exhausted")?;
+        let frame = self.recover_frame(self.epoch)?;
+        self.generation = generation;
+        self.input_attached &= expected.is_some();
+        self.resumed_from = expected.map(|owner| owner.generation);
+        self.accepted = None;
+        Ok(Some(Resume {
+            owner: self.attachment(self.epoch)?,
+            frame,
+        }))
+    }
+
+    fn poll_frame(&mut self, epoch: u32) -> Result<Option<CellFrame>, String> {
         self.check(epoch)?;
         let session = self.session.as_mut().unwrap();
         session.poll_with_sync_capture(self.flight.is_none())?;
@@ -80,33 +173,50 @@ impl LiveBridge {
         } else {
             session.terminal().frame()?
         };
-        let revision = u32::try_from(frame.stamp().revision).map_err(|_| "revision exhausted")?;
-        if revision == self.delivered {
+        if self
+            .accepted
+            .as_ref()
+            .is_some_and(|last| frame.stamp().revision == last.stamp().revision)
+        {
             return Ok(None);
         }
-        let wire = from_engine(&frame, "pty-demo", epoch)?;
-        self.flight = Some(revision);
-        self.stable = Some(frame);
+        Ok(Some(frame))
+    }
+
+    fn publish(&mut self, frame: CellFrame) {
+        self.stable = Some(frame.clone());
+        self.flight = Some(frame);
+    }
+
+    pub fn poll(&mut self, epoch: u32) -> Result<Option<WireFrame>, String> {
+        let Some(frame) = self.poll_frame(epoch)? else {
+            return Ok(None);
+        };
+        let wire = from_engine(&frame, &self.id, epoch)?;
+        self.publish(frame);
         Ok(Some(wire))
+    }
+
+    pub fn poll_update(&mut self, epoch: u32) -> Result<Option<Update>, String> {
+        let Some(frame) = self.poll_frame(epoch)? else {
+            return Ok(None);
+        };
+        let update = semantic::update(self.accepted.as_ref(), &frame, &self.id, epoch)?;
+        self.publish(frame);
+        Ok(Some(update))
     }
     /// Explicit full-snapshot recovery after lost delivery/ACK. Never changes PTY or input.
     /// Caller must discard older outstanding transport callbacks before applying this frame.
     pub fn recover_frame(&mut self, epoch: u32) -> Result<WireFrame, String> {
         self.check(epoch)?;
         let session = self.session.as_ref().unwrap();
-        if !session.is_drained() && session.terminal().publication_held() {
-            let wire = from_engine(
-                self.stable.as_ref().ok_or("missing stable frame")?,
-                "pty-demo",
-                epoch,
-            )?;
-            self.flight = Some(wire.revision);
-            return Ok(wire);
-        }
-        let frame = session.terminal().frame()?;
-        let wire = from_engine(&frame, "pty-demo", epoch)?;
-        self.flight = Some(wire.revision);
-        self.stable = Some(frame);
+        let frame = if !session.is_drained() && session.terminal().publication_held() {
+            self.stable.clone().ok_or("missing stable frame")?
+        } else {
+            session.terminal().frame()?
+        };
+        let wire = from_engine(&frame, &self.id, epoch)?;
+        self.publish(frame);
         Ok(wire)
     }
     /// Independent immutable history snapshot; does not consume or acknowledge a live frame.
@@ -140,14 +250,23 @@ impl LiveBridge {
     }
     pub fn acknowledge(&mut self, epoch: u32, revision: u32) -> Result<(), String> {
         self.check(epoch)?;
-        if self.flight.is_none() && self.delivered == revision && revision != 0 {
+        if self.flight.is_none()
+            && self
+                .accepted
+                .as_ref()
+                .is_some_and(|frame| frame.stamp().revision == u64::from(revision))
+        {
             return Ok(()); // retry of a successfully applied but lost ACK response
         }
-        if self.flight != Some(revision) {
+        if self
+            .flight
+            .as_ref()
+            .is_none_or(|frame| frame.stamp().revision != u64::from(revision))
+        {
             return Err("wrong frame ACK".into());
         }
-        self.delivered = revision;
-        self.flight = None;
+        self.accepted = self.flight.take();
+        self.resumed_from = None;
         Ok(())
     }
     fn enqueue(&mut self, epoch: u32, bytes: Vec<u8>) -> Result<(), String> {
@@ -215,15 +334,134 @@ impl LiveBridge {
         self.session.as_mut().unwrap().close()?;
         let cleanup_pending = self.session.as_ref().unwrap().cleanup_pending();
         self.session.take();
+        self.id.clear();
+        self.input_attached = false;
         self.stable = None;
         self.input.clear();
         self.flight = None;
+        self.accepted = None;
+        self.resumed_from = None;
         Ok(CloseStatus { cleanup_pending })
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_stream_reconnects_to_the_same_pty_after_lost_delta_and_ack() {
+        let mut bridge = LiveBridge::default();
+        let epoch = bridge.open(16, 80).unwrap();
+        let original = bridge.attachment(epoch).unwrap();
+        let Some(Update::Snapshot { frame }) = bridge.poll_update(epoch).unwrap() else {
+            panic!("missing initial snapshot");
+        };
+        bridge.acknowledge(epoch, frame.revision).unwrap();
+        write_owned_line(
+            &mut bridge,
+            epoch,
+            b"TOKEN=STILL_RUNNING; stty -echo; printf '\\033[10;1H%s\\r\\n' INITIAL_DELTA\n",
+        );
+
+        let mut accepted = frame.revision;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let unacknowledged = loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "visible delta missing"
+            );
+            match bridge.poll_update(epoch).unwrap() {
+                Some(Update::Delta { frame }) => {
+                    assert_eq!(frame.base_revision, accepted);
+                    assert_eq!(frame.session, original.session);
+                    assert!(frame.rows.len() < 16);
+                    if frame.rows.iter().any(|row| {
+                        row.cells
+                            .iter()
+                            .map(|cell| cell.text.as_str())
+                            .collect::<String>()
+                            .trim()
+                            == "INITIAL_DELTA"
+                    }) {
+                        let revision = frame.revision;
+                        let delta_len = serde_json::to_vec(&Update::Delta { frame }).unwrap().len();
+                        let current = bridge.flight.as_ref().unwrap();
+                        let snapshot_len = serde_json::to_vec(&Update::Snapshot {
+                            frame: from_engine(current, &original.session, epoch).unwrap(),
+                        })
+                        .unwrap()
+                        .len();
+                        assert!(delta_len < snapshot_len);
+                        println!(
+                            "{{\"delta_bytes\":{delta_len},\"snapshot_bytes\":{snapshot_len}}}"
+                        );
+                        break revision;
+                    }
+                    accepted = frame.revision;
+                    bridge.acknowledge(epoch, accepted).unwrap();
+                }
+                Some(Update::Snapshot { frame }) => {
+                    accepted = frame.revision;
+                    bridge.acknowledge(epoch, accepted).unwrap();
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(2)),
+            }
+        };
+        assert!(bridge.poll_update(epoch).unwrap().is_none());
+
+        let resumed = bridge.resume(Some(&original)).unwrap().unwrap();
+        assert_eq!(resumed.owner.session, original.session);
+        assert_eq!(resumed.owner.epoch, original.epoch);
+        assert_ne!(resumed.owner.generation, original.generation);
+        assert!(resumed.frame.revision >= unacknowledged);
+        let retry = bridge.resume(Some(&original)).unwrap().unwrap();
+        assert_eq!(retry.owner, resumed.owner);
+        assert_eq!(retry.frame.revision, resumed.frame.revision);
+        assert!(bridge.validate_attachment(&original).is_err());
+        assert!(bridge.validate_input(&original).is_err());
+        bridge.acknowledge(epoch, resumed.frame.revision).unwrap();
+        assert!(bridge.resume(Some(&original)).is_err());
+
+        assert_eq!(bridge.validate_input(&resumed.owner).unwrap(), epoch);
+        write_owned_line(
+            &mut bridge,
+            epoch,
+            b"printf '\\033[12;1H%s\\r\\n' \"$TOKEN\"\n",
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shell variable did not survive"
+            );
+            if let Some(frame) = bridge.poll(epoch).unwrap() {
+                bridge.acknowledge(epoch, frame.revision).unwrap();
+                if frame.rows.iter().any(|row| {
+                    row.iter()
+                        .map(|cell| cell.text.as_str())
+                        .collect::<String>()
+                        .trim()
+                        == "STILL_RUNNING"
+                }) {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        bridge.resize(epoch, 12, 72).unwrap();
+        let Some(Update::Snapshot { frame }) = bridge.poll_update(epoch).unwrap() else {
+            panic!("layout change must send a snapshot");
+        };
+        assert_eq!((frame.rows.len(), frame.cols), (12, 72));
+        bridge.detach(&resumed.owner).unwrap();
+        assert!(bridge.validate_attachment(&resumed.owner).is_err());
+        let view_only = bridge.resume(None).unwrap().unwrap();
+        assert_eq!(view_only.owner.session, original.session);
+        assert!(bridge.validate_input(&view_only.owner).is_err());
+        assert_eq!(bridge.validate_attachment(&view_only.owner).unwrap(), epoch);
+        bridge.close(epoch).unwrap();
+    }
 
     fn write_owned_line(bridge: &mut LiveBridge, epoch: u32, line: &[u8]) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -501,7 +739,7 @@ mod tests {
         assert_eq!(bridge.history(epoch, 0).unwrap().epoch, epoch);
         assert_eq!(bridge.status(epoch).unwrap().unsupported, "0");
         let frame = bridge.poll(epoch).unwrap().unwrap();
-        assert_eq!(frame.session, "pty-demo");
+        assert_eq!(frame.session, bridge.attachment(epoch).unwrap().session);
         assert!(bridge.poll(epoch).unwrap().is_none());
         bridge.history(epoch, 0).unwrap();
         assert!(bridge.poll(epoch).unwrap().is_none());

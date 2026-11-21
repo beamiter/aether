@@ -3425,8 +3425,10 @@ dependencies = [
 name = "tauri-terminal-frame-bridge"
 version = "0.0.1"
 dependencies = [
+ "getrandom 0.4.3",
  "jterm-headless-session-spike",
  "jterm_engine",
+ "libc",
  "serde",
  "serde_json",
 ]
@@ -3435,6 +3437,9 @@ dependencies = [
 name = "tauri-terminal-lab"
 version = "0.0.1"
 dependencies = [
+ "gdkx11",
+ "gtk",
+ "serde",
  "serde_json",
  "tauri",
  "tauri-build",

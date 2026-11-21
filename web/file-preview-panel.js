@@ -1,7 +1,7 @@
 import {createFilePreview,selectedPathAtCell} from './file-preview.js';
 // This panel is explicitly local and independent of terminal/Codex output.
 // Directory selection grants a snapshot, not arbitrary path or remote access.
-export function installFilePreviewPanel(document,{getFrame=()=>null,getEpoch=()=>null}={}){
+export function installFilePreviewPanel(document,{getFrame=()=>null,getEpoch=()=>null,getSession=()=>'pty-demo'}={}){
  let paths=[],origin=null,selectionError=false;
  const picker=document.querySelector('#preview-folder'),choices=document.querySelector('#preview-files'),panel=document.querySelector('#file-preview'),title=document.querySelector('#preview-title'),body=document.querySelector('#preview-source'),notice=document.querySelector('#preview-notice');
  const raster=document.querySelector('#preview-raster');
@@ -56,7 +56,7 @@ export function installFilePreviewPanel(document,{getFrame=()=>null,getEpoch=()=
  });
  document.querySelector('canvas').addEventListener('click',event=>{
   if(event.button!==0||!event.ctrlKey||event.altKey||event.shiftKey||event.metaKey||event.defaultPrevented)return;
-  const frame=getFrame(),epoch=getEpoch();if(epoch===null||!frame||frame.epoch!==epoch||frame.session!=='pty-demo')return;
+  const frame=getFrame(),epoch=getEpoch();if(epoch===null||!frame||frame.epoch!==epoch||frame.session!==getSession())return;
   const rect=event.currentTarget.getBoundingClientRect();
   if(!rect.width||!rect.height)return;
   const column=Math.floor((event.clientX-rect.left)/rect.width*frame.cols),row=Math.floor((event.clientY-rect.top)/rect.height*frame.rows.length);
