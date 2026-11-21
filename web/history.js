@@ -12,7 +12,7 @@ export function installHistory({older,newer,refresh,output,label,invoke,getEpoch
   let group=null;
   function load(delta) {
     const epoch=getEpoch();if(epoch===null)return Promise.resolve();
-    if(!group||group.epoch!==epoch)group={epoch,offset:0,desired:0,pending:null,promise:null};
+    if(!group||group.epoch!==epoch)group={epoch,offset:0,total:null,desired:0,pending:null,promise:null};
     const current=group;
     current.desired=Math.max(0,Math.min(1024,current.desired+delta));
     current.pending=current.desired;
@@ -21,12 +21,17 @@ export function installHistory({older,newer,refresh,output,label,invoke,getEpoch
       while(current.pending!==null&&group===current&&getEpoch()===epoch){
         const requested=current.pending;current.pending=null;
         try {
-          const snapshot=acceptHistory(await invoke('history_shell',{epoch,offset:requested}),epoch);
+          const value=await invoke('history_shell',{epoch,offset:requested});
           if(group!==current||getEpoch()!==epoch)return;
-          // A more recent user request supersedes this result; do not disturb
-          // selected text with an intermediate page.
+          // A newer request already owns the output. Do not validate or encode
+          // the abandoned reply, and do not disturb selected text.
           if(current.pending!==null)continue;
-          current.offset=current.desired=snapshot.offset;output.value=snapshot.text;output.setSelectionRange(0,0);
+          const snapshot=acceptHistory(value,epoch);
+          const unchanged=current.total===snapshot.total_rows&&current.offset===snapshot.offset&&output.value===snapshot.text;
+          current.offset=current.desired=snapshot.offset;current.total=snapshot.total_rows;
+          // Refresh can advance the revision without changing this page.
+          // Assigning even identical text would collapse the browser selection.
+          if(!unchanged){output.value=snapshot.text;output.setSelectionRange(0,0);}
           const end=snapshot.total_rows-snapshot.offset,start=Math.max(1,end-127);
           label.textContent=`Snapshot ${snapshot.revision}: ${end>0?`archived rows ${start}–${end}`:'no archived rows'} of ${snapshot.total_rows}; ${snapshot.offset} newer rows skipped. Select text and copy normally. Refresh for new output.`;
         }catch(e){

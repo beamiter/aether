@@ -102,3 +102,40 @@ test('history newer refresh is preserved even when its target equals the failed 
  assert.equal(h.requests.length,2);assert.equal(h.requests[1].args.offset,0);
  h.requests[1].resolve(page());await pending;assert.equal(h.output.value,'hello\nworld');
 });
+
+test('unchanged page refresh preserves selected text while updating the revision label',async()=>{
+ const h=setup(),selectionWrites=[];
+ h.output.setSelectionRange=(...range)=>selectionWrites.push(range);
+ const first=h.click('refresh');h.requests[0].resolve(page());await first;
+ assert.deepEqual(selectionWrites,[[0,0]]);
+ let rewrites=0,value=h.output.value;
+ Object.defineProperty(h.output,'value',{get(){return value;},set(next){rewrites++;value=next;}});
+ const same=h.click('refresh');h.requests[1].resolve({...page(),revision:'13'});await same;
+ assert.equal(rewrites,0);assert.deepEqual(selectionWrites,[[0,0]]);
+ assert.match(h.label.textContent,/Snapshot 13/);
+
+ const differentPage=h.click('older');h.requests[2].resolve(page(1,value,2,3));await differentPage;
+ assert.equal(rewrites,1);assert.deepEqual(selectionWrites,[[0,0],[0,0]]);
+ assert.match(h.label.textContent,/2 newer rows skipped/);
+ const changed=h.click('refresh');h.requests[3].resolve(page(1,'updated text',2,3));await changed;
+ assert.equal(rewrites,2);assert.equal(h.output.value,'updated text');
+ assert.deepEqual(selectionWrites,[[0,0],[0,0],[0,0]]);
+});
+
+test('already superseded and previous-epoch history payloads skip validation entirely',async()=>{
+ const h=setup(),encoded=[],Encoder=globalThis.TextEncoder;
+ globalThis.TextEncoder=class extends Encoder{encode(text){encoded.push(text);return super.encode(text);}};
+ try{
+  const old=h.click('refresh');h.click('older');
+  h.requests[0].resolve(page(1,'x'.repeat(131200)));await tick();
+  assert.deepEqual(encoded,[]);assert.equal(h.requests.length,2);
+  h.requests[1].resolve(page(1,'latest',20,30));await old;
+  assert.deepEqual(encoded,['latest']);
+  const previous=h.click('refresh');h.reset();h.setEpoch(2);
+  const fresh=h.click('refresh');
+  h.requests[2].resolve(page(1,'y'.repeat(131200)));await previous;
+  assert.deepEqual(encoded,['latest']);assert.equal(h.output.value,'');
+  h.requests[3].resolve(page(2,'new session'));await fresh;
+  assert.deepEqual(encoded,['latest','new session']);assert.equal(h.output.value,'new session');
+ }finally{globalThis.TextEncoder=Encoder;}
+});
