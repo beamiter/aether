@@ -124,7 +124,9 @@ document.querySelector('#copy-visible').addEventListener('click',()=>{
   if(!state)return;
   history.reset();
   const output=document.querySelector('#history-output');
-  output.value=state.rows.map(row=>row.filter(cell=>cell.width!==0).map(cell=>cell.text).join('').trimEnd()).join('\n');
+  // Match Rust archive copy: strip ASCII blank padding, not displayed
+  // Unicode spaces such as NBSP or the wide ideographic space.
+  output.value=state.rows.map(row=>row.filter(cell=>cell.width!==0).map(cell=>cell.text).join('').replace(/ +$/,'')).join('\n');
   document.querySelector('#history-label').textContent=`Visible grid snapshot ${state.revision}. Select and copy normally; visual rows are separated by newlines.`;
 });
 

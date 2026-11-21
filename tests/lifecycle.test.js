@@ -302,3 +302,26 @@ test('already consumed terminal keys never reach shell or dismiss paste review',
   origin.handlers.keydown({key:'ArrowUp',currentTarget:origin,target:origin,preventDefault(){}});await tick();assert.equal(sent.length,1);
  }
 });
+
+test('visible grid copy removes only ASCII padding, preserving deliberate Unicode spaces',async()=>{
+ const frame=JSON.parse(fs.readFileSync(new URL('../web/unicode-frame.json',import.meta.url),'utf8'));
+ frame.session='pty-demo';frame.cols=5;frame.cursor_row=0;frame.cursor_col=0;
+ const color={foreground:'#ffffff',background:'#000000',style:0};
+ const c=(text,width=1)=>({...color,text,width});
+ frame.rows=[
+  [c('A'),c('\u00a0'),c(' '),c(' '),c(' ')],
+  [c('界',2),c(' ',0),c('\u3000',2),c(' ',0),c(' ')],
+  [c('B'),c(' '),c('\u202f'),c(' '),c(' ')],
+  [c(' '),c(' '),c(' '),c(' '),c(' ')]
+ ];
+ const seen=[];
+ const h=harness(async(name,args)=>{
+  if(name==='open_shell')return 1;
+  if(name==='poll_shell')return frame;
+  if(name==='ack_shell'){seen.push(args.revision);return;}
+  assert.fail('unexpected IPC '+name);
+ });
+ await h.click('#open');h.click('#copy-visible');
+ assert.deepEqual(seen,[frame.revision]);
+ assert.equal(h.el('#history-output').value,'A\u00a0\n界\u3000\nB \u202f\n');
+});
