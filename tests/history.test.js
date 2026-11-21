@@ -24,7 +24,9 @@ test('history burst keeps one active and one latest target, not hundreds of IPCs
  assert.equal(h.requests.length,1);
  h.requests[0].resolve(page(1,'intermediate'));await tick();
  assert.equal(h.output.value,'selected');assert.equal(h.requests.length,2);assert.equal(h.requests[1].args.offset,1024);
- h.requests[1].resolve(page(1,'final',1024,1024));await pending;assert.equal(h.output.value,'final');assert.equal(h.requests.length,2);
+ h.requests[1].resolve(page(1,'',1024,1024));await tick();
+ assert.equal(h.output.value,'selected');assert.equal(h.requests.length,3);assert.equal(h.requests[2].args.offset,896);
+ h.requests[2].resolve(page(1,'final',896,1024));await pending;assert.equal(h.output.value,'final');assert.equal(h.requests.length,3);
 });
 test('rapid opposite navigation coalesces to the requested offset',async()=>{
  const h=setup();const pending=h.click('older');h.click('older');h.click('newer');
@@ -38,9 +40,10 @@ test('history failure without newer intent preserves selected text and allows ex
  const retry=h.click('refresh');assert.equal(h.requests[1].args.offset,0);h.requests[1].resolve(page());await retry;
  assert.equal(h.output.value,'hello\nworld');
 });
-test('clamped backend offset becomes the next navigation base',async()=>{
- const h=setup();const first=h.click('older');h.requests[0].resolve(page(1,'short',3,3));await first;
- const next=h.click('newer');assert.equal(h.requests[1].args.offset,0);h.requests[1].resolve(page());await next;
+test('corrected oldest full window becomes the next navigation base',async()=>{
+ const h=setup();const first=h.click('older');h.requests[0].resolve(page(1,'partial',20,130));await tick();
+ assert.equal(h.requests[1].args.offset,2);h.requests[1].resolve(page(1,'oldest',2,130));await first;
+ const next=h.click('newer');assert.equal(h.requests[2].args.offset,0);h.requests[2].resolve(page(1,'newest',0,130));await next;
 });
 
 test('history rejects oversized strings before encoding and keeps exact UTF-8 limits',()=>{
@@ -106,18 +109,18 @@ test('history newer refresh is preserved even when its target equals the failed 
 test('unchanged page refresh preserves selected text while updating the revision label',async()=>{
  const h=setup(),selectionWrites=[];
  h.output.setSelectionRange=(...range)=>selectionWrites.push(range);
- const first=h.click('refresh');h.requests[0].resolve(page());await first;
+ const first=h.click('refresh');h.requests[0].resolve(page(1,'hello\nworld',0,150));await first;
  assert.deepEqual(selectionWrites,[[0,0]]);
  let rewrites=0,value=h.output.value;
  Object.defineProperty(h.output,'value',{get(){return value;},set(next){rewrites++;value=next;}});
- const same=h.click('refresh');h.requests[1].resolve({...page(),revision:'13'});await same;
+ const same=h.click('refresh');h.requests[1].resolve({...page(1,'hello\nworld',0,150),revision:'13'});await same;
  assert.equal(rewrites,0);assert.deepEqual(selectionWrites,[[0,0]]);
  assert.match(h.label.textContent,/Snapshot 13/);
 
- const differentPage=h.click('older');h.requests[2].resolve(page(1,value,2,3));await differentPage;
+ const differentPage=h.click('older');h.requests[2].resolve(page(1,value,20,150));await differentPage;
  assert.equal(rewrites,1);assert.deepEqual(selectionWrites,[[0,0],[0,0]]);
- assert.match(h.label.textContent,/2 newer rows skipped/);
- const changed=h.click('refresh');h.requests[3].resolve(page(1,'updated text',2,3));await changed;
+ assert.match(h.label.textContent,/20 newer rows skipped/);
+ const changed=h.click('refresh');h.requests[3].resolve(page(1,'updated text',20,150));await changed;
  assert.equal(rewrites,2);assert.equal(h.output.value,'updated text');
  assert.deepEqual(selectionWrites,[[0,0],[0,0],[0,0]]);
 });
@@ -129,7 +132,7 @@ test('already superseded and previous-epoch history payloads skip validation ent
   const old=h.click('refresh');h.click('older');
   h.requests[0].resolve(page(1,'x'.repeat(131200)));await tick();
   assert.deepEqual(encoded,[]);assert.equal(h.requests.length,2);
-  h.requests[1].resolve(page(1,'latest',20,30));await old;
+  h.requests[1].resolve(page(1,'latest',20,200));await old;
   assert.deepEqual(encoded,['latest']);
   const previous=h.click('refresh');h.reset();h.setEpoch(2);
   const fresh=h.click('refresh');
@@ -138,4 +141,76 @@ test('already superseded and previous-epoch history payloads skip validation ent
   h.requests[3].resolve(page(2,'new session'));await fresh;
   assert.deepEqual(encoded,['latest','new session']);assert.equal(h.output.value,'new session');
  }finally{globalThis.TextEncoder=Encoder;}
+});
+
+// Mirrors the Rust bridge's 128-row end-relative window including empty overshoot.
+function rustReply(request,total,revision='12'){
+ const offset=Math.min(request.args.offset,total),end=total-offset,start=Math.max(0,end-128);
+ const text=Array.from({length:end-start},(_,i)=>'archived '+(start+i+1)).join('\n');
+ request.resolve({...page(request.args.epoch,text,offset,total),revision});
+}
+test('three-row archive: older is harmless after Refresh, and first Older corrects once',async()=>{
+ for(const initial of ['refresh','older']){
+  const h=setup();let selections=0;h.output.setSelectionRange=()=>selections++;
+  const first=h.click(initial);rustReply(h.requests[0],3);
+  if(initial==='older'){
+   await tick();assert.equal(h.output.value,'');assert.equal(selections,0);
+   assert.equal(h.requests[1].args.offset,0);rustReply(h.requests[1],3);
+  }
+  await first;assert.equal(h.output.value,'archived 1\narchived 2\narchived 3');
+  assert.equal(selections,1);assert.match(h.label.textContent,/archived rows 1–3 of 3/);
+  const count=h.requests.length;
+  const noOlder=h.click('older');assert.equal(h.requests.length,count);await noOlder;
+  const noNewer=h.click('newer');assert.equal(h.requests.length,count);await noNewer;
+  assert.equal(selections,1);
+ }
+});
+test('archive edges keep all 128 displayed rows and still allow explicit refresh',async()=>{
+ const h=setup();const first=h.click('refresh');rustReply(h.requests[0],129);await first;
+ const older=h.click('older');assert.equal(h.requests[1].args.offset,1);
+ rustReply(h.requests[1],129);await older;
+ assert.match(h.label.textContent,/archived rows 1–128 of 129/);
+ await h.click('older');assert.equal(h.requests.length,2);
+ const refresh=h.click('refresh');rustReply(h.requests[2],130);await refresh;
+ const next=h.click('older');assert.equal(h.requests[3].args.offset,2);
+ rustReply(h.requests[3],130);await next;
+ assert.match(h.label.textContent,/archived rows 1–128 of 130/);
+});
+test('archive shrink preserves selected page until valid correction, including a genuinely empty archive',async()=>{
+ const h=setup();const first=h.click('refresh');rustReply(h.requests[0],400);await first;
+ let selectionWrites=0;h.output.setSelectionRange=()=>selectionWrites++;
+ const previous=h.output.value,label=h.label.textContent;
+ const older=h.click('older');rustReply(h.requests[1],3);await tick();
+ assert.equal(h.output.value,previous);assert.equal(h.label.textContent,label);assert.equal(selectionWrites,0);
+ assert.equal(h.requests[2].args.offset,0);
+ rustReply(h.requests[2],0);await older;
+ assert.equal(h.output.value,'');assert.match(h.label.textContent,/no archived rows/);assert.equal(selectionWrites,1);
+});
+test('at most one correction when the archive shrinks twice; then preserve prior text and explicit refresh',async()=>{
+ const h=setup();const first=h.click('refresh');rustReply(h.requests[0],400);await first;
+ const previous=h.output.value;
+ const older=h.click('older');rustReply(h.requests[1],130);await tick();assert.equal(h.requests[2].args.offset,2);
+ rustReply(h.requests[2],129);await older;
+ assert.equal(h.requests.length,3);assert.equal(h.output.value,previous);
+ assert.match(h.label.textContent,/Archive changed during navigation/);
+ const refresh=h.click('refresh');assert.equal(h.requests[3].args.offset,0);
+ rustReply(h.requests[3],129);await refresh;assert.match(h.label.textContent,/archived rows 2–129/);
+});
+test('new navigation supersedes an already in-flight correction without a stale selection change',async()=>{
+ const h=setup();const first=h.click('refresh');rustReply(h.requests[0],400);await first;
+ const previous=h.output.value;
+ const older=h.click('older');rustReply(h.requests[1],133);await tick();assert.equal(h.requests[2].args.offset,5);
+ h.click('newer');rustReply(h.requests[2],133);await tick();
+ assert.equal(h.requests.length,4);assert.equal(h.requests[3].args.offset,0);
+ assert.equal(h.output.value,previous);
+ rustReply(h.requests[3],133);await older;assert.match(h.label.textContent,/archived rows 6–133/);
+});
+test('old-epoch correction cannot overwrite the new shell or dispatch again',async()=>{
+ const h=setup();const first=h.click('older');rustReply(h.requests[0],3);await tick();
+ assert.equal(h.requests[1].args.offset,0);
+ h.reset();h.setEpoch(2);
+ const fresh=h.click('refresh');rustReply(h.requests[2],7);await fresh;
+ const freshText=h.output.value,freshLabel=h.label.textContent;
+ rustReply(h.requests[1],3);await first;
+ assert.equal(h.requests.length,3);assert.equal(h.output.value,freshText);assert.equal(h.label.textContent,freshLabel);
 });

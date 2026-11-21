@@ -8,18 +8,26 @@ export function acceptHistory(value, epoch) {
       typeof value.text !== 'string' || value.text.length > 131200 || new TextEncoder().encode(value.text).length > 131200 || /[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(value.text)) throw new Error('invalid history snapshot');
   return Object.freeze({...value});
 }
+// Mirrors the fixed page size in LiveBridge::history (bridge/src/live.rs).
+const HISTORY_PAGE_ROWS=128;
+const oldestOffset=total=>Math.max(0,total-HISTORY_PAGE_ROWS);
 export function installHistory({older,newer,refresh,output,label,invoke,getEpoch}) {
   let group=null;
   function load(delta) {
     const epoch=getEpoch();if(epoch===null)return Promise.resolve();
     if(!group||group.epoch!==epoch)group={epoch,offset:0,total:null,desired:0,pending:null,promise:null};
     const current=group;
-    current.desired=Math.max(0,Math.min(1024,current.desired+delta));
-    current.pending=current.desired;
+    const maxOffset=current.total===null?1024:oldestOffset(current.total);
+    const desired=Math.max(0,Math.min(maxOffset,current.desired+delta));
+    // An already visible edge needs no IPC and must not disturb selection.
+    // Refresh (delta zero) still explicitly requests current archive metadata.
+    if(delta!==0&&desired===current.desired&&current.total!==null)return current.promise??Promise.resolve();
+    current.desired=desired;
+    current.pending={offset:desired,corrected:false};
     if(current.promise)return current.promise;
     current.promise=(async()=>{
       while(current.pending!==null&&group===current&&getEpoch()===epoch){
-        const requested=current.pending;current.pending=null;
+        const {offset:requested,corrected}=current.pending;current.pending=null;
         try {
           const value=await invoke('history_shell',{epoch,offset:requested});
           if(group!==current||getEpoch()!==epoch)return;
@@ -27,12 +35,22 @@ export function installHistory({older,newer,refresh,output,label,invoke,getEpoch
           // the abandoned reply, and do not disturb selected text.
           if(current.pending!==null)continue;
           const snapshot=acceptHistory(value,epoch);
+          const max=oldestOffset(snapshot.total_rows);
+          if(snapshot.offset>max){
+            // The archive length was unknown or shrank after the last page.
+            // Keep the visible page while obtaining one valid boundary snapshot.
+            // Repeated shrink cannot spin; the next refresh is user-driven.
+            if(corrected)throw new Error('Archive changed during navigation. Refresh to view archived rows.');
+            current.desired=max;
+            current.pending={offset:max,corrected:true};
+            continue;
+          }
           const unchanged=current.total===snapshot.total_rows&&current.offset===snapshot.offset&&output.value===snapshot.text;
           current.offset=current.desired=snapshot.offset;current.total=snapshot.total_rows;
           // Refresh can advance the revision without changing this page.
           // Assigning even identical text would collapse the browser selection.
           if(!unchanged){output.value=snapshot.text;output.setSelectionRange(0,0);}
-          const end=snapshot.total_rows-snapshot.offset,start=Math.max(1,end-127);
+          const end=snapshot.total_rows-snapshot.offset,start=Math.max(1,end-HISTORY_PAGE_ROWS+1);
           label.textContent=`Snapshot ${snapshot.revision}: ${end>0?`archived rows ${start}–${end}`:'no archived rows'} of ${snapshot.total_rows}; ${snapshot.offset} newer rows skipped. Select text and copy normally. Refresh for new output.`;
         }catch(e){
           if(group===current&&getEpoch()===epoch){
