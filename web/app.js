@@ -146,18 +146,19 @@ document.querySelector('#command').addEventListener('submit',async event=>{
   // Reserve one byte for the appended newline before creating an encoded copy.
   if(input.value.length>4095){status.textContent='Input exceeds 4096-byte bound';return;}
   const bytes=new TextEncoder().encode(input.value+'\n');if(bytes.length>4096){status.textContent='Input exceeds 4096-byte bound';return;}
-  send.disabled=true;input.disabled=true;const current=epoch,attachment=owner;let at=0;let failed=false;
-  try{await keyQueue.chain;if(epoch!==current||keyQueue.locked)throw new Error('input unavailable');for(let attempts=0;at<bytes.length&&attempts<128;attempts++){
-    if(epoch!==current)throw new Error('session changed');
-    if(keyQueue.locked)throw new Error('input became unavailable');
+  send.disabled=true;input.disabled=true;const current=epoch,attachment=owner,queue=keyQueue;let at=0;let failed=false;
+  try{await queue.chain;if(!ownsInput(attachment,queue))return;if(queue.locked)throw new Error('input unavailable');for(let attempts=0;at<bytes.length&&attempts<128;attempts++){
+    if(!ownsInput(attachment,queue))return;
+    if(queue.locked)throw new Error('input became unavailable');
     const n=await invokeAttached('write_shell',{epoch:current,bytes:Array.from(bytes.subarray(at))},attachment);
-    // A final old-epoch acknowledgement must not clear a reopened session's draft.
-    if(epoch!==current)return;
+    // A detached view can reattach at the same epoch. Its old ACK may
+    // describe accepted bytes, but cannot edit or refocus the new view.
+    if(!ownsInput(attachment,queue))return;
     if(!Number.isInteger(n)||n<0||n>bytes.length-at)throw new Error('invalid write count');at+=n;
     if(n===0)await new Promise(resolve=>setTimeout(resolve,10));
   }if(at!==bytes.length)throw new Error('write blocked; do not resend automatically');input.value='';}
-  catch(e){failed=true;if(epoch===current){pasteReview.reset();keyQueue.locked=true;status.textContent=`${at} bytes accepted: ${String(e?.message??e)}. Input locked; close/reopen before retrying.`;}}
-  finally{if(epoch===current&&!failed&&!keyQueue.locked){send.disabled=false;input.disabled=false;input.focus();}}
+  catch(e){failed=true;if(ownsInput(attachment,queue)){pasteReview.reset();queue.locked=true;status.textContent=`${at} bytes accepted: ${String(e?.message??e)}. Input locked; close/reopen before retrying.`;}}
+  finally{if(ownsInput(attachment,queue)&&!failed&&!queue.locked){send.disabled=false;input.disabled=false;input.focus();}}
 });
 
 const colsInput=document.querySelector('#cols'),rowsInput=document.querySelector('#rows');
@@ -170,15 +171,18 @@ document.querySelector('#reveal-cursor').addEventListener('click',()=>{if(!state
 
 // Browser supplies logical events only; Rust chooses all terminal wire sequences.
 let keyQueue={chain:Promise.resolve(),pending:0,locked:false};
+function ownsInput(attachment,queue){
+  return attachment!==null&&owner===attachment&&keyQueue===queue;
+}
 function enqueueLogical(command,payload){
   if(epoch===null||input.disabled)return;
   const queue=keyQueue;
   if(queue.pending>=128){pasteReview.reset();queue.locked=true;status.textContent='Keyboard queue full; input locked. Close/reopen before retrying.';input.disabled=send.disabled=true;return;}
   const current=epoch,attachment=owner;queue.pending++;
   queue.chain=queue.chain.then(async()=>{
-    if(epoch!==current||queue.locked)return;
+    if(!ownsInput(attachment,queue)||queue.locked)return;
     try{await invokeAttached(command,{epoch:current,...payload},attachment);}
-    catch(e){if(epoch===current){pasteReview.reset();queue.locked=true;input.disabled=send.disabled=true;status.textContent=`Input not accepted: ${String(e?.message??e)}. Close/reopen before retrying.`;}}
+    catch(e){if(ownsInput(attachment,queue)){pasteReview.reset();queue.locked=true;input.disabled=send.disabled=true;status.textContent=`Input not accepted: ${String(e?.message??e)}. Close/reopen before retrying.`;}}
   }).finally(()=>{queue.pending--;});
 }
 function keydown(event){

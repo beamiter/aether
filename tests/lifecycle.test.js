@@ -527,3 +527,82 @@ test('same-epoch SSH recovery retires old history requests without losing the co
  assert.equal(output.value,'current attachment');
  assert.deepEqual(selectionWrites,[[0,0],[0,0],[0,0]]);
 });
+
+function sameEpochInputHarness(onInput) {
+ const first={session:'e'.repeat(32),epoch:1,generation:1};
+ const attached={...first,generation:3};
+ const frame={...JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8')),session:first.session};
+ const commands=[];
+ const h=harness(async(name,{action})=>{
+  assert.equal(name,'ssh_terminal');
+  if(action.operation==='open')return first;
+  if(action.operation==='attach')return {owner:attached,frame};
+  const command=action.command;commands.push(command);
+  switch(command.kind){
+   case 'recover':return {owner:{...first,generation:2},frame,input_allowed:true};
+   case 'write':case 'key':return onInput(command);
+   case 'poll':case 'ack':case 'detach':return null;
+   case 'status':return {epoch:1,exited:false,drained:false,write_error:null,unsupported:'0',dropped_reply_bytes:'0'};
+   default:throw Error(command.kind);
+  }
+ });
+ async function open(){h.el('#ssh-terminal-host').value='lab';await h.submitSsh();}
+ async function reattach(){await h.click('#detach');await h.click('#attach');}
+ return {...h,open,reattach,commands};
+}
+
+test('late command ACK cannot clear or refocus the same-epoch read-only reattachment',async()=>{
+ const old=deferred();
+ const h=sameEpochInputHarness(command=>{assert.equal(command.owner.generation,1);return old.promise;});
+ let focused=0;
+ const input=h.el('#input');input.focus=()=>focused++;
+ await h.open();input.value='old write';
+ const submit=h.submit();await tick();
+ const write=h.commands.find(({kind})=>kind==='write');assert.ok(write);
+ await h.reattach();input.value='retained draft';
+ old.resolve(write.bytes.length);await submit;
+ assert.equal(input.value,'retained draft');
+ assert.equal(focused,0);
+ assert.equal(input.disabled,true);
+ assert.match(h.el('#status').textContent,/view-only mode/);
+ assert.equal(h.commands.filter(({kind})=>kind==='write').length,1);
+});
+
+for(const result of ['ok','error']){
+ test(`retired logical input ${result} cannot dispatch queued keys or change the reattached UI`,async()=>{
+  const old=deferred(),keys=[];
+  const h=sameEpochInputHarness(command=>{
+   keys.push([command.name,command.owner.generation]);
+   if(command.name==='a')return old.promise;
+   return null;
+  });
+  await h.open();
+  const key=name=>h.el('canvas').handlers.keydown({key:name,preventDefault(){}});
+  key('a');await tick();key('b');
+  assert.deepEqual(keys,[['a',1]]);
+  await h.reattach();
+  if(result==='ok')old.resolve(null);else old.reject(Error('old writer closed'));
+  await tick();await tick();
+  assert.deepEqual(keys,[['a',1]]);
+  assert.equal(h.el('#input').disabled,true);
+  assert.match(h.el('#status').textContent,/view-only mode/);
+ });
+}
+
+test('same-shell recovery keeps pending-write safety lock without retrying a stale suffix',async()=>{
+ const old=deferred();
+ const h=sameEpochInputHarness(()=>old.promise);
+ const input=h.el('#input');
+ await h.open();input.value='old partial write';
+ const submit=h.submit();await tick();
+ assert.equal(h.commands.filter(({kind})=>kind==='write').length,1);
+ await h.click('#recover');
+ assert.match(h.el('#status').textContent,/SSH output snapshot recovered/);
+ assert.equal(input.disabled,true);
+ old.resolve(1);await submit;
+ assert.equal(h.commands.filter(({kind})=>kind==='write').length,1);
+ assert.equal(input.value,'old partial write');
+ assert.equal(input.disabled,true);
+ assert.equal(h.el('#send').disabled,true);
+ assert.match(h.el('#status').textContent,/SSH output snapshot recovered/);
+});
