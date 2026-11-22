@@ -1,0 +1,14 @@
+{
+  "productName": "Aether Terminal",
+  "bundle": {
+    "active": true,
+    "targets": ["deb"],
+    "icon": ["icons/icon.png"],
+    "category": "DeveloperTool",
+    "shortDescription": "Aether terminal and Workspace desktop",
+    "longDescription": "Terminal sessions, retained history, and Workspace with local and SSH hosts.",
+    "linux": {
+      "deb": { "section": "utils", "recommends": ["openssh-client"] }
+    }
+  }
+}

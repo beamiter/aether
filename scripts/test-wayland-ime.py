@@ -97,9 +97,16 @@ def run(args):
 
         def focus_ime():
             driver.click("#reveal-cursor")
-            driver.click("main canvas")
+            fixtures["click_visible_terminal"](driver)
             wait_for(lambda: driver.execute("return document.activeElement.id === 'ime-input';"),
                      "the real IME input did not receive focus")
+            # Let the native WebKit view present the textarea's cursor after
+            # the focus moves from the command field to the terminal.
+            assert driver.command("POST", "/execute/async", {"args": [], "script": """
+                const finish = arguments[0];
+                requestAnimationFrame(() => requestAnimationFrame(() =>
+                    finish(document.activeElement.id === 'ime-input')));
+            """}), "IME input lost focus before its caret was rendered"
 
         receipt = root / "pty-receipt"
         capture(receipt)
@@ -144,7 +151,6 @@ def run(args):
                  "committed preedit did not clear")
         trace = trace_path.read_text(errors="replace")
         assert f'{context}.commit_string("你")' in trace
-        (control / "finish").touch()
         assert ime.wait(timeout=5) == 0
 
         left = driver.execute(fixtures["READ"])["current_tab"]
@@ -176,11 +182,41 @@ def run(args):
         wait_for(lambda: other_receipt.read_bytes() == b"z", "fresh input did not reach the selected second PTY")
         assert receipt.read_bytes() == expected
 
+        compositor_socket = wait_for(
+            lambda: next((entry for entry in runtime.glob("sway-ipc.*.sock") if entry.is_socket()), None),
+            "private compositor control socket did not start")
+        swaymsg = Path(args.sway).with_name("swaymsg")
+
+        def control_compositor(*arguments):
+            return json.loads(subprocess.check_output([swaymsg, "-s", compositor_socket, *arguments],
+                                                      env=compositor_env, timeout=5))
+
+        original_workspace, = (entry["name"] for entry in control_compositor("-t", "get_workspaces")
+                               if entry["focused"])
+        blurred = root / "blurred-composition"
+        blurred.mkdir()
+        blurred_ime = spawn([ime_client, blurred], "blurred-ime.log")
+        wait_for((blurred / "connected").exists, "window-blur input method did not attach")
+        (blurred / "start").touch()
+        wait_for(lambda: driver.execute("return document.querySelector('#terminal-preedit').textContent === 'ni';"),
+                 "cannot begin composition before losing window focus")
+        assert control_compositor("workspace", "ime-window-unfocused")[0]["success"]
+        wait_for(lambda: driver.execute("return document.querySelector('#terminal-preedit').hidden;"),
+                 "Wayland window focus loss did not clear preedit")
+        assert other_receipt.read_bytes() == b"z" and receipt.read_bytes() == expected
+        fixtures["stop_driver"](blurred_ime)
+        assert control_compositor("workspace", shlex.quote(original_workspace))[0]["success"]
+        focus_ime()
+        subprocess.run([args.wtype, "w"], env=env, timeout=5, check=True)
+        wait_for(lambda: other_receipt.read_bytes() == b"zw", "returning to the window changed PTY input")
+        assert receipt.read_bytes() == expected
+
         with binary.open("rb") as executable:
             digest = hashlib.file_digest(executable, "sha256").hexdigest()
         result = dict(binary_sha256=digest, backend="wayland", transport="channel",
                       preedit_bytes=0, committed_hex=expected.hex(),
-                      preedit_geometry=anchor, cursor_rectangle=cursor, pane_switch_cancelled_preedit=True)
+                      preedit_geometry=anchor, cursor_rectangle=cursor, pane_switch_cancelled_preedit=True,
+                      window_blur_cancelled_preedit=True)
         (root / "result.json").write_text(json.dumps(result, indent=2) + "\n")
         print(json.dumps(result), flush=True)
 

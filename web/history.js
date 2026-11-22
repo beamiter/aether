@@ -6,11 +6,14 @@ export function acceptHistory(value, epoch) {
       !Number.isInteger(value.offset) || value.offset < 0 || value.offset > 1024 ||
       !Number.isInteger(value.total_rows) || value.total_rows < 0 || value.total_rows > 1024 || value.offset > value.total_rows ||
       typeof value.text !== 'string' || value.text.length > 131200 || new TextEncoder().encode(value.text).length > 131200 || /[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(value.text)) throw new Error('invalid history snapshot');
+  const count=value.row_count;
+  if(count!==undefined&&(!Number.isInteger(count)||count<Number(value.total_rows>0)||
+      count>Math.min(HISTORY_PAGE_ROWS,value.total_rows-value.offset)))throw new Error('invalid history snapshot row count');
   return Object.freeze({...value});
 }
-// Mirrors the fixed page size in LiveBridge::history (bridge/src/live.rs).
+// Maximum ordinary page size in LiveBridge::history.
 const HISTORY_PAGE_ROWS=128;
-const oldestOffset=total=>Math.max(0,total-HISTORY_PAGE_ROWS);
+const oldestOffset=(total,rows=HISTORY_PAGE_ROWS)=>Math.max(0,total-rows);
 export function installHistory({older,newer,refresh,output,label,invoke,getOwner,searchControls}) {
   let group=null,activeSearch=null,searchId=0;
 
@@ -50,9 +53,10 @@ export function installHistory({older,newer,refresh,output,label,invoke,getOwner
     current.busy=true;group=null;updateSearchControls();
     searchControls.status.textContent='Searching retained history…';
     try{
-      // A search visits at most 1,024 rows in 64-row windows. One extra
-      // request can exhaust the previously visible window.
-      for(let steps=0;steps<17;steps++){
+      // A search visits at most 1,024 rows. Byte-limited windows still
+      // contain at least 16 rows until the oldest window. Allow one extra
+      // request for the remainder of the currently visible window.
+      for(let steps=0;steps<65;steps++){
         const result=await invoke('search_local_history',{owner,search:{id:current.id,query:current.query,restart}});
         if(!isCurrent())return;
         restart=false;
@@ -77,7 +81,7 @@ export function installHistory({older,newer,refresh,output,label,invoke,getOwner
         }
         label.textContent=`History snapshot ${page.revision}. Select or copy the matching text.`;
         searchControls.status.textContent='Match selected in retained history.';
-        group={owner,offset:page.offset,total:page.total_rows,desired:page.offset,pending:null,promise:null};
+        group={owner,offset:page.offset,total:page.total_rows,rows:page.row_count??HISTORY_PAGE_ROWS,desired:page.offset,pending:null,promise:null};
         current.hasHit=true;
         return;
       }
@@ -97,12 +101,14 @@ export function installHistory({older,newer,refresh,output,label,invoke,getOwner
       // Recovery can rotate the attachment without replacing the PTY. Keep
       // only the page already shown, never its old pending navigation lease.
       const offset=sameShell?group.offset:0,total=sameShell?group.total:null;
-      group={owner,offset,total,desired:offset,pending:null,promise:null};
+      const rows=sameShell?group.rows:HISTORY_PAGE_ROWS;
+      group={owner,offset,total,rows,desired:offset,pending:null,promise:null};
     }
     const current=group;
     const isCurrent=()=>group===current&&getOwner()===owner;
-    const maxOffset=current.total===null?1024:oldestOffset(current.total);
-    const desired=Math.max(0,Math.min(maxOffset,current.desired+delta));
+    const maxOffset=current.total===null?1024:oldestOffset(current.total,current.rows);
+    const step=Math.sign(delta)*Math.min(Math.abs(delta),Math.max(1,current.rows));
+    const desired=Math.max(0,Math.min(maxOffset,current.desired+step));
     // An already visible edge needs no IPC and must not disturb selection.
     // Refresh (delta zero) still explicitly requests current archive metadata.
     if(delta!==0&&desired===current.desired&&current.total!==null)return current.promise??Promise.resolve();
@@ -119,7 +125,8 @@ export function installHistory({older,newer,refresh,output,label,invoke,getOwner
           // the abandoned reply, and do not disturb selected text.
           if(current.pending!==null)continue;
           const snapshot=acceptHistory(value,owner.epoch);
-          const max=oldestOffset(snapshot.total_rows);
+          const rows=snapshot.row_count??HISTORY_PAGE_ROWS;
+          const max=oldestOffset(snapshot.total_rows,rows);
           if(snapshot.offset>max){
             // The archive length was unknown or shrank after the last page.
             // Keep the visible page while obtaining one valid boundary snapshot.
@@ -130,11 +137,11 @@ export function installHistory({older,newer,refresh,output,label,invoke,getOwner
             continue;
           }
           const unchanged=current.total===snapshot.total_rows&&current.offset===snapshot.offset&&output.value===snapshot.text;
-          current.offset=current.desired=snapshot.offset;current.total=snapshot.total_rows;
+          current.offset=current.desired=snapshot.offset;current.total=snapshot.total_rows;current.rows=rows;
           // Refresh can advance the revision without changing this page.
           // Assigning even identical text would collapse the browser selection.
           if(!unchanged){output.value=snapshot.text;output.setSelectionRange(0,0);}
-          const end=snapshot.total_rows-snapshot.offset,start=Math.max(1,end-HISTORY_PAGE_ROWS+1);
+          const end=snapshot.total_rows-snapshot.offset,start=Math.max(1,end-rows+1);
           label.textContent=`Snapshot ${snapshot.revision}: ${end>0?`archived rows ${start}–${end}`:'no archived rows'} of ${snapshot.total_rows}; ${snapshot.offset} newer rows skipped. Select text and copy normally. Refresh for new output.`;
         }catch(e){
           if(isCurrent()){

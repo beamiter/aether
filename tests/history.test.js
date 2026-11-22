@@ -15,6 +15,27 @@ test('history rejects foreign, unbounded and control-bearing snapshots',()=>{
  assert.equal(acceptHistory(page(),1).text,'hello\nworld');
  for(const change of [{epoch:2},{total_rows:1025},{offset:4},{text:'\x1b[31m'},{text:'x'.repeat(131201)},{revision:'-1'}])assert.throws(()=>acceptHistory({...page(),...change},1));
 });
+test('byte-limited history pages report their exact ranges and reach the oldest retained row',async()=>{
+ const h=setup();
+ for(const row_count of [0,0.5,129,null])assert.throws(()=>acceptHistory({...page(),row_count},1),/invalid history snapshot/);
+ const first=h.click('refresh');h.requests[0].resolve({...page(1,'newest',0,200),row_count:32});await first;
+ assert.match(h.label.textContent,/archived rows 169–200 of 200/);
+ const older=h.click('older');for(let i=0;i<20;i++)h.click('older');
+ h.requests[1].resolve({...page(1,'intermediate',20,200),row_count:32});await tick();
+ assert.equal(h.requests[2].args.offset,168);
+ h.requests[2].resolve({...page(1,'oldest',168,200),row_count:32});await older;
+ assert.equal(h.output.value,'oldest');assert.match(h.label.textContent,/archived rows 1–32 of 200/);
+ await h.click('older');assert.equal(h.requests.length,3);
+});
+test('history navigation steps through dense windows without skipping archived rows',async()=>{
+ const h=setup();
+ const first=h.click('refresh');h.requests[0].resolve({...page(1,'newest',0,60),row_count:8});await first;
+ const older=h.click('older');assert.equal(h.requests[1].args.offset,8);
+ h.requests[1].resolve({...page(1,'older',8,60),row_count:4});await older;
+ const next=h.click('older');assert.equal(h.requests[2].args.offset,12);
+ h.requests[2].resolve({...page(1,'oldest in view',12,60),row_count:4});await next;
+ assert.equal(h.output.value,'oldest in view');
+});
 test('history reset discards old completion and a stuck epoch does not block a new one',async()=>{
  const h=setup();const old=h.click('refresh');h.reset();h.setEpoch(2);const fresh=h.click('refresh');
  assert.equal(h.requests.length,2);h.requests[0].resolve(page(1,'stale'));await old;assert.equal(h.output.value,'');
@@ -267,10 +288,11 @@ function searchSetup(){
  let owner={session:'owner',epoch:1,generation:1};
  const requests=[];
  const controls={form:element(),query:element(),find:element(),older:element(),cancel:element(),status:element(),enabled:()=>true};
- const output=element();
- const history=installHistory({output,label:element(),older:element(),newer:element(),refresh:element(),searchControls:controls,
+ const output=element(), older=element();
+ const history=installHistory({output,label:element(),older,newer:element(),refresh:element(),searchControls:controls,
   getOwner:()=>owner,invoke:(name,args)=>new Promise((resolve,reject)=>requests.push({name,args,resolve,reject}))});
- return {controls,output,requests,rotate:()=>{owner={...owner,generation:owner.generation+1};history.updateSearchControls();},
+ return {controls,output,requests,olderPage:()=>older.handlers.click(),
+  rotate:()=>{owner={...owner,generation:owner.generation+1};history.updateSearchControls();},
   find:query=>{controls.query.value=query;return controls.form.handlers.submit({preventDefault(){}});}};
 }
 test('native search sends one bounded step at a time and selects a validated UTF-16 range',async()=>{
@@ -286,6 +308,14 @@ test('native search sends one bounded step at a time and selects a validated UTF
  h.requests[2].reject(Error('History changed. Start a new search.'));await next;
  assert.match(h.controls.status.textContent,/History changed/);assert.deepEqual(h.output.selection,[3,4]);
  assert.equal(h.controls.older.disabled,true);
+});
+test('a matched history window supplies the next ordinary page offset',async()=>{
+ const h=searchSetup(), pending=h.find('中');
+ h.requests[0].resolve({kind:'match',id:1,epoch:1,snapshot:{...page(1,'这里 中',10,200),row_count:4},start:3,end:4});
+ await pending;
+ const older=h.olderPage();assert.equal(h.requests[1].name,'history_shell');assert.equal(h.requests[1].args.offset,14);
+ h.requests[1].resolve({...page(1,'older',14,200),row_count:4});await older;
+ assert.equal(h.output.value,'older');
 });
 test('cancel and an attachment change leave no stale search continuation or selection',async()=>{
  const h=searchSetup();

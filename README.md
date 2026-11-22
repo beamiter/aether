@@ -8,7 +8,7 @@ ANSI parser. **This is not a daily-use terminal.**
 ## Shared core
 
 The three Cargo manifests pin the shared crates to
-`32297ea559ad217169c4127022dd084758a6c329`. `jterm_runtime` owns the local PTY, direct child and
+`afb42aaba56b7cdb256a287a3c31e9f76a734744`. `jterm_runtime` owns the local PTY, direct child and
 output drain. Its `jterm_engine::terminal::Terminal` owns parsing, screen
 state, input encoding, history and immutable frames. The session host supplies
 each frame stream's epoch. Run `python3 scripts/check-core-pin.py` to verify
@@ -19,7 +19,9 @@ that every shared package in the manifests and lockfiles uses that published com
 
 Open the experimental shell to start a semantic session. **Recover output
 snapshot** resynchronizes the current view. **Detach view** leaves the shell open
-for **Reconnect view**, which restores the output in read-only mode.
+for **Reconnect view**, which restores the output in read-only mode. Reloading
+the desktop page also leaves the local shell running. **Reconnect view** restores
+its output, including output produced during the reload.
 
 Use **New shell tab** to open a second local shell. Select the numbered tabs to
 return to each shell's output, draft, and working process. A tab that was parked
@@ -213,6 +215,28 @@ There are three independent Cargo manifests, not a root Cargo workspace.
 `src-tauri` depends on `../bridge`, bridge on `../session`, and Tauri embeds
 `../web`. Internal crate/package identifiers remain those of the imported lab;
 they are not additional terminal engines.
+
+### Debian candidate package
+
+On a Debian or Ubuntu build host with the same prerequisites, build the desktop
+and SSH host from the same checkout. The package installs `tauri-terminal-lab`,
+`aether-terminal-host` and an Aether Terminal desktop entry.
+
+```sh
+npm ci --ignore-scripts
+export CARGO_TARGET_DIR="$PWD/target"
+cargo build --release --locked --manifest-path src-tauri/Cargo.toml --bin tauri-terminal-lab
+cargo build --release --locked --manifest-path bridge/Cargo.toml --bin aether-terminal-host
+scripts/package-linux-deb.sh "$CARGO_TARGET_DIR/release/tauri-terminal-lab" \
+  "$CARGO_TARGET_DIR/release/aether-terminal-host" ./target/packages
+```
+
+To rehearse an upgrade, package two distinct builds. Pass a higher package
+version as the fourth argument for the candidate. With `fakeroot` installed,
+run `python3 -B scripts/test-linux-deb.py OLD.deb CANDIDATE.deb`. It uses a
+private package root and checks that Workspace can reopen the pre-upgrade backup
+with the previous binary. Keep the previous package and a pre-upgrade backup
+together when preparing a rollback.
 
 ## What validation covers
 

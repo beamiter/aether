@@ -2,16 +2,24 @@
 use crate::{
     from_engine,
     history_search::{HistorySearch, HistorySearchRequest, HistorySearchResponse},
+    protocol::MAX_HISTORY_SNAPSHOT_BYTES,
     semantic::{self, Attachment, Resume, SessionSelector, Update},
     WireFrame,
 };
-use jterm_engine::frame::CellFrame;
-use jterm_headless_session_spike::Session;
+use jterm_engine::{
+    frame::CellFrame,
+    terminal::{HistoryPage, Terminal},
+};
+use jterm_headless_session_spike::{Session, WakeSink};
 mod command_blocks;
 mod raw_suffix;
 pub use crate::protocol::{CloseStatus, HistorySnapshot, SessionStatus};
 pub use command_blocks::{BlockSelection, CommandBlockSnapshot, RetainedBlock};
 use raw_suffix::RawSuffix;
+
+const HISTORY_PAGE_ROWS: usize = 128;
+const MIN_HISTORY_PAGE_ROWS: usize = 32;
+const MAX_HISTORY_OFFSET: usize = 1024;
 
 #[derive(Default)]
 pub struct LiveBridge {
@@ -52,6 +60,17 @@ impl LiveBridge {
 
     pub fn set_hyperlink_policy(&mut self, policy: jterm_engine::hyperlink::HyperlinkPolicy) {
         self.hyperlink_policy = Some(policy);
+    }
+
+    /// Wake the desktop worker after the reader queues output or an exit.
+    pub fn notify_on_output(
+        &self,
+        notify: impl Fn() + Send + Sync + 'static,
+    ) -> Result<(), String> {
+        self.session
+            .as_ref()
+            .ok_or("terminal session is closed")?
+            .set_output_wake(WakeSink::new(notify))
     }
 
     pub fn open(&mut self, rows: usize, cols: usize) -> Result<u32, String> {
@@ -103,6 +122,8 @@ impl LiveBridge {
         if self.local_desktop {
             session.enable_underline_colors();
             session.enable_grapheme_clusters();
+            session.enable_keyboard_disambiguation();
+            session.enable_history_preserving_resize();
         }
         if let Some(policy) = self.hyperlink_policy {
             session.enable_hyperlinks(policy);
@@ -574,17 +595,14 @@ impl LiveBridge {
     /// Independent immutable history snapshot; does not consume or acknowledge a live frame.
     pub fn history(&self, epoch: u32, offset: usize) -> Result<HistorySnapshot, String> {
         self.check(epoch)?;
-        let page = self
-            .session
-            .as_ref()
-            .unwrap()
-            .terminal()
-            .history_page(offset, 128)?;
+        let terminal = self.session.as_ref().unwrap().terminal();
+        let page = bounded_history_page(terminal, offset)?;
         Ok(HistorySnapshot {
             epoch,
             revision: page.revision.to_string(),
             offset: page.offset,
             total_rows: page.total_rows,
+            row_count: Some(page.row_count),
             text: page.text,
         })
     }
@@ -604,12 +622,12 @@ impl LiveBridge {
             {
                 return Err("stale history search".into());
             }
-            self.history_search = Some(HistorySearch::new(request.id, request.query.clone()));
+            self.history_search = Some(HistorySearch::new(request.id, request.query.clone())?);
         }
         let search = self
             .history_search
             .as_mut()
-            .filter(|search| search.id == request.id && search.query == request.query)
+            .filter(|search| search.id == request.id && search.query() == request.query)
             .ok_or("start a new history search")?;
         search.step(self.session.as_ref().unwrap().terminal(), epoch)
     }
@@ -723,9 +741,53 @@ impl LiveBridge {
         Ok(CloseStatus { cleanup_pending })
     }
 }
+
+fn bounded_history_page(terminal: &Terminal, offset: usize) -> Result<HistoryPage, String> {
+    if offset > MAX_HISTORY_OFFSET {
+        return Err("history page out of bounds".into());
+    }
+    let rows = terminal.history_rows();
+    let mut limit = HISTORY_PAGE_ROWS;
+    loop {
+        let oldest_offset = rows.saturating_sub(limit);
+        let page = terminal.history_page(offset.min(oldest_offset), limit)?;
+        if page.text.len() <= MAX_HISTORY_SNAPSHOT_BYTES {
+            return Ok(page);
+        }
+        if limit <= MIN_HISTORY_PAGE_ROWS {
+            return Err("history snapshot exceeds its byte limit".into());
+        }
+        limit /= 2;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dense_unicode_history_respects_the_wire_budget_and_reaches_the_oldest_row() {
+        let mut terminal = Terminal::new(2, 256).unwrap();
+        terminal.enable_grapheme_clusters();
+        let cluster = "e\u{301}\u{302}\u{303}\u{304}\u{305}";
+        let body = cluster.repeat(248);
+        for row in 0..170 {
+            terminal
+                .feed(format!("{row:03} {body}\r\n").as_bytes())
+                .unwrap();
+        }
+        let newest = bounded_history_page(&terminal, 0).unwrap();
+        assert_eq!(newest.row_count, 32);
+        assert!(newest.text.len() <= MAX_HISTORY_SNAPSHOT_BYTES);
+        assert!(newest.text.ends_with(&body));
+
+        let oldest = bounded_history_page(&terminal, MAX_HISTORY_OFFSET).unwrap();
+        assert_eq!(oldest.offset + oldest.row_count, oldest.total_rows);
+        assert_eq!(
+            oldest.text.lines().next(),
+            Some(format!("000 {body}").as_str())
+        );
+    }
 
     #[test]
     fn prepared_editor_launch_has_its_own_epoch_and_uses_exact_argv() {

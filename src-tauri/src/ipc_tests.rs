@@ -120,21 +120,29 @@ fn local_tab_activation_rotates_the_lease_after_an_ack_and_retries_exactly() {
     assert!(invoke(&window, "activate_local_tab", new_tab)["Err"].is_string());
     assert!(write(second).is_ok());
 
-    invoke(
-        &window,
-        "text_shell",
-        json!({"owner":second,"text":"pending"}),
-    );
-    let busy = invoke(
-        &window,
-        "activate_local_tab",
-        json!({"owner":second,
-        "targetEpoch":first["epoch"],"preserveInput":true}),
-    );
-    assert!(busy["Err"]
-        .as_str()
-        .unwrap()
-        .contains("current shell input"));
+    {
+        use std::sync::{Arc, Mutex};
+        // Keep the worker from draining the logical input between admission
+        // and the switch check. Output-driven wakes may drain it immediately.
+        let local = window.state::<Arc<Mutex<super::LocalSessions>>>();
+        let mut sessions = local.lock().unwrap();
+        let source = serde_json::from_value(second.clone()).unwrap();
+        let target_epoch = serde_json::from_value(first["epoch"].clone()).unwrap();
+        sessions
+            .input(&source, |bridge, epoch| bridge.text(epoch, "pending"))
+            .unwrap();
+        let error = sessions
+            .activate_tab(
+                Some(&source),
+                Some(target_epoch),
+                true,
+                super::SnapshotFormat::Compatibility,
+                Arc::downgrade(local.inner()),
+            )
+            .err()
+            .expect("queued input must prevent parking its attachment");
+        assert!(error.contains("current shell input"));
+    }
     assert_eq!(
         invoke(&window, "shell_status", json!({"owner":second}))["epoch"],
         second["epoch"]

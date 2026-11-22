@@ -9,7 +9,13 @@ on:
       - '.github/workflows/native-webkit.yml'
       - 'scripts/test-two-local-webkit.py'
       - 'scripts/test-remote-project-webkit.py'
+      - 'scripts/test-ssh-terminal-session.py'
+      - 'scripts/test-ssh-terminal-webview.py'
+      - 'scripts/test-wayland-ime.py'
       - 'scripts/test-workspace-rollback.py'
+      - 'scripts/test-linux-deb.py'
+      - 'scripts/package-linux-deb.sh'
+      - 'packaging/linux-deb.json'
       - 'bridge/Cargo.lock'
       - 'session/Cargo.lock'
       - 'src-tauri/Cargo.lock'
@@ -34,12 +40,13 @@ jobs:
           sudo apt-get install --yes --no-install-recommends \
             build-essential pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev \
             librsvg2-dev libxdo-dev libssl-dev webkit2gtk-driver \
-            xvfb xauth dbus-daemon fonts-dejavu-core xdotool ripgrep vim \
-            openssh-client openssh-server bubblewrap sway wtype \
-            python3-gi gir1.2-atspi-2.0 at-spi2-core
+            xvfb xauth dbus-daemon fonts-dejavu-core xdotool xclip imagemagick metacity ripgrep vim \
+            openssh-client openssh-server bubblewrap sway wtype libwayland-dev \
+            python3-gi gir1.2-atspi-2.0 at-spi2-core fakeroot
           sudo install -d -m 0755 /run/sshd
           dpkg-query -W libwebkit2gtk-4.1-0 webkit2gtk-driver xvfb
       - name: Build desktop at the workflow revision
+        id: build
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           rustup toolchain install 1.100.0 --profile minimal
@@ -48,7 +55,7 @@ jobs:
           cargo build --locked --manifest-path src-tauri/Cargo.toml --bin tauri-terminal-lab
           cargo build --locked --manifest-path bridge/Cargo.toml --bin aether-terminal-host
           printf 'CARGO_TARGET_DIR=%s\n' "$CARGO_TARGET_DIR" >> "$GITHUB_ENV"
-      - name: Local PTYs, notebook and Vim9 on X11
+      - name: Local PTYs, Workspace, API Chat, native task, notebook and Vim9 on X11
         timeout-minutes: 5
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
@@ -58,28 +65,74 @@ jobs:
           sha256sum "$app"
           xvfb-run --auto-servernum --server-args="-screen 0 1600x1200x24 -nolisten tcp" \
             dbus-run-session -- timeout --kill-after=25s 240s \
-              /usr/bin/python3 -B scripts/test-two-local-webkit.py "$app" --notebook --vim9
+              /usr/bin/python3 -B scripts/test-two-local-webkit.py "$app" \
+                --workspace --api-chat --native-task --notebook --vim9
+      - name: Verify Wayland composition across terminal and window focus changes
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 4
+        run: |
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          core=$(cargo metadata --locked --manifest-path src-tauri/Cargo.toml --format-version 1 --filter-platform "$host" |
+            python3 -c 'import json,sys; from pathlib import Path; print(next(Path(p["manifest_path"]).parents[2] for p in json.load(sys.stdin)["packages"] if p["name"] == "jterm_engine"))')
+          fixture_dir=$(mktemp -d "$RUNNER_TEMP/aether-wayland.XXXXXX")
+          curl --fail --silent --show-error --location --retry 2 --max-time 60 \
+            https://archive.ubuntu.com/ubuntu/pool/universe/w/wlroots/wlroots_0.17.1.orig.tar.gz \
+            --output "$fixture_dir/wlroots.tar.gz"
+          printf '%s  %s\n' b4b1b08daf0728cd2648fb57660493e5b3eafe4fcc081c138de864895181cdfe \
+            "$fixture_dir/wlroots.tar.gz" | sha256sum --check
+          tar -xzf "$fixture_dir/wlroots.tar.gz" -C "$fixture_dir" \
+            wlroots-0.17.1/protocol/input-method-unstable-v2.xml \
+            wlroots-0.17.1/protocol/wlr-virtual-pointer-unstable-v1.xml
+          bash "$core/crates/jterm_gtk_view/tests/build-wayland-fixtures.sh" \
+            "$fixture_dir/wlroots-0.17.1/protocol" "$fixture_dir/clients"
+          dbus-run-session -- /usr/bin/python3 -B scripts/test-wayland-ime.py \
+            "$CARGO_TARGET_DIR/debug/tauri-terminal-lab" --output "$fixture_dir/evidence" \
+            --ime-client "$fixture_dir/clients/native-ime-client"
       - name: SSH files and read-only Workspace on X11
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 4
         run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1440x1100x24 -nolisten tcp" \
             dbus-run-session -- python3 -B scripts/test-remote-project-webkit.py \
               "$CARGO_TARGET_DIR/debug/tauri-terminal-lab" "$CARGO_TARGET_DIR/debug/aether-terminal-host"
       - name: SSH files and read-only Workspace on native Wayland
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 4
         run: |
           dbus-run-session -- python3 -B scripts/test-remote-project-webkit.py \
             "$CARGO_TARGET_DIR/debug/tauri-terminal-lab" "$CARGO_TARGET_DIR/debug/aether-terminal-host" \
             --backend wayland
+      - name: Recover an interactive SSH terminal after relay loss
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 4
+        run: |
+          /usr/bin/python3 -B scripts/test-remote-project-webkit.py \
+            "$CARGO_TARGET_DIR/debug/tauri-terminal-lab" "$CARGO_TARGET_DIR/debug/aether-terminal-host" \
+            --interactive-terminal
       - name: Check out the previous Workspace host
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        id: previous
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: 9e9e630432453739c9c74931405705bacc7a7d7a
           path: rollback-base
           persist-credentials: false
-      - name: Rehearse Workspace upgrade and backup rollback
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        if: ${{ !cancelled() && steps.previous.outcome == 'success' }}
+        with:
+          node-version: '24'
+      - name: Rehearse Debian install, upgrade and Workspace backup rollback
+        if: ${{ !cancelled() && steps.previous.outcome == 'success' }}
+        timeout-minutes: 5
         run: |
-          candidate="${RUNNER_TEMP:?}/aether-rollback-candidate"
-          install -m 0755 "$CARGO_TARGET_DIR/debug/tauri-terminal-lab" "$candidate"
+          npm ci --ignore-scripts
+          stage="${RUNNER_TEMP:?}/aether-rollback"
+          install -D -m 0755 "$CARGO_TARGET_DIR/debug/tauri-terminal-lab" "$stage/candidate/desktop"
+          install -D -m 0755 "$CARGO_TARGET_DIR/debug/aether-terminal-host" "$stage/candidate/host"
           cargo build --locked --manifest-path rollback-base/src-tauri/Cargo.toml --bin tauri-terminal-lab
-          python3 -B scripts/test-workspace-rollback.py "$CARGO_TARGET_DIR/debug/tauri-terminal-lab" "$candidate"
+          cargo build --locked --manifest-path rollback-base/bridge/Cargo.toml --bin aether-terminal-host
+          previous=$(scripts/package-linux-deb.sh "$CARGO_TARGET_DIR/debug/tauri-terminal-lab" \
+            "$CARGO_TARGET_DIR/debug/aether-terminal-host" "$stage/packages" 0.0.1-qa)
+          candidate=$(scripts/package-linux-deb.sh "$stage/candidate/desktop" "$stage/candidate/host" \
+            "$stage/packages" 0.0.2-qa)
+          python3 -B scripts/test-linux-deb.py "$previous" "$candidate"

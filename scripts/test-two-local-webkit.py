@@ -159,7 +159,7 @@ def shell_identity(sidecar):
 def birth(pid):
     try:
         return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return None
 
 
@@ -184,6 +184,8 @@ def click_tab(driver, number):
         "Wait for the current shell input before switching tabs.",
     }
     last_click = None
+    attempted_status = None
+    used_keyboard = False
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         state = driver.execute(READ)
@@ -195,6 +197,19 @@ def click_tab(driver, number):
             try:
                 driver.click(selector)
                 last_click = time.monotonic()
+                attempted_status = state["status"]
+            except ProtocolError as error:
+                if error.error != "stale element reference":
+                    raise
+        elif (number in state["available_tabs"] and state["current_tab"] != number
+              and not used_keyboard and last_click is not None
+              and state["status"] == attempted_status and time.monotonic() - last_click >= .5):
+            # A native click can be lost while the notebook is remapped by
+            # WebKit. Exercise the same button by keyboard when its click
+            # produced no transition or refusal in the page.
+            try:
+                driver.type(selector, "\ue007")
+                used_keyboard = True
             except ProtocolError as error:
                 if error.error != "stale element reference":
                     raise
@@ -285,6 +300,10 @@ def exercise(driver, owned):
     search_archive(archive_query)
     wait_for(lambda: state()["selected_history"] == archive_query and state()["selection_context"] == "newer ",
              "native find did not select the newest retained match")
+    driver.type("#input", "printf 'later %s%s\\r\\n' AETHER_ARCHIVE_ NEEDLE; seq 1 52; "
+                "printf '\\033[H\\033[48;2;17;33;49m \\033[0m'")
+    driver.click("#send")
+    wait_for(lambda: state()["pixel"] == [17, 33, 49, 255], "live output did not advance the real archive")
     driver.click("#history-find-older")
     wait_for(lambda: state()["selected_history"] == archive_query and state()["selection_context"] == "older ",
              "native find did not cross the archive page boundary")
@@ -490,6 +509,7 @@ def exercise(driver, owned):
                       "split_pane_focus_and_resize_isolated": True,
                       "inactive_split_pane_streams_new_output": True,
                       "native_history_find_pages_and_session_isolation": True,
+                      "native_history_find_keeps_its_source_while_output_appends": True,
                       "native_history_reads_archived_pty_output": True,
                       "native_v4_soft_wrap_wide_copy_and_double_underline": True,
                       "native_v4_truecolor_and_indexed_underline": True,
@@ -575,6 +595,157 @@ def exercise_hyperlinks(driver, owned):
     wait_for(lambda: driver.execute(READ)["status"].startswith("Terminal closed"), "hyperlink shell did not close")
     print(json.dumps({"native_v4_osc8_visible_and_opens_once": True,
                       "native_v4_osc8_credentials_fail_closed": True}), flush=True)
+
+
+def click_visible_terminal(driver):
+    point = wait_for(lambda: driver.execute("""
+        const canvas = document.querySelector('main canvas');
+        const rect = canvas.getBoundingClientRect(), clip = canvas.parentElement.getBoundingClientRect();
+        const left = Math.max(0, rect.left, clip.left), right = Math.min(innerWidth, rect.right, clip.right);
+        const top = Math.max(0, rect.top, clip.top), bottom = Math.min(innerHeight, rect.bottom, clip.bottom);
+        if (left >= right || top >= bottom) return null;
+        const x = Math.floor((left + right) / 2), y = Math.floor((top + bottom) / 2);
+        return document.elementFromPoint(x, y) === canvas ? {x, y} : null;
+    """), "terminal canvas has no visible click target")
+    driver.command("POST", "/actions", {"actions": [{
+        "type": "pointer", "id": "terminal-pointer", "parameters": {"pointerType": "mouse"},
+        "actions": [
+            {"type": "pointerMove", "origin": "viewport", "duration": 0, **point},
+            {"type": "pointerDown", "button": 0},
+            {"type": "pointerUp", "button": 0},
+        ],
+    }]})
+    driver.command("DELETE", "/actions")
+
+
+def exercise_height_shrink(driver):
+    def state():
+        return driver.execute(READ)
+
+    driver.click("#open")
+    original = wait_for(lambda: state() if state()["writable"] else None, "resize fixture has a local PTY")
+    rows = int(driver.execute("return document.querySelector('#rows').value"))
+    assert rows > 8
+    driver.type("#input", r"stty -echo; printf '\033[3J\033[2J\033[H%s\033[999;1H%s' "
+                r"AETHER-RESIZE-ARCHIVE AETHER-RESIZE-LIVE; IFS= read -r pause")
+    driver.click("#send")
+
+    def visible():
+        driver.click("#copy-visible")
+        return state()["dump"]
+
+    def resize(height):
+        driver.clear("#rows")
+        driver.type("#rows", str(height))
+        driver.click("#resize")
+        wait_for(lambda: f" × {height} " in state()["cursor"], "native WebKit accepted the resized viewport")
+
+    wait_for(lambda: all(marker in visible() for marker in ("AETHER-RESIZE-ARCHIVE", "AETHER-RESIZE-LIVE")),
+             "both resize witnesses were visible before the shrink")
+    resize(8)
+    assert state()["current_tab"] == original["current_tab"]
+    live = visible()
+    assert "AETHER-RESIZE-LIVE" in live and "AETHER-RESIZE-ARCHIVE" not in live
+    driver.click("#history-refresh")
+    wait_for(lambda: "AETHER-RESIZE-ARCHIVE" in state()["dump"], "displaced top row reached the retained history")
+    resize(rows)
+    driver.click("#close")
+    wait_for(lambda: state()["status"].startswith("Terminal closed"), "resize fixture closed")
+    print(json.dumps({"native_height_shrink_keeps_live_output_and_archives_displaced_rows": True}), flush=True)
+
+
+def exercise_renderer_reload(driver, owned):
+    def state():
+        return driver.execute(READ)
+
+    def painted(marker):
+        driver.click("#copy-visible")
+        return re.search(r"(?m)^" + re.escape(marker) + r" *$", state()["dump"])
+
+    before = owned / "renderer-reload-before.pid"
+    release = owned / "renderer-reload-release"
+    after = owned / "renderer-reload-after.pid"
+    forbidden = owned / "renderer-reload-unsent"
+    driver.click("#open")
+    original = wait_for(lambda: (view := state())["writable"] and view["current_tab"],
+                        "reload fixture did not open a terminal")
+    command = (f'printf "%s" "$$" > {shlex.quote(str(before))}; '
+               "printf 'AETHER-RENDERER-BEFORE\\n'; "
+               f'while test ! -f {shlex.quote(str(release))}; do sleep 0.05; done; '
+               f'printf "%s" "$$" > {shlex.quote(str(after))}; '
+               "printf 'AETHER-RENDERER-AFTER\\n'")
+    driver.type("#input", command)
+    driver.click("#send")
+    wait_for(lambda: before.is_file() and painted("AETHER-RENDERER-BEFORE"),
+             "the original renderer did not display its PTY output")
+    driver.type("#input", f"printf replayed > {shlex.quote(str(forbidden))}")
+    assert state()["draft"]
+
+    driver.command("POST", "/refresh", {})
+    wait_for(lambda: opened_page(driver) and state()["current_tab"] is None, "new WebKit page did not load")
+    release.touch()
+    wait_for(lambda: after.is_file() and after.read_text().isdigit(), "detached PTY did not advance during reload")
+    assert after.read_text() == before.read_text()
+    driver.click("#attach")
+    wait_for(lambda: state()["current_tab"] == original and painted("AETHER-RENDERER-AFTER"),
+             "new renderer did not reattach to the original PTY")
+    observed = state()
+    assert not observed["writable"] and not observed["resize"] and not observed["draft"]
+    assert not forbidden.exists()
+    assert re.search(r"(?m)^AETHER-RENDERER-BEFORE *$", observed["dump"])
+    driver.click("#close")
+    wait_for(lambda: state()["status"].startswith("Terminal closed"), "reload fixture did not close")
+    print(json.dumps({"native_renderer_reload_keeps_same_pty": True,
+                      "native_renderer_reload_recovers_detached_output_read_only": True}), flush=True)
+
+
+def exercise_keyboard(driver, owned):
+    probe = owned / "keyboard-probe.py"
+    receipt = owned / "keyboard-bytes"
+    probe.write_text('''import os, select, sys, termios, tty
+mode = termios.tcgetattr(0)
+try:
+    tty.setraw(0)
+    os.write(1, b"\\x1b[?1049h\\x1b[>31u\\x1b[?u\\x1b[2J\\x1b[HAETHER-KEYBOARD-READY")
+    with open(sys.argv[1], "wb", buffering=0) as output:
+        while select.select([0], [], [], 10)[0]:
+            data = os.read(0, 256)
+            output.write(data)
+            if not data or data.endswith(b"q"):
+                break
+finally:
+    os.write(1, b"\\x1b[?1049l\\r\\nAETHER-KEYBOARD-FINISHED\\r\\n")
+    termios.tcsetattr(0, termios.TCSANOW, mode)
+''')
+    driver.click("#open")
+    wait_for(lambda: driver.execute(READ)["transport"] == "channel", "keyboard fixture shell did not attach")
+    driver.type("#input", f"/usr/bin/python3 {shlex.quote(str(probe))} {shlex.quote(str(receipt))}")
+    driver.click("#send")
+
+    def painted(marker):
+        driver.click("#copy-visible")
+        return marker in driver.execute(READ)["dump"]
+
+    wait_for(lambda: painted("AETHER-KEYBOARD-READY"), "keyboard reporting did not reach the native canvas")
+    driver.click("#reveal-cursor")
+    click_visible_terminal(driver)
+    wait_for(lambda: driver.execute("""
+        return document.activeElement === document.querySelector('#ime-input') ||
+               document.activeElement === document.querySelector('main canvas');
+    """), "keyboard fixture did not focus the native input surface")
+    actions = []
+    for keys in (("\ue008", "\ue007"), ("\ue00c",), ("\ue009", "i"), ("q",)):
+        actions.extend({"type": "keyDown", "value": key} for key in keys)
+        actions.extend({"type": "keyUp", "value": key} for key in reversed(keys))
+    driver.command("POST", "/actions", {"actions": [{"type": "key", "id": "terminal-keys", "actions": actions}]})
+    driver.command("DELETE", "/actions")
+    wait_for(lambda: painted("AETHER-KEYBOARD-FINISHED"), "keyboard probe did not return to the shell")
+    expected = b"\x1b[?1u\x1b[13;2u\x1b[27u\x1b[105;5uq"
+    actual = receipt.read_bytes()
+    assert actual == expected, (expected, actual)
+    driver.click("#close")
+    wait_for(lambda: driver.execute(READ)["status"].startswith("Terminal closed"), "keyboard shell did not close")
+    print(json.dumps({"native_kitty_disambiguation": True, "pty_bytes_verified": len(actual)}), flush=True)
 
 
 def exercise_restart(driver, owned, binary):
@@ -1459,6 +1630,7 @@ def exercise_native_context(driver, owned, command, reopen_task, task, starts_fi
         return driver.execute("""
             return {
               contextStatus: document.querySelector('#native-context-status').textContent,
+              canReloadContext: !document.querySelector('#native-context-reload').disabled,
               taskStatus: document.querySelector('#native-status').textContent,
               goal: document.querySelector('#native-context-goal').value,
               completed: document.querySelector('#native-context-completed').value,
@@ -1529,8 +1701,12 @@ def exercise_native_context(driver, owned, command, reopen_task, task, starts_fi
     assert view()["draft"] == "" and view()["canInspect"]
     assert len(starts_file.read_text().splitlines()) == 1
 
-    driver.click("#native-context-reload")
-    wait_for(lambda: "revision 3" in view()["contextStatus"], "latest context revision did not reload")
+    wait_for(lambda: view()["canReloadContext"], "the saved context reload is still busy")
+    # Activate this button by keyboard to exercise it after the preview folds
+    # and moves the control on screen.
+    driver.type("#native-context-reload", "\ue007")
+    wait_for(lambda: (current := view())["remaining"] == "Latest remaining work from the shared host."
+             and "revision 3" in current["contextStatus"], "latest context revision did not reload")
     driver.click("#native-context-preview")
     wait_for(lambda: view()["canUse"], "fresh Codex handoff did not become available")
     packet = view()["packet"]
@@ -2275,6 +2451,14 @@ def exercise_vim9_workbench(driver, owned):
                       "native_vim9_actual_gui_disconnect_preserves_live_pty_input": True}), flush=True)
 
 
+def private_accessibility_address():
+    from gi.repository import Gio, GLib
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    address = bus.call_sync("org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus", "GetAddress", None,
+                            GLib.VariantType.new("(s)"), Gio.DBusCallFlags.NONE, 5000, None)
+    return address.unpack()[0]
+
+
 def run(binary, jsh, workspace, api, native, notebook=False, output_review=False, vim9=False):
     executable = shutil.which("WebKitWebDriver")
     if not executable or not os.environ.get("DISPLAY") or not os.environ.get("XAUTHORITY"):
@@ -2299,6 +2483,9 @@ def run(binary, jsh, workspace, api, native, notebook=False, output_review=False
             path = owned / name.lower()
             path.mkdir(mode=0o700)
             env["XDG_RUNTIME_DIR" if name == "RUNTIME" else f"XDG_{name}_HOME"] = str(path)
+        if vim9:
+            address = private_accessibility_address()
+            os.environ["AT_SPI_BUS_ADDRESS"] = env["AT_SPI_BUS_ADDRESS"] = address
         if output_review:
             (owned / "Downloads").mkdir()
             (Path(env["XDG_CONFIG_HOME"]) / "user-dirs.dirs").write_text(
@@ -2327,6 +2514,9 @@ def run(binary, jsh, workspace, api, native, notebook=False, output_review=False
                 wait_for(lambda: opened_page(driver), "embedded Aether tauri: page did not load")
                 exercise(driver, owned)
                 exercise_hyperlinks(driver, owned)
+                exercise_keyboard(driver, owned)
+                exercise_height_shrink(driver)
+                exercise_renderer_reload(driver, owned)
                 exercise_restart(driver, owned, binary)
                 if jsh:
                     exercise_command_blocks(driver, owned, output_review)

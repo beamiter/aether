@@ -1,6 +1,6 @@
 use local_sessions::LocalSessions;
 use std::sync::{Arc, Mutex};
-use tauri::ipc::Channel;
+use tauri::{ipc::Channel, webview::PageLoadEvent, Manager};
 use tauri_terminal_frame_bridge::{
     history_search::{HistorySearchRequest, HistorySearchResponse},
     live::{LiveBridge, SessionStatus},
@@ -442,6 +442,18 @@ fn application<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<
         .manage(Arc::new(
             Mutex::new(remote_desktop::WindowRemote::default()),
         ))
+        .on_page_load(|webview, payload| {
+            if webview.label() != "main" || payload.event() != PageLoadEvent::Started {
+                return;
+            }
+            let sessions = webview.state::<Arc<Mutex<LocalSessions>>>();
+            let Ok(mut sessions) = sessions.lock() else {
+                return;
+            };
+            if let Err(error) = sessions.retire_renderer() {
+                eprintln!("Cannot detach the previous local terminal view: {error}");
+            }
+        })
         .on_window_event(remote_desktop::window_event)
         .invoke_handler(tauri::generate_handler![
             demo_frame,

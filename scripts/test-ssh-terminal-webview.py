@@ -47,7 +47,7 @@ def owned_desktop(app, group):
         pid, pgid = map(int, entry.split())
         if pgid != group:
             continue
-        with contextlib.suppress(FileNotFoundError, PermissionError):
+        with contextlib.suppress(FileNotFoundError, PermissionError, ProcessLookupError):
             if os.path.samefile(f"/proc/{pid}/exe", app):
                 return pid
     return None
@@ -252,8 +252,7 @@ def exercise(app, destination, helper):
         snap("read-only")
 
         forbidden = str(owned / "read-only-write")
-        driver.click("main canvas")
-        assert driver.execute("return document.activeElement?.id === 'ime-input';")
+        native["click_visible_terminal"](driver)
         run("xdotool", "type", "--clearmodifiers", f"printf forbidden > {quote(forbidden)}")
         run("xdotool", "key", "Return")
         probe["remote_python"](destination,

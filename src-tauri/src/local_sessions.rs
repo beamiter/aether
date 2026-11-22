@@ -223,9 +223,10 @@ impl LocalSessions {
         shared: Weak<Mutex<Self>>,
     ) -> Result<Attachment, String> {
         self.ensure_worker(shared)?;
+        let worker = self.worker.as_ref().unwrap();
         let prev_epoch = self.last_epoch;
         let owner = self.registry.open(|| {
-            let (owned, owner) = Self::spawn(prev_epoch, integrated)?;
+            let (owned, owner) = Self::spawn(prev_epoch, integrated, worker)?;
             Ok((owner.session.clone(), owned, owner))
         })?;
         self.last_epoch = owner.epoch;
@@ -233,7 +234,11 @@ impl LocalSessions {
         Ok(owner)
     }
 
-    fn spawn(prev_epoch: u32, integrated: bool) -> Result<(OwnedLocalPty, Attachment), String> {
+    fn spawn(
+        prev_epoch: u32,
+        integrated: bool,
+        worker: &LocalWorker,
+    ) -> Result<(OwnedLocalPty, Attachment), String> {
         let mut bridge = LiveBridge::local_desktop_after(prev_epoch);
         bridge.set_hyperlink_policy(jterm_core::link::is_openable_osc8);
         let epoch = if integrated {
@@ -241,6 +246,7 @@ impl LocalSessions {
         } else {
             bridge.open(24, 80)?
         };
+        worker.watch(&bridge)?;
         let owner = bridge.attachment(epoch)?;
         let owned = OwnedLocalPty {
             bridge,
@@ -312,7 +318,8 @@ impl LocalSessions {
             owned.parked_input = false;
             activated
         } else {
-            let (mut owned, original) = Self::spawn(self.last_epoch, false)?;
+            let (mut owned, original) =
+                Self::spawn(self.last_epoch, false, self.worker.as_ref().unwrap())?;
             let Entry::Vacant(entry) = self.registry.sessions.entry(original.session) else {
                 return Err("terminal session ID collision".into());
             };
@@ -388,6 +395,21 @@ impl LocalSessions {
         if self.worker.is_none() {
             self.worker = Some(LocalWorker::start(shared)?);
         }
+        Ok(())
+    }
+
+    /// The native WebView started a new document. Retire its old attachment
+    /// and any unknown input while leaving the already launched PTY running.
+    pub(crate) fn retire_renderer(&mut self) -> Result<(), String> {
+        if let Some(id) = self.registry.reader.clone() {
+            let owned = self.registry.reader(&id)?;
+            let owner = owned.bridge.attachment(owned.target.epoch)?;
+            self.retire_view(&owner, false)?;
+        }
+        for session in self.registry.sessions.values_mut() {
+            session.parked_input = false;
+        }
+        self.pending_tab = None;
         Ok(())
     }
 
@@ -646,7 +668,11 @@ impl LocalSessions {
     ) -> Result<R, String> {
         let owned = self.registry.reader(&owner.session)?;
         let epoch = owned.bridge.validate_logical_input(owner)?;
-        operation(&mut owned.bridge, epoch)
+        let result = operation(&mut owned.bridge, epoch);
+        if let Some(worker) = &self.worker {
+            worker.wake();
+        }
+        result
     }
 
     pub(crate) fn write_raw(&mut self, owner: Attachment, bytes: Vec<u8>) -> Result<usize, String> {

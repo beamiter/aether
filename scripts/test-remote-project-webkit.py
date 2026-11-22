@@ -11,6 +11,7 @@ import runpy
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 
 native = runpy.run_path(str(Path(__file__).with_name("test-two-local-webkit.py")))
@@ -173,7 +174,7 @@ def exercise_workspace(driver, binary, host_id, store):
           "paged evidence search", "replaced revision refused", "exact document", "disconnect"]}), flush=True)
 
 
-def exercise(app, helper, backend, compositor_libraries):
+def exercise(app, helper, backend, compositor_libraries, terminal_only=False):
     uid = os.getuid()
     runtime = Path(f"/run/user/{uid}")
     if not runtime.is_dir() or runtime.stat().st_uid != uid:
@@ -228,6 +229,16 @@ SetEnv JTERM_WORKSPACE_STATE_DIR={state}
                                capture_output=True, text=True, timeout=10)
         if probe.returncode:
             raise RuntimeError(f"Loopback SSH failed: {probe.stderr}\n{(owned / 'sshd.log').read_text()}")
+        # Give only the test processes this SSH host and key configuration.
+        wrap = ["bwrap", "--dev-bind", "/", "/", "--ro-bind", ssh / "config", "/etc/ssh/ssh_config"]
+        personal = Path.home() / ".ssh"
+        if personal.is_dir():
+            wrap += ["--ro-bind", ssh, personal]
+        if terminal_only:
+            script = Path(__file__).with_name("test-ssh-terminal-webview.py").resolve()
+            subprocess.run([*wrap, "--", sys.executable, "-B", script, app, "aether-qa", helper],
+                           check=True, timeout=180)
+            return
         remote_env = os.environ | {"JTERM_WORKSPACE_STATE_DIR": str(state)}
         host = start([app, "--jterm-session-host"], "host.log", remote_env)
         store = state / "run" / "host.sock"
@@ -261,12 +272,6 @@ SetEnv JTERM_WORKSPACE_STATE_DIR={state}
             start(["wtype", "-s", "600000", "-k", "F24"], "seat.log", env)
         driver_port = port()
         driver = native["Driver"](driver_port)
-        # Both native clients run system OpenSSH. Give only this test process
-        # a private SSH configuration without editing the user's home.
-        wrap = ["bwrap", "--dev-bind", "/", "/", "--ro-bind", ssh / "config", "/etc/ssh/ssh_config"]
-        personal = Path.home() / ".ssh"
-        if personal.is_dir():
-            wrap += ["--ro-bind", ssh, personal]
         webdriver = shutil.which("WebKitWebDriver")
         if not webdriver:
             raise RuntimeError("WebKitWebDriver is required")
@@ -302,5 +307,10 @@ if __name__ == "__main__":
     parser.add_argument("helper", type=Path)
     parser.add_argument("--backend", choices=["x11", "wayland"], default="x11")
     parser.add_argument("--compositor-libraries", type=Path)
+    parser.add_argument("--interactive-terminal", action="store_true",
+                        help="exercise the SSH terminal and reconnect over a private X11 display")
     args = parser.parse_args()
-    exercise(args.aether.resolve(strict=True), args.helper.resolve(strict=True), args.backend, args.compositor_libraries)
+    if args.interactive_terminal and args.backend != "x11":
+        parser.error("--interactive-terminal uses a private X11 display")
+    exercise(args.aether.resolve(strict=True), args.helper.resolve(strict=True), args.backend,
+             args.compositor_libraries, args.interactive_terminal)
