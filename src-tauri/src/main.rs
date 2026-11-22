@@ -41,6 +41,41 @@ async fn open_shell<R: tauri::Runtime>(
 }
 
 #[tauri::command]
+async fn open_second_local_shell<R: tauri::Runtime>(
+    window: tauri::WebviewWindow<R>,
+    epoch: u32,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
+) -> Result<Attachment, String> {
+    require_terminal_window(&window)?;
+    run_bridge(bridge.inner().clone(), move |bridge| {
+        bridge.open_second(epoch)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn list_local_shells<R: tauri::Runtime>(
+    window: tauri::WebviewWindow<R>,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
+) -> Result<Vec<u32>, String> {
+    require_terminal_window(&window)?;
+    run_bridge(bridge.inner().clone(), |bridge| Ok(bridge.list_epochs())).await
+}
+
+#[tauri::command]
+async fn attach_selected_local_shell<R: tauri::Runtime>(
+    window: tauri::WebviewWindow<R>,
+    epoch: u32,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
+) -> Result<Option<Resume>, String> {
+    require_terminal_window(&window)?;
+    run_bridge(bridge.inner().clone(), move |bridge| {
+        bridge.attach_selected(epoch)
+    })
+    .await
+}
+
+#[tauri::command]
 async fn attach_shell<R: tauri::Runtime>(
     window: tauri::WebviewWindow<R>,
     target: Option<SessionSelector>,
@@ -232,6 +267,9 @@ fn application<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<
             demo_frame,
             acknowledge,
             open_shell,
+            open_second_local_shell,
+            list_local_shells,
+            attach_selected_local_shell,
             attach_shell,
             detach_shell,
             poll_shell,

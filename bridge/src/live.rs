@@ -57,7 +57,15 @@ impl LiveBridge {
     /// Standalone/SSH transport retains its existing recovery contract.
     #[doc(hidden)]
     pub fn local_desktop() -> Self {
+        Self::local_desktop_after(0)
+    }
+
+    /// Desktop owner allocates a fresh epoch across all of its retained PTYs;
+    /// this stores the last allocated value, not an attachment capability.
+    #[doc(hidden)]
+    pub fn local_desktop_after(last_epoch: u32) -> Self {
         Self {
+            epoch: last_epoch,
             order_partial_input: true,
             ..Self::default()
         }

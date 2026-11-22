@@ -402,6 +402,15 @@ fn tauri_ipc_real_pty_lifecycle_and_wire_contract() {
 
 #[test]
 fn detached_local_pty_drains_past_kernel_capacity_without_frontend_poll() {
+    detached_pressure(false);
+}
+
+#[test]
+fn second_local_pty_keeps_one_reader_and_first_makes_progress_while_inactive() {
+    detached_pressure(true);
+}
+
+fn detached_pressure(open_second: bool) {
     use std::{
         os::unix::fs::DirBuilderExt,
         path::PathBuf,
@@ -524,11 +533,92 @@ printf '%s' "$$" > {written}
     let expected_pid = std::fs::read_to_string(&armed).unwrap();
     assert!(!expected_pid.is_empty() && expected_pid.bytes().all(|byte| byte.is_ascii_digit()));
     invoke(&window, "detach_shell", json!({"owner":owner}));
+    let second = if open_second {
+        assert_eq!(
+            invoke(&window, "list_local_shells", json!({})),
+            json!([owner["epoch"]])
+        );
+        assert!(tauri::test::get_ipc_response(
+            &window,
+            request(
+                "open_second_local_shell",
+                json!({"epoch":owner["epoch"].as_u64().unwrap()+1})
+            )
+        )
+        .is_err());
+        assert!(tauri::test::get_ipc_response(&window, request("open_shell", json!({}))).is_err());
+        let other_window = tauri::WebviewWindowBuilder::new(&app, "other", Default::default())
+            .build()
+            .unwrap();
+        for (name, body) in [
+            ("list_local_shells", json!({})),
+            ("open_second_local_shell", json!({"epoch":owner["epoch"]})),
+            (
+                "attach_selected_local_shell",
+                json!({"epoch":owner["epoch"]}),
+            ),
+        ] {
+            assert!(tauri::test::get_ipc_response(&other_window, request(name, body)).is_err());
+        }
+        let second = invoke(
+            &window,
+            "open_second_local_shell",
+            json!({"epoch":owner["epoch"]}),
+        );
+        assert_ne!(second["session"], owner["session"]);
+        assert!(second["epoch"].as_u64().unwrap() > owner["epoch"].as_u64().unwrap());
+        assert_eq!(
+            invoke(&window, "list_local_shells", json!({})),
+            json!([owner["epoch"], second["epoch"]])
+        );
+        assert!(tauri::test::get_ipc_response(
+            &window,
+            request(
+                "attach_selected_local_shell",
+                json!({"epoch":owner["epoch"]})
+            )
+        )
+        .is_err());
+        assert!(tauri::test::get_ipc_response(
+            &window,
+            request("poll_shell", json!({"owner":owner}))
+        )
+        .is_err());
+        assert!(tauri::test::get_ipc_response(
+            &window,
+            request("write_shell", json!({"owner":owner,"bytes":[120]}))
+        )
+        .is_err());
+        assert!(tauri::test::get_ipc_response(
+            &window,
+            request("open_second_local_shell", json!({"epoch":owner["epoch"]}))
+        )
+        .is_err());
+        let b_pid = temp.0.join("second-pid");
+        invoke(
+            &window,
+            "text_shell",
+            json!({"owner":second,"text":format!(
+            "printf '%s' \"$$\" > {}; printf '\\nAETHER_SECOND_%s\\n' LIVE",quote(&b_pid))}),
+        );
+        invoke(
+            &window,
+            "key_shell",
+            json!({"owner":second,"name":"Enter","shift":false,"alt":false,"ctrl":false}),
+        );
+        Some((second, b_pid))
+    } else {
+        None
+    };
     std::fs::write(&gate, b"go").unwrap();
     let deadline = Instant::now() + Duration::from_secs(12);
+    let mut other_visible = second.is_none();
     let completed_without_view = loop {
-        // Intentionally no poll, status, attach, callback, or other IPC here.
-        if std::fs::read_to_string(&written).is_ok_and(|pid| pid == expected_pid) {
+        // No IPC for A. B's independent foreground lease stays active.
+        if let Some((other, _)) = &second {
+            other_visible |= poll_marker(other, "AETHER_SECOND_LIVE");
+        }
+        if other_visible && std::fs::read_to_string(&written).is_ok_and(|pid| pid == expected_pid) {
             break true;
         }
         if Instant::now() >= deadline {
@@ -537,6 +627,39 @@ printf '%s' "$$" > {written}
         std::thread::sleep(Duration::from_millis(10));
     };
     let last_phase = std::fs::read_to_string(&phase).unwrap_or_default();
+    if let Some((other, b_pid)) = &second {
+        if completed_without_view {
+            let pid = std::fs::read_to_string(b_pid).unwrap();
+            assert!(!pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()));
+            assert_ne!(pid, expected_pid);
+        }
+        invoke(&window, "detach_shell", json!({"owner":other}));
+        assert!(
+            tauri::test::get_ipc_response(&window, request("attach_shell", json!({}))).is_err()
+        );
+        let second_view = invoke(
+            &window,
+            "attach_selected_local_shell",
+            json!({"epoch":other["epoch"]}),
+        );
+        assert_eq!(second_view["owner"]["session"], other["session"]);
+        assert_ne!(second_view["owner"]["generation"], other["generation"]);
+        if other_visible {
+            assert!(marker_rows(
+                &second_view["frame"]["rows"],
+                "AETHER_SECOND_LIVE"
+            ));
+        }
+        assert!(!marker_rows(
+            &second_view["frame"]["rows"],
+            "AETHER_PRESSURE_END"
+        ));
+        invoke(
+            &window,
+            "close_shell",
+            json!({"owner":second_view["owner"]}),
+        );
+    }
     let resumed = invoke(
         &window,
         "attach_shell",
@@ -561,8 +684,8 @@ printf '%s' "$$" > {written}
     assert_eq!(attached["epoch"], owner["epoch"]);
     assert_ne!(attached["generation"], owner["generation"]);
     assert!(
-        completed_without_view,
-        "detached fixture did not complete before reconnect: phase={last_phase:?}, end_marker={end_seen}"
+        completed_without_view && other_visible,
+        "detached fixture did not complete before reconnect: phase={last_phase:?}, end_marker={end_seen}, other_marker={other_visible}"
     );
     assert!(
         end_seen,

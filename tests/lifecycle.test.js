@@ -21,8 +21,8 @@ function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsuppo
   return result;
  };
  const elements=new Map(),timers=new Map();let id=0;
- const el=selector=>{if(!elements.has(selector))elements.set(selector,{disabled:false,value:'',textContent:'',style:{},handlers:{},focus(){},addEventListener(name,fn){this.handlers[name]=fn}});return elements.get(selector)};
- const context={installFilePreviewPanel:()=>({dismiss(){}}),document:{querySelector:el},__TAURI__:{core:{invoke}},acceptFull,acceptUpdate,installIme,installHistory,installPasteReview,resizeQueue,cursorTarget,paint,TextEncoder:Encoder,TextDecoder,
+ const el=selector=>{if(!elements.has(selector))elements.set(selector,{disabled:false,value:'',textContent:'',style:{},handlers:{},focus(){},replaceChildren(...options){this.options=options;},addEventListener(name,fn){this.handlers[name]=fn}});return elements.get(selector)};
+ const context={installFilePreviewPanel:()=>({dismiss(){}}),document:{querySelector:el,createElement:()=>({})},__TAURI__:{core:{invoke}},acceptFull,acceptUpdate,installIme,installHistory,installPasteReview,resizeQueue,cursorTarget,paint,TextEncoder:Encoder,TextDecoder,
  setInterval(fn){timers.set(++id,fn);return id},clearInterval(i){timers.delete(i)},setTimeout};
  vm.runInNewContext(fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8').replace(/^import .*\n/gm,''),context);
  return {el,timers,click:s=>el(s).handlers.click(),submit:()=>el('#command').handlers.submit({preventDefault(){}}),submitSsh:()=>el('#ssh-terminal-form').handlers.submit({preventDefault(){}})};
@@ -667,4 +667,121 @@ test('local reconnect never paints or ACKs a foreign, stale, or missing retained
  assert.equal(frames[0].session,first.session);
  assert.equal(acked.length,1);
  assert.equal(h.el('#input').disabled,true);
+});
+
+test('explicit second local shell parks the first draft and reconnects exact selected shell view-only',async()=>{
+ const first={session:'a'.repeat(32),epoch:1,generation:1};
+ const second={session:'b'.repeat(32),epoch:2,generation:1};
+ const frame=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+ const calls=[];
+ let firstOpened=false,secondOpened=false;
+ const h=harness(async(name,args)=>{
+  calls.push([name,args]);
+  switch(name){
+    case 'open_shell':assert(!firstOpened);firstOpened=true;return first;
+    case 'list_local_shells':return (secondOpened?[first,second]:[first]).map(owner=>owner.epoch);
+    case 'open_second_local_shell':assert.equal(args.epoch,first.epoch);secondOpened=true;return second;
+    case 'poll_shell':case 'detach_shell':case 'ack_shell':return null;
+    case 'attach_selected_local_shell':
+      assert.equal(args.epoch,first.epoch);
+      return {owner:{...first,generation:3},frame:{...frame,session:first.session,epoch:first.epoch}};
+    case 'write_shell':assert.equal(args.epoch,second.epoch);return args.bytes.length;
+    default:throw Error(name);
+  }
+ });
+ await h.click('#open');h.el('#input').value='first-only draft';
+ assert.equal(h.el('#manage-local').disabled,true);
+ await h.click('#detach');
+ await h.click('#manage-local');assert.equal(h.el('#open-second-local').disabled,false);
+ await h.click('#open-second-local');
+ assert.equal(h.el('#input').value,'');assert.equal(h.el('#input').disabled,false);
+ h.el('#input').value='second command';await h.submit();
+ await h.click('#detach');await h.click('#manage-local');
+ assert.equal(h.el('#attach-selected-local').disabled,true);
+ assert.equal(h.el('#open-second-local').disabled,true);
+ h.el('#local-shell-selection').value=String(first.epoch);h.el('#local-shell-selection').handlers.change();
+ await h.click('#attach-selected-local');
+ assert.equal(h.el('#input').value,'first-only draft');assert.equal(h.el('#input').disabled,true);
+ assert.match(h.el('#status').textContent,/view-only/);
+ assert.deepEqual(calls.filter(([name])=>name==='write_shell').map(([,args])=>args.epoch),[2]);
+});
+
+test('lost second-open response does not retry or present another shell as writable',async()=>{
+ const first={session:'a'.repeat(32),epoch:3,generation:1};
+ const second={session:'b'.repeat(32),epoch:4,generation:1};
+ const frame=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+ let uncertain=0,closed=false;
+ const h=harness(async(name,args)=>{
+  switch(name){
+   case 'open_shell':return first;
+   case 'detach_shell':case 'poll_shell':case 'ack_shell':return null;
+   case 'list_local_shells':return (uncertain?[first,second]:[first]).map(owner=>owner.epoch);
+   case 'open_second_local_shell':uncertain++;throw Error('reply lost');
+   case 'attach_selected_local_shell':
+    assert.equal(args.epoch,second.epoch);
+    return {owner:{...second,generation:2},frame:{...frame,session:second.session,epoch:second.epoch}};
+   case 'close_shell':assert.equal(args.epoch,second.epoch);closed=true;return {cleanup_pending:true};
+   default:throw Error(name);
+  }
+ });
+ await h.click('#open');h.el('#input').value='do not send to the other shell';
+ await h.click('#detach');await h.click('#manage-local');await h.click('#open-second-local');
+ assert.match(h.el('#status').textContent,/open unconfirmed/);
+ assert.equal(h.el('#input').disabled,true);
+ await h.click('#open-second-local');assert.equal(uncertain,1);
+ await h.click('#manage-local');
+ h.el('#local-shell-selection').value=String(second.epoch);h.el('#local-shell-selection').handlers.change();
+ await h.click('#attach-selected-local');
+ assert.equal(h.el('#input').value,'');assert.equal(h.el('#input').disabled,true);
+ await h.click('#close');assert(closed);
+});
+
+test('late local roster reply cannot expose second-open controls after another view opens',async()=>{
+ const list=deferred(),calls=[];
+ const h=harness(async(name)=>{
+  calls.push(name);
+  if(name==='list_local_shells')return list.promise;
+  if(name==='open_shell')return 2;
+  if(name==='poll_shell')return null;
+  throw Error(name);
+ });
+ const pending=h.click('#manage-local');
+ await h.click('#open');
+ list.resolve([1]);await pending;
+ assert.equal(h.el('#local-shell-options').hidden,true);
+ await h.click('#open-second-local');
+ assert(!calls.includes('open_second_local_shell'));
+});
+
+test('confirmed local close clears only B draft; targetless reattach restores A draft',async()=>{
+ const a={session:'a'.repeat(32),epoch:7,generation:1};
+ const b={session:'b'.repeat(32),epoch:8,generation:1};
+ const frame=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+ let bCloseCalls=0;
+ const h=harness(async(name,args)=>{
+  switch(name){
+   case 'open_shell':return a;
+   case 'list_local_shells':return [a.epoch];
+   case 'open_second_local_shell':assert.equal(args.epoch,a.epoch);return b;
+   case 'poll_shell':case 'ack_shell':case 'detach_shell':return null;
+   case 'close_shell':
+     assert.equal(args.epoch,b.epoch);
+     if(++bCloseCalls===1)throw Error('close not confirmed');
+     return {cleanup_pending:true};
+   case 'attach_shell':
+     assert.equal(args,undefined);
+     return {owner:{...a,generation:3},frame:{...frame,session:a.session,epoch:a.epoch}};
+   default:throw Error(name);
+  }
+ });
+ await h.click('#open');h.el('#input').value='draft only for A';
+ await h.click('#detach');await h.click('#manage-local');await h.click('#open-second-local');
+ h.el('#input').value='private draft only for B';
+ await h.click('#close');assert.equal(h.el('#input').value,'private draft only for B');
+ assert.match(h.el('#status').textContent,/Close error/);
+ await h.click('#close');assert.equal(h.el('#input').value,'');
+ await h.click('#attach');
+ assert.equal(h.el('#input').value,'draft only for A');
+ assert.equal(h.el('#input').disabled,true);
+ assert.equal(bCloseCalls,2);
 });

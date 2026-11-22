@@ -89,14 +89,28 @@ impl<T, const LIMIT: usize> Registry<T, LIMIT> {
         Ok(Some(result))
     }
 
-    fn detached(&mut self) -> Option<&mut T> {
-        // The desktop registry is a singleton, and may have no session.
-        // Do not implicitly select an owner if a future multi-PTY registry
-        // has several retained sessions; that needs its own fair scheduler.
-        if self.reader.is_some() || self.sessions.len() != 1 {
-            return None;
+    fn next_inactive(
+        &mut self,
+        after: Option<&str>,
+        ready: impl Fn(&T) -> bool,
+    ) -> Option<(&String, &mut T)> {
+        let active = self.reader.as_deref();
+        let admitted = |id: &String, value: &T| active != Some(id.as_str()) && ready(value);
+        // One bounded eligible turn; wrap in stable key order. The desktop
+        // cap is two, so even the skipped/blocked scan is bounded.
+        let mut fallback = None;
+        for (id, value) in &mut self.sessions {
+            if !admitted(id, value) {
+                continue;
+            }
+            if after.is_none_or(|after| id.as_str() > after) {
+                return Some((id, value));
+            }
+            if fallback.is_none() {
+                fallback = Some((id, value));
+            }
         }
-        self.sessions.values_mut().next()
+        fallback
     }
 
     fn close<R>(
@@ -116,31 +130,81 @@ impl<T, const LIMIT: usize> Registry<T, LIMIT> {
 struct OwnedLocalPty {
     bridge: LiveBridge,
     raw: RawSuffix<Attachment>,
+    target: SessionSelector,
+    pump_candidate: bool,
 }
 
 #[derive(Default)]
 pub(crate) struct LocalSessions {
-    // Keep the existing one-PTY public behavior. A later explicit pane open
-    // can opt into multiple retained IDs, rather than widening it here.
-    registry: Registry<OwnedLocalPty, 1>,
-    // Recycle the empty bridge on close to preserve legacy increasing epochs.
-    vacant: Option<LiveBridge>,
+    registry: Registry<OwnedLocalPty, 2>,
+    last_epoch: u32,
+    pump_after: Option<String>,
     detached_worker: Option<DetachedWorker>,
 }
 
 impl LocalSessions {
     pub(crate) fn open(&mut self) -> Result<Attachment, String> {
-        let vacant = &mut self.vacant;
-        self.registry.open(|| {
-            let bridge = vacant.get_or_insert_with(LiveBridge::local_desktop);
+        // Keep the ordinary opener fail-closed if *any* PTY remains.
+        if !self.registry.sessions.is_empty() {
+            return Err("close the existing session first".into());
+        }
+        self.open_fresh()
+    }
+
+    pub(crate) fn open_second(&mut self, retained_epoch: u32) -> Result<Attachment, String> {
+        if self.registry.sessions.len() != 1 || self.registry.reader.is_some() {
+            return Err("detach the single existing local shell before opening a second".into());
+        }
+        self.target_for_epoch(retained_epoch)?;
+        self.open_fresh()
+    }
+
+    pub(crate) fn list_epochs(&self) -> Vec<u32> {
+        // Attachment IDs are also needed for close/input. Discovery exposes
+        // only local epoch labels and cannot manufacture an attachment.
+        let mut owned: Vec<_> = self
+            .registry
+            .sessions
+            .values()
+            .map(|pty| pty.target.epoch)
+            .collect();
+        owned.sort_unstable();
+        owned
+    }
+
+    fn target_for_epoch(&self, epoch: u32) -> Result<SessionSelector, String> {
+        self.registry
+            .sessions
+            .values()
+            .find(|owned| owned.target.epoch == epoch)
+            .map(|owned| owned.target.clone())
+            .ok_or_else(|| "no such retained local shell".into())
+    }
+
+    pub(crate) fn attach_selected(&mut self, epoch: u32) -> Result<Option<Resume>, String> {
+        let target = self.target_for_epoch(epoch)?;
+        self.attach(Some(&target))
+    }
+
+    fn open_fresh(&mut self) -> Result<Attachment, String> {
+        let prev_epoch = self.last_epoch;
+        let owner = self.registry.open(|| {
+            let mut bridge = LiveBridge::local_desktop_after(prev_epoch);
             let epoch = bridge.open(24, 80)?;
             let owner = bridge.attachment(epoch)?;
             let owned = OwnedLocalPty {
-                bridge: vacant.take().unwrap(),
+                bridge,
                 raw: RawSuffix::default(),
+                target: SessionSelector {
+                    session: owner.session.clone(),
+                    epoch,
+                },
+                pump_candidate: false,
             };
             Ok((owner.session.clone(), owned, owner))
-        })
+        })?;
+        self.last_epoch = owner.epoch;
+        Ok(owner)
     }
 
     pub(crate) fn attach(
@@ -154,6 +218,7 @@ impl LocalSessions {
                     .attach_read_only(target)?
                     .ok_or("terminal session closed")?;
                 owned.raw.retain_only_current(&view.owner);
+                owned.pump_candidate = false;
                 Ok(view)
             })
     }
@@ -175,6 +240,7 @@ impl LocalSessions {
         self.registry.detach(&owner.session, |owned| {
             owned.bridge.detach(owner)?;
             owned.raw.retire_view();
+            owned.pump_candidate = matches!(owned.raw, RawSuffix::None);
             Ok(())
         })?;
         self.detached_worker.as_ref().unwrap().wake();
@@ -182,10 +248,25 @@ impl LocalSessions {
     }
 
     fn pump_detached(&mut self) -> bool {
-        let Some(owned) = self.registry.detached() else {
+        let eligible =
+            |owned: &OwnedLocalPty| owned.pump_candidate && matches!(owned.raw, RawSuffix::None);
+        let Some((id, owned)) = self
+            .registry
+            .next_inactive(self.pump_after.as_deref(), eligible)
+        else {
             return false;
         };
-        matches!(owned.raw, RawSuffix::None) && owned.bridge.pump_detached_idle().unwrap_or(false)
+        if self.pump_after.as_deref() != Some(id) {
+            self.pump_after = Some(id.clone());
+        }
+        owned.pump_candidate = owned.bridge.pump_detached_idle().unwrap_or(false);
+        // If the selected owner stopped, another inactive PTY may still be
+        // admitted. It will get the next tick, never a second read this tick.
+        owned.pump_candidate
+            || self
+                .registry
+                .next_inactive(self.pump_after.as_deref(), eligible)
+                .is_some()
     }
 
     pub(crate) fn recover(&mut self, owner: &Attachment) -> Result<Resume, String> {
@@ -230,11 +311,10 @@ impl LocalSessions {
     pub(crate) fn close(&mut self, owner: &Attachment) -> Result<CloseStatus, String> {
         // An already issued close still addresses this exact stable PTY and
         // epoch if recovery has since rotated its view generation.
-        let (owned, result) = self.registry.close(&owner.session, |owned| {
+        let (_, result) = self.registry.close(&owner.session, |owned| {
             let epoch = owned.bridge.validate_session(owner)?;
             owned.bridge.close(epoch)
         })?;
-        self.vacant = Some(owned.bridge);
         if let Some(worker) = &self.detached_worker {
             worker.wake();
         }

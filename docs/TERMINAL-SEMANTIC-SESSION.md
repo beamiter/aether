@@ -58,6 +58,24 @@ still locks instead of automatically retrying a failed request. This neither
 proves that kernel-accepted bytes were executed nor changes the terminal query
 reply order during an active raw command. SSH transport has not changed.
 
+## Two local shells (desktop only)
+
+With the current view detached, select **Show retained local shells**. If
+exactly one local shell exists, **Open second local shell** explicitly starts
+one more writable shell without closing the first. Detach again and choose a
+shell by its local number to reconnect view-only. Only one view can be attached
+at a time. Reconnecting view-only does not grant resize or input authority;
+ordinary Open won't start a new shell while any local shell remains. Use
+**Close shell** on the view you intend to close. If an open response is lost,
+list and choose the exact local shell; the app does not automatically open
+another.
+
+The list returns only owner-local epoch numbers, not attachment identifiers,
+generations, working directories or history. It does not allocate a shell or
+perform IPC against SSH. While a different view is attached, each inactive
+write-idle PTY can still advance under the same owner. The two-entry scheduler
+uses round-robin choice and at most one bounded detached poll per turn.
+
 ## OpenSSH transport
 
 Build the helper on the Linux host with
