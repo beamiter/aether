@@ -1,3 +1,4 @@
+use local_sessions::LocalSessions;
 use std::sync::{Arc, Mutex};
 use tauri_terminal_frame_bridge::{
     live::{LiveBridge, SessionStatus},
@@ -11,6 +12,7 @@ use tauri_terminal_frame_bridge::{
     reason = "Other frontends use the shared client's native clipboard controls."
 )]
 mod jwm_remote_session;
+mod local_sessions;
 mod remote_desktop;
 mod ssh_terminal;
 #[tauri::command]
@@ -32,25 +34,21 @@ async fn acknowledge(
 #[tauri::command]
 async fn open_shell<R: tauri::Runtime>(
     window: tauri::WebviewWindow<R>,
-    bridge: tauri::State<'_, Arc<Mutex<LiveBridge>>>,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<Attachment, String> {
     require_terminal_window(&window)?;
-    run_bridge(bridge.inner().clone(), |bridge| {
-        let epoch = bridge.open(24, 80)?;
-        bridge.attachment(epoch)
-    })
-    .await
+    run_bridge(bridge.inner().clone(), LocalSessions::open).await
 }
 
 #[tauri::command]
 async fn attach_shell<R: tauri::Runtime>(
     window: tauri::WebviewWindow<R>,
     target: Option<SessionSelector>,
-    bridge: tauri::State<'_, Arc<Mutex<LiveBridge>>>,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<Option<Resume>, String> {
     require_terminal_window(&window)?;
     run_bridge(bridge.inner().clone(), move |bridge| {
-        bridge.attach_read_only(target.as_ref())
+        bridge.attach(target.as_ref())
     })
     .await
 }
@@ -58,7 +56,7 @@ async fn attach_shell<R: tauri::Runtime>(
 #[tauri::command]
 async fn detach_shell(
     owner: Attachment,
-    bridge: tauri::State<'_, Arc<Mutex<LiveBridge>>>,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<(), String> {
     run_bridge(bridge.inner().clone(), move |bridge| bridge.detach(&owner)).await
 }
@@ -66,14 +64,14 @@ async fn detach_shell(
 #[tauri::command]
 async fn poll_shell(
     owner: Attachment,
-    bridge: tauri::State<'_, Arc<Mutex<LiveBridge>>>,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<Option<Update>, String> {
     run_attached(bridge.inner().clone(), owner, LiveBridge::poll_update).await
 }
 #[tauri::command]
 async fn shell_status(
     owner: Attachment,
-    bridge: tauri::State<'_, Arc<Mutex<LiveBridge>>>,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<SessionStatus, String> {
     run_attached(bridge.inner().clone(), owner, |bridge, epoch| {
         bridge.status(epoch)
@@ -84,7 +82,7 @@ async fn shell_status(
 async fn ack_shell(
     owner: Attachment,
     revision: u32,
-    bridge: tauri::State<'_, Arc<Mutex<LiveBridge>>>,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<(), String> {
     run_attached(bridge.inner().clone(), owner, move |bridge, epoch| {
         bridge.acknowledge(epoch, revision)
@@ -95,7 +93,7 @@ async fn ack_shell(
 async fn write_shell(
     owner: Attachment,
     bytes: Vec<u8>,
-    bridge: tauri::State<'_, Arc<Mutex<LiveBridge>>>,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<usize, String> {
     run_input(bridge.inner().clone(), owner, move |bridge, epoch| {
         bridge.write(epoch, &bytes)
@@ -107,7 +105,7 @@ async fn resize_shell(
     owner: Attachment,
     rows: usize,
     cols: usize,
-    bridge: tauri::State<'_, Arc<Mutex<LiveBridge>>>,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<(), String> {
     run_input(bridge.inner().clone(), owner, move |bridge, epoch| {
         bridge.resize(epoch, rows, cols)
@@ -117,15 +115,9 @@ async fn resize_shell(
 #[tauri::command]
 async fn close_shell(
     owner: Attachment,
-    bridge: tauri::State<'_, Arc<Mutex<LiveBridge>>>,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<tauri_terminal_frame_bridge::live::CloseStatus, String> {
-    // A close already requested for this exact PTY remains valid if a
-    // concurrent recovery rotated the view attachment first.
-    run_bridge(bridge.inner().clone(), move |bridge| {
-        let epoch = bridge.validate_session(&owner)?;
-        bridge.close(epoch)
-    })
-    .await
+    run_bridge(bridge.inner().clone(), move |bridge| bridge.close(&owner)).await
 }
 #[tauri::command]
 async fn key_shell(
@@ -134,7 +126,7 @@ async fn key_shell(
     shift: bool,
     alt: bool,
     ctrl: bool,
-    bridge: tauri::State<'_, Arc<Mutex<LiveBridge>>>,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<(), String> {
     run_input(bridge.inner().clone(), owner, move |bridge, epoch| {
         bridge.key(epoch, &name, shift, alt, ctrl)
@@ -145,7 +137,7 @@ async fn key_shell(
 async fn paste_shell(
     owner: Attachment,
     text: String,
-    bridge: tauri::State<'_, Arc<Mutex<LiveBridge>>>,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<(), String> {
     run_input(bridge.inner().clone(), owner, move |bridge, epoch| {
         bridge.paste(epoch, &text)
@@ -156,7 +148,7 @@ async fn paste_shell(
 async fn text_shell(
     owner: Attachment,
     text: String,
-    bridge: tauri::State<'_, Arc<Mutex<LiveBridge>>>,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<(), String> {
     run_input(bridge.inner().clone(), owner, move |bridge, epoch| {
         bridge.text(epoch, &text)
@@ -167,7 +159,7 @@ async fn text_shell(
 async fn history_shell(
     owner: Attachment,
     offset: usize,
-    bridge: tauri::State<'_, Arc<Mutex<LiveBridge>>>,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<tauri_terminal_frame_bridge::live::HistorySnapshot, String> {
     run_attached(bridge.inner().clone(), owner, move |bridge, epoch| {
         bridge.history(epoch, offset)
@@ -177,14 +169,9 @@ async fn history_shell(
 #[tauri::command]
 async fn recover_shell(
     owner: Attachment,
-    bridge: tauri::State<'_, Arc<Mutex<LiveBridge>>>,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<Resume, String> {
-    run_bridge(bridge.inner().clone(), move |bridge| {
-        bridge
-            .resume(Some(&owner))?
-            .ok_or("terminal session closed".into())
-    })
-    .await
+    run_bridge(bridge.inner().clone(), move |bridge| bridge.recover(&owner)).await
 }
 
 fn require_terminal_window<R: tauri::Runtime>(
@@ -198,27 +185,19 @@ fn require_terminal_window<R: tauri::Runtime>(
 }
 
 async fn run_attached<T: Send + 'static>(
-    bridge: Arc<Mutex<LiveBridge>>,
+    bridge: Arc<Mutex<LocalSessions>>,
     owner: Attachment,
     operation: impl FnOnce(&mut LiveBridge, u32) -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
-    run_bridge(bridge, move |bridge| {
-        let epoch = bridge.validate_attachment(&owner)?;
-        operation(bridge, epoch)
-    })
-    .await
+    run_bridge(bridge, move |bridge| bridge.attached(&owner, operation)).await
 }
 
 async fn run_input<T: Send + 'static>(
-    bridge: Arc<Mutex<LiveBridge>>,
+    bridge: Arc<Mutex<LocalSessions>>,
     owner: Attachment,
     operation: impl FnOnce(&mut LiveBridge, u32) -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
-    run_bridge(bridge, move |bridge| {
-        let epoch = bridge.validate_input(&owner)?;
-        operation(bridge, epoch)
-    })
-    .await
+    run_bridge(bridge, move |bridge| bridge.input(&owner, operation)).await
 }
 
 // PTY creation, parsing and mutex contention run on the blocking pool, never
@@ -241,7 +220,7 @@ where
 fn application<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     builder
         .manage(Arc::new(Mutex::new(DemoBridge::default())))
-        .manage(Arc::new(Mutex::new(LiveBridge::default())))
+        .manage(Arc::new(Mutex::new(LocalSessions::default())))
         .manage(Arc::new(Mutex::new(ssh_terminal::SshTerminal::default())))
         .manage(Arc::new(
             Mutex::new(remote_desktop::WindowRemote::default()),

@@ -177,7 +177,7 @@ fn command_dispatch_returns_while_backend_lock_is_busy() {
     let (locked_tx, locked_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let holder = std::thread::spawn(move || {
-        let state = handle.state::<std::sync::Arc<std::sync::Mutex<super::LiveBridge>>>();
+        let state = handle.state::<std::sync::Arc<std::sync::Mutex<super::LocalSessions>>>();
         let _guard = state.lock().unwrap();
         locked_tx.send(()).unwrap();
         // A broken synchronous handler must fail rather than deadlock the test.
@@ -291,11 +291,18 @@ fn tauri_ipc_real_pty_lifecycle_and_wire_contract() {
     );
 
     invoke(&window, "detach_shell", json!({"owner": current}));
-    assert!(tauri::test::get_ipc_response(
-        &window,
-        request("poll_shell", json!({"owner": current})),
-    )
-    .is_err());
+    for (command, arguments) in [
+        ("open_shell", json!({})),
+        ("poll_shell", json!({"owner": current})),
+        ("recover_shell", json!({"owner": current})),
+        (
+            "resize_shell",
+            json!({"owner": current, "rows": 10, "cols": 65}),
+        ),
+        ("write_shell", json!({"owner": current, "bytes": [120]})),
+    ] {
+        assert!(tauri::test::get_ipc_response(&window, request(command, arguments)).is_err());
+    }
     let id = owner["session"].as_str().unwrap();
     let other_id = format!(
         "{}{}",
@@ -324,6 +331,14 @@ fn tauri_ipc_real_pty_lifecycle_and_wire_contract() {
     assert!(tauri::test::get_ipc_response(
         &window,
         request(
+            "resize_shell",
+            json!({"owner": attached_owner, "rows": 11, "cols": 66})
+        ),
+    )
+    .is_err());
+    assert!(tauri::test::get_ipc_response(
+        &window,
+        request(
             "write_shell",
             json!({"owner": attached_owner, "bytes": [120]})
         ),
@@ -341,5 +356,14 @@ fn tauri_ipc_real_pty_lifecycle_and_wire_contract() {
     let next = invoke(&window, "open_shell", json!({}));
     assert!(next["epoch"].as_u64().unwrap() > epoch);
     assert_ne!(next["session"], owner["session"]);
+    assert!(tauri::test::get_ipc_response(
+        &window,
+        request("close_shell", json!({"owner": attached_owner})),
+    )
+    .is_err());
+    assert_eq!(
+        invoke(&window, "shell_status", json!({"owner": next}))["epoch"],
+        next["epoch"]
+    );
     invoke(&window, "close_shell", json!({"owner": next}));
 }
