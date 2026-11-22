@@ -23,6 +23,13 @@ Open the experimental shell to start a semantic session. **Recover output
 snapshot** resynchronizes the current view. **Detach view** leaves the shell open
 for **Reconnect view**, which restores the output in read-only mode.
 
+To keep two local shells, detach the current view, then choose **Show retained
+local shells** and **Open second local shell**. The new shell accepts input.
+Detach again, choose a numbered shell, and select **Reconnect selected
+view-only** to switch back to its output. Only one view is attached at a time;
+reconnecting does not grant input or resize access. Use **Close shell** on the
+view you intend to close.
+
 For a remote PTY, run `aether-terminal-host serve` on the Linux host and use
 **Open SSH shell** with an OpenSSH host alias or `user@host`. The same terminal
 view displays local and SSH cell updates. After an SSH interruption, **Recover
@@ -102,14 +109,19 @@ commit; this link alone is not a claim that a particular commit passed.
 - The Vim smoke drives actual Vim through a PTY and checks screen transitions,
   edits, resize, exact saved content and primary-screen restoration. Chinese
   committed text is tested; a platform IME is not.
-- Linux compilation links a debug desktop executable; it does not launch a GUI.
+- The Linux build job links a debug desktop executable without launching it.
+- The separate [native WebKitGTK smoke workflow](https://github.com/beamiter/aether/actions/workflows/native-webkit.yml)
+  launches the built Aether app under X11/Xvfb and drives it with WebDriver.
+  The [run at f5ccee2](https://github.com/beamiter/aether/actions/runs/44991481517/job/137113278722)
+  verified two real local shells, distinct output and Canvas colors, explicit
+  read-only reconnection, isolated drafts and reaping of both direct children.
+  [Smoke setup and scope](docs/NATIVE-LOCAL-WEBKIT-SMOKE.md)
 
-GUI acceptance for the terminal renderer, native keyboard and clipboard, and
-platform IME remains pending, including Wayland and candidate positioning.
-Process ownership covers only the direct
-shell, not descendant containment. The product shell uses `TERM=dumb`; the Vim
-smoke opts into `TERM=xterm`. Unsupported sequences and Unicode shaping limitations
-remain explicit. See [lifecycle policy](LIFECYCLE-POLICY.md) and
+This native smoke does not test physical mouse input, compositor screenshots,
+Wayland, platform IME or native clipboard behavior. Process ownership covers
+only the direct shell, not descendant containment. The product shell uses
+`TERM=dumb`; the Vim smoke opts into `TERM=xterm`. Unsupported sequences and
+Unicode shaping limitations remain explicit. See [lifecycle policy](LIFECYCLE-POLICY.md) and
 [session contracts](session/README.md).
 
 ## History
