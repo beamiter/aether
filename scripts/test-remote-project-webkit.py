@@ -177,7 +177,8 @@ def exercise(app, helper, backend, compositor_libraries):
     uid = os.getuid()
     runtime = Path(f"/run/user/{uid}")
     if not runtime.is_dir() or runtime.stat().st_uid != uid:
-        runtime = Path(tempfile.gettempdir())
+        # OpenSSH StrictModes checks the ancestors of AuthorizedKeysFile.
+        runtime = Path.home()
     with tempfile.TemporaryDirectory(prefix="aether-remote-", dir=runtime) as temporary, contextlib.ExitStack() as stack:
         owned = Path(temporary)
         def start(argv, log, env=None):
@@ -222,8 +223,11 @@ SetEnv JTERM_WORKSPACE_STATE_DIR={state}
 """)
         daemon = start(["/usr/sbin/sshd", "-D", "-e", "-f", config], "sshd.log")
         wait(lambda: (owned / "sshd.pid").is_file() or daemon.poll() is not None, "private sshd")
-        subprocess.run(["/usr/bin/ssh", "-F", ssh / "config", "-oBatchMode=yes", "-oStrictHostKeyChecking=yes",
-                        "aether-qa", "true"], check=True, timeout=10)
+        probe = subprocess.run(["/usr/bin/ssh", "-F", ssh / "config", "-oBatchMode=yes",
+                                "-oStrictHostKeyChecking=yes", "aether-qa", "true"],
+                               capture_output=True, text=True, timeout=10)
+        if probe.returncode:
+            raise RuntimeError(f"Loopback SSH failed: {probe.stderr}\n{(owned / 'sshd.log').read_text()}")
         remote_env = os.environ | {"JTERM_WORKSPACE_STATE_DIR": str(state)}
         host = start([app, "--jterm-session-host"], "host.log", remote_env)
         store = state / "run" / "host.sock"

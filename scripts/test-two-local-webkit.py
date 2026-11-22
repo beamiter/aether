@@ -2142,6 +2142,10 @@ def exercise_vim9_overlays(driver, owned):
 
 
 def exercise_vim9_workbench(driver, owned):
+    import gi
+    gi.require_version("Atspi", "2.0")
+    from gi.repository import Atspi
+    Atspi.init()
     project = owned / "vim-project"
     (project / "src").mkdir(parents=True)
     (project / "Makefile").touch()
@@ -2150,15 +2154,43 @@ def exercise_vim9_workbench(driver, owned):
     source.write_text("AETHER_VIM9_ORIGINAL\n")
     driver.click("#vim9-workbench > summary")
 
+    def children(node):
+        for index in range(node.get_child_count()):
+            child = node.get_child_at_index(index)
+            if child is not None:
+                yield child
+
+    def descendants(node):
+        for child in children(node):
+            yield child
+            yield from descendants(child)
+
     def choose(button="#vim9-open", path=source):
         driver.click(button)
         chooser = subprocess.check_output(
             ["xdotool", "search", "--sync", "--onlyvisible", "--name", "^Open local file in Vim9$"],
             timeout=10, text=True).splitlines()[-1]
+        pid = int(subprocess.check_output(["xdotool", "getwindowpid", chooser], text=True, timeout=5))
+        def dialog():
+            return next((window for app in children(Atspi.get_desktop(0)) if app.get_process_id() == pid
+                         for window in children(app) if window.get_name() == "Open local file in Vim9"
+                         and window.get_state_set().contains(Atspi.StateType.SHOWING)), None)
+        native_dialog = wait_for(dialog, "GTK file chooser did not expose its accessible window")
         subprocess.run(["xdotool", "windowfocus", "--sync", chooser], check=True, timeout=5)
         subprocess.run(["xdotool", "key", "ctrl+l"], check=True, timeout=5)
-        subprocess.run(["xdotool", "type", "--clearmodifiers", str(path)], check=True, timeout=5)
-        subprocess.run(["xdotool", "key", "Return"], check=True, timeout=5)
+        location = wait_for(lambda: next((node for node in descendants(native_dialog)
+                            if node.get_state_set().contains(Atspi.StateType.FOCUSED)
+                            and node.get_state_set().contains(Atspi.StateType.EDITABLE)), None),
+                            "GTK file chooser did not focus its location field")
+        assert location.get_editable_text_iface().set_text_contents(str(path))
+        wait_for(lambda: Atspi.Text.get_text(location.get_text_iface(), 0, -1) == str(path),
+                 "GTK location differs from the fixture")
+        accept = wait_for(lambda: next((node for node in descendants(native_dialog)
+                          if node.get_role() == Atspi.Role.PUSH_BUTTON and node.get_name() == "Open"
+                          and node.get_state_set().contains(Atspi.StateType.SENSITIVE)), None),
+                          "GTK file chooser did not enable Open")
+        assert accept.get_action_iface().do_action(0)
+        wait_for(lambda: not dialog(), "GTK file chooser did not accept the selected file")
 
     def editor():
         return driver.execute("""

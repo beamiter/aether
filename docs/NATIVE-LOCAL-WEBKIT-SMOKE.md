@@ -72,8 +72,10 @@ PTY blocks, generate enough new commands to evict both original blocks, then
 download the frozen Markdown and JSON. The fixture reads both files and
 checks the original revisions and diff after eviction.
 
-Add `--vim9` with Vim 9 and `xdotool` installed to select a real file in
-the GTK chooser. The fixture checks authenticated Vim9 Canvas painting,
+Add `--vim9` with Vim 9, `xdotool` and the Python AT-SPI bindings installed
+to select a real file in the GTK chooser. The fixture verifies the entered
+path and activates the dialog's Open button through its accessibility interface.
+It checks authenticated Vim9 Canvas painting,
 edits that file through the buffer view and the fallback PTY, checks exact
 Unicode bytes after native saves, and verifies Vim exits and its view clears.
 It then closes the reopened Vim's GUI channel and saves through the same
@@ -173,3 +175,20 @@ kinds of pagination, stale search selections, and the document's exact revision.
 Successful output includes the case ID, display backend and both binary hashes.
 The desktop workflow runs both displays against the same build. Its X11 local
 journey also exercises Notebook and the Vim9 workbench.
+
+## Workspace upgrade and backup rollback
+
+Run the two built desktop executables through their embedded Workspace hosts.
+The rehearsal creates a disposable state root with the previous build, saves a
+draft, and takes an online SQLite backup. The candidate opens the original draft
+and saves a new revision. The previous build then opens and edits the backup in
+a separate state root. The candidate reopens its own root and verifies its newer
+draft. A third copy carries a newer schema version so the rehearsal can check
+the candidate's refusal and compare the database bytes before and after.
+
+```sh
+python3 -B scripts/test-workspace-rollback.py "$previous_desktop" "$candidate_desktop"
+```
+
+The result records both executable hashes and the refused schema version under
+`WORKSPACE.ROLLBACK.001`. Use two distinct builds that support protocol 2.
