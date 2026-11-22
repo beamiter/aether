@@ -430,6 +430,7 @@ fn detached_local_pty_drains_past_kernel_capacity_without_frontend_poll() {
     let payload = temp.0.join("payload");
     std::fs::write(&payload, vec![b'X'; 256 * 1024]).unwrap();
     let written = temp.0.join("done");
+    let phase = temp.0.join("phase");
     fn quote(path: &std::path::Path) -> String {
         format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"))
     }
@@ -439,22 +440,32 @@ fn detached_local_pty_drains_past_kernel_capacity_without_frontend_poll() {
             r#"original=$(stty -g) || return 1
 stty -echo -icanon min 1 time 0 || return 1
 printf '%s' "$$" > {armed}
+printf '%s' armed > {phase}
 printf '\nAETHER_PRESSURE_ARMED\n'
 n=0
 while [ ! -f {gate} ] && [ "$n" -lt 300 ]; do sleep .05; n=$((n+1)); done
 [ -f {gate} ] || return 1
+printf '%s' copying > {phase}
 cat {payload} || return 1
+printf '%s' payload-written > {phase}
 printf '\nAETHER_PRESSURE_END\n\033[H\033[6n' || return 1
+printf '%s' awaiting-reply > {phase}
 # Exact parser reply proves the owner reached the marker before reattach.
-reply=$(timeout 4 dd bs=1 count=6 2>/dev/null | od -An -tx1 | tr -d ' \n')
+# A separate timeout process group would make dd stop on the controlling TTY.
+reply=$(timeout --foreground 4 dd bs=1 count=6 2>/dev/null | od -An -tx1 | tr -d ' \n')
 stty "$original" || return 1
-[ "$reply" = 1b5b313b3152 ] || return 1
+if [ "$reply" != 1b5b313b3152 ]; then
+    printf '%s' reply-short-or-mismatched > {phase}
+    return 1
+fi
+printf '%s' reply-verified > {phase}
 printf '%s' "$$" > {written}
 "#,
             gate = quote(&gate),
             armed = quote(&armed),
             payload = quote(&payload),
-            written = quote(&written)
+            written = quote(&written),
+            phase = quote(&phase)
         ),
     )
     .unwrap();
@@ -525,6 +536,7 @@ printf '%s' "$$" > {written}
         }
         std::thread::sleep(Duration::from_millis(10));
     };
+    let last_phase = std::fs::read_to_string(&phase).unwrap_or_default();
     let resumed = invoke(
         &window,
         "attach_shell",
@@ -550,7 +562,7 @@ printf '%s' "$$" > {written}
     assert_ne!(attached["generation"], owner["generation"]);
     assert!(
         completed_without_view,
-        "detached writer stalled without a frontend read"
+        "detached fixture did not complete before reconnect: phase={last_phase:?}, end_marker={end_seen}"
     );
     assert!(
         end_seen,
