@@ -606,3 +606,65 @@ test('same-shell recovery keeps pending-write safety lock without retrying a sta
  assert.equal(h.el('#send').disabled,true);
  assert.match(h.el('#status').textContent,/SSH output snapshot recovered/);
 });
+
+test('local reconnect targets exactly the detached PTY; startup still allows explicit singleton attach',async()=>{
+ const first={session:'b'.repeat(32),epoch:1,generation:1};
+ const resumed={...first,generation:3};
+ const raw=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+ const attachArgs=[],frames=[],acks=[];
+ const h=harness(async(name,args)=>{
+  switch(name){
+   case 'open_shell':return first;
+   case 'attach_shell':{
+    attachArgs.push(args);
+    if(attachArgs.length===1)return null;
+    return {owner:resumed,frame:{...raw,session:resumed.session,epoch:resumed.epoch}};
+   }
+   case 'poll_shell':case 'detach_shell':return null;
+   case 'ack_shell':acks.push(args);return null;
+   default:throw Error(name);
+  }
+ },undefined,undefined,(_canvas,frame)=>frames.push(frame));
+ await h.click('#attach');assert.equal(attachArgs[0],undefined);
+ assert.match(h.el('#status').textContent,/No existing shell/);
+ await h.click('#open');await h.click('#detach');await h.click('#attach');
+ assert.equal(attachArgs.length,2);
+ assert.equal(attachArgs[1].target.session,first.session);
+ assert.equal(attachArgs[1].target.epoch,first.epoch);
+ assert.deepEqual(Object.keys(attachArgs[1].target).sort(),['epoch','session']);
+ assert.equal(frames.length,1);assert.equal(acks.length,1);
+ assert.equal(h.el('#input').disabled,true);
+ assert.match(h.el('#status').textContent,/view-only/);
+});
+
+test('local reconnect never paints or ACKs a foreign, stale, or missing retained target',async()=>{
+ const first={session:'7'.repeat(32),epoch:1,generation:1};
+ const raw=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+ const expected={...first,generation:3};
+ const replies=[{...expected,session:'8'.repeat(32)},{...expected,epoch:2},first,null,expected];
+ const argsSeen=[],frames=[],acked=[];
+ const h=harness(async(name,args)=>{
+  switch(name){
+   case 'open_shell':return first;
+   case 'attach_shell':{
+    argsSeen.push(args);
+    const owner=replies.shift();
+    return owner&&{owner,frame:{...raw,session:owner.session,epoch:owner.epoch}};
+   }
+   case 'poll_shell':case 'detach_shell':return null;
+   case 'ack_shell':acked.push(args);return null;
+   default:throw Error(name);
+  }
+ },undefined,undefined,(_canvas,frame)=>frames.push(frame));
+ await h.click('#open');await h.click('#detach');
+ for(let i=0;i<4;i++){
+  await h.click('#attach');assert.match(h.el('#status').textContent,/retained local session/i);
+  assert.equal(frames.length,0);assert.equal(acked.length,0);
+ }
+ await h.click('#attach');
+ assert.equal(argsSeen.length,5);
+ assert.ok(argsSeen.every(args=>args.target.session===first.session&&args.target.epoch===first.epoch));
+ assert.equal(frames[0].session,first.session);
+ assert.equal(acked.length,1);
+ assert.equal(h.el('#input').disabled,true);
+});

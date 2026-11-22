@@ -13,6 +13,14 @@ pub struct Attachment {
     pub generation: u32,
 }
 
+/// Names the retained PTY independently of any writable view generation.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSelector {
+    pub session: String,
+    pub epoch: u32,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Resume {
     pub owner: Attachment,

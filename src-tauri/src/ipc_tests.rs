@@ -296,7 +296,28 @@ fn tauri_ipc_real_pty_lifecycle_and_wire_contract() {
         request("poll_shell", json!({"owner": current})),
     )
     .is_err());
-    let attached = invoke(&window, "attach_shell", json!({}));
+    let id = owner["session"].as_str().unwrap();
+    let other_id = format!(
+        "{}{}",
+        if id.starts_with('0') { '1' } else { '0' },
+        &id[1..]
+    );
+    for target in [
+        json!({"session": other_id, "epoch": epoch}),
+        json!({"session": id, "epoch": epoch + 1}),
+        json!({"session": id, "epoch": epoch, "generation": 3}),
+    ] {
+        assert!(tauri::test::get_ipc_response(
+            &window,
+            request("attach_shell", json!({"target": target}))
+        )
+        .is_err());
+    }
+    let attached = invoke(
+        &window,
+        "attach_shell",
+        json!({"target": {"session": id, "epoch": epoch}}),
+    );
     let attached_owner = &attached["owner"];
     assert_eq!(attached_owner["session"], owner["session"]);
     assert_eq!(attached_owner["generation"], 4);

@@ -1,7 +1,7 @@
 //! Linux-only limited PTY integration. Not a production process owner.
 use crate::{
     from_engine,
-    semantic::{self, Attachment, Resume, Update},
+    semantic::{self, Attachment, Resume, SessionSelector, Update},
     WireFrame,
 };
 use jterm_engine::frame::CellFrame;
@@ -77,12 +77,28 @@ impl LiveBridge {
         })
     }
 
-    pub fn validate_session(&self, owner: &Attachment) -> Result<u32, String> {
-        self.check(owner.epoch)?;
-        if owner.session != self.id {
+    fn validate_session_identity(&self, session: &str, epoch: u32) -> Result<u32, String> {
+        self.check(epoch)?;
+        if session != self.id {
             return Err("foreign terminal session".into());
         }
-        Ok(owner.epoch)
+        Ok(epoch)
+    }
+
+    pub fn validate_session(&self, owner: &Attachment) -> Result<u32, String> {
+        self.validate_session_identity(&owner.session, owner.epoch)
+    }
+
+    /// Attach a read-only view to the selected PTY, never another retained one.
+    /// An omitted selector preserves explicit singleton attach behavior.
+    pub fn attach_read_only(
+        &mut self,
+        target: Option<&SessionSelector>,
+    ) -> Result<Option<Resume>, String> {
+        if let Some(target) = target {
+            self.validate_session_identity(&target.session, target.epoch)?;
+        }
+        self.resume(None)
     }
 
     pub fn validate_attachment(&self, owner: &Attachment) -> Result<u32, String> {

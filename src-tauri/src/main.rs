@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use tauri_terminal_frame_bridge::{
     live::{LiveBridge, SessionStatus},
-    semantic::{Attachment, Resume, Update},
+    semantic::{Attachment, Resume, SessionSelector, Update},
     DemoBridge, WireFrame,
 };
 
@@ -45,10 +45,14 @@ async fn open_shell<R: tauri::Runtime>(
 #[tauri::command]
 async fn attach_shell<R: tauri::Runtime>(
     window: tauri::WebviewWindow<R>,
+    target: Option<SessionSelector>,
     bridge: tauri::State<'_, Arc<Mutex<LiveBridge>>>,
 ) -> Result<Option<Resume>, String> {
     require_terminal_window(&window)?;
-    run_bridge(bridge.inner().clone(), |bridge| bridge.resume(None)).await
+    run_bridge(bridge.inner().clone(), move |bridge| {
+        bridge.attach_read_only(target.as_ref())
+    })
+    .await
 }
 
 #[tauri::command]

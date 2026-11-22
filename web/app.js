@@ -7,7 +7,7 @@ const canvas=document.querySelector('canvas'),status=document.querySelector('#st
 const open=document.querySelector('#open'),attach=document.querySelector('#attach'),detach=document.querySelector('#detach'),close=document.querySelector('#close'),input=document.querySelector('#input'),send=document.querySelector('#send');
 const sshForm=document.querySelector('#ssh-terminal-form'),sshHost=document.querySelector('#ssh-terminal-host'),openSsh=document.querySelector('#open-ssh');
 let state=null,epoch=null,owner=null,timer=null,polling=null,generation=0,transport=0,recovery=null;
-let sshSession=null,sshInputSuspended=false;
+let sshSession=null,sshInputSuspended=false,detachedLocal=null;
 const filePreview=installFilePreviewPanel(document,{getFrame:()=>state,getEpoch:()=>epoch,getSession:()=>owner?.session});
 const imeInput=document.querySelector('#ime-input');
 const ime=installIme(imeInput,{getEpoch:()=>epoch!==null&&!input.disabled?epoch:null,commit:(text,owner)=>{if(owner!==epoch)return;if(text.length>4096||new TextEncoder().encode(text).length>4096){status.textContent='Committed text exceeds 4096-byte limit; nothing sent.';return;}enqueueLogical('text_shell',{text});}});
@@ -87,6 +87,7 @@ async function openShell(destination=null){
     const result=destination===null?await invoke('open_shell'):await invoke('ssh_terminal',{action:{operation:'open',destination}});
     if(generation!==attempt)return;
     owner=acceptOwner(result);sshSession=destination===null?null:owner.session;
+    if(destination===null)detachedLocal=null;
     epoch=owner.epoch;keyQueue={chain:Promise.resolve(),pending:0,locked:false};state=null;
     resize.disabled=close.disabled=detach.disabled=input.disabled=send.disabled=false;
     status.textContent=destination===null?'Experimental /bin/sh; TERM=dumb. Focus terminal for experimental keyboard input; no native GUI/IME acceptance.':`SSH shell connected to ${destination}.`;
@@ -103,12 +104,21 @@ attach.addEventListener('click',async()=>{
   if(epoch!==null||attach.disabled)return;
   const attempt=++generation;filePreview.dismiss();pasteReview.reset();ime.reset();history.reset();
   setOpenDisabled(true);attach.disabled=button.disabled=true;
+  const expected=sshSession===null?detachedLocal:null;
   try {
-    const result=sshSession===null?await invoke('attach_shell'):await invoke('ssh_terminal',{action:{operation:'attach'}});
+    const result=sshSession===null
+      ? await (expected?invoke('attach_shell',{target:{session:expected.session,epoch:expected.epoch}}):invoke('attach_shell'))
+      : await invoke('ssh_terminal',{action:{operation:'attach'}});
     if(generation!==attempt)return;
-    if(!result){sshSession=null;status.textContent='No existing shell session.';return;}
+    if(!result){
+      if(expected)throw new Error('Retained local session no longer available.');
+      sshSession=null;status.textContent='No existing shell session.';return;
+    }
     const nextOwner=acceptOwner(result.owner);
+    if(expected&&(nextOwner.session!==expected.session||nextOwner.epoch!==expected.epoch||
+        nextOwner.generation<=expected.generation))throw new Error('Retained local session did not match the reconnect response.');
     const next=acceptFull(null,result.frame,nextOwner);
+    if(sshSession===null)detachedLocal=null;
     owner=nextOwner;epoch=owner.epoch;keyQueue={chain:Promise.resolve(),pending:0,locked:true};
     input.disabled=send.disabled=resize.disabled=true;close.disabled=detach.disabled=false;
     paint(canvas,next);state=next;describeCursor();
@@ -121,7 +131,11 @@ attach.addEventListener('click',async()=>{
 });
 detach.addEventListener('click',async()=>{
   if(!owner||detach.disabled||recovery?.epoch===epoch)return;
-  const attempt=++generation,previous=owner;owner=null;epoch=null;state=null;transport++;
+  const attempt=++generation,previous=owner;
+  // Keep the PTY identity even if the detach reply is lost. A later explicit
+  // reconnect must not claim a different retained local terminal.
+  if(previous.session!==sshSession)detachedLocal=previous;
+  owner=null;epoch=null;state=null;transport++;
   clearInterval(timer);sshInputSuspended=false;filePreview.dismiss();pasteReview.reset();ime.reset();history.reset();
   resize.disabled=close.disabled=detach.disabled=input.disabled=send.disabled=true;
   canvas.width=canvas.width;
