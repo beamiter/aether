@@ -232,6 +232,38 @@ fn tauri_ipc_real_pty_lifecycle_and_wire_contract() {
         "resize_shell",
         json!({"owner": owner, "rows": 9, "cols": 64}),
     );
+    // An admitted logical event keeps ordinary raw backpressure. The same
+    // local IPC may retry its exact LF, but cannot substitute another byte.
+    invoke(
+        &window,
+        "text_shell",
+        json!({"owner": owner, "text": "true"}),
+    );
+    let raw_suffix = json!({"owner": owner, "bytes": [10]});
+    assert_eq!(invoke(&window, "write_shell", raw_suffix.clone()), 0);
+    assert!(tauri::test::get_ipc_response(
+        &window,
+        request("write_shell", json!({"owner": owner, "bytes": [88]})),
+    )
+    .is_err());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let update = invoke(&window, "poll_shell", json!({"owner": owner}));
+        if !update.is_null() {
+            invoke(
+                &window,
+                "ack_shell",
+                json!({"owner": owner, "revision": update["frame"]["revision"]}),
+            );
+        }
+        let accepted = invoke(&window, "write_shell", raw_suffix.clone());
+        if accepted == 1 {
+            break;
+        }
+        assert_eq!(accepted, 0);
+        assert!(Instant::now() < deadline, "owned raw suffix stayed blocked");
+        std::thread::sleep(Duration::from_millis(2));
+    }
     invoke(
         &window,
         "text_shell",

@@ -38,6 +38,20 @@ through the bounded PTY path while a view polls. While detached, the live PTY ma
 wait for capacity in its kernel buffers until a view reconnects. Closing the
 Aether application ends the local owner process and its attachment lifetime.
 
+## Local command line suffix ownership
+
+The desktop form sends the same UTF-8 bytes (including its appended LF) through
+local `write_shell`. A zero or short accepted count retains only the exact
+unwritten bytes for that view attachment. A later call must supply that exact
+suffix; it is not a new command or a request to replay the accepted prefix.
+The owner never writes the retained bytes on its own. A replaced/detached
+attachment cannot continue them. If a prefix was accepted or the count was
+invalid/failed, this raw command route stays interrupted until explicit close.
+A successful complete count does not deduplicate a lost full reply; the form
+still locks instead of automatically retrying a failed request. This neither
+proves that kernel-accepted bytes were executed nor changes the terminal query
+reply order during an active raw command. SSH transport has not changed.
+
 ## OpenSSH transport
 
 Build the helper on the Linux host with

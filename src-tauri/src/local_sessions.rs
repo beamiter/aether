@@ -1,4 +1,6 @@
 //! Local desktop ownership, separate from the SSH transport.
+mod raw_suffix;
+use raw_suffix::RawSuffix;
 use std::collections::{btree_map::Entry, BTreeMap};
 use tauri_terminal_frame_bridge::{
     live::{CloseStatus, LiveBridge},
@@ -96,11 +98,16 @@ impl<T, const LIMIT: usize> Registry<T, LIMIT> {
     }
 }
 
+struct OwnedLocalPty {
+    bridge: LiveBridge,
+    raw: RawSuffix<Attachment>,
+}
+
 #[derive(Default)]
 pub(crate) struct LocalSessions {
     // Keep the existing one-PTY public behavior. A later explicit pane open
     // can opt into multiple retained IDs, rather than widening it here.
-    registry: Registry<LiveBridge, 1>,
+    registry: Registry<OwnedLocalPty, 1>,
     // Recycle the empty bridge on close to preserve legacy increasing epochs.
     vacant: Option<LiveBridge>,
 }
@@ -112,7 +119,11 @@ impl LocalSessions {
             let bridge = vacant.get_or_insert_with(LiveBridge::local_desktop);
             let epoch = bridge.open(24, 80)?;
             let owner = bridge.attachment(epoch)?;
-            Ok((owner.session.clone(), vacant.take().unwrap(), owner))
+            let owned = OwnedLocalPty {
+                bridge: vacant.take().unwrap(),
+                raw: RawSuffix::default(),
+            };
+            Ok((owner.session.clone(), owned, owner))
         })
     }
 
@@ -121,24 +132,33 @@ impl LocalSessions {
         target: Option<&SessionSelector>,
     ) -> Result<Option<Resume>, String> {
         self.registry
-            .attach(target.map(|target| target.session.as_str()), |bridge| {
-                bridge
+            .attach(target.map(|target| target.session.as_str()), |owned| {
+                let view = owned
+                    .bridge
                     .attach_read_only(target)?
-                    .ok_or_else(|| "terminal session closed".into())
+                    .ok_or("terminal session closed")?;
+                owned.raw.retain_only_current(&view.owner);
+                Ok(view)
             })
     }
 
     pub(crate) fn detach(&mut self, owner: &Attachment) -> Result<(), String> {
-        self.registry
-            .detach(&owner.session, |bridge| bridge.detach(owner))
+        self.registry.detach(&owner.session, |owned| {
+            owned.bridge.detach(owner)?;
+            owned.raw.retire_view();
+            Ok(())
+        })
     }
 
     pub(crate) fn recover(&mut self, owner: &Attachment) -> Result<Resume, String> {
         // Keep LiveBridge's idempotent previous-generation recovery rules.
-        self.registry
-            .reader(&owner.session)?
+        let owned = self.registry.reader(&owner.session)?;
+        let view = owned
+            .bridge
             .resume(Some(owner))?
-            .ok_or_else(|| "terminal session closed".into())
+            .ok_or("terminal session closed")?;
+        owned.raw.retain_only_current(&view.owner);
+        Ok(view)
     }
 
     pub(crate) fn attached<R>(
@@ -146,7 +166,7 @@ impl LocalSessions {
         owner: &Attachment,
         operation: impl FnOnce(&mut LiveBridge, u32) -> Result<R, String>,
     ) -> Result<R, String> {
-        let bridge = self.registry.reader(&owner.session)?;
+        let bridge = &mut self.registry.reader(&owner.session)?.bridge;
         let epoch = bridge.validate_attachment(owner)?;
         operation(bridge, epoch)
     }
@@ -156,19 +176,27 @@ impl LocalSessions {
         owner: &Attachment,
         operation: impl FnOnce(&mut LiveBridge, u32) -> Result<R, String>,
     ) -> Result<R, String> {
-        let bridge = self.registry.reader(&owner.session)?;
+        let bridge = &mut self.registry.reader(&owner.session)?.bridge;
         let epoch = bridge.validate_input(owner)?;
         operation(bridge, epoch)
+    }
+
+    pub(crate) fn write_raw(&mut self, owner: Attachment, bytes: Vec<u8>) -> Result<usize, String> {
+        let owned = self.registry.reader(&owner.session)?;
+        let epoch = owned.bridge.validate_input(&owner)?;
+        owned
+            .raw
+            .write(owner, bytes, |bytes| owned.bridge.write(epoch, bytes))
     }
 
     pub(crate) fn close(&mut self, owner: &Attachment) -> Result<CloseStatus, String> {
         // An already issued close still addresses this exact stable PTY and
         // epoch if recovery has since rotated its view generation.
-        let (bridge, result) = self.registry.close(&owner.session, |bridge| {
-            let epoch = bridge.validate_session(owner)?;
-            bridge.close(epoch)
+        let (owned, result) = self.registry.close(&owner.session, |owned| {
+            let epoch = owned.bridge.validate_session(owner)?;
+            owned.bridge.close(epoch)
         })?;
-        self.vacant = Some(bridge);
+        self.vacant = Some(owned.bridge);
         Ok(result)
     }
 }

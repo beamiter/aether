@@ -95,8 +95,8 @@ async fn write_shell(
     bytes: Vec<u8>,
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<usize, String> {
-    run_input(bridge.inner().clone(), owner, move |bridge, epoch| {
-        bridge.write(epoch, &bytes)
+    run_bridge(bridge.inner().clone(), move |bridge| {
+        bridge.write_raw(owner, bytes)
     })
     .await
 }
