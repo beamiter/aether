@@ -19,7 +19,6 @@ jobs:
     timeout-minutes: 25
     env:
       CARGO_BUILD_JOBS: 2
-      CARGO_TARGET_DIR: ${{ runner.temp }}/aether-native-build
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -37,12 +36,14 @@ jobs:
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           rustup toolchain install 1.100.0 --profile minimal
           python3 scripts/check-core-pin.py
+          export CARGO_TARGET_DIR="${RUNNER_TEMP:?}/aether-native-build"
           cargo build --locked --manifest-path src-tauri/Cargo.toml --bin tauri-terminal-lab
+          printf 'CARGO_TARGET_DIR=%s\n' "$CARGO_TARGET_DIR" >> "$GITHUB_ENV"
       - name: Native window and owned local PTY acceptance (not SSH)
         timeout-minutes: 4
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          app="$CARGO_TARGET_DIR/debug/tauri-terminal-lab"
+          app="${CARGO_TARGET_DIR:?}/debug/tauri-terminal-lab"
           test -x "$app"
           test ! -L "$app"
           sha256sum "$app"
