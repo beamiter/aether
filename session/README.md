@@ -1,7 +1,7 @@
 # Headless session spike (Linux only)
 
 This is an isolated local prototype, not a production terminal/session manager.
-It uses the exact pinned `jterm_engine@8d0c0aa` parser, screen and local VT
+It uses the exactly pinned shared `jterm_engine` parser, screen and local VT
 semantic dispatcher. No byte parsing is performed in JavaScript.
 
 ## API
@@ -19,7 +19,7 @@ semantic dispatcher. No byte parsing is performed in JavaScript.
 
 ## Explicit limits
 
-There is no scrollback/reflow, complete OSC policy, Kitty graphics,
+There is no history reflow, complete OSC policy, Kitty graphics,
 IME composition, combining grapheme storage, selection or rendering code.
 Unhandled events and zero-width combining marks increment an explicit counter.
 Unicode scalar width uses unicode-width 0.2.3; this is not yet parity-audited
@@ -74,7 +74,7 @@ Check `cleanup_pending()` and `is_exited()` on the retained session ticket.
 
 `encode_text` handles IME committed text as complete UTF-8 without bracketed-paste or modifier transforms, matching the existing Frost committed-text path; controls are rejected and nonzero Kitty flags remain explicitly unsupported.
 
-Query behavior and protocol source evidence are documented in `../QUERY-POLICY.md`; no old-host DA2 identity is advertised.
+Query behavior and protocol source evidence are documented in `../QUERY-POLICY.md`; no other host's DA identity is advertised.
 
 ### Bounded primary history snapshots
 
@@ -93,6 +93,11 @@ immutable under subsequent output, eviction, resize and alternate-screen changes
 Resize preserves historical physical widths; no reflow occurs and resized-away
 live rows are not archived. Copy extraction joins soft wraps, separates hard
 lines, strips hard-line trailing padding and omits wide continuation cells.
+It also omits a certified synthetic right-margin gap when a double-width
+character wrapped early past a never-written default cell. An authored space,
+a previously edited margin, and an archive row without this proof are
+not newly omitted. The gap changes copied history text only, not archived
+physical column coordinates, live snapshots or frame/bridge messages.
 Selecting only a wide continuation does not invent its preceding lead character.
 `HistoryPage::selection_text(sr, sc, er, ec)` uses physical-cell coordinates and a
 half-open lexicographic interval; `(row_count, 0)` is a valid end sentinel. Output

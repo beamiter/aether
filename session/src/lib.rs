@@ -39,11 +39,16 @@ pub struct HistoryPage {
     pub total_rows: usize,
     pub row_count: usize,
     pub text: String,
-    rows: Vec<Row>,
+    rows: Vec<HistoryCopyRow>,
+}
+struct HistoryCopyRow {
+    // Physical addressing is unchanged. Only extraction may omit this slot.
+    row: Row,
+    synthetic_gap: Option<usize>,
 }
 impl HistoryPage {
     /// Half-open lexicographic range. End may be (row_count, 0) for whole page.
-    /// Wide continuation-only selections yield no duplicate/invented glyph.
+    /// Wide continuations and certified synthetic margin gaps emit no text.
     pub fn selection_text(
         &self,
         start_row: usize,
@@ -52,7 +57,8 @@ impl HistoryPage {
         end_col: usize,
     ) -> Result<String, String> {
         let valid = |r: usize, c: usize| {
-            r < self.rows.len() && c <= self.rows[r].cells.len() || r == self.rows.len() && c == 0
+            r < self.rows.len() && c <= self.rows[r].row.cells.len()
+                || r == self.rows.len() && c == 0
         };
         if !valid(start_row, start_col)
             || !valid(end_row, end_col)
@@ -62,15 +68,17 @@ impl HistoryPage {
         }
         let mut text = String::new();
         for row in start_row..self.rows.len().min(end_row.saturating_add(1)) {
-            let cells = &self.rows[row].cells;
+            let cells = &self.rows[row].row.cells;
             let start = if row == start_row { start_col } else { 0 };
             let end = if row == end_row { end_col } else { cells.len() };
-            for cell in &cells[start..end] {
-                if !cell.flags.wide_continuation() {
+            for (offset, cell) in cells[start..end].iter().enumerate() {
+                if !cell.flags.wide_continuation()
+                    && self.rows[row].synthetic_gap != Some(start + offset)
+                {
                     text.push(cell.character);
                 }
             }
-            if row < end_row && !self.rows[row].wrapped {
+            if row < end_row && !self.rows[row].row.wrapped {
                 // Physical trailing blank padding is not copied across a hard line.
                 while text.ends_with(' ') {
                     text.pop();
@@ -416,14 +424,17 @@ impl Terminal {
         let offset = offset.min(total_rows);
         let end = total_rows - offset;
         let start = end.saturating_sub(limit);
-        let rows: Vec<Row> = self
+        let rows: Vec<HistoryCopyRow> = self
             .history
             .iter()
             .skip(start)
             .take(end - start)
-            .map(|line| Row {
-                cells: Arc::from(line.decompress()),
-                wrapped: line.is_wrapped,
+            .map(|line| HistoryCopyRow {
+                row: Row {
+                    cells: Arc::from(line.decompress()),
+                    wrapped: line.is_wrapped,
+                },
+                synthetic_gap: line.synthetic_margin_gap(),
             })
             .collect();
         let mut page = HistoryPage {
@@ -451,7 +462,11 @@ impl Terminal {
             self.motion(VerticalMotion::Wrap);
         }
         if self.screen.prepare_character_width(width, wrap) {
-            self.motion(VerticalMotion::Wrap);
+            let capture = self.history_admitted();
+            let effect = self
+                .screen
+                .vertical_early_wide_wrap(width, capture, || RawRowId::UNTRACKED);
+            self.capture_history(effect.region);
         }
         let translated = self.screen.translate_char(ch);
         self.screen.write_char_in_row(translated, width, wrap);
@@ -663,6 +678,23 @@ impl Terminal {
             let step = self.parser.next(&input[at..]);
             at += step.consumed;
             let Some(event) = step.event else { continue };
+            // Aether has no DA identity contract. A newer shared legacy
+            // dispatcher answers DA1/DA2 as Ember; do not inherit that identity.
+            // As before, count unsupported CSI c, but leave ESC c (RIS) alone.
+            if matches!(
+                &event,
+                Event::Csi {
+                    final_byte: b'c',
+                    ..
+                }
+            ) {
+                let before = self.unsupported;
+                self.unsupported();
+                if self.unsupported != before {
+                    self.record_unsupported_event(&event);
+                }
+                continue;
+            }
             // Local adapter compatibility guard retained from the 57ed89a baseline: it accepted
             // nonempty CSI intermediates for SGR. Vim deliberately sends 0%m
             // as an unknown-sequence probe; it must not reset drawing state.

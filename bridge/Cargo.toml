@@ -5,7 +5,7 @@ edition = "2021"
 default-run = "tauri-terminal-frame-bridge"
 
 [dependencies]
-jterm_engine = { git = "https://github.com/beamiter/jterm_core", rev = "f0107afaf631d29d06358abec3997f1b5712b627" }
+jterm_engine = { git = "https://github.com/beamiter/jterm_core", rev = "a9a52c41f478d18ec365d5c9d016d4829920b9f4" }
 getrandom = "0.4"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
