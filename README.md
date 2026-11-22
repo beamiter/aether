@@ -7,7 +7,7 @@ ANSI parser. **This is not a daily-use terminal.**
 
 ## Shared core
 
-The current exact pin is `8d0c0aafa06468b3935712fa477a971bc3cd8eae` in the
+The current exact pin is `f0107afaf631d29d06358abec3997f1b5712b627` in the
 session/bridge manifests and all three Cargo lockfiles. Run
 `python3 scripts/check-core-pin.py` to check the pin and relative crate paths.
 
