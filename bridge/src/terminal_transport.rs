@@ -1,11 +1,12 @@
 //! Private Linux PTY owner and versioned RPC records for OpenSSH stdio.
+mod session_table;
 pub mod ssh;
 
 use crate::{live::LiveBridge, semantic::Attachment};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
+use session_table::SessionTable;
 use std::{
-    collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, Write},
     os::fd::AsRawFd,
@@ -103,12 +104,7 @@ pub struct Reply {
 
 #[derive(Default)]
 struct Host {
-    sessions: HashMap<String, HostedSession>,
-}
-
-struct HostedSession {
-    bridge: LiveBridge,
-    last_used: Instant,
+    sessions: SessionTable<LiveBridge, MAX_SESSIONS>,
 }
 
 fn reply_value(value: impl Serialize) -> Result<Value, String> {
@@ -133,8 +129,7 @@ fn check_input(length: usize) -> Result<(), String> {
 
 impl Host {
     fn expire(&mut self, now: Instant) {
-        self.sessions
-            .retain(|_, session| now.duration_since(session.last_used) < INACTIVITY);
+        self.sessions.expire(now, INACTIVITY);
     }
 
     fn reply(&mut self, request: Request) -> Reply {
@@ -154,23 +149,13 @@ impl Host {
         let (id, result) = match command {
             Command::Open { rows, cols } => {
                 check_grid(rows, cols)?;
-                if self.sessions.len() >= MAX_SESSIONS {
-                    return Err("terminal host session limit reached".into());
-                }
-                let mut bridge = LiveBridge::default();
-                let epoch = bridge.open(rows, cols)?;
-                let owner = bridge.attachment(epoch)?;
-                let result = reply_value(&owner)?;
-                let entry = self.sessions.entry(owner.session);
-                if let std::collections::hash_map::Entry::Vacant(entry) = entry {
-                    entry.insert(HostedSession {
-                        bridge,
-                        last_used: Instant::now(),
-                    });
-                } else {
-                    return Err("terminal session ID collision".into());
-                }
-                return Ok(result);
+                return self.sessions.admit(|| {
+                    let mut bridge = LiveBridge::default();
+                    let epoch = bridge.open(rows, cols)?;
+                    let owner = bridge.attachment(epoch)?;
+                    let result = reply_value(&owner)?;
+                    Ok((owner.session, bridge, result))
+                });
             }
             Command::Close { owner } => {
                 let bridge = self.bridge(&owner.session)?;
@@ -243,14 +228,13 @@ impl Host {
                 })?
             }
         };
-        self.sessions.get_mut(&id).unwrap().last_used = Instant::now();
+        self.sessions.touch(&id, Instant::now());
         Ok(result)
     }
 
     fn bridge(&mut self, id: &str) -> Result<&mut LiveBridge, String> {
         self.sessions
             .get_mut(id)
-            .map(|owned| &mut owned.bridge)
             .ok_or("terminal session unavailable".into())
     }
 
@@ -513,6 +497,71 @@ mod tests {
         );
         host.expire(Instant::now() + INACTIVITY);
         assert!(host.sessions.is_empty());
+    }
+
+    #[test]
+    fn stale_close_at_capacity_cannot_release_another_session_or_its_replacement() {
+        fn open(host: &mut Host) -> Result<Attachment, String> {
+            let result = host.execute(Command::Open { rows: 16, cols: 80 })?;
+            Ok(serde_json::from_value(result).unwrap())
+        }
+
+        let mut host = Host::default();
+        let a = open(&mut host).unwrap();
+        let b = open(&mut host).unwrap();
+        assert_ne!(a.session, b.session);
+        assert_eq!(a.epoch, b.epoch);
+        assert_eq!(a.generation, b.generation);
+        for _ in 2..MAX_SESSIONS {
+            open(&mut host).unwrap();
+        }
+        let mut resumed = host.execute(Command::Recover { owner: a.clone() }).unwrap();
+        let resumed: Attachment = serde_json::from_value(resumed["owner"].take()).unwrap();
+        assert_eq!(resumed.session, a.session);
+        assert_eq!(resumed.epoch, a.epoch);
+        assert_eq!(resumed.generation, a.generation + 1);
+
+        assert_eq!(
+            host.execute(Command::Close { owner: a.clone() })
+                .unwrap_err(),
+            "stale terminal attachment"
+        );
+        assert_eq!(
+            host.execute(Command::Write {
+                owner: a.clone(),
+                bytes: vec![b'x'],
+            })
+            .unwrap_err(),
+            "stale terminal attachment"
+        );
+        assert_eq!(
+            open(&mut host).unwrap_err(),
+            "terminal host session limit reached"
+        );
+        host.execute(Command::Status { owner: b.clone() }).unwrap();
+
+        host.execute(Command::Close {
+            owner: resumed.clone(),
+        })
+        .unwrap();
+        let replacement = open(&mut host).unwrap();
+        assert_ne!(replacement.session, a.session);
+        assert_ne!(replacement.session, b.session);
+        assert_eq!(replacement.epoch, a.epoch);
+        assert_eq!(replacement.generation, a.generation);
+        for old in [a, resumed] {
+            assert_eq!(
+                host.execute(Command::Close { owner: old }).unwrap_err(),
+                "terminal session unavailable"
+            );
+        }
+        host.execute(Command::Status { owner: replacement })
+            .unwrap();
+        host.execute(Command::Status { owner: b }).unwrap();
+        assert_eq!(
+            open(&mut host).unwrap_err(),
+            "terminal host session limit reached"
+        );
     }
 
     #[test]
