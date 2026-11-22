@@ -34,7 +34,9 @@ function acceptOwner(attachment) {
   return attachment;
 }
 const pasteReview=installPasteReview({panel:document.querySelector('#paste-review'),preview:document.querySelector('#paste-preview'),escaped:document.querySelector('#paste-escaped'),confirm:document.querySelector('#paste-confirm'),cancel:document.querySelector('#paste-cancel'),getEpoch:()=>epoch!==null&&!input.disabled?epoch:null,send:(text,owner)=>{if(owner===epoch)enqueueLogical('paste_shell',{text});},onError:message=>{status.textContent=message;}});
-const history=installHistory({older:document.querySelector('#history-older'),newer:document.querySelector('#history-newer'),refresh:document.querySelector('#history-refresh'),output:document.querySelector('#history-output'),label:document.querySelector('#history-label'),invoke:invokeAttached,getEpoch:()=>epoch});
+const history=installHistory({older:document.querySelector('#history-older'),newer:document.querySelector('#history-newer'),refresh:document.querySelector('#history-refresh'),output:document.querySelector('#history-output'),label:document.querySelector('#history-label'),
+ invoke:(command,{owner:attachment,...args})=>invokeAttached(command,{epoch:attachment.epoch,...args},attachment),
+ getOwner:()=>owner});
 sshForm.hidden=!invoke;
 button.textContent=invoke?'Next Rust frame':'Load verified Rust fixture';setOpenDisabled(false);attach.disabled=!invoke;
 button.addEventListener('click',async()=>{

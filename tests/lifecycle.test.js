@@ -474,3 +474,56 @@ test('live paint failure is not ACKed; same-geometry recovery and detach retain 
  assert.deepEqual(resizes,['width','height','width'],'detach still explicitly discards pixels');
  assert.equal(pixels.length,0);
 });
+
+test('same-epoch SSH recovery retires old history requests without losing the committed archive page',async()=>{
+ const first={session:'d'.repeat(32),epoch:1,generation:1};
+ const resumed={...first,generation:2};
+ const frame={...JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8')),
+  session:first.session,epoch:first.epoch};
+ const requests=[],selectionWrites=[];
+ const h=harness(async(name,{action})=>{
+  assert.equal(name,'ssh_terminal');
+  if(action.operation==='open')return first;
+  const command=action.command;
+  switch(command.kind){
+   case 'poll':case 'ack':return null;
+   case 'status':return {epoch:1,exited:false,drained:false,write_error:null,unsupported:'0',dropped_reply_bytes:'0'};
+   case 'recover':assert.deepEqual(command.owner,first);return {owner:resumed,frame,input_allowed:true};
+   case 'history':{
+    const pending=deferred();requests.push({command,pending});return pending.promise;
+   }
+   default:throw Error(command.kind);
+  }
+ });
+ const output=h.el('#history-output'),label=h.el('#history-label');
+ output.setSelectionRange=(...range)=>selectionWrites.push(range);
+ h.el('#ssh-terminal-host').value='lab';
+ await h.submitSsh();
+ function result(text,offset,revision='12'){
+  return {epoch:1,revision,offset,total_rows:300,text};
+ }
+ const initial=h.click('#history-refresh');
+ requests[0].pending.resolve(result('initial',0));await initial;
+ const committed=h.click('#history-older');
+ requests[1].pending.resolve(result('retained\u00a0page',20));await committed;
+ const retainedLabel=label.textContent;
+ const stale=h.click('#history-older');
+ assert.equal(requests[2].command.offset,40);
+ assert.deepEqual(requests[2].command.owner,first);
+ await h.click('#recover');
+ assert.equal(output.value,'retained\u00a0page');
+ assert.deepEqual(selectionWrites,[[0,0],[0,0]]);
+
+ const fresh=h.click('#history-older');
+ assert.equal(requests.length,4,'a retired attachment must not block the current request');
+ assert.equal(requests[3].command.offset,40,'new intent starts from the committed offset');
+ assert.deepEqual(requests[3].command.owner,resumed);
+ requests[2].pending.resolve(result('late old attachment',40,'13'));
+ await stale;
+ assert.equal(output.value,'retained\u00a0page');
+ assert.equal(label.textContent,retainedLabel);
+ assert.deepEqual(selectionWrites,[[0,0],[0,0]]);
+ requests[3].pending.resolve(result('current attachment',40,'14'));await fresh;
+ assert.equal(output.value,'current attachment');
+ assert.deepEqual(selectionWrites,[[0,0],[0,0],[0,0]]);
+});

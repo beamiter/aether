@@ -4,10 +4,12 @@ const page=(epoch=1,text='hello\nworld',offset=0,total_rows=3)=>({epoch,revision
 const tick=()=>new Promise(r=>setImmediate(r));
 function setup(){
  const element=()=>({value:'',textContent:'',handlers:{},setSelectionRange(){},addEventListener(n,f){this.handlers[n]=f}});
- let epoch=1;const requests=[];
+ let owner={session:'owner',epoch:1,generation:1};const requests=[];
  const items={older:element(),newer:element(),refresh:element(),output:element(),label:element()};
- const ui=installHistory({...items,getEpoch:()=>epoch,invoke:(_,args)=>new Promise((resolve,reject)=>requests.push({args,resolve,reject}))});
- return {...items,...ui,requests,setEpoch:e=>epoch=e,click:n=>items[n].handlers.click()};
+ const ui=installHistory({...items,getOwner:()=>owner,invoke:(_,args)=>new Promise((resolve,reject)=>
+  requests.push({owner:args.owner,args:{epoch:args.owner.epoch,offset:args.offset},resolve,reject}))});
+ return {...items,...ui,requests,setEpoch:epoch=>owner={...owner,epoch},
+  rotate:()=>owner={...owner,generation:owner.generation+1},click:n=>items[n].handlers.click()};
 }
 test('history rejects foreign, unbounded and control-bearing snapshots',()=>{
  assert.equal(acceptHistory(page(),1).text,'hello\nworld');
@@ -213,4 +215,48 @@ test('old-epoch correction cannot overwrite the new shell or dispatch again',asy
  const freshText=h.output.value,freshLabel=h.label.textContent;
  rustReply(h.requests[1],3);await first;
  assert.equal(h.requests.length,3);assert.equal(h.output.value,freshText);assert.equal(h.label.textContent,freshLabel);
+});
+
+test('retired same-epoch history replies cannot alter selection, encode text, or correct a page',async()=>{
+ const h=setup(), selectionWrites=[], encoded=[], Encoder=globalThis.TextEncoder;
+ h.output.setSelectionRange=(...range)=>selectionWrites.push(range);
+ globalThis.TextEncoder=class extends Encoder{encode(text){encoded.push(text);return super.encode(text);}};
+ try {
+  const committed=h.click('refresh');h.requests[0].resolve(page(1,'retained\u00a0text',0,300));await committed;
+  const originalLabel=h.label.textContent;
+  const stale=h.click('older');
+  h.rotate();
+  h.requests[1].resolve(page(1,'x'.repeat(131200),20,21));
+  await tick();
+  assert.equal(h.requests.length,2,'superseded owner cannot schedule an oldest-window correction');
+  await stale;
+  assert.deepEqual(encoded,['retained\u00a0text']);
+  assert.equal(h.output.value,'retained\u00a0text');
+  assert.equal(h.label.textContent,originalLabel);
+  assert.deepEqual(selectionWrites,[[0,0]]);
+  const fresh=h.click('older');
+  assert.equal(h.requests[2].args.offset,20);
+  assert.equal(h.requests[2].owner.generation,2);
+  h.requests[2].resolve(page(1,'new owner',20,300));await fresh;
+  assert.equal(h.output.value,'new owner');
+ }finally{globalThis.TextEncoder=Encoder;}
+});
+
+test('retired same-epoch history failure does not surface an old error or consume queued navigation',async()=>{
+ const h=setup();
+ const committed=h.click('refresh');h.requests[0].resolve(page(1,'retained',0,300));await committed;
+ const originalLabel=h.label.textContent;
+ const stale=h.click('older');
+ h.click('older');h.rotate();
+ const fresh=h.click('older');
+ assert.equal(h.requests.length,3,'retired group must not hold the current intent');
+ assert.equal(h.requests[2].owner.generation,2);
+ assert.equal(h.requests[2].args.offset,20,'retired pending intent is not inherited');
+ h.requests[1].reject(Error('retired connection rejected'));
+ await stale;
+ assert.equal(h.requests.length,3);
+ assert.equal(h.label.textContent,originalLabel);
+ assert.equal(h.output.value,'retained');
+ h.requests[2].resolve(page(1,'fresh',20,300));await fresh;
+ assert.equal(h.output.value,'fresh');
 });

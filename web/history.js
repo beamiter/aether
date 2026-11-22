@@ -11,12 +11,19 @@ export function acceptHistory(value, epoch) {
 // Mirrors the fixed page size in LiveBridge::history (bridge/src/live.rs).
 const HISTORY_PAGE_ROWS=128;
 const oldestOffset=total=>Math.max(0,total-HISTORY_PAGE_ROWS);
-export function installHistory({older,newer,refresh,output,label,invoke,getEpoch}) {
+export function installHistory({older,newer,refresh,output,label,invoke,getOwner}) {
   let group=null;
   function load(delta) {
-    const epoch=getEpoch();if(epoch===null)return Promise.resolve();
-    if(!group||group.epoch!==epoch)group={epoch,offset:0,total:null,desired:0,pending:null,promise:null};
+    const owner=getOwner();if(owner===null)return Promise.resolve();
+    if(group?.owner!==owner){
+      const sameShell=group?.owner.session===owner.session&&group.owner.epoch===owner.epoch;
+      // Recovery can rotate the attachment without replacing the PTY. Keep
+      // only the page already shown, never its old pending navigation lease.
+      const offset=sameShell?group.offset:0,total=sameShell?group.total:null;
+      group={owner,offset,total,desired:offset,pending:null,promise:null};
+    }
     const current=group;
+    const isCurrent=()=>group===current&&getOwner()===owner;
     const maxOffset=current.total===null?1024:oldestOffset(current.total);
     const desired=Math.max(0,Math.min(maxOffset,current.desired+delta));
     // An already visible edge needs no IPC and must not disturb selection.
@@ -26,15 +33,15 @@ export function installHistory({older,newer,refresh,output,label,invoke,getEpoch
     current.pending={offset:desired,corrected:false};
     if(current.promise)return current.promise;
     current.promise=(async()=>{
-      while(current.pending!==null&&group===current&&getEpoch()===epoch){
+      while(current.pending!==null&&isCurrent()){
         const {offset:requested,corrected}=current.pending;current.pending=null;
         try {
-          const value=await invoke('history_shell',{epoch,offset:requested});
-          if(group!==current||getEpoch()!==epoch)return;
+          const value=await invoke('history_shell',{owner,offset:requested});
+          if(!isCurrent())return;
           // A newer request already owns the output. Do not validate or encode
           // the abandoned reply, and do not disturb selected text.
           if(current.pending!==null)continue;
-          const snapshot=acceptHistory(value,epoch);
+          const snapshot=acceptHistory(value,owner.epoch);
           const max=oldestOffset(snapshot.total_rows);
           if(snapshot.offset>max){
             // The archive length was unknown or shrank after the last page.
@@ -53,7 +60,7 @@ export function installHistory({older,newer,refresh,output,label,invoke,getEpoch
           const end=snapshot.total_rows-snapshot.offset,start=Math.max(1,end-HISTORY_PAGE_ROWS+1);
           label.textContent=`Snapshot ${snapshot.revision}: ${end>0?`archived rows ${start}–${end}`:'no archived rows'} of ${snapshot.total_rows}; ${snapshot.offset} newer rows skipped. Select text and copy normally. Refresh for new output.`;
         }catch(e){
-          if(group===current&&getEpoch()===epoch){
+          if(isCurrent()){
             // A failed superseded request must not erase newer user intent.
             // Consume only that queued target, never retry this failure itself.
             if(current.pending!==null)continue;
