@@ -24,6 +24,205 @@ fn invoke(window: &tauri::WebviewWindow<MockRuntime>, command: &str, body: Value
 }
 
 #[test]
+fn local_v4_snapshot_recovery_and_attach_keep_exact_lease_and_receipt() {
+    let app = super::application(tauri::test::mock_builder())
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .unwrap();
+    let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build()
+        .unwrap();
+    let owner = invoke(&window, "open_shell", json!({}));
+    assert!(tauri::test::get_ipc_response(
+        &window,
+        request("recover_shell", json!({"owner":owner,"frameVersion":5}))
+    )
+    .is_err());
+    let arguments = json!({"owner":owner,"frameVersion":4});
+    let recovered = invoke(&window, "recover_shell", arguments.clone());
+    assert_eq!(invoke(&window, "recover_shell", arguments), recovered);
+    let frame: Value = serde_json::from_str(recovered["frame"].as_str().unwrap()).unwrap();
+    let current = &recovered["owner"];
+    assert_eq!(frame["kind"], "snapshot");
+    assert_eq!(frame["stamp"]["version"], 4);
+    assert_eq!(frame["stamp"]["session"], owner["session"]);
+    assert_eq!(current["generation"], 2);
+    let revision = &frame["stamp"]["revision"];
+    for invalid in [
+        json!({"owner":owner,"revision":revision}),
+        json!({"owner":current,"revision":"09007199254740993"}),
+        json!({"owner":current,"revision":9007199254740993_u64}),
+        json!({"owner":current,"revision":"9007199254740993"}),
+    ] {
+        assert!(tauri::test::get_ipc_response(&window, request("ack_shell", invalid)).is_err());
+    }
+    let ack = json!({"owner":current,"revision":revision});
+    invoke(&window, "ack_shell", ack.clone());
+    invoke(&window, "ack_shell", ack);
+    invoke(&window, "detach_shell", json!({"owner":current}));
+    let attached = invoke(
+        &window,
+        "attach_selected_local_shell",
+        json!({"epoch":current["epoch"],"frameVersion":4}),
+    );
+    let frame: Value = serde_json::from_str(attached["frame"].as_str().unwrap()).unwrap();
+    assert_eq!(frame["stamp"]["version"], 4);
+    assert_eq!(frame["stamp"]["session"], current["session"]);
+    assert_eq!(attached["owner"]["generation"], 4);
+    invoke(&window, "close_shell", json!({"owner":attached["owner"]}));
+}
+
+#[test]
+fn local_tab_activation_rotates_the_lease_after_an_ack_and_retries_exactly() {
+    let app = super::application(tauri::test::mock_builder())
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .unwrap();
+    let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build()
+        .unwrap();
+    let first = invoke(&window, "open_shell", json!({}));
+    let new_tab = json!({"owner":first,"targetEpoch":null,"preserveInput":true});
+    let switched = invoke(&window, "activate_local_tab", new_tab.clone());
+    let second = &switched["Ok"]["owner"];
+    assert_ne!(second["session"], first["session"]);
+    assert_eq!(switched["Ok"]["input_allowed"], true);
+    assert_eq!(
+        invoke(&window, "activate_local_tab", new_tab.clone()),
+        switched
+    );
+    assert_eq!(
+        invoke(&window, "list_local_shells", json!({})),
+        json!([first["epoch"], second["epoch"]])
+    );
+
+    let write = |owner: &Value| {
+        tauri::test::get_ipc_response(
+            &window,
+            request("write_shell", json!({"owner":owner,"bytes":[120]})),
+        )
+    };
+    assert!(
+        write(&first).is_err(),
+        "the parked view kept its write lease"
+    );
+    assert!(write(second)
+        .unwrap_err()
+        .to_string()
+        .contains("acknowledge"));
+    let ack = |view: &Value| {
+        invoke(
+            &window,
+            "ack_shell",
+            json!({"owner":view["Ok"]["owner"],
+            "revision":view["Ok"]["frame"]["revision"]}),
+        );
+    };
+    ack(&switched);
+    assert!(invoke(&window, "activate_local_tab", new_tab)["Err"].is_string());
+    assert!(write(second).is_ok());
+
+    invoke(
+        &window,
+        "text_shell",
+        json!({"owner":second,"text":"pending"}),
+    );
+    let busy = invoke(
+        &window,
+        "activate_local_tab",
+        json!({"owner":second,
+        "targetEpoch":first["epoch"],"preserveInput":true}),
+    );
+    assert!(busy["Err"]
+        .as_str()
+        .unwrap()
+        .contains("current shell input"));
+    assert_eq!(
+        invoke(&window, "shell_status", json!({"owner":second}))["epoch"],
+        second["epoch"]
+    );
+
+    let returned = invoke(
+        &window,
+        "activate_local_tab",
+        json!({"owner":second,
+        "targetEpoch":first["epoch"],"preserveInput":false}),
+    );
+    let return_owner = &returned["Ok"]["owner"];
+    assert_eq!(return_owner["session"], first["session"]);
+    assert_ne!(return_owner["generation"], first["generation"]);
+    assert_eq!(returned["Ok"]["input_allowed"], true);
+    ack(&returned);
+    assert!(write(return_owner).is_ok());
+    invoke(&window, "close_shell", json!({"owner":return_owner}));
+
+    let read_only = invoke(
+        &window,
+        "activate_local_tab",
+        json!({"owner":null,
+        "targetEpoch":second["epoch"],"preserveInput":true}),
+    );
+    assert_eq!(read_only["Ok"]["owner"]["session"], second["session"]);
+    assert_eq!(read_only["Ok"]["input_allowed"], false);
+    ack(&read_only);
+    assert!(write(&read_only["Ok"]["owner"])
+        .unwrap_err()
+        .to_string()
+        .contains("read-only"));
+    invoke(
+        &window,
+        "close_shell",
+        json!({"owner":read_only["Ok"]["owner"]}),
+    );
+}
+
+#[test]
+fn split_poll_observes_inactive_geometry_without_transferring_resize_authority() {
+    let app = super::application(tauri::test::mock_builder())
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .unwrap();
+    let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build()
+        .unwrap();
+    let first = invoke(&window, "open_shell", json!({}));
+    invoke(
+        &window,
+        "resize_shell",
+        json!({"owner":first,"rows":17,"cols":71}),
+    );
+    let other = invoke(
+        &window,
+        "activate_local_tab",
+        json!({"owner":first,
+        "targetEpoch":null,"preserveInput":true}),
+    );
+    let second = &other["Ok"]["owner"];
+    invoke(
+        &window,
+        "ack_shell",
+        json!({"owner":second,"revision":other["Ok"]["frame"]["revision"]}),
+    );
+    let observe = json!({"owner":second,"epoch":first["epoch"],"revision":null});
+    let snapshot = invoke(&window, "observe_local_shell", observe);
+    assert_eq!(snapshot["session"], first["session"]);
+    assert_eq!(snapshot["cols"], 71);
+    assert_eq!(snapshot["rows"].as_array().unwrap().len(), 17);
+    assert!(tauri::test::get_ipc_response(
+        &window,
+        request("resize_shell", json!({"owner":first,"rows":1,"cols":1}))
+    )
+    .is_err());
+    assert!(tauri::test::get_ipc_response(
+        &window,
+        request(
+            "observe_local_shell",
+            json!({"owner":second,"epoch":second["epoch"],"revision":null})
+        )
+    )
+    .is_err());
+    invoke(&window, "close_shell", json!({"owner":second}));
+    invoke(&window, "close_shell", json!({"owner":first}));
+}
+
+#[test]
 fn ssh_terminal_ipc_rejects_foreign_windows_and_unadmitted_commands() {
     let app = super::application(tauri::test::mock_builder())
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
@@ -240,14 +439,16 @@ fn tauri_ipc_real_pty_lifecycle_and_wire_contract() {
         json!({"owner": owner, "text": "true"}),
     );
     let raw_suffix = json!({"owner": owner, "bytes": [10]});
-    assert_eq!(invoke(&window, "write_shell", raw_suffix.clone()), 0);
-    assert!(tauri::test::get_ipc_response(
-        &window,
-        request("write_shell", json!({"owner": owner, "bytes": [88]})),
-    )
-    .is_err());
+    let mut accepted = invoke(&window, "write_shell", raw_suffix.clone());
+    if accepted == 0 {
+        assert!(tauri::test::get_ipc_response(
+            &window,
+            request("write_shell", json!({"owner": owner, "bytes": [88]})),
+        )
+        .is_err());
+    }
     let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
+    while accepted == 0 {
         let update = invoke(&window, "poll_shell", json!({"owner": owner}));
         if !update.is_null() {
             invoke(
@@ -256,14 +457,11 @@ fn tauri_ipc_real_pty_lifecycle_and_wire_contract() {
                 json!({"owner": owner, "revision": update["frame"]["revision"]}),
             );
         }
-        let accepted = invoke(&window, "write_shell", raw_suffix.clone());
-        if accepted == 1 {
-            break;
-        }
-        assert_eq!(accepted, 0);
+        accepted = invoke(&window, "write_shell", raw_suffix.clone());
         assert!(Instant::now() < deadline, "owned raw suffix stayed blocked");
         std::thread::sleep(Duration::from_millis(2));
     }
+    assert_eq!(accepted, 1);
     invoke(
         &window,
         "text_shell",
@@ -320,6 +518,15 @@ fn tauri_ipc_real_pty_lifecycle_and_wire_contract() {
             json!({"owner": current, "offset": 0})
         )["epoch"],
         epoch
+    );
+    assert!(tauri::test::get_ipc_response(
+        &window,
+        request("local_command_blocks", json!({"owner": owner}))
+    )
+    .is_err());
+    assert_eq!(
+        invoke(&window, "local_command_blocks", json!({"owner": current})),
+        json!({"owner": current, "enabled": false, "blocks": []})
     );
 
     invoke(&window, "detach_shell", json!({"owner": current}));
@@ -401,16 +608,28 @@ fn tauri_ipc_real_pty_lifecycle_and_wire_contract() {
 }
 
 #[test]
+fn opened_local_pty_drains_before_any_frame_receiver_exists() {
+    retained_pressure(PressureView::Attached);
+}
+
+#[test]
 fn detached_local_pty_drains_past_kernel_capacity_without_frontend_poll() {
-    detached_pressure(false);
+    retained_pressure(PressureView::Detached);
 }
 
 #[test]
 fn second_local_pty_keeps_one_reader_and_first_makes_progress_while_inactive() {
-    detached_pressure(true);
+    retained_pressure(PressureView::SecondActive);
 }
 
-fn detached_pressure(open_second: bool) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PressureView {
+    Attached,
+    Detached,
+    SecondActive,
+}
+
+fn retained_pressure(view: PressureView) {
     use std::{
         os::unix::fs::DirBuilderExt,
         path::PathBuf,
@@ -523,7 +742,15 @@ printf '%s' "$$" > {written}
         marker_rows(&update["frame"]["rows"], label)
     };
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !poll_marker(&owner, "AETHER_PRESSURE_ARMED") {
+    let armed_now = || {
+        if view == PressureView::Attached {
+            std::fs::read_to_string(&armed)
+                .is_ok_and(|pid| !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()))
+        } else {
+            poll_marker(&owner, "AETHER_PRESSURE_ARMED")
+        }
+    };
+    while !armed_now() {
         assert!(
             Instant::now() < deadline,
             "pressure shell did not reach gate"
@@ -532,8 +759,10 @@ printf '%s' "$$" > {written}
     }
     let expected_pid = std::fs::read_to_string(&armed).unwrap();
     assert!(!expected_pid.is_empty() && expected_pid.bytes().all(|byte| byte.is_ascii_digit()));
-    invoke(&window, "detach_shell", json!({"owner":owner}));
-    let second = if open_second {
+    if view != PressureView::Attached {
+        invoke(&window, "detach_shell", json!({"owner":owner}));
+    }
+    let second = if view == PressureView::SecondActive {
         assert_eq!(
             invoke(&window, "list_local_shells", json!({})),
             json!([owner["epoch"]])
@@ -685,7 +914,7 @@ printf '%s' "$$" > {written}
     assert_ne!(attached["generation"], owner["generation"]);
     assert!(
         completed_without_view && other_visible,
-        "detached fixture did not complete before reconnect: phase={last_phase:?}, end_marker={end_seen}, other_marker={other_visible}"
+        "PTY fixture did not complete before frame retrieval: phase={last_phase:?}, end_marker={end_seen}, other_marker={other_visible}"
     );
     assert!(
         end_seen,

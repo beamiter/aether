@@ -1,5 +1,5 @@
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';
-import {acceptFull,acceptUpdate,paint} from '../web/frames.js';
+import {acceptFull,acceptUpdate,clearPaint,paint} from '../web/frames.js';
 import {cursorTarget} from '../web/viewport.js';
 const demo=()=>JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
 test('accept actual Rust engine fixture and isolate external mutation',()=>{const raw=demo(),f=acceptFull(null,raw);raw.rows[0][0].text='X';assert.notEqual(f.rows[0][0].text,'X');assert.equal(f.cols,64);});
@@ -210,4 +210,64 @@ test('fractional and allocation-clamped DPR preserve cell-by-cell background ras
  const ratio=Math.sqrt(16777216/(256*12*128*24));
  assert.ok(large.backgrounds.every(([_,dpr,__,___,w,h])=>dpr===ratio&&w===12&&h===24));
  assert.ok(large.canvas.width*large.canvas.height<=16777216);
+});
+
+function deltaFrom(base, fields={}) {
+ return acceptUpdate(base,{kind:'delta',frame:{...base,base_revision:base.revision,
+  revision:base.revision+1,rows:[],...fields}});
+}
+
+test('validated row deltas repaint only changed rows and the rows affected by the cursor',()=>{
+ const {canvas,g,writes}=observedCanvas();
+ const initial=smallPaintFrame({cols:2,rows:4});
+ paint(canvas,initial,1.25);
+ const clears=[],texts=[],cursors=[];
+ g.clearRect=(...area)=>clears.push(area);
+ g.fillText=(_,x,y)=>texts.push([x,y]);
+ g.strokeRect=(...area)=>cursors.push(area);
+
+ const changed=initial.rows[2].map(c=>({...c,text:'Y'}));
+ const next=deltaFrom(initial,{rows:[{index:2,cells:changed}]});
+ paint(canvas,next,1.25);
+ assert.deepEqual(clears.splice(0),[[0,60,30,30]]);
+ assert.deepEqual(texts.splice(0),[[0,50],[12,50]]);
+ assert.equal(cursors.length,0);
+
+ const moved=deltaFrom(next,{cursor_row:3});
+ paint(canvas,moved,1.25);
+ assert.deepEqual(clears.splice(0),[[0,0,30,30],[0,90,30,30]]);
+ assert.deepEqual(texts.splice(0),[[0,2],[12,2],[0,74],[12,74]]);
+ assert.deepEqual(cursors.splice(0),[[.5,72.5,11,23]]);
+
+ const hidden=deltaFrom(moved,{cursor_visible:false});
+ paint(canvas,hidden,1.25);
+ assert.deepEqual(clears.splice(0),[[0,90,30,30]]);
+ assert.deepEqual(texts.splice(0),[[0,74],[12,74]]);
+ paint(canvas,deltaFrom(hidden,{pending_wrap:true,cursor_row:1}),1.25);
+ assert.deepEqual([clears,texts,cursors],[[],[],[]]);
+ assert.deepEqual(writes,[['width',30],['height',120]]);
+});
+
+test('reset, fractional row edges and interrupted deltas fall back to a full repaint',()=>{
+ const {canvas,g,writes}=observedCanvas();
+ const initial=smallPaintFrame({cols:2,rows:4});
+ const next=deltaFrom(initial,{cursor_row:2});
+ paint(canvas,initial,1);
+ const clears=[];
+ g.clearRect=(...area)=>clears.push(area);
+ const fill=g.fillText;
+ g.fillText=()=>{throw new Error('interrupted');};
+ assert.throws(()=>paint(canvas,next,1),/interrupted/);
+ assert.deepEqual(clears.splice(0),[[0,0,24,24],[0,48,24,24]]);
+ g.fillText=fill;
+ paint(canvas,next,1);
+ assert.deepEqual(clears.splice(0),[[0,0,24,96]]);
+
+ clearPaint(canvas);
+ paint(canvas,next,1);
+ assert.deepEqual(clears.splice(0),[[0,0,24,96]]);
+ paint(canvas,next,1.01);
+ paint(canvas,deltaFrom(next,{cursor_row:3}),1.01);
+ assert.deepEqual(clears,[[0,0,24,96],[0,0,24,96]]);
+ assert.deepEqual(writes,[['width',24],['height',96],['width',24]]);
 });

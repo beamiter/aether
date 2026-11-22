@@ -2,25 +2,40 @@
 """Drive the exact Aether desktop binary and two owned local PTYs in WebKitGTK."""
 import argparse
 import contextlib
+import errno
+import fcntl
 import http.client
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+import pty
 from pathlib import Path
 import re
 import shlex
 import shutil
 import signal
 import socket
+import sqlite3
+import struct
 import subprocess
 import tempfile
+import termios
+import threading
 import time
 from urllib.parse import quote
 
 ELEMENT = "element-6066-11e4-a52e-4f735466cecf"
 READ = """
+const canvas = document.querySelector('main canvas');
+const ctx = canvas.getContext('2d');
+const peer = document.querySelector('#peer-canvas');
+const peerScale = peer.width / (parseFloat(peer.style.width) || peer.width);
+const history = document.querySelector('#history-output');
+const scale = canvas.width / (parseFloat(canvas.style.width) || canvas.width);
 return {
   status: document.querySelector('#status').textContent,
   health: document.querySelector('#health').textContent,
+  transport: document.querySelector('#health').dataset.transport || '',
   cursor: document.querySelector('#cursor-status').textContent,
   draft: document.querySelector('#input').value,
   writable: !document.querySelector('#input').disabled &&
@@ -32,9 +47,23 @@ return {
   selected: document.querySelector('#local-shell-selection').value,
   choose: !document.querySelector('#attach-selected-local').disabled,
   second: !document.querySelector('#open-second-local').disabled,
-  dump: document.querySelector('#history-output').value,
-  pixel: Array.from(document.querySelector('main canvas')
-                    .getContext('2d').getImageData(2, 2, 1, 1).data)
+  tabs: Array.from(document.querySelectorAll('#local-tab-list button'), tab => tab.dataset.epoch),
+  current_tab: document.querySelector('#local-tab-list [aria-current]')?.dataset.epoch || null,
+  split: document.querySelector('#terminal-panes').dataset.split || '',
+  peer_geometry: peer.dataset.geometry || '',
+  peer_pixel: Array.from(peer.getContext('2d').getImageData(2,2,1,1).data),
+  peer_fifth_row_pixel: Array.from(peer.getContext('2d').getImageData(2,Math.floor(96 * peerScale) + 2,1,1).data),
+  active_x: document.querySelector('#active-pane').getBoundingClientRect().left,
+  peer_x: document.querySelector('#peer-pane').getBoundingClientRect().left,
+  focused: document.activeElement?.id,
+  restore_layout: !document.querySelector('#saved-local-layout').hidden &&
+                  !document.querySelector('#restore-local-layout').disabled,
+  dump: history.value,
+  find_status: document.querySelector('#history-find-status').textContent,
+  selected_history: history.value.slice(history.selectionStart, history.selectionEnd),
+  selection_context: history.value.slice(Math.max(0, history.selectionStart - 6), history.selectionStart),
+  pixel: Array.from(ctx.getImageData(2, 2, 1, 1).data),
+  fifth_row_pixel: Array.from(ctx.getImageData(2, Math.floor(96 * scale) + 2, 1, 1).data)
 };
 """
 
@@ -92,6 +121,9 @@ class Driver:
     def type(self, selector, text):
         self.command("POST", self.element_path(selector) + "/value", {"text": text})
 
+    def clear(self, selector):
+        self.command("POST", self.element_path(selector) + "/clear", {})
+
     def close(self):
         if self.session is not None:
             self.command("DELETE", "")
@@ -109,8 +141,10 @@ def wait_for(predicate, label, timeout=10):
 
 def opened_page(driver):
     return driver.execute("""
-        return location.protocol === 'tauri:' && location.hostname === 'localhost' && Boolean(globalThis.__TAURI__?.core?.invoke)
-            && Boolean(document.querySelector('#open'));
+        const open = document.querySelector('#open');
+        return document.readyState === 'complete'
+            && location.protocol === 'tauri:' && location.hostname === 'localhost'
+            && Boolean(globalThis.__TAURI__?.core?.invoke) && Boolean(open && !open.disabled);
     """)
 
 
@@ -128,6 +162,30 @@ def birth(pid):
         return None
 
 
+def write_from_current_tab(driver, pid_file, color=None):
+    command = f"printf '%s' \"$$\" > {shlex.quote(str(pid_file))}"
+    if color:
+        r, g, b, _ = color
+        command = (f"stty -echo; printf '\\033[2J\\033[H\\033[48;2;{r};{g};{b}m%20s\\033[0m\\r\\n' ''; "
+                   + command)
+    driver.clear("#input")
+    driver.type("#input", command)
+    driver.click("#send")
+    wait_for(lambda: pid_file.is_file() and pid_file.stat().st_size > 0, "writable tab did not accept input")
+    return shell_identity(pid_file)
+
+
+def click_tab(driver, number):
+    assert re.fullmatch(r"[1-9][0-9]{0,9}", number)
+    driver.click(f'#local-tab-list [data-epoch="{number}"]')
+
+    def active():
+        status = driver.execute(READ)
+        return status["current_tab"] == number and status["writable"]
+
+    wait_for(active, "selected tab never regained input")
+
+
 def exercise(driver, owned):
     def state():
         return driver.execute(READ)
@@ -142,11 +200,15 @@ def exercise(driver, owned):
     def marker_on_screen(marker, absent, color):
         def sample():
             s = state()
-            return s["dump"].splitlines().count(marker) == 1 and absent not in s["dump"] and s["pixel"] == color
+            return (s["transport"] == "channel" and s["dump"].splitlines().count(marker) == 1
+                    and absent not in s["dump"] and s["pixel"] == color)
         def snapshot():
             driver.click("#copy-visible")
             return sample()
-        return wait_for(snapshot, f"native grid/canvas did not isolate {marker}")
+        try:
+            return wait_for(snapshot, f"native grid/canvas did not isolate {marker}")
+        except AssertionError as error:
+            raise AssertionError(f"{error}\n{json.dumps(state(), ensure_ascii=False)}") from error
 
     def launch(column, color, marker, pid_path):
         r, g, b, _ = color
@@ -168,6 +230,11 @@ def exercise(driver, owned):
         driver.click("#detach")
         wait_for(lambda: state()["status"].startswith("View detached."), "view did not detach")
 
+    def search_archive(query):
+        driver.clear("#history-find-query")
+        driver.type("#history-find-query", query)
+        driver.click("#history-find")
+
     def select(label):
         assert re.fullmatch(r"[1-9][0-9]{0,9}", label)
         before = state()
@@ -183,6 +250,27 @@ def exercise(driver, owned):
 
     driver.click("#open")
     wait_for(lambda: state()["writable"], "first local shell did not open")
+    archive_query = "AETHER_ARCHIVE_NEEDLE"
+    archive_command = ("stty -echo; printf 'older %s%s\\r\\n' AETHER_ARCHIVE_ NEEDLE; seq 1 90; "
+                       "printf 'newer %s%s\\r\\n' AETHER_ARCHIVE_ NEEDLE; seq 91 124; "
+                       "printf '%s%s\\r\\n' AETHER_HISTORY_ READY")
+    driver.type("#input", archive_command)
+    driver.click("#send")
+
+    def archived():
+        driver.click("#copy-visible")
+        return "AETHER_HISTORY_READY" in state()["dump"].splitlines()
+
+    wait_for(archived, "the real PTY did not finish writing the retained archive")
+    driver.click("#history-refresh")
+    wait_for(lambda: state()["dump"].count(archive_query) == 2,
+             "native history reader did not show scrolled PTY output")
+    search_archive(archive_query)
+    wait_for(lambda: state()["selected_history"] == archive_query and state()["selection_context"] == "newer ",
+             "native find did not select the newest retained match")
+    driver.click("#history-find-older")
+    wait_for(lambda: state()["selected_history"] == archive_query and state()["selection_context"] == "older ",
+             "native find did not cross the archive page boundary")
     a, b = "AETHER_NATIVE_LOCAL_A", "AETHER_NATIVE_LOCAL_B"
     red, blue = [206, 48, 70, 255], [31, 96, 208, 255]
     a_pid_path, b_pid_path = owned / "a.pid", owned / "b.pid"
@@ -192,7 +280,69 @@ def exercise(driver, owned):
     marker_on_screen(a, b, red)
     a_pid, a_birth = shell_identity(a_pid_path)
     assert a_birth is not None
+    driver.click("#recover")
+    wait_for(lambda: state()["status"].startswith("Output snapshot recovered"), "local channel snapshot recovery did not complete")
+    assert birth(a_pid) == a_birth, "channel recovery replaced the owned shell"
     wait_for(lambda: state()["writable"] and state()["draft"] == "", "first command adoption not settled")
+    old_pixel = state()["fifth_row_pixel"]
+    green = [38, 152, 87, 255]
+    driver.type("#input", "printf '\\033[5;1H\\033[48;2;38;152;87m%20s\\033[0m\\033[3;1H' ''")
+    driver.click("#send")
+    assert old_pixel != green, "single-row update fixture already painted"
+    wait_for(lambda: state()["fifth_row_pixel"] == green, "single-row PTY color did not reach Canvas")
+    marker_on_screen(a, b, red)
+    wait_for(lambda: state()["writable"] and state()["draft"] == "", "single-row edit adoption not settled")
+    driver.type("#input", ("printf '\\033[7;1H\\033[38;2;193;56;219;4:2;58:2::100:223:71m%080d"
+                           "\\033[0m%s\\033[9;1H' 0 'AETHER_V4_WRAP_尾'"))
+    driver.click("#send")
+
+    def wrapped_rendition(color):
+        driver.click("#copy-visible")
+        if "0" * 80 + "AETHER_V4_WRAP_尾" not in state()["dump"]:
+            return False
+        painted = driver.execute("""
+            const canvas = document.querySelector('main canvas');
+            const scale = canvas.width / parseFloat(canvas.style.width);
+            const ctx = canvas.getContext('2d');
+            const sample = row => Array.from(ctx.getImageData(Math.floor(5.5 * scale),
+                Math.floor((6 * 24 + row + 0.5) * scale), 1, 1).data);
+            return [sample(21), sample(22), sample(23)];
+        """)
+        return painted[0] == painted[2] == color and painted[1] != color
+
+    wait_for(lambda: wrapped_rendition([100, 223, 71, 255]),
+             "v4 wrapped wide text and truecolor double underline did not reach native WebKit")
+    wait_for(lambda: state()["writable"] and state()["draft"] == "", "styled wrap edit adoption not settled")
+    driver.type("#input", ("printf '\\033[7;1H\\033[38;2;193;56;219;4:2;58:5:42m%080d"
+                           "\\033[0m\\033[9;1H' 0"))
+    driver.click("#send")
+    wait_for(lambda: wrapped_rendition([0, 215, 135, 255]),
+             "v4 indexed underline update did not repaint the unchanged text and span")
+    wait_for(lambda: state()["writable"] and state()["draft"] == "", "underline update adoption not settled")
+    driver.type("#input", ("printf '\\033[11;1He'; sleep 0.12; printf '\\314\\201 \\360\\237\\221\\251'; "
+                           "sleep 0.12; printf '\\342\\200\\215'; sleep 0.12; "
+                           "printf '\\360\\237\\222\\273!\\033[9;1H'"))
+    driver.click("#send")
+
+    def composed_cells():
+        driver.click("#copy-visible")
+        return "e\u0301 👩‍💻!" in state()["dump"]
+
+    wait_for(composed_cells, "fragmented combining text and a wide joined emoji did not survive v4 copy")
+    wait_for(lambda: state()["writable"] and state()["draft"] == "", "cluster edit adoption not settled")
+    driver.type("#input", ("printf '\\033[12;1H.GH!Z\\033[12;2H\\342\\231\\245'; "
+                           "sleep 0.12; printf '\\357\\270\\217\\033[13;1H.AB!Y"
+                           "\\033[13;2H\\342\\214\\232'; sleep 0.12; "
+                           "printf '\\357\\270\\216\\033[9;1H'"))
+    driver.click("#send")
+
+    def late_width_cells():
+        driver.click("#copy-visible")
+        output = state()["dump"]
+        return ".♥️!Z" in output and ".⌚︎B!Y" in output
+
+    wait_for(late_width_cells, "v4 did not copy the revised VS16 and VS15 cell widths")
+    wait_for(lambda: state()["writable"] and state()["draft"] == "", "variation selector edit adoption not settled")
     driver.type("#input", draft_a)
     detach()
 
@@ -203,19 +353,23 @@ def exercise(driver, owned):
     assert state()["writable"] and state()["draft"] == ""
     launch("B", blue, b, b_pid_path)
     marker_on_screen(b, a, blue)
+    search_archive(archive_query)
+    wait_for(lambda: state()["find_status"] == "No matches in retained history.", "history search leaked the other shell")
+    assert state()["selected_history"] != archive_query
     b_pid, b_birth = shell_identity(b_pid_path)
     assert b_birth is not None and b_pid != a_pid
     wait_for(lambda: state()["writable"] and state()["draft"] == "", "second command adoption not settled")
     driver.type("#input", draft_b)
-    detach()
 
     choices = list_shells(2)
+    assert choices["writable"], "opening the roster revoked the current input lease"
     assert not choices["choose"] and not choices["second"] and choices["selected"] == "", "ambiguous choice was implicitly authorized"
     a_label, b_label = sorted(choices["options"], key=int)
     assert a_label == first["options"][0] and a_label != b_label
     select(a_label)
     marker_on_screen(a, b, red)
     current = state()
+    assert current["fifth_row_pixel"] == green, "reattaching lost the edited row"
     assert birth(a_pid) == a_birth
     assert not current["writable"] and not current["resize"] and current["draft"] == draft_a
     try:
@@ -223,13 +377,12 @@ def exercise(driver, owned):
     except ProtocolError as err:
         if err.error not in {"element not interactable", "invalid element state"}:
             raise
-    detach()
-
     choices = list_shells(2)
     assert not choices["choose"] and choices["selected"] == ""
     select(b_label)
     marker_on_screen(b, a, blue)
     current = state()
+    assert current["fifth_row_pixel"] != green, "a dirty row leaked into the other shell"
     assert birth(b_pid) == b_birth
     assert not current["writable"] and not current["resize"] and current["draft"] == draft_b
     assert not forbidden_a.exists() and not forbidden_b.exists(), "a parked draft executed"
@@ -242,10 +395,436 @@ def exercise(driver, owned):
     wait_for(lambda: birth(a_pid) != a_birth, "first owned shell not reaped")
     list_shells(0)
     assert not forbidden_a.exists() and not forbidden_b.exists(), "a parked draft executed"
+
+    driver.click("#open")
+    wait_for(lambda: state()["writable"] and len(state()["tabs"]) == 1, "initial shell tab did not open")
+    a_tab = state()["current_tab"]
+    a_identity = write_from_current_tab(driver, owned / "tab-a.pid", red)
+    wait_for(lambda: state()["writable"] and state()["draft"] == "", "first tab input still pending")
+    split_gate = owned / "advance-inactive-pane"
+    gate = shlex.quote(str(split_gate))
+    inactive_command = (f"(n=0; while [ \"$n\" -lt 200 ] && [ ! -e {gate} ]; do "
+                        f"n=$((n+1)); sleep .05; done; if [ -e {gate} ]; then "
+                        "printf '\\033[5;1H\\033[48;2;38;152;87m%20s\\033[0m\\033[3;1H' ''; fi) &")
+    driver.type("#input", inactive_command)
+    driver.click("#send")
+    wait_for(lambda: state()["writable"] and state()["draft"] == "", "inactive output job was not admitted")
+    driver.type("#input", draft_a)
+    driver.click("#new-local-tab")
+    wait_for(lambda: state()["writable"] and len(state()["tabs"]) == 2 and state()["current_tab"] != a_tab,
+             "new shell tab did not get its own lease")
+    b_tab = state()["current_tab"]
+    assert state()["draft"] == ""
+    b_identity = write_from_current_tab(driver, owned / "tab-b.pid", blue)
+    assert b_identity[0] != a_identity[0]
+    wait_for(lambda: state()["writable"] and state()["draft"] == "", "second tab input still pending")
+    driver.type("#input", draft_b)
+
+    driver.click("#split-local")
+
+    def split_with_b_active():
+        s = state()
+        return s["split"] == "right" and s["peer_x"] < s["active_x"] and s["pixel"] == blue and s["peer_pixel"] == red
+
+    wait_for(split_with_b_active, "two native panes did not show their separate canvases")
+    assert state()["peer_fifth_row_pixel"] != green
+    split_gate.touch()
+    wait_for(lambda: state()["peer_fifth_row_pixel"] == green, "inactive pane did not present new PTY output")
+    assert state()["pixel"] == blue and state()["fifth_row_pixel"] != green
+    assert state()["peer_geometry"] == "80x24"
+    for selector, value in [("#cols", "84"), ("#rows", "12")]:
+        driver.clear(selector)
+        driver.type(selector, value)
+    driver.click("#resize")
+    wait_for(lambda: state()["cursor"].startswith("84 × 12"), "split resize never reached the active PTY")
+    assert state()["peer_geometry"] == "80x24"
+    driver.click("#focus-peer-pane")
+
+    def split_with_a_active():
+        s = state()
+        return (s["current_tab"] == a_tab and s["focused"] == "ime-input"
+                and s["split"] == "left" and s["active_x"] < s["peer_x"] and s["peer_geometry"] == "84x12")
+
+    wait_for(split_with_a_active, "clicking the inactive pane did not transfer input and focus")
+    assert state()["cursor"].startswith("80 × 24")
+    assert state()["resize"] and state()["draft"] == draft_a
+    assert write_from_current_tab(driver, owned / "tab-a-return.pid") == a_identity
+    wait_for(lambda: state()["writable"] and state()["draft"] == "", "first tab return input still pending")
+    click_tab(driver, b_tab)
+    assert state()["draft"] == draft_b
+    assert write_from_current_tab(driver, owned / "tab-b-return.pid") == b_identity
+    wait_for(lambda: state()["writable"] and state()["draft"] == "", "second tab return input still pending")
+    close_without_stale_presentation()
+    wait_for(lambda: birth(b_identity[0]) != b_identity[1], "closed writable tab was not reaped")
+    click_tab(driver, a_tab)
+    assert state()["tabs"] == [a_tab]
+    assert write_from_current_tab(driver, owned / "tab-a-after-close.pid") == a_identity
+    wait_for(lambda: state()["writable"] and state()["draft"] == "", "surviving tab input still pending")
+    close_without_stale_presentation()
+    wait_for(lambda: birth(a_identity[0]) != a_identity[1], "surviving owned tab was not reaped")
+    assert not forbidden_a.exists() and not forbidden_b.exists(), "a writable tab replayed another draft"
     print(json.dumps({"native_webkitgtk": True, "owned_local_ptys": 2,
+                      "local_frames_delivered_by_tauri_channel": True,
+                      "local_channel_recovers_same_pty": True,
                       "distinct_canvas_colors_and_markers": True, "explicit_view_only_reattach": True,
+                      "direct_view_switch_from_live_roster": True,
+                      "writable_tabs_return_to_same_owned_shell": True,
+                      "writable_surviving_tab_after_close": True,
+                      "split_pane_focus_and_resize_isolated": True,
+                      "inactive_split_pane_streams_new_output": True,
+                      "native_history_find_pages_and_session_isolation": True,
+                      "native_history_reads_archived_pty_output": True,
+                      "native_v4_soft_wrap_wide_copy_and_double_underline": True,
+                      "native_v4_truecolor_and_indexed_underline": True,
+                      "native_v4_fragmented_combining_and_wide_cluster": True,
+                      "native_v4_late_variation_selector_growth_and_contraction": True,
+                      "single_row_canvas_update_and_reattach": True,
                       "parked_drafts_isolated": True, "closed_canvas_and_status_cleared": True,
                       "owned_direct_children_reaped": True}), flush=True)
+
+
+def prepare_hyperlink_handler(owned, env):
+    applications = Path(env["XDG_DATA_HOME"]) / "applications"
+    applications.mkdir(mode=0o700)
+    handler = owned / "record-hyperlink"
+    handler.write_text("#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$HOME/opened-hyperlinks\"\n")
+    handler.chmod(0o700)
+    name = "aether-hyperlink-fixture.desktop"
+    (applications / name).write_text(
+        f"[Desktop Entry]\nType=Application\nName=Aether hyperlink fixture\nExec={handler} %u\n"
+        "MimeType=x-scheme-handler/https;\nNoDisplay=true\n")
+    (Path(env["XDG_CONFIG_HOME"]) / "mimeapps.list").write_text(
+        f"[Default Applications]\nx-scheme-handler/https={name};\n")
+
+
+def exercise_hyperlinks(driver, owned):
+    target = "https://aether-hyperlink.test/visible-target"
+    opened = owned / "opened-hyperlinks"
+    driver.click("#open")
+    wait_for(lambda: driver.execute(READ)["transport"] == "channel", "hyperlink fixture shell did not attach")
+    driver.command("POST", "/window/rect", {"width": 1380, "height": 1000})
+    driver.click("#reveal-cursor")
+    point = driver.execute("""
+        const canvas = document.querySelector('main canvas');
+        const rect = canvas.getBoundingClientRect(), clip = canvas.parentElement.getBoundingClientRect();
+        const y = (Math.max(0, rect.top, clip.top) + Math.min(innerHeight, rect.bottom, clip.bottom)) / 2;
+        return {row:Math.floor((y - rect.top) * 24 / rect.height), col:10};
+    """)
+    assert 0 <= point["row"] < 24
+
+    def write_link(uri, marker):
+        driver.type("#input", (f"stty -echo; printf '\\033[2J\\033[{point['row']+1};{point['col']+1}H"
+                               f"\\033]8;;%s\\007{marker}\\033]8;;\\007' {shlex.quote(uri)}"))
+        driver.click("#send")
+        def painted():
+            driver.click("#copy-visible")
+            return marker in driver.execute(READ)["dump"]
+        wait_for(painted, "hyperlink fixture text did not paint")
+
+    def hover(pressed=False):
+        driver.click("#reveal-cursor")
+        geometry = driver.execute(f"""
+            const canvas = document.querySelector('main canvas'), rect = canvas.getBoundingClientRect();
+            const x = Math.floor(rect.left + ({point['col']} + 0.5) * rect.width / 80);
+            const y = Math.floor(rect.top + ({point['row']} + 0.5) * rect.height / 24);
+            return document.elementFromPoint(x,y) === canvas ? {{x,y}} : null;
+        """)
+        assert geometry, "hyperlink fixture cell is clipped"
+        move = {"type": "pointerMove", "origin": "viewport", "duration": 0, **geometry}
+        pointer = {"type": "pointer", "id": "aether-link-pointer", "parameters": {"pointerType": "mouse"},
+                   "actions": [move]}
+        actions = [pointer]
+        if pressed:
+            pointer["actions"] += [{"type": "pointerDown", "button": 0}, {"type": "pointerUp", "button": 0}]
+            actions.append({"type": "key", "id": "aether-link-keys", "actions": [
+                {"type": "keyDown", "value": "\ue009"}, {"type": "pause", "duration": 0},
+                {"type": "pause", "duration": 0}, {"type": "keyUp", "value": "\ue009"}]})
+        driver.command("POST", "/actions", {"actions": actions})
+        driver.command("DELETE", "/actions")
+
+    write_link(target, "VALID_LINK")
+    hover()
+    assert driver.execute("return document.querySelector('main canvas').title;") == f"Ctrl-click to open {target}"
+    assert not opened.exists(), "hover opened the URI without a click"
+    hover(pressed=True)
+    wait_for(lambda: opened.is_file() and opened.read_text().splitlines() == [target],
+             "explicit hyperlink did not reach the native default handler")
+    write_link("https://user@aether-hyperlink.test/rejected", "REFUSED_LINK")
+    hover()
+    assert driver.execute("return document.querySelector('main canvas').title;") == ""
+    hover(pressed=True)
+    assert opened.read_text().splitlines() == [target], "a rejected target reached the handler"
+    driver.click("#close")
+    wait_for(lambda: driver.execute(READ)["status"].startswith("Terminal closed"), "hyperlink shell did not close")
+    print(json.dumps({"native_v4_osc8_visible_and_opens_once": True,
+                      "native_v4_osc8_credentials_fail_closed": True}), flush=True)
+
+
+def exercise_restart(driver, owned, binary):
+    def state():
+        return driver.execute(READ)
+
+    driver.click("#open")
+    wait_for(lambda: state()["writable"] and len(state()["tabs"]) == 1, "restart fixture's first shell did not open")
+    first = state()["current_tab"]
+    first_before = write_from_current_tab(driver, owned / "before-restart-a.pid")
+    wait_for(lambda: state()["writable"] and state()["draft"] == "", "first restart fixture write is pending")
+    forbidden = owned / "restart-must-not-run"
+    driver.type("#input", f"printf replayed > {shlex.quote(str(forbidden))}")
+    driver.click("#new-local-tab")
+    wait_for(lambda: state()["writable"] and len(state()["tabs"]) == 2, "restart fixture's second shell did not open")
+    second_before = write_from_current_tab(driver, owned / "before-restart-b.pid")
+    wait_for(lambda: state()["writable"] and state()["draft"] == "", "second restart fixture write is pending")
+    driver.click("#split-local")
+    wait_for(lambda: state()["split"] == "right" and state()["peer_geometry"] == "80x24", "restart fixture split was not visible")
+    click_tab(driver, first)
+    assert "replayed" in state()["draft"]
+
+    driver.close()
+    for identity in (first_before, second_before):
+        wait_for(lambda: birth(identity[0]) != identity[1], "previous desktop survived shutdown with an owned shell")
+    driver.open(binary)
+    wait_for(lambda: opened_page(driver), "embedded page did not load after restarting Aether")
+    wait_for(lambda: state()["restore_layout"], "saved shell layout unavailable after restarting Aether")
+    assert not state()["writable"] and not state()["tabs"], "restart started a shell before the restore action"
+    driver.click("#restore-local-layout")
+    wait_for(lambda: state()["status"] == "Opened two fresh shells in the saved layout.", "layout restore did not finish")
+    restored = state()
+    first, second = restored["tabs"]
+    assert restored["writable"] and restored["current_tab"] == first, "saved active position was lost"
+    wait_for(lambda: state()["split"] == "left" and state()["peer_geometry"] == "80x24", "saved split layout was lost")
+    assert restored["draft"] == "" and not forbidden.exists(), "old command draft survived restart"
+    first_after = write_from_current_tab(driver, owned / "after-restart-a.pid")
+    wait_for(lambda: state()["writable"] and state()["draft"] == "", "first restored shell write is pending")
+    click_tab(driver, second)
+    assert state()["draft"] == ""
+    second_after = write_from_current_tab(driver, owned / "after-restart-b.pid")
+    assert len({first_before, second_before, first_after, second_after}) == 4, "restore reused an old shell identity"
+    wait_for(lambda: state()["writable"] and state()["draft"] == "", "second restored shell write is pending")
+    driver.click("#close")
+    wait_for(lambda: birth(second_after[0]) != second_after[1], "restored second shell was not reaped")
+    click_tab(driver, first)
+    driver.click("#close")
+    wait_for(lambda: birth(first_after[0]) != first_after[1], "restored first shell was not reaped")
+    assert not forbidden.exists()
+    print(json.dumps({"native_restart_restores_tab_count_and_active_position": True,
+                      "native_restart_restores_split_panes": True,
+                      "restore_starts_fresh_pty_identities_without_replay": True}), flush=True)
+
+
+def exercise_command_blocks(driver, owned, output_review=False):
+    def state():
+        return driver.execute(READ)
+
+    def visible(text):
+        def snapshot():
+            driver.click("#copy-visible")
+            return text in state()["dump"].splitlines()
+        return wait_for(snapshot, f"native live grid did not display {text!r}")
+
+    def send(command):
+        wait_for(lambda: state()["writable"], "integrated shell does not own input")
+        driver.type("#input", command)
+        driver.click("#send")
+        wait_for(lambda: state()["writable"] and state()["draft"] == "", "shell command input is still pending")
+
+    def blocks():
+        return driver.execute("""
+            return Array.from(document.querySelectorAll('#command-block-list details'), card => ({
+              command: card.querySelector('code').textContent,
+              body: card.textContent,
+              output: card.querySelector('textarea')?.value ?? null,
+              open: card.open,
+            }));
+        """)
+
+    def refresh_for(command):
+        def read():
+            if driver.execute("return document.querySelector('#command-block-refresh').disabled;"):
+                return None
+            if reported := next((item for item in blocks() if item["command"] == command), None):
+                return reported
+            driver.click("#command-block-refresh")
+            return None
+        return wait_for(read, f"native jsh did not report a completed block for {command!r}")
+
+    driver.click("#open-integrated")
+    wait_for(lambda: state()["writable"] and state()["transport"] == "channel", "integrated local shell did not open")
+    jsh_tab = state()["current_tab"]
+
+    def ready_prompt():
+        driver.click("#copy-visible")
+        return "❯" in state()["dump"]
+
+    wait_for(ready_prompt, "local jsh did not reach its native prompt")
+    receipt = owned / "jsh.pid"
+    command = f'printf "%s" "$$" > {shlex.quote(str(receipt))}; cd /tmp; printf "AETHER_%s\\n" BLOCK_ONE; false'
+    send(command)
+    wait_for(lambda: receipt.is_file() and receipt.stat().st_size, "jsh did not write its live PID")
+    identity = shell_identity(receipt)
+    visible("AETHER_BLOCK_ONE")
+    driver.click("#command-block-toggle")
+    first = refresh_for(command)
+    assert first["output"] == "AETHER_BLOCK_ONE\n" and "Exit 1" in first["body"], first
+    assert "PTY-reported OSC 133 · jsh-" in first["body"], first
+    driver.click("#command-block-list details summary")
+    driver.click("#command-block-list details button")
+
+    def copy_status():
+        return driver.execute("""
+            const status=document.querySelector('#command-block-status').textContent;
+            const output=document.querySelector('#command-block-list textarea');
+            if(status==='Output copied.')return 'clipboard';
+            if(status.startsWith('Output selected.')&&output.selectionStart===0&&output.selectionEnd===output.value.length){
+              return 'selection';
+            }
+            return null;
+        """)
+
+    if wait_for(copy_status, "native block output copy did not select only captured text") == "clipboard" and shutil.which("xclip"):
+        assert subprocess.check_output(["xclip", "-selection", "clipboard", "-o"], timeout=2) == first["output"].encode()
+    driver.click("#command-block-return")
+    assert state()["focused"] == "ime-input"
+    send("pwd")
+    visible("/tmp")
+    driver.click("#command-block-toggle")
+    pwd = refresh_for("pwd")
+    assert pwd["output"] == "/tmp\n" and "Exit 0" in pwd["body"], pwd
+    assert any(item["command"] == command and item["open"] for item in blocks()), "another block collapsed the previous card"
+    # Reinsert the original revision and append a shell operator before pressing
+    # Enter. That suffix only parses as part of the recalled, still-editable line.
+    driver.click("#command-block-list details[open] .command-block-recall")
+    wait_for(lambda: driver.execute("return document.querySelector('#command-block-status').textContent") ==
+             "Command inserted at the shell prompt.", "command was not inserted at the live prompt")
+    recalled = owned / "recalled-line"
+    driver.type("#ime-input", f"; printf recalled > {shlex.quote(str(recalled))}\ue007")
+    wait_for(lambda: recalled.is_file() and recalled.read_text() == "recalled", "recalled line was executed before explicit Enter")
+
+    # The actual live PTY receives hidden input while a command is running.
+    # The input is never included in that command's OSC metadata or output.
+    driver.click("#command-block-return")
+    secret_receipt = owned / "hidden-input"
+    secret_command = ("/bin/sh -c 'stty -echo; printf \"AETHER_%s\\n\" PRIVATE_READY; "
+                      "IFS= read -r input; stty echo; printf \"%s\" \"$input\" > "
+                      + str(secret_receipt) + "; printf \"AETHER_%s\\n\" PRIVATE_DONE'")
+    send(secret_command)
+    visible("AETHER_PRIVATE_READY")
+    driver.click("#command-block-toggle")
+    driver.click("#command-block-list details[open] .command-block-recall")
+    wait_for(lambda: "Wait for the integrated shell prompt" in driver.execute(
+        "return document.querySelector('#command-block-status').textContent"), "command recall reached foreground read")
+    driver.click("#command-block-return")
+    sentinel = "native-hidden-input"
+    driver.type("#ime-input", sentinel + "\ue007")
+    wait_for(lambda: secret_receipt.is_file() and secret_receipt.read_text() == sentinel,
+             "the live shell did not receive the hidden input")
+    driver.click("#command-block-toggle")
+    private = refresh_for(secret_command)
+    assert private["output"] == "AETHER_PRIVATE_READY\nAETHER_PRIVATE_DONE\n", private
+    assert sentinel not in private["body"]
+    print(json.dumps({"native_jsh_recall": ["editable line", "explicit Enter", "foreground input isolation"]}), flush=True)
+    driver.click("#command-block-return")
+
+    # Exercise live alternate-screen rendering and keyboard return in the same
+    # integrated PTY. The fullscreen screen contents do not become a block.
+    editor_file = owned / "vim-fixture.txt"
+    editor_file.write_text("AETHER_NATIVE_VIM\n")
+    editor = f"vim -Nu NONE -i NONE -n -X {shlex.quote(str(editor_file))}"
+    send(editor)
+    visible("AETHER_NATIVE_VIM")
+    driver.type("#ime-input", "\ue00c:q!\ue007")
+    driver.click("#command-block-toggle")
+    fullscreen = refresh_for(editor)
+    assert fullscreen["output"] is None and "screen operations" in fullscreen["body"], fullscreen
+    driver.click("#command-block-return")
+
+    driver.click("#new-local-tab")
+    wait_for(lambda: state()["current_tab"] != jsh_tab and state()["writable"], "plain peer tab did not open")
+    plain_tab = state()["current_tab"]
+    driver.click("#split-local")
+    driver.click("#command-block-toggle")
+    wait_for(lambda: "sessions opened with jsh" in driver.execute("""
+        return document.querySelector('#command-block-status').textContent;
+    """), "peer inherited the integrated tab's block state")
+    assert not blocks()
+    click_tab(driver, jsh_tab)
+    driver.click("#command-block-toggle")
+    assert refresh_for(command)["output"] == first["output"]
+    assert state()["split"] and birth(identity[0]) == identity[1], "block view changed the live PTY"
+    if output_review:
+        exercise_frozen_output_review(driver, owned, send, refresh_for, blocks, command)
+    driver.click("#close")
+    wait_for(lambda: birth(identity[0]) != identity[1], "closed integrated shell was not reaped")
+    click_tab(driver, plain_tab)
+    driver.click("#close")
+    wait_for(lambda: state()["status"].startswith("Terminal closed"), "plain peer did not close")
+    print(json.dumps({"native_jsh_markers_from_owned_pty": True,
+                      "native_command_block_plain_output_and_status": True,
+                      "native_block_return_preserves_pty_cwd_and_input": True,
+                      "native_blocks_exclude_hidden_input_and_vim_screen": True,
+                      "native_blocks_isolated_between_split_tabs": True}), flush=True)
+
+
+def exercise_frozen_output_review(driver, owned, send, refresh_for, blocks, before):
+    def option(select, command):
+        return driver.execute(f"""
+            const id=Array.from(document.querySelectorAll('#command-block-list details'))
+                .find(card=>card.querySelector('code').textContent==={json.dumps(command)})?.dataset.sequence;
+            return Array.from(document.querySelectorAll('#command-review-{select} option'))
+                .find(option=>option.textContent.startsWith('#'+id+' · '))?.value ?? null;
+        """)
+
+    before_revision = option("before", before)
+    after_revision = option("after", "pwd")
+    assert re.fullmatch(r"[0-9a-f]{64}", before_revision or "")
+    assert re.fullmatch(r"[0-9a-f]{64}", after_revision or "")
+    driver.click(f'#command-review-before option[value="{before_revision}"]')
+    driver.click(f'#command-review-after option[value="{after_revision}"]')
+    driver.click("#command-review-compare")
+
+    def current():
+        return driver.execute("""
+            const view=document.querySelector('#command-review');
+            return !view.hidden && {id:view.dataset.reviewId,
+                diff:view.querySelector('pre').textContent};
+        """)
+
+    frozen = wait_for(current, "frozen output comparison did not render")
+    assert "-AETHER_BLOCK_ONE\n+/tmp\n" in frozen["diff"], frozen
+    for index in range(8):
+        replacement = f"printf 'REVIEW_REPLACEMENT_{index}\\n'"
+        send(replacement)
+        refresh_for(replacement)
+    assert not any(record["command"] in (before, "pwd") for record in blocks()), "old records were not evicted"
+    assert current() == frozen, "live updates changed the frozen comparison"
+
+    for extension, button in (("md", "markdown"), ("json", "json")):
+        driver.click("#command-review-" + button)
+        name = f"aether-output-{frozen['id']}.{extension}"
+
+        def downloaded():
+            return next((path for path in (owned / name, owned / "Downloads" / name)
+                         if path.is_file() and path.stat().st_size), None)
+
+        evidence = wait_for(downloaded, f"native WebKit did not save {name}")
+        content = evidence.read_text()
+        if extension == "json":
+            exported = json.loads(content)
+            assert exported["schema"] == "aether.command-output-review.v1"
+            assert exported["review"]["reviewId"] == frozen["id"]
+            assert exported["review"]["comparison"] == frozen["diff"]
+            assert exported["before"]["revision"] == before_revision
+            assert exported["after"]["revision"] == after_revision
+            assert exported["before"]["output"] == {"kind": "text", "text": "AETHER_BLOCK_ONE\n"}
+            assert exported["after"]["output"] == {"kind": "text", "text": "/tmp\n"}
+        else:
+            assert content.startswith("# Frozen command output review\n")
+            assert before_revision in content and after_revision in content
+            assert frozen["diff"] in content
+        assert "REVIEW_REPLACEMENT" not in content
+    print(json.dumps({"native_output_review_exact_owned_records": True,
+                      "native_output_review_stays_frozen_after_retention_eviction": True,
+                      "native_output_review_downloads_markdown_and_json": True}), flush=True)
 
 
 def stop_driver(child):
@@ -260,12 +839,1342 @@ def stop_driver(child):
         child.wait(timeout=4)
 
 
+WORKSPACE_ID = "11111111-1111-4111-8111-111111111111"
+
+
+def prepare_workspace(owned, env, launch):
+    profile = owned / "profile with spaces"
+    project = owned / "cli-project"
+    project.mkdir()
+    transcripts = {}
+    for account, title in [(profile, "Selected Workspace fixture"), (owned / ".codex", "Other Workspace fixture")]:
+        source = account / "sessions" / "2026" / "11" / "22" / "rollout.jsonl"
+        source.parent.mkdir(parents=True)
+        records = [
+            {"type": "session_meta", "payload": {"id": WORKSPACE_ID, "cwd": str(project)}},
+            {"type": "event_msg", "payload": {"type": "user_message", "message": title}},
+            {"type": "event_msg", "payload": {"type": "task_complete"}},
+        ]
+        source.write_text("".join(json.dumps(record) + "\n" for record in records))
+        transcripts[str(account)] = source
+    executable = launch / "codex"
+    executable.write_text("""#!/bin/sh
+set -eu
+test "$1" = resume
+printf '%s|%s|%s|%s\\n' "$$" "$CODEX_HOME" "$PWD" "$2" >> "$AETHER_WORKSPACE_TRACE"
+printf 'WORKSPACE_READY\\n'
+while IFS= read -r line; do
+    printf '%s\\n' "$line" >> "$AETHER_WORKSPACE_INPUT"
+    if [ "$line" = exit-fixture ]; then exit 7; fi
+    printf 'WORKSPACE_REPLY:%s\\n' "$line"
+done
+""")
+    executable.chmod(0o700)
+    env.update({
+        "CODEX_HOME": str(profile),
+        "JTERM_WORKSPACE_STATE_DIR": str(owned / "workspace"),
+        "AETHER_WORKSPACE_TRACE": str(owned / "provider-starts"),
+        "AETHER_WORKSPACE_INPUT": str(owned / "provider-input"),
+    })
+    return transcripts
+
+
+def exercise_workspace(driver, owned, binary, env, transcripts):
+    state = Path(env["JTERM_WORKSPACE_STATE_DIR"])
+    socket_file = state / "run" / "host.sock"
+    log = owned / "workspace-host.log"
+    with log.open("wb") as output:
+        host = subprocess.Popen([binary, "--jterm-session-host"], env=env, cwd=owned,
+                                stdin=subprocess.DEVNULL, stdout=output, stderr=output,
+                                start_new_session=True)
+    helper = None
+    master = None
+    identity = None
+    trace = Path(env["AETHER_WORKSPACE_TRACE"])
+    received = Path(env["AETHER_WORKSPACE_INPUT"])
+    profile = env["CODEX_HOME"]
+
+    def read_state():
+        return driver.execute("""
+            return {
+              status: document.querySelector('#workspace-status').textContent,
+              writable: !document.querySelector('#workspace-input').disabled,
+              choices: Array.from(document.querySelector('#workspace-conversation').options, option =>
+                ({id:option.value,title:option.textContent})),
+              selected: document.querySelector('#workspace-conversation').value,
+              visible: !document.querySelector('#workspace-view').hidden,
+              output: document.querySelector('#workspace-output').value,
+            };
+        """)
+
+    def select_fixture():
+        driver.click("#agent-workspace > summary")
+        wait_for(lambda: len(read_state()["choices"]) == 2, "native Workspace catalog did not show both sources")
+        choices = read_state()["choices"]
+        assert len({choice["id"] for choice in choices}) == 2, "both profiles collapsed into one native UUID"
+        choice = next((index, row) for index, row in enumerate(choices, 1) if row["title"] == "Selected Workspace fixture")
+        driver.click(f"#workspace-conversation option:nth-child({choice[0]})")
+        assert read_state()["selected"] == choice[1]["id"]
+        return choice[1]["id"]
+
+    def shows(text):
+        def snapshot():
+            if not read_state()["visible"]:
+                return False
+            driver.click("#workspace-copy-visible")
+            return text in read_state()["output"].splitlines()
+        wait_for(snapshot, f"Workspace Canvas did not show {text!r}")
+
+    try:
+        wait_for(lambda: socket_file.is_socket(), "the embedded Workspace host did not bind")
+        conversation = select_fixture()
+        assert json.loads(conversation.removeprefix("jterm:cli:v1:"))[2:] == [profile, WORKSPACE_ID]
+        database = state / "workspace.sqlite3"
+        with contextlib.closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as db:
+            assert db.execute("SELECT version FROM schema_version").fetchone()[0] == 6
+            row = json.loads(db.execute("SELECT row_json FROM conversations WHERE id=?", (conversation,)).fetchone()[0])
+        descriptor = {
+            "row": row, "native_id": WORKSPACE_ID, "provider": "codex", "provider_home": profile,
+            "source": str(transcripts[profile]), "cwd": row["cwd"], "cols": 80, "rows": 24,
+        }
+        master, slave = pty.openpty()
+        try:
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+            os.set_blocking(master, False)
+            helper = subprocess.Popen([binary, "--jterm-session-attach", json.dumps(descriptor)],
+                                      cwd=owned, env=env, stdin=slave, stdout=slave, stderr=slave,
+                                      start_new_session=True)
+        finally:
+            os.close(slave)
+        helper_output = bytearray()
+
+        def helper_saw(text):
+            try:
+                helper_output.extend(os.read(master, 65536))
+            except BlockingIOError:
+                pass
+            except OSError as error:
+                if error.errno != errno.EIO:
+                    raise
+            assert len(helper_output) < 1024 * 1024
+            return text in helper_output
+
+        wait_for(lambda: helper_saw(b"WORKSPACE_READY"), "the existing embedded terminal did not attach")
+        starts = trace.read_text().splitlines()
+        assert len(starts) == 1
+        pid, home, cwd, native_id = starts[0].split("|")
+        identity = int(pid), birth(int(pid))
+        assert identity[1] and (home, cwd, native_id) == (profile, row["cwd"], WORKSPACE_ID)
+        os.write(master, b"from-existing-terminal\n")
+        wait_for(lambda: helper_saw(b"WORKSPACE_REPLY:from-existing-terminal"), "existing lease did not deliver input")
+
+        driver.click("#workspace-attach")
+        wait_for(lambda: "attached to another terminal" in read_state()["status"], "Workspace host failed to reject a competing lease")
+        assert not read_state()["writable"] and not read_state()["visible"]
+        os.write(master, b"\x1d")
+        assert helper.wait(timeout=5) == 0
+        assert birth(identity[0]) == identity[1]
+
+        driver.click("#workspace-attach")
+        wait_for(lambda: read_state()["writable"], "native Workspace view did not adopt the host lease")
+        shows("WORKSPACE_REPLY:from-existing-terminal")
+        driver.type("#workspace-input", "from-aether" + "\ue007")
+        shows("WORKSPACE_REPLY:from-aether")
+        driver.click("#workspace-detach")
+        wait_for(lambda: "Terminal detached" in read_state()["status"], "native Workspace view did not release its lease")
+        assert birth(identity[0]) == identity[1]
+
+        driver.click("#workspace-attach")
+        wait_for(lambda: read_state()["writable"], "detached Workspace did not reattach")
+        shows("WORKSPACE_REPLY:from-aether")
+        driver.close()
+        assert birth(identity[0]) == identity[1], "closing the attached app stopped the Workspace provider"
+        driver.open(binary)
+        wait_for(lambda: opened_page(driver), "embedded application did not reopen")
+        assert select_fixture() == conversation
+        driver.click("#workspace-attach")
+        wait_for(lambda: read_state()["writable"], "reopened app did not recover the same Workspace terminal")
+        shows("WORKSPACE_REPLY:from-aether")
+        driver.type("#workspace-input", "exit-fixture" + "\ue007")
+        wait_for(lambda: "exited with status 7" in read_state()["status"], "native Workspace exit receipt missing")
+        assert not read_state()["writable"]
+        assert received.read_text().splitlines() == ["from-existing-terminal", "from-aether", "exit-fixture"]
+        assert trace.read_text().splitlines() == starts
+        print(json.dumps({
+            "native_workspace_shared_schema_6_catalog": True,
+            "native_workspace_duplicate_uuid_preserves_source": True,
+            "native_workspace_conflicting_cli_lease_refused": True,
+            "native_workspace_reopens_existing_provider_pty": True,
+            "native_workspace_provider_input_and_exit_once": True,
+        }), flush=True)
+    except Exception:
+        print("Workspace fixture:", log.read_text()[-4000:], read_state())
+        raise
+    finally:
+        if helper is not None and helper.poll() is None:
+            stop_driver(helper)
+        if master is not None:
+            os.close(master)
+        if identity and birth(identity[0]) == identity[1]:
+            args = Path(f"/proc/{identity[0]}/cmdline")
+            if args.is_file() and os.fsencode(owned / "bin" / "codex") in args.read_bytes():
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(identity[0], signal.SIGTERM)
+        stop_driver(host)
+
+
 def interrupted(_signum, _frame):
     # Let the outer timeout take the same cleanup path as an ordinary failure.
     raise TimeoutError("native WebKit smoke interrupted")
 
 
-def run(binary):
+def workspace_command(socket_file, kind, values):
+    request = {"Command": {"version": 2, "command": kind if values is None else {kind: values}}}
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
+        stream.settimeout(5)
+        stream.connect(str(socket_file))
+        stream.sendall(json.dumps(request).encode() + b"\n")
+        with stream.makefile("rb") as reader:
+            return json.loads(reader.readline(12 * 1024 * 1024 + 1))["Reply"]
+
+
+@contextlib.contextmanager
+def api_provider(env):
+    requests = []
+    gate = threading.Event()
+    cancel_gate = threading.Event()
+    first = b'{"message":{"role":"assistant","content":"First streamed segment. "},"done":false}\n'
+    last = b'{"message":{"role":"assistant","content":"Final durable segment."},"done":true}\n'
+
+    class Provider(BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_POST(self):
+            length = int(self.headers["Content-Length"])
+            if self.path != "/api/chat" or not 0 < length <= 1024 * 1024:
+                self.send_error(400)
+                return
+            requests.append(json.loads(self.rfile.read(length)))
+            release = gate if len(requests) == 1 else cancel_gate
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Content-Length", str(len(first) + len(last)))
+            self.end_headers()
+            try:
+                self.wfile.write(first)
+                self.wfile.flush()
+                if release.wait(timeout=55):
+                    self.wfile.write(last)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    env.update({
+        "AETHER_AI_PROVIDER": "ollama",
+        "AETHER_AI_BASE_URL": f"http://127.0.0.1:{server.server_port}",
+        "AETHER_AI_MODEL": "isolated-aether-fixture",
+        "AETHER_AI_MAX_TOKENS": "64",
+    })
+    try:
+        yield requests, gate, cancel_gate
+    finally:
+        gate.set()
+        cancel_gate.set()
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=3)
+
+
+def exercise_api_chat(driver, owned, binary, env, fixture):
+    requests, gate, cancel_gate = fixture
+    state = Path(env["JTERM_WORKSPACE_STATE_DIR"])
+    with (owned / "api-host.log").open("wb") as output:
+        host = subprocess.Popen([binary, "--jterm-session-host"], cwd=owned, env=env,
+                                stdin=subprocess.DEVNULL, stdout=output, stderr=output,
+                                start_new_session=True)
+    socket_file = state / "run" / "host.sock"
+
+    def command(kind, values):
+        return workspace_command(socket_file, kind, values)
+
+    def read():
+        return driver.execute("""
+            return {
+              status: document.querySelector('#chat-status').textContent,
+              job: document.querySelector('#chat-job-status').textContent,
+              draft: document.querySelector('#chat-draft').value,
+              preview: document.querySelector('#chat-preview').textContent,
+              history: Array.from(document.querySelectorAll('#chat-history pre'), el=>el.textContent),
+              options: Array.from(document.querySelector('#chat-select').options, el=>el.value),
+              canOpen: !document.querySelector('#chat-open').disabled,
+              view: !document.querySelector('#chat-view').hidden,
+              canCancel: !document.querySelector('#chat-cancel').disabled,
+              canSend: !document.querySelector('#chat-send').disabled,
+            };
+        """)
+
+    def show_chat():
+        for selector in ["#agent-workspace", "#workspace-api"]:
+            if not driver.execute(f"return document.querySelector('{selector}').open;"):
+                driver.click(f"{selector} > summary")
+        wait_for(lambda: driver.execute("return !document.querySelector('#chat-new').disabled;"),
+                 "API conversation controls did not load")
+
+    def reopen():
+        driver.click("#chat-refresh")
+        def ready_to_open():
+            chat = read()
+            return chat["canOpen"] and conversation in chat["options"]
+
+        wait_for(ready_to_open, "the shared API conversation was lost")
+        driver.click("#chat-open")
+        wait_for(lambda: read()["view"], "the shared API conversation did not reopen")
+
+    first_draft = "first native request\nspanning two lines"
+    newer_draft = "newer saved draft\nsurvives background completion"
+    try:
+        def host_ready():
+            if host.poll() is not None:
+                raise RuntimeError("the isolated API Workspace host exited")
+            try:
+                return "Ok" in command("CatalogPage", {"before": None, "limit": 1})
+            except (OSError, KeyError, ValueError):
+                return False
+
+        wait_for(host_ready, "the API Workspace host did not bind")
+        show_chat()
+        driver.click("#chat-new")
+        wait_for(lambda: read()["view"], "the shared API conversation was not created")
+        page = command("CatalogPage", {"before": None, "limit": 32})["Ok"]["CatalogPage"]
+        conversation = next(row["id"] for row in page["rows"] if row["kind"] == "Api")
+        driver.type("#chat-draft", first_draft.replace("\n", "\ue007"))
+        assert read()["draft"] == first_draft, repr(read()["draft"])
+        driver.click("#chat-save")
+        wait_for(lambda: read()["status"] == "Draft saved.", "initial draft was not committed")
+        initial = command("LoadChat", {"id": conversation})["Ok"]["Chat"]["chat"]
+        driver.click("#chat-send")
+        wait_for(lambda: "First streamed segment." in read()["preview"], "initial API preview did not stream")
+        assert len(requests) == 1 and requests[0]["stream"] is True and read()["canCancel"]
+        assert requests[0]["messages"][-1]["content"] == first_draft, requests[0]["messages"]
+        assert read()["draft"] == "" and not read()["canSend"]
+        assert "another live view" in command("AttachApi", {
+            "id": conversation, "epoch": initial["epoch"] + 1, "view": "competing-native-fixture",
+        })["Err"].lower()
+
+        driver.type("#chat-draft", newer_draft.replace("\n", "\ue007"))
+        assert read()["draft"] == newer_draft, repr(read()["draft"])
+        driver.click("#chat-save")
+        wait_for(lambda: read()["status"] == "Draft saved.", "newer draft was not committed")
+        active = command("LoadChat", {"id": conversation})["Ok"]["Chat"]["chat"]
+        assert active["draft_revision"] > initial["draft_revision"]
+        assert "revision conflict" in command("SetDraft", {
+            "id": conversation, "expected_revision": initial["draft_revision"], "text": "STALE",
+        })["Err"]
+        assert "already has a request in flight" in command("BeginSubmission", {
+            "id": conversation, "expected_revision": active["revision"],
+            "draft_revision": active["draft_revision"], "text": newer_draft,
+        })["Err"]
+        assert len(requests) == 1 and not read()["canSend"]
+
+        driver.click("#chat-detach")
+        wait_for(lambda: not read()["view"] and read()["status"] == "Conversation detached.",
+                 "API view detach was not acknowledged")
+        reopen()
+        wait_for(lambda: "First streamed segment." in read()["preview"] and read()["canCancel"],
+                 "detached API execution did not reattach")
+        assert read()["draft"] == newer_draft
+        driver.close()
+        driver.open(binary)
+        wait_for(lambda: opened_page(driver), "Aether did not reopen during API streaming")
+        show_chat()
+        reopen()
+        wait_for(lambda: "First streamed segment." in read()["preview"] and read()["canCancel"],
+                 "reopened native API view did not recover the same stream")
+        assert read()["draft"] == newer_draft and len(requests) == 1
+        gate.set()
+        answer = "First streamed segment. Final durable segment."
+        wait_for(lambda: read()["history"] == [first_draft, answer], "completed API turn was not loaded from SQLite")
+        assert read()["draft"] == newer_draft and len(requests) == 1 and not read()["canCancel"]
+        driver.click("#chat-detach")
+        wait_for(lambda: not read()["view"], "completed API conversation did not detach")
+        reopen()
+        assert read()["history"] == [first_draft, answer] and read()["draft"] == newer_draft
+        driver.click("#chat-send")
+        wait_for(lambda: len(requests) == 2 and "First streamed segment." in read()["preview"],
+                 "second explicit submission did not reach the host")
+        assert requests[1]["messages"][-1]["content"] == newer_draft and read()["canCancel"]
+        driver.click("#chat-cancel")
+        wait_for(lambda: read()["job"] == "Request cancelled." and read()["draft"] == newer_draft,
+                 "cancelled API request did not restore its draft after cleanup")
+        assert read()["history"] == [first_draft, answer] and len(requests) == 2
+        print(json.dumps({
+            "native_workspace_api_shared_draft_and_durable_history": True,
+            "native_workspace_api_preview_survives_app_close": True,
+            "native_workspace_api_single_submission_and_control_conflict": True,
+            "native_workspace_api_newer_draft_survives_completion": True,
+            "native_workspace_api_explicit_cancel_restores_draft": True,
+        }), flush=True)
+    except Exception:
+        print("API fixture:", (owned / "api-host.log").read_text()[-4000:], read())
+        raise
+    finally:
+        gate.set()
+        cancel_gate.set()
+        stop_driver(host)
+
+
+def prepare_native_task(owned, env, launch):
+    profile = Path(env.setdefault("CODEX_HOME", str(owned / "native-profile")))
+    profile.mkdir(mode=0o700, exist_ok=True)
+    profile.chmod(0o700)
+    auth = profile / "auth.json"
+    auth.write_text(json.dumps({
+        "auth_mode": "chatgpt",
+        "tokens": {"access_token": "native-fixture-placeholder", "account_id": "isolated-fixture"},
+    }))
+    auth.chmod(0o600)
+    executable = launch / "codex"
+    if executable.exists():
+        executable.rename(launch / "codex-cli-fixture")
+    fixture = launch / "native-codex-fixture.py"
+    shutil.copyfile(Path(__file__).with_name("native-codex-fixture.py"), fixture)
+    executable.write_text("""#!/usr/bin/env node
+const {spawnSync}=require('node:child_process');
+const {join}=require('node:path');
+const child=spawnSync('/usr/bin/python3',[join(__dirname,'native-codex-fixture.py'),...process.argv.slice(2)],{stdio:'inherit'});
+process.exit(child.status ?? 1);
+""")
+    executable.chmod(0o700)
+    repository = owned / "native-task-repository"
+    repository.mkdir()
+    git_env = {"HOME": str(owned), "PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8", "GIT_CONFIG_NOSYSTEM": "1"}
+
+    def git(*args):
+        return subprocess.check_output(["/usr/bin/git", *args], cwd=repository, env=git_env, timeout=10, text=True)
+
+    git("init", "--quiet")
+    (repository / "tracked.txt").write_text("original native fixture baseline\n")
+    git("add", "tracked.txt")
+    git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "-m", "fixture")
+    env.setdefault("JTERM_WORKSPACE_STATE_DIR", str(owned / "workspace"))
+    return repository, git("rev-parse", "HEAD").strip()
+
+
+def exercise_native_tools(driver, command, task, snapshot, starts_file):
+    marker = "AETHER_VERIFICATION_PASSED"
+    validation = "validation:" + snapshot["validation"]["run_id"]
+    assert re.fullmatch(r"validation:validation-[0-9a-f-]+", validation)
+    # Later indexed imports give the real validation record an older page and
+    # a replaceable hit for the revision fence. They are separate evidence.
+    imported = [{
+        "conversation": task,
+        "event_id": f"external:aether-tools-{index}",
+        "revision": "r1",
+        "source": "ImportedHistory",
+        "message_sequence": None,
+        "text": f"Imported reader fixture {index}, search term {marker}",
+        "truncated": False,
+    } for index in range(32)]
+    assert command("IndexText", {"documents": imported}) == {"Ok": "Ack"}
+    starts = starts_file.read_text().splitlines()
+
+    def view():
+        return driver.execute("""
+            const record = document.querySelector('#tools-document-identity');
+            return {
+              status: document.querySelector('#tools-status').textContent,
+              hits: Array.from(document.querySelectorAll('#tools-results button'), button=>button.dataset.eventId),
+              older: !document.querySelector('#tools-more').disabled,
+              scope: !document.querySelector('#tools-scope').disabled,
+              opened: !document.querySelector('#tools-document').hidden,
+              text: document.querySelector('#tools-document-text').textContent,
+              source: document.querySelector('#tools-document-source').textContent,
+              anchor: [record.dataset.conversation, record.dataset.eventId, record.dataset.revision],
+            };
+        """)
+
+    driver.click("#workspace-tools > summary")
+    wait_for(lambda: view()["scope"], "Tools did not recognize the current native task")
+    driver.click("#tools-scope")
+    driver.type("#tools-query", marker)
+    driver.click("#tools-submit")
+    wait_for(lambda: (page := view())["older"] and len(page["hits"]) == 30, "Tools did not open the bounded evidence index")
+    assert validation not in view()["hits"]
+    changed = {**imported[-1], "revision": "r2", "text": f"Updated imported record, search term {marker}"}
+    assert command("IndexText", {"documents": [changed]}) == {"Ok": "Ack"}
+    driver.click('#tools-results button[data-event-id="external:aether-tools-31"]')
+    wait_for(lambda: "Search again" in view()["status"], "Tools opened a replaced evidence revision")
+    assert not view()["opened"]
+
+    driver.click("#tools-more")
+    wait_for(lambda: validation in view()["hits"], "Tools did not page to the real native validation")
+    driver.click(f'#tools-results button[data-event-id="{validation}"]')
+    wait_for(lambda: (record := view())["opened"] and marker in record["text"], "actual validation evidence was not opened")
+    displayed = view()
+    conversation, event_id, revision = displayed["anchor"]
+    assert conversation == task and event_id == validation and revision
+    exact = command("ReadSearchDocument", {
+        "conversation": conversation, "event_id": event_id, "revision": revision,
+    })["Ok"]["SearchDocument"]["document"]
+    assert displayed["source"] == "Validation evidence" and exact["source"] == "Validation"
+    assert displayed["text"] == exact["text"] and "Status: Passed" in displayed["text"]
+    driver.clear("#tools-query")
+    wait_for(lambda: not view()["opened"] and not view()["hits"], "editing the query did not retire old evidence")
+    assert starts_file.read_text().splitlines() == starts
+
+
+def exercise_native_mission(driver, owned, command, reopen_task, task, snapshot, starts_file):
+    def view():
+        return driver.execute("""
+            return {
+              status: document.querySelector('#mission-status').textContent,
+              plan: document.querySelector('#mission-repositories').textContent,
+              goal: document.querySelector('#mission-edit-goal').value,
+              evidence: document.querySelector('#mission-evidence').textContent,
+              phase: document.querySelector('#mission-evidence-state').textContent,
+              stale: Boolean(document.querySelector('#mission-evidence [data-check="stale"]')),
+              open: !document.querySelector('#mission-open').disabled,
+              create: !document.querySelector('#mission-new').disabled,
+              freeze: !document.querySelector('#mission-freeze').disabled,
+              expanded: document.querySelector('#workspace-mission').open,
+            };
+        """)
+
+    def read():
+        return command("ReadMission", {"id": mission_id})["Ok"]["Mission"]
+
+    def show_missions():
+        def expand():
+            if not view()["expanded"]:
+                driver.click("#workspace-mission > summary")
+            return view()["expanded"]
+
+        wait_for(expand, "Missions summary did not expand")
+        try:
+            wait_for(lambda: (current := view())["create"] and current["status"] in (
+                "Mission catalog refreshed.", "No saved Missions."
+            ), "Missions did not recognize the selected native task")
+        except AssertionError:
+            print("Missions fixture:", view(), flush=True)
+            raise
+
+    show_missions()
+    title = "Deliver the isolated fixture"
+    goal = "Observe the exact worktree and its current verification receipt."
+    name = "example/aether-native-mission-fixture"
+    driver.type("#mission-title", title)
+    driver.type("#mission-goal", goal)
+    driver.type("#mission-repository", name)
+    driver.clear("#mission-target")
+    # The host's strict remote ref admission keeps this proof offline while
+    # still doing real local Git and task validation inspection.
+    driver.type("#mission-target", "refs/heads/-offline-fixture")
+    driver.click("#mission-new")
+    wait_for(lambda: "Mission saved · revision 1" in view()["status"], "the Mission plan was not saved")
+    saved, = command("MissionList", None)["Ok"]["Missions"]["missions"]
+    mission_id = saved["id"]
+    repository, = saved["repositories"]
+    assert repository["path"] == snapshot["task"]["worktree_path"]
+    assert repository["baseline"] == snapshot["task"]["base_commit"]
+    link, = repository["tasks"]
+    assert link["conversation"] == task and link["task_id"] == snapshot["task"]["id"]
+    assert link["run_id"] == snapshot["incarnation"] and link["source_sequence"] >= snapshot["sequence"]
+    assert snapshot["incarnation"] in view()["plan"]
+    assert read()["report"] is None
+
+    replacement = "Changed shared acceptance goal."
+    changed = {**saved, "goal": replacement}
+    external = command("SaveMission", {"expected_revision": 1, "mission": changed})
+    assert external["Ok"]["Mission"]["mission"]["revision"] == 2
+    driver.type("#mission-edit-goal", " Keep this attempted edit.")
+    driver.click("#mission-save")
+    wait_for(lambda: any(detail in view()["status"] for detail in ("changed in another", "Saved revision reloaded")),
+             "another view's Mission save was overwritten")
+    assert view()["goal"].endswith("Keep this attempted edit.") and read()["mission"]["goal"] == replacement
+    driver.click("#mission-open")
+    wait_for(lambda: view()["goal"] == replacement and "revision 2" in view()["status"],
+             "reopening the Mission did not load the shared acceptance goal")
+
+    driver.click("#mission-inspect")
+    wait_for(lambda: "Current inspection" in view()["phase"] and view()["stale"],
+             "host did not inspect actual local worktree and stale validation evidence")
+    assert "uncommitted changes" in view()["evidence"] and not view()["freeze"]
+    historical = read()["report"]["repositories"][0]
+    assert historical["observed"]["head"] == repository["baseline"] and historical["observed"]["dirty"]
+
+    worktree = Path(repository["path"])
+    git_env = {"HOME": str(owned), "PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8", "GIT_CONFIG_NOSYSTEM": "1"}
+
+    def git(*args):
+        return subprocess.check_output(["/usr/bin/git", *args], cwd=worktree, env=git_env, timeout=10, text=True)
+
+    git("add", "--", "tracked.txt")
+    git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "-m", "Mission candidate")
+    candidate = git("rev-parse", "HEAD").strip()
+    assert candidate != repository["baseline"]
+    driver.click("#mission-inspect")
+    wait_for(lambda: view()["freeze"] and candidate in view()["evidence"],
+             "the host did not observe the committed fixture candidate")
+    driver.click("#mission-freeze")
+    wait_for(lambda: "Candidates frozen · revision 3" in view()["status"], "the observed candidate was not frozen")
+    assert read()["mission"]["repositories"][0]["candidate"] == candidate
+    driver.click("#mission-inspect")
+    wait_for(lambda: "Current inspection" in view()["phase"] and "Commit verified" in view()["evidence"],
+             "Mission candidate commit was not independently verified")
+    assert view()["stale"] and "Push unverified" in view()["evidence"]
+    assert len(starts_file.read_text().splitlines()) == 1
+
+    reopen_task(task)
+    show_missions()
+    wait_for(lambda: view()["open"], "the saved Mission was absent after restart")
+    driver.click("#mission-open")
+    wait_for(lambda: "Saved observation" in view()["phase"], "Mission evidence did not reopen as historical")
+    assert not view()["freeze"] and "Commit pending" in view()["evidence"] and candidate in view()["plan"]
+    assert len(starts_file.read_text().splitlines()) == 1
+
+
+def exercise_native_context(driver, owned, command, reopen_task, task, starts_file, repository):
+    def view():
+        return driver.execute("""
+            return {
+              contextStatus: document.querySelector('#native-context-status').textContent,
+              taskStatus: document.querySelector('#native-status').textContent,
+              goal: document.querySelector('#native-context-goal').value,
+              completed: document.querySelector('#native-context-completed').value,
+              remaining: document.querySelector('#native-context-remaining').value,
+              constraints: document.querySelector('#native-context-constraints').value,
+              materials: document.querySelector('#native-context-materials').textContent,
+              canEdit: !document.querySelector('#native-context-goal').disabled,
+              canUse: !document.querySelector('#native-context-use').disabled,
+              packet: document.querySelector('#native-context-body').textContent,
+              draft: document.querySelector('#native-goal').value,
+              repository: document.querySelector('#native-repository').value,
+              consent: document.querySelector('#native-consent').checked,
+              canStart: !document.querySelector('#native-start').disabled,
+              hasApproval: Boolean(document.querySelector('#native-approvals button:not(:disabled)')),
+              canInspect: !document.querySelector('#native-inspect').disabled,
+            };
+        """)
+
+    def shared_context():
+        return command("ReadContext", {"id": task})["Ok"]["Context"]["context"]
+
+    def edit_shared(**fields):
+        context = shared_context()
+        context.update(fields)
+        return command("SaveContext", {
+            "id": task, "expected_revision": context["revision"], "context": context,
+        })["Ok"]["Context"]["context"]
+
+    def show_context():
+        driver.click("#native-context > summary")
+        wait_for(lambda: view()["canEdit"], "the selected native task context did not load")
+
+    show_context()
+    context_goal = "Review the fixture approval and pass the reviewed findings to a follow-up."
+    local_fixture_secret = "sk-artificialAetherContextPacketFixture000000001"
+    driver.type("#native-context-goal", context_goal)
+    driver.type("#native-context-completed", "Finished the original verification.")
+    driver.type("#native-context-remaining", "Check the final scope.")
+    driver.type("#native-context-constraints", "Keep the current repository.")
+    driver.type("#native-context-note", f"Reviewed evidence with synthetic key {local_fixture_secret}")
+    driver.click("#native-context-save")
+    wait_for(lambda: "saved at revision 1" in view()["contextStatus"], "authored context was not saved")
+    original = shared_context()
+    assert original["goal"] == context_goal and original["revision"] == 1
+    assert original["materials"][0]["kind"] == "Note"
+    assert local_fixture_secret not in view()["materials"] and "[REDACTED:openai-key]" in view()["materials"]
+    assert local_fixture_secret not in original["materials"][0]["text"]
+
+    reopen_task(task)
+    wait_for(lambda: view()["canInspect"], "source native task did not reopen for context")
+    show_context()
+    assert view()["goal"] == context_goal and view()["completed"] == original["completed"]
+    assert edit_shared(constraints="New constraint from a second client.")["revision"] == 2
+    driver.type("#native-context-remaining", " Keep this local unsaved edit.")
+    driver.click("#native-context-save")
+    wait_for(lambda: "Shared context changed" in view()["contextStatus"], "stale desktop context write was accepted")
+    assert view()["remaining"].endswith("Keep this local unsaved edit.")
+    assert shared_context()["remaining"] == original["remaining"]
+    driver.click("#native-context-reload")
+    wait_for(lambda: view()["constraints"] == "New constraint from a second client.",
+             "explicit reload did not read the second client's saved context")
+    driver.click("#native-context-preview")
+    wait_for(lambda: view()["canUse"], "the host did not build a reviewed Codex handoff")
+    assert context_goal in view()["packet"] and "Source materials revision: 2" in view()["packet"]
+    assert edit_shared(remaining="Latest remaining work from the shared host.")["revision"] == 3
+    driver.click("#native-context-use")
+    wait_for(lambda: "Materials changed" in view()["contextStatus"], "changed packet opened a stale task draft")
+    assert view()["draft"] == "" and view()["canInspect"]
+    assert len(starts_file.read_text().splitlines()) == 1
+
+    driver.click("#native-context-reload")
+    wait_for(lambda: "revision 3" in view()["contextStatus"], "latest context revision did not reload")
+    driver.click("#native-context-preview")
+    wait_for(lambda: view()["canUse"], "fresh Codex handoff did not become available")
+    packet = view()["packet"]
+    assert context_goal in packet and "Source materials revision: 3" in packet
+    assert "Latest remaining work from the shared host." in packet and "Material: Task note (Note)" in packet
+    assert "[REDACTED:openai-key]" in packet and local_fixture_secret not in packet
+    driver.click("#native-context-use")
+    wait_for(lambda: "New task draft prepared" in view()["taskStatus"], "handoff did not open the native task composer")
+    draft = view()
+    assert draft["draft"] == packet and draft["repository"] == str(repository)
+    assert not draft["consent"] and not draft["canStart"] and not draft["hasApproval"]
+    entries = command("NativeCatalog", {"after": None, "limit": 4})["Ok"]["NativeCatalog"]["entries"]
+    assert [entry["id"] for entry in entries] == [task]
+    assert len(starts_file.read_text().splitlines()) == 1
+
+    driver.clear("#native-title")
+    driver.type("#native-title", "Explicit context follow-up")
+    driver.click("#native-consent")
+    driver.click("#native-start")
+    wait_for(lambda: view()["hasApproval"], "explicit handoff draft did not start a new native task", timeout=20)
+    entries = command("NativeCatalog", {"after": None, "limit": 4})["Ok"]["NativeCatalog"]["entries"]
+    assert len(entries) == 2
+    followup = next(entry["id"] for entry in entries if entry["id"] != task)
+    original_task = command("InspectNative", {"id": task})["Ok"]["Native"]["snapshot"]
+    new_task = command("InspectNative", {"id": followup})["Ok"]["Native"]["snapshot"]
+    first, second = [json.loads(line) for line in starts_file.read_text().splitlines()]
+    assert first["pid"] != second["pid"] and first["thread"] != second["thread"]
+    assert second["cwd"] == new_task["task"]["worktree_path"] != first["cwd"]
+    assert new_task["task"]["brief"]["goal"] == packet.strip() and new_task["task"]["brief"]["validation"] is None
+    last_prompt = json.loads((owned / "native-task-prompts").read_text().splitlines()[-1])
+    assert last_prompt["pid"] == second["pid"] and last_prompt["brief"]["goal"] == packet.strip()
+    assert original_task["task"]["status"] == "completed"
+    provider_birth = birth(second["pid"])
+    assert provider_birth is not None
+    return followup, Path(second["cwd"]), second["pid"], provider_birth
+
+
+def exercise_native_manual_acceptance(driver, command, reopen_task, followup, starts_file):
+    task, worktree, pid, provider_birth = followup
+    starts = starts_file.read_text().splitlines()
+
+    def view():
+        return driver.execute("""
+            return {
+              status: document.querySelector('#native-status').textContent,
+              lifecycle: document.querySelector('#native-lifecycle').textContent,
+              canFinish: !document.querySelector('#native-finish').disabled,
+              canInspect: !document.querySelector('#native-inspect').disabled,
+              canReview: !document.querySelector('#native-accept-reviewed').disabled,
+              canAccept: !document.querySelector('#native-accept-verified').disabled,
+              result: !document.querySelector('#native-result').hidden,
+              diff: document.querySelector('#native-diff').textContent,
+            };
+        """)
+
+    assert not view()["canReview"] and not view()["canAccept"]
+    driver.click("#native-approvals button")
+    wait_for(lambda: view()["canFinish"], "the no-recipe provider did not reach review")
+    driver.click("#native-finish")
+    wait_for(lambda: (state := view())["canInspect"] and state["lifecycle"] == "Ready for review"
+             and birth(pid) != provider_birth, "the manual-review provider did not finish")
+    assert not view()["canReview"]
+    driver.click("#native-inspect")
+    wait_for(lambda: view()["canReview"], "inspection did not enable exact human review")
+    assert not view()["canAccept"] and "edited inside the native fixture worktree" in view()["diff"]
+
+    with (worktree / "tracked.txt").open("a") as tracked:
+        tracked.write("Changed after human inspection\n")
+    driver.click("#native-accept-reviewed")
+    wait_for(lambda: (state := view())["status"].startswith("Worktree changed after inspection")
+             and not state["result"], "manual acceptance did not reject the changed worktree")
+    snapshot = command("InspectNative", {"id": task})["Ok"]["Native"]["snapshot"]
+    assert snapshot["task"]["status"] == "ready_for_review" and not view()["canReview"]
+
+    driver.click("#native-inspect")
+    wait_for(lambda: (state := view())["canReview"] and "Changed after human inspection" in state["diff"],
+             "freshly inspected diff was not offered for human acceptance")
+    driver.click("#native-accept-reviewed")
+    wait_for(lambda: view()["lifecycle"] == "Completed", "explicit human acceptance was not stored")
+    accepted = command("InspectNative", {"id": task})["Ok"]["Native"]["snapshot"]
+    assert accepted["incarnation"] == snapshot["incarnation"] and accepted["task"]["status"] == "completed"
+    assert accepted["task"]["validation"]["status"] == "not_run" and accepted["validation"] is None
+    reopen_task(task)
+    wait_for(lambda: view()["lifecycle"] == "Completed", "manual acceptance did not reopen")
+    assert starts_file.read_text().splitlines() == starts
+
+
+def exercise_native_queue(driver, command, reopen_task, accepted_task, repository, starts_file):
+    starts = starts_file.read_text().splitlines()
+
+    def catalog():
+        return command("NativeCatalog", {"after": None, "limit": 16})["Ok"]["NativeCatalog"]["entries"]
+
+    def snapshot(task):
+        return command("InspectNative", {"id": task})["Ok"]["Native"]["snapshot"]
+
+    def saved_queue():
+        return command("QueueSnapshot", None)["Ok"]["Queue"]["snapshot"]
+
+    def view():
+        return driver.execute("""
+            const deps=document.querySelector('#queue-dependencies');
+            return {
+              draft: document.querySelector('#native-draft-goal').textContent,
+              status: document.querySelector('#queue-status').textContent,
+              rows: Object.fromEntries(Array.from(document.querySelectorAll('#queue-entries li'),
+                item=>[item.dataset.task,item.textContent])),
+              editing: !deps.disabled,
+              options: Array.from(deps.options,option=>option.value),
+              selected: Array.from(deps.selectedOptions,option=>option.value),
+              start: !document.querySelector('#queue-launch').disabled,
+              confirm: !document.querySelector('#queue-confirm').disabled,
+              pending: Boolean(document.querySelector('#native-approvals button:not(:disabled)')),
+              create: !document.querySelector('#native-save-draft').disabled,
+            };
+        """)
+
+    def new_draft(title, goal):
+        previous = {entry["id"] for entry in catalog()}
+        driver.click("#native-detach")
+        wait_for(lambda: view()["create"], "native draft composer did not open")
+        driver.type("#native-repository", str(repository))
+        driver.type("#native-title", title)
+        driver.type("#native-goal", goal)
+        driver.click("#native-save-draft")
+        wait_for(lambda: view()["draft"] == goal, "the saved draft was not attached")
+        created, = {entry["id"] for entry in catalog()} - previous
+        saved = snapshot(created)
+        assert saved["saved_draft"] and not saved["live"] and not saved["preparing"]
+        assert saved["task"]["brief"]["goal"] == goal and not view()["pending"]
+        assert starts_file.read_text().splitlines() == starts
+        return created
+
+    def show_queue():
+        driver.click("#workspace-queue > summary")
+        wait_for(lambda: view()["editing"], "the shared queue did not open for the exact draft")
+
+    def choose_dependency(task):
+        choices = view()["options"]
+        assert task in choices
+        driver.type("#queue-dependencies", "\ue011" + "\ue015" * choices.index(task))
+        wait_for(lambda: view()["selected"] == [task], "queue dependency selection did not settle")
+
+    blocker = new_draft("Unstarted queue dependency", "Review the fixture approval at a later stage.")
+    goal = "Review the fixture approval only after the queued dependency is accepted."
+    queued = new_draft("Durable queued fixture", goal)
+    show_queue()
+    choose_dependency(blocker)
+    driver.click("#queue-save")
+    wait_for(lambda: "Waiting for accepted dependencies" in view()["rows"].get(queued, ""),
+             "the host queue did not block the saved draft on its dependency")
+    assert not view()["start"] and not view()["confirm"]
+    first = saved_queue()
+    assert first["entries"][0]["intent"]["dependencies"] == [blocker]
+
+    other = command("QueueUpdate", {"update": {
+        "expected_revision": first["revision"],
+        "change": {"Upsert": {"intent": {"id": blocker, "dependencies": [], "location": {"kind": "local"}}}},
+    }})["Ok"]["Queue"]["snapshot"]
+    choose_dependency(accepted_task)
+    driver.click("#queue-save")
+    wait_for(lambda: "changed in another view" in view()["status"], "a stale queue revision overwrote another view")
+    assert view()["selected"] == [accepted_task] and saved_queue()["revision"] == other["revision"]
+    assert starts_file.read_text().splitlines() == starts
+
+    reopen_task(queued)
+    wait_for(lambda: view()["draft"] == goal, "the exact unstarted draft did not persist")
+    show_queue()
+    assert view()["selected"] == [blocker]
+    choose_dependency(accepted_task)
+    driver.click("#queue-save")
+    wait_for(lambda: (state := view())["confirm"]
+             and "Ready to start explicitly" in state["rows"].get(queued, ""),
+             "accepted predecessor did not make the draft ready")
+    before = snapshot(queued)
+    assert before["saved_draft"] and not before["live"] and not view()["start"]
+    assert starts_file.read_text().splitlines() == starts
+    driver.click("#queue-confirm")
+    driver.click("#queue-launch")
+    wait_for(lambda: view()["pending"], "explicit queued launch did not reach the scoped provider", timeout=20)
+    after = snapshot(queued)
+    assert after["id"] == before["id"] and after["incarnation"] == before["incarnation"]
+    assert not after["saved_draft"] and after["live"] and not view()["start"]
+    receipts = starts_file.read_text().splitlines()
+    assert len(receipts) == len(starts) + 1 and receipts[:-1] == starts
+    active = json.loads(receipts[-1])
+    assert active["cwd"] == after["task"]["worktree_path"]
+    assert snapshot(blocker)["saved_draft"]
+    started = birth(active["pid"])
+    driver.click("#native-stop")
+    wait_for(lambda: birth(active["pid"]) != started, "queued task provider was not reaped")
+
+
+def exercise_native_task(driver, owned, binary, env, fixture):
+    repository, baseline = fixture
+    runtime = Path("/run/user") / str(os.getuid())
+    bus = runtime / "bus"
+    if not bus.is_socket():
+        raise RuntimeError("native approval smoke needs a real user systemd bus")
+    # The desktop remains on its private display/session bus. Only the native
+    # host connects to the user's systemd manager for its transient scope.
+    host_env = {**env, "XDG_RUNTIME_DIR": str(runtime), "DBUS_SESSION_BUS_ADDRESS": f"unix:path={bus}"}
+    log = owned / "native-task-host.log"
+    with log.open("wb") as output:
+        host = subprocess.Popen([binary, "--jterm-session-host"], cwd=owned, env=host_env,
+                                stdin=subprocess.DEVNULL, stdout=output, stderr=output,
+                                start_new_session=True)
+    socket_file = Path(env["JTERM_WORKSPACE_STATE_DIR"]) / "run" / "host.sock"
+    starts_file = owned / "native-provider-starts"
+    receipts = owned / "native-approval-receipts"
+    verification_count = owned / "native-verification-count"
+    verification_gate = owned / "native-verification-gate"
+    gate_path = shlex.quote(str(verification_gate))
+    recipe = (
+        f"printf 'run\\n' >> {shlex.quote(str(verification_count))}; "
+        "printf 'AETHER_VERIFICATION_STARTED\\n'; "
+        f"for step in $(seq 1 360); do test -f {gate_path} && break; sleep .05; done; "
+        f"test -f {gate_path} && grep -q 'edited inside the native fixture worktree' tracked.txt "
+        "&& printf 'AETHER_VERIFICATION_PASSED\\n'"
+    )
+    provider_identity = None
+
+    def status():
+        return driver.execute("""
+            return {
+              status: document.querySelector('#native-status').textContent,
+              detail: document.querySelector('#native-detail').textContent,
+              lifecycle: document.querySelector('#native-lifecycle').textContent,
+              worktree: document.querySelector('#native-worktree').textContent,
+              output: document.querySelector('#native-output').textContent,
+              approval: document.querySelector('#native-approvals').textContent,
+              hasApproval: Boolean(document.querySelector('#native-approvals button:not(:disabled)')),
+              finish: !document.querySelector('#native-finish').disabled,
+              canOpen: !document.querySelector('#native-open').disabled,
+              canInspect: !document.querySelector('#native-inspect').disabled,
+              canVerify: !document.querySelector('#native-verify').disabled,
+              canAccept: !document.querySelector('#native-accept-verified').disabled,
+              verification: document.querySelector('#native-verification-status').textContent,
+              verificationOutput: document.querySelector('#native-verification-output').textContent,
+              inspectionValidation: document.querySelector('#native-validation').textContent,
+              options: Array.from(document.querySelector('#native-select').options, option=>option.value),
+              diff: document.querySelector('#native-diff').textContent,
+            };
+        """)
+
+    def show_tasks():
+        for selector in ["#agent-workspace", "#workspace-native"]:
+            if not driver.execute(f"return document.querySelector('{selector}').open;"):
+                driver.click(f"{selector} > summary")
+        wait_for(lambda: driver.execute("return !document.querySelector('#native-refresh').disabled;"),
+                 "native task catalog did not load")
+
+    def command(kind, values):
+        return workspace_command(socket_file, kind, values)
+
+    def reopen_task(task):
+        driver.close()
+        driver.open(binary)
+        wait_for(lambda: opened_page(driver), "Aether did not reopen for the native task")
+        show_tasks()
+        wait_for(lambda: (view := status())["canOpen"] and task in view["options"],
+                 "shared native task was absent after reopening")
+        selected = driver.execute("return document.querySelector('#native-select').value;")
+        if selected != task:
+            row = status()["options"].index(task)
+            driver.type("#native-select", "\ue011" + "\ue015" * row)
+            wait_for(lambda: driver.execute("return document.querySelector('#native-select').value;") == task,
+                     "could not select the exact saved native task")
+        driver.click("#native-open")
+
+    def host_ready():
+        if host.poll() is not None:
+            raise RuntimeError("the isolated native task host exited")
+        try:
+            return "Ok" in command("NativeCatalog", {"after": None, "limit": 1})
+        except (OSError, KeyError, ValueError):
+            return False
+
+    try:
+        wait_for(host_ready, "native task host did not bind")
+        show_tasks()
+        assert driver.execute("return document.querySelector('#native-start').disabled;")
+        driver.type("#native-repository", str(repository))
+        driver.type("#native-title", "Isolated native approval fixture")
+        driver.type("#native-goal", "Review the fixture approval")
+        driver.type("#native-verification-recipe", recipe)
+        driver.click("#native-consent")
+        driver.click("#native-start")
+        wait_for(lambda: status()["hasApproval"], "the scoped Codex approval did not reach Aether", timeout=20)
+        presented = status()
+        assert "printf fixture-only" in presented["approval"] and "pending request" in presented["output"]
+        assert presented["lifecycle"] == "Waiting for approval"
+        assert not presented["canVerify"] and not verification_count.exists()
+        entries = command("NativeCatalog", {"after": None, "limit": 4})["Ok"]["NativeCatalog"]["entries"]
+        assert len(entries) == 1
+        task = entries[0]["id"]
+        snapshot = command("InspectNative", {"id": task})["Ok"]["Native"]["snapshot"]
+        worktree = Path(snapshot["task"]["worktree_path"])
+        assert snapshot["task"]["base_commit"] == baseline and worktree.parent.name == "native-worktrees"
+        assert worktree != repository and "edited inside" in (worktree / "tracked.txt").read_text()
+        assert (repository / "tracked.txt").read_text() == "original native fixture baseline\n"
+        starts = starts_file.read_text().splitlines()
+        assert len(starts) == 1
+        launch = json.loads(starts[0])
+        assert Path(launch["cwd"]) == worktree and "-codex-" in launch["cgroup"] and ".scope" in launch["cgroup"]
+        provider_identity = launch["pid"], birth(launch["pid"])
+        assert provider_identity[1] and not receipts.exists()
+        conflict = command("AttachNative", {"id": task, "incarnation": snapshot["incarnation"], "view": "competing-native-task"})
+        assert "another" in conflict["Err"].lower(), conflict
+
+        assert birth(provider_identity[0]) == provider_identity[1]
+        reopen_task(task)
+        assert birth(provider_identity[0]) == provider_identity[1]
+        wait_for(lambda: status()["hasApproval"], "reopened Aether did not regain the pending native approval")
+        assert status()["approval"] == presented["approval"] and not receipts.exists()
+        driver.click("#native-approvals button")
+        wait_for(lambda: status()["finish"] and "Decline observed" in status()["output"],
+                 "native provider did not receive the explicit decline")
+        assert [json.loads(line) for line in receipts.read_text().splitlines()] == [{"decision": "decline"}]
+        assert starts_file.read_text().splitlines() == starts
+        driver.click("#native-finish")
+        wait_for(lambda: status()["canInspect"] and birth(provider_identity[0]) != provider_identity[1],
+                 "native Finish did not release the real provider scope")
+        driver.click("#native-inspect")
+        wait_for(lambda: "edited inside the native fixture worktree" in status()["diff"], "task diff was not inspected")
+        assert status()["canVerify"] and not status()["canAccept"] and not verification_count.exists()
+        assert driver.execute("return document.querySelector('#native-verification-command').textContent;") == recipe
+        assert driver.execute("return document.querySelector('#native-verification-shell').textContent;") == "Shell /bin/sh"
+        driver.click("#native-verify")
+        wait_for(lambda: (view := status())["verification"] == "Running"
+                 and "AETHER_VERIFICATION_STARTED" in view["verificationOutput"],
+                 "the host verification PTY did not start")
+        assert verification_count.read_text().splitlines() == ["run"]
+        assert not status()["canAccept"] and not status()["canInspect"]
+        reopen_task(task)
+        wait_for(lambda: (view := status())["verification"] == "Running"
+                 and "AETHER_VERIFICATION_STARTED" in view["verificationOutput"],
+                 "reopened Aether did not recover the live verification PTY")
+        assert verification_count.read_text().splitlines() == ["run"]
+        verification_gate.touch()
+        wait_for(lambda: (view := status())["verification"] == "Passed"
+                 and "AETHER_VERIFICATION_PASSED" in view["verificationOutput"],
+                 "host verification did not pass")
+        first_check = command("InspectNative", {"id": task})["Ok"]["Native"]["snapshot"]["validation"]
+        assert first_check["evidence"]["cwd"] == str(worktree)
+        assert first_check["evidence"]["shell"] == "/bin/sh"
+        assert first_check["evidence"]["command"] == recipe
+        assert first_check["evidence"]["unchanged_after_run"] and not status()["canAccept"]
+
+        driver.click("#native-inspect")
+        wait_for(lambda: status()["canAccept"], "current verified evidence was not eligible for acceptance")
+        with (worktree / "tracked.txt").open("a") as tracked:
+            tracked.write("external edit after inspection\n")
+        driver.click("#native-accept-verified")
+        wait_for(lambda: "Validation evidence is stale" in status()["status"],
+                 "host did not reject stale worktree evidence")
+        assert not status()["canAccept"] and status()["lifecycle"] != "Completed"
+        wait_for(lambda: (view := status())["canVerify"] and view["verification"] == "Needs review",
+                 "fresh verification was not available after stale evidence")
+        driver.click("#native-verify")
+        wait_for(lambda: status()["verification"] == "Passed", "explicit verification rerun did not pass")
+        assert verification_count.read_text().splitlines() == ["run", "run"]
+        driver.click("#native-inspect")
+        wait_for(lambda: (view := status())["canAccept"] and "external edit after inspection" in view["diff"],
+                 "fresh reviewed diff did not enable acceptance")
+        driver.click("#native-accept-verified")
+        wait_for(lambda: status()["lifecycle"] == "Completed", "verified work was not accepted by the host")
+        reopened = command("InspectNative", {"id": task})["Ok"]["Native"]["snapshot"]
+        assert reopened["incarnation"] == snapshot["incarnation"] and reopened["task"]["status"] == "completed"
+        assert reopened["validation"]["run_id"] != first_check["run_id"]
+        assert reopened["validation"]["evidence"]["fingerprint"] != first_check["evidence"]["fingerprint"]
+        reopen_task(task)
+        wait_for(lambda: status()["lifecycle"] == "Completed", "accepted task could not reopen")
+        assert not status()["canAccept"] and not status()["canVerify"]
+        assert verification_count.read_text().splitlines() == ["run", "run"]
+        assert (repository / "tracked.txt").read_text() == "original native fixture baseline\n"
+        assert starts_file.read_text().splitlines() == starts
+        exercise_native_tools(driver, command, task, reopened, starts_file)
+        exercise_native_mission(driver, owned, command, reopen_task, task, reopened, starts_file)
+        followup = exercise_native_context(driver, owned, command, reopen_task, task, starts_file, repository)
+        exercise_native_manual_acceptance(driver, command, reopen_task, followup, starts_file)
+        exercise_native_queue(driver, command, reopen_task, task, repository, starts_file)
+        assert verification_count.read_text().splitlines() == ["run", "run"]
+        assert (repository / "tracked.txt").read_text() == "original native fixture baseline\n"
+        print(json.dumps({
+            "native_task_shared_host_isolated_worktree": True,
+            "native_task_codex_systemd_scope": True,
+            "native_task_conflicting_view_refused": True,
+            "native_task_reopens_exact_pending_approval": True,
+            "native_task_decline_receipt_once": True,
+            "native_task_finish_and_read_only_diff": True,
+            "native_verification_explicit_and_owned": True,
+            "native_verification_reopens_running_without_replay": True,
+            "native_acceptance_rejects_stale_worktree_evidence": True,
+            "native_verified_acceptance_persists_after_reopen": True,
+            "native_context_persists_redacted_material_and_rejects_stale_save": True,
+            "native_context_preview_rejects_changed_shared_revision": True,
+            "native_context_opens_unsent_draft_then_separate_native_task": True,
+            "native_mission_links_exact_worktree_and_run": True,
+            "native_mission_cas_keeps_local_edit_and_reopens_saved_plan": True,
+            "native_mission_freezes_observed_commit_and_keeps_stale_checks_pending": True,
+            "native_tools_pages_to_exact_native_validation": True,
+            "native_tools_refuses_replaced_revision_without_launch": True,
+            "native_manual_acceptance_rejects_unreviewed_worktree_edit": True,
+            "native_manual_acceptance_persists_without_validation": True,
+            "native_queue_persists_drafts_dependencies_and_rejects_stale_update": True,
+            "native_queue_ready_does_not_launch_until_explicit_consent": True,
+        }), flush=True)
+    except Exception:
+        print("Native task fixture:", log.read_text()[-4000:], status())
+        raise
+    finally:
+        verification_gate.touch()
+        if starts_file.is_file():
+            for entry in starts_file.read_text().splitlines():
+                with contextlib.suppress(ValueError, KeyError, FileNotFoundError, ProcessLookupError):
+                    pid = json.loads(entry)["pid"]
+                    args = Path(f"/proc/{pid}/cmdline").read_bytes()
+                    if os.fsencode(owned / "bin" / "native-codex-fixture.py") in args.split(b"\0"):
+                        os.kill(pid, signal.SIGTERM)
+        stop_driver(host)
+
+
+def exercise_notebook(driver, owned):
+    from hashlib import sha256
+
+    source = owned / "native-cells.jtnb.md"
+    ran = owned / "notebook-explicit-run"
+    late = owned / "notebook-child-escaped-stop"
+    document = (
+        "# Native cells\n\n"
+        "<script>document.body.dataset.notebookExecuted = 'yes'</script>\n\n"
+        "```shell\n"
+        "printf 'NOTE_OUT\\n'\nprintf 'NOTE_ERR\\n' >&2\n"
+        f"pwd > {shlex.quote(str(ran))}\nexit 17\n"
+        "```\n\n"
+        "```sh\n"
+        f"(sleep 3; printf child > {shlex.quote(str(late))}) &\n"
+        "printf 'PARTIAL_OUT\\n'\nprintf 'PARTIAL_ERR\\n' >&2\nwait\n"
+        "```\n\n"
+        "```javascript\nthrow Error('read-only fence')\n```\n"
+    ).encode()
+    source.write_bytes(document)
+    fingerprint = sha256(document).hexdigest()
+    driver.click("#local-notebook > summary")
+    driver.type("#notebook-file", str(source))
+    driver.click("#notebook-open")
+    wait_for(lambda: driver.execute(
+        f"return document.querySelector('#notebook-source-id').textContent.includes('{fingerprint}')"),
+        "exact native notebook source did not open")
+    assert not ran.exists() and not late.exists()
+    assert driver.execute("""
+        return !document.body.dataset.notebookExecuted &&
+          !document.querySelector('[data-notebook-cell="5"] button') &&
+          document.querySelectorAll('[data-notebook-run]').length === 2 &&
+          document.querySelector('#notebook-run-result').hidden;
+    """)
+
+    def result():
+        return driver.execute("""
+            return {
+                title: document.querySelector('#notebook-run-title').textContent,
+                stdout: document.querySelector('#notebook-stdout').textContent,
+                stderr: document.querySelector('#notebook-stderr').textContent,
+                locked: document.querySelector('#notebook-close').disabled,
+            };
+        """)
+
+    driver.click('[data-notebook-run="1"]')
+    wait_for(lambda: result()["title"].endswith("Exited (exit 17)"), "cell exit receipt not rendered")
+    assert result() == {"title": "Cell 1 · shell · Exited (exit 17)",
+                        "stdout": "NOTE_OUT\n", "stderr": "NOTE_ERR\n", "locked": False}
+    assert ran.is_file()
+    execution_directory = Path(ran.read_text().strip())
+    assert execution_directory != owned and execution_directory.name.startswith("jterm-notebook-")
+
+    driver.click('[data-notebook-run="3"]')
+    def partial():
+        current = result()
+        return current["stdout"] == "PARTIAL_OUT\n" and current["stderr"] == "PARTIAL_ERR\n" and current["locked"]
+    wait_for(partial, "live partial stdout/stderr did not arrive")
+    driver.click('[data-notebook-stop="3"]')
+    wait_for(lambda: result()["title"].endswith("Stopped (signal 9)"), "cell stop receipt not rendered")
+    assert result() == {"title": "Cell 2 · sh · Stopped (signal 9)",
+                        "stdout": "PARTIAL_OUT\n", "stderr": "PARTIAL_ERR\n", "locked": False}
+    time.sleep(3.1)
+    assert not late.exists(), "stopped cell left a live child"
+
+    driver.click("#notebook-close")
+    wait_for(lambda: not execution_directory.exists(), "closed notebook working directory was not removed")
+    ran.unlink()
+    driver.type("#notebook-file", str(source))
+    driver.click("#notebook-open")
+    wait_for(lambda: driver.execute(
+        f"return !document.querySelector('#notebook-document').hidden && document.querySelector('#notebook-run-result').hidden && document.querySelector('#notebook-source-id').textContent.includes('{fingerprint}')"),
+        "notebook did not reopen with unchanged source and no run")
+    assert not ran.exists() and not late.exists()
+    driver.click("#notebook-close")
+    print(json.dumps({"notebook_native_file_open_and_reopen": True,
+                      "notebook_exit_code_and_split_streams": True,
+                      "notebook_stop_kept_partial_output_and_no_group_child_write": True}), flush=True)
+
+
+def exercise_vim9_project(driver, source):
+    def view():
+        return driver.execute("""
+            const el=id=>document.querySelector('#vproject-'+id), project=document.querySelector('#vim9-project');
+            return {labels:Array.from(el('choices').children,b=>b.textContent),
+                status:el('status').textContent,file:document.querySelector('#vim9-status').textContent,
+                root:el('root').textContent, jobs:el('jobs').textContent, output:el('output').textContent,
+                diagnostics:el('diagnostics').textContent,line:project.dataset.line,col:project.dataset.byteColumn,windows:project.dataset.windowCount};
+        """)
+
+    def pick(title):
+        wait_for(lambda: title in view()["labels"], f"missing Vim project choice {title}")
+        index = view()["labels"].index(title) + 1
+        driver.click(f"#vproject-choices button:nth-child({index})")
+
+    def find(text):
+        driver.clear("#vproject-query")
+        driver.type("#vproject-query", text)
+        driver.click("#vproject-lookup button")
+
+    driver.click("#vim9-project > summary")
+    try:
+        pick("src/")
+        wait_for(lambda: view()["root"].endswith("/src"), "Vim project tree did not enter directory")
+        pick("note.txt")
+        wait_for(lambda: "note.txt" in view()["file"], "Vim did not open the chosen project file")
+        find("src/note.txt:2:4")
+        pick("src/note.txt")
+        wait_for(lambda: (view()["line"], view()["col"]) == ("2", "4"), "Vim file:line:byte-column navigation")
+        find(">split vertically")
+        pick("Split editor vertically")
+        wait_for(lambda: view()["windows"] == "2", "Vim command palette did not create a split")
+        driver.type("#vproject-search-query", "PROJECT_EVIDENCE")
+        driver.click("#vproject-search button")
+        wait_for(lambda: "1 matches" in view()["jobs"] and "note.txt" in view()["diagnostics"], "Vim project search with quickfix evidence")
+        driver.type("#vproject-build-command", "printf 'AETHER_BUILD_OUTPUT\\n'; exit 7")
+        driver.click("#vproject-build button")
+        wait_for(lambda: "Build exit 7" in view()["jobs"] and "AETHER_BUILD_OUTPUT" in view()["output"], "Vim build output and exit code")
+        driver.clear("#vproject-build-command")
+        driver.type("#vproject-build-command", "sleep 15")
+        driver.click("#vproject-build button")
+        wait_for(lambda: "Build running" in view()["jobs"], "Vim build did not start")
+        driver.click("#vproject-stop-build")
+        wait_for(lambda: "Build stopped" in view()["jobs"], "Vim build did not stop")
+        # Close the split with Vim's own action and return to the original file.
+        driver.type("#vim9-input", ":close\ue007")
+        wait_for(lambda: view()["windows"] == "1", "Vim did not close its split")
+        find(source.name)
+        pick(source.name)
+        wait_for(lambda: source.name in view()["file"], "Vim project picker did not return to original buffer")
+    except Exception:
+        print("Vim project:", view(), flush=True)
+        raise
+    driver.click("#vim9-project > summary")
+    print(json.dumps({"native_vim9_project": ["tree", "file:line:byte-column", "palette", "quickfix search", "build exit/output", "cancel"]}), flush=True)
+
+
+def exercise_vim9_workbench(driver, owned):
+    project = owned / "vim-project"
+    (project / "src").mkdir(parents=True)
+    (project / "Makefile").touch()
+    (project / "src" / "note.txt").write_text("First line\n中PROJECT_EVIDENCE\n")
+    source = project / "native Vim9 edit.txt"
+    source.write_text("AETHER_VIM9_ORIGINAL\n")
+    driver.click("#vim9-workbench > summary")
+
+    def choose(button="#vim9-open", path=source):
+        driver.click(button)
+        chooser = subprocess.check_output(
+            ["xdotool", "search", "--sync", "--onlyvisible", "--name", "^Open local file in Vim9$"],
+            timeout=10, text=True).splitlines()[-1]
+        subprocess.run(["xdotool", "windowfocus", "--sync", chooser], check=True, timeout=5)
+        subprocess.run(["xdotool", "key", "ctrl+l"], check=True, timeout=5)
+        subprocess.run(["xdotool", "type", "--clearmodifiers", str(path)], check=True, timeout=5)
+        subprocess.run(["xdotool", "key", "Return"], check=True, timeout=5)
+
+    def editor():
+        return driver.execute("""
+            const canvas=document.querySelector('#vim9-render');
+            const pixels=canvas.getContext('2d').getImageData(0,0,32,32).data;
+            return {source:document.querySelector('#vim9-screen').dataset.source,
+                status:document.querySelector('#vim9-status').textContent,
+                error:document.querySelector('#vim9-error').textContent,
+                painted:pixels.some((channel,index)=>index%4===3 && channel>0),
+                manualFallback:document.querySelector('#vim9-fallback').checked,
+                save:!document.querySelector('#vim9-save').disabled,
+                released:!document.querySelector('#vim9-release').disabled};
+        """)
+
+    def renderer_ready():
+        view = editor()
+        return view["source"] == "vim9" and view["painted"] and view["save"] and source.name in view["status"]
+
+    try:
+        choose()
+        wait_for(renderer_ready, "authenticated Vim9 buffer was not painted over its live PTY", timeout=20)
+        driver.type("#vim9-input", "GoAETHER_VIM9_GUI_中\ue00c")
+        wait_for(lambda: "Modified" in editor()["status"], "Vim did not own the GUI text edit")
+        assert source.read_text() == "AETHER_VIM9_ORIGINAL\n"
+        driver.click("#vim9-save")
+        first_edit = "AETHER_VIM9_ORIGINAL\nAETHER_VIM9_GUI_中\n"
+        wait_for(lambda: source.read_text() == first_edit, "Vim9 save did not persist exact GUI text")
+        driver.click("#vim9-fallback")
+        wait_for(lambda: editor()["source"] == "terminal", "live compatibility Vim was not shown")
+        driver.type("#vim9-input", "GoAETHER_VIM9_PTY_你\ue00c")
+        wait_for(lambda: "Modified" in editor()["status"], "compatibility view did not edit the same Vim buffer")
+        driver.click("#vim9-fallback")
+        wait_for(renderer_ready, "native paint did not resume for the same editor")
+        assert source.read_text() == first_edit
+        driver.click("#vim9-save")
+        final = first_edit + "AETHER_VIM9_PTY_你\n"
+        wait_for(lambda: source.read_text() == final, "Vim did not save both edits to the chosen local file")
+        exercise_vim9_project(driver, source)
+        driver.click("#vim9-quit")
+        wait_for(lambda: editor()["released"], "workbench did not receive the Vim/PTy exit")
+        driver.click("#vim9-release")
+        wait_for(lambda: driver.execute("return document.querySelector('#vim9-viewport').hidden;"),
+                 "closed workbench retained the departed Vim frame")
+
+        driver.type("#preview-single", str(source))
+        driver.click("#preview-show")
+        wait_for(lambda: driver.execute("return !document.querySelector('#preview-vim9').hidden;"),
+                 "the text preview did not offer a separate Vim9 chooser")
+        other = owned / source.name
+        other.write_text("Different file with the same basename\n")
+        choose("#preview-vim9", other)
+        wait_for(lambda: driver.execute("return document.querySelector('#preview-notice').textContent.includes('differs from the preview');"),
+                 "Vim opened a different local file with the same name")
+        assert driver.execute("return document.querySelector('#vim9-viewport').hidden;")
+        choose("#preview-vim9")
+        wait_for(renderer_ready, "verified local snapshot did not open in Vim9", timeout=20)
+        disconnect = owned / "disconnect-owned-vim.vim"
+        disconnect.write_text(
+            "let sid = getscriptinfo({'name': 'vim9-ide-bridge.vim'})[0].sid\n"
+            "call ch_close(getscriptinfo({'sid': sid})[0].variables.bridge)\n")
+        driver.type("#vim9-input", f":source {disconnect}\ue007")
+
+        def automatic_fallback():
+            view = editor()
+            return view["source"] == "terminal" and not view["manualFallback"] and not view["save"]
+
+        wait_for(automatic_fallback, "disconnecting the Vim GUI bridge did not expose the live terminal")
+        driver.type("#vim9-input", "GoAETHER_VIM9_AFTER_LOSS_文\ue00c:wq\ue007")
+        wait_for(lambda: source.read_text() == final + "AETHER_VIM9_AFTER_LOSS_文\n",
+                 "Vim could not save the same buffer after losing its GUI bridge")
+        wait_for(lambda: editor()["released"], "compatibility Vim exit did not drain its terminal")
+        driver.click("#vim9-release")
+    except Exception:
+        print("Vim9 editor:", editor(), "chosen file:", source.read_text())
+        raise
+    print(json.dumps({"native_vim9_exact_chooser_open_and_canvas": True,
+                      "native_vim9_preview_refuses_same_name_different_bytes": True,
+                      "native_vim9_gui_and_compatibility_edit_same_buffer": True,
+                      "native_vim9_saved_exact_unicode_and_graceful_exit": True,
+                      "native_vim9_actual_gui_disconnect_preserves_live_pty_input": True}), flush=True)
+
+
+def run(binary, jsh, workspace, api, native, notebook=False, output_review=False, vim9=False):
     executable = shutil.which("WebKitWebDriver")
     if not executable or not os.environ.get("DISPLAY") or not os.environ.get("XAUTHORITY"):
         raise RuntimeError("run with official WebKitWebDriver and authenticated Xvfb")
@@ -275,15 +2184,32 @@ def run(binary):
         env.update({"HOME": scratch, "PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8",
                     "GDK_BACKEND": "x11", "LIBGL_ALWAYS_SOFTWARE": "1",
                     "TAURI_WEBVIEW_AUTOMATION": "true"})
+        if jsh or workspace or native:
+            launch = owned / "bin"
+            launch.mkdir()
+            env["PATH"] = f"{launch}:/usr/bin:/bin"
+        if jsh:
+            (launch / "jsh").symlink_to(jsh)
+        transcripts = prepare_workspace(owned, env, launch) if workspace else None
+        native_fixture = prepare_native_task(owned, env, launch) if native else None
+        if api and not workspace:
+            env["JTERM_WORKSPACE_STATE_DIR"] = str(owned / "workspace")
         for name in ("CACHE", "CONFIG", "DATA", "RUNTIME", "STATE"):
             path = owned / name.lower()
             path.mkdir(mode=0o700)
             env["XDG_RUNTIME_DIR" if name == "RUNTIME" else f"XDG_{name}_HOME"] = str(path)
+        if output_review:
+            (owned / "Downloads").mkdir()
+            (Path(env["XDG_CONFIG_HOME"]) / "user-dirs.dirs").write_text(
+                'XDG_DOWNLOAD_DIR="$HOME/Downloads"\n')
+        prepare_hyperlink_handler(owned, env)
         with socket.socket() as slot:
             slot.bind(("127.0.0.1", 0))
             port = slot.getsockname()[1]
         driver = Driver(port)
-        with (owned / "driver.log").open("wb") as log:
+        with (owned / "driver.log").open("wb") as log, (
+            api_provider(env) if api else contextlib.nullcontext()
+        ) as fixture:
             child = subprocess.Popen([executable, "--host=127.0.0.1", f"--port={port}"],
                                      env=env, cwd=owned, stdout=log, stderr=subprocess.STDOUT,
                                      start_new_session=True)
@@ -299,6 +2225,20 @@ def run(binary):
                 driver.open(binary)
                 wait_for(lambda: opened_page(driver), "embedded Aether tauri: page did not load")
                 exercise(driver, owned)
+                exercise_hyperlinks(driver, owned)
+                exercise_restart(driver, owned, binary)
+                if jsh:
+                    exercise_command_blocks(driver, owned, output_review)
+                if workspace:
+                    exercise_workspace(driver, owned, binary, env, transcripts)
+                if api:
+                    exercise_api_chat(driver, owned, binary, env, fixture)
+                if native:
+                    exercise_native_task(driver, owned, binary, env, native_fixture)
+                if notebook:
+                    exercise_notebook(driver, owned)
+                if vim9:
+                    exercise_vim9_workbench(driver, owned)
             except Exception:
                 with (owned / "driver.log").open("rb") as tail:
                     tail.seek(max(0, tail.seek(0, 2) - 4096))
@@ -314,8 +2254,22 @@ def run(binary):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path, help="exact built tauri-terminal-lab executable")
+    parser.add_argument("--jsh", type=Path, help="installed jsh executable for the optional native command-block journey")
+    parser.add_argument("--workspace", action="store_true", help="include the isolated shared Workspace host and CLI PTY journey")
+    parser.add_argument("--api-chat", action="store_true", help="include the isolated local streaming API conversation")
+    parser.add_argument("--native-task", action="store_true", help="include the isolated scoped native Codex task and approval")
+    parser.add_argument("--notebook", action="store_true", help="include native file selection and a supervised notebook run/stop")
+    parser.add_argument("--output-review", action="store_true", help="compare and export actual local jsh outputs after eviction")
+    parser.add_argument("--vim9", action="store_true", help="open an actual local workbench and edit/save through Vim and its fallback PTY")
     args = parser.parse_args()
     if not args.binary.is_absolute() or args.binary.is_symlink() or not args.binary.is_file() or not os.access(args.binary, os.X_OK):
         parser.error("an absolute regular executable is required")
+    if args.jsh and (not args.jsh.is_absolute() or not args.jsh.is_file() or not os.access(args.jsh, os.X_OK)
+                     or not shutil.which("vim")):
+        parser.error("--jsh requires an absolute installed jsh executable and Vim")
+    if args.output_review and not args.jsh:
+        parser.error("--output-review requires --jsh")
+    if args.vim9 and (not shutil.which("vim") or not shutil.which("xdotool")):
+        parser.error("--vim9 requires Vim 9 and xdotool for native file chooser input")
     signal.signal(signal.SIGTERM, interrupted)
-    run(args.binary)
+    run(args.binary, args.jsh, args.workspace, args.api_chat, args.native_task, args.notebook, args.output_review, args.vim9)

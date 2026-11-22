@@ -260,3 +260,45 @@ test('retired same-epoch history failure does not surface an old error or consum
  h.requests[2].resolve(page(1,'fresh',20,300));await fresh;
  assert.equal(h.output.value,'fresh');
 });
+
+function searchSetup(){
+ const element=()=>({value:'',textContent:'',handlers:{},focus(){},
+  setSelectionRange(start,end){this.selection=[start,end];},addEventListener(n,f){this.handlers[n]=f;}});
+ let owner={session:'owner',epoch:1,generation:1};
+ const requests=[];
+ const controls={form:element(),query:element(),find:element(),older:element(),cancel:element(),status:element(),enabled:()=>true};
+ const output=element();
+ const history=installHistory({output,label:element(),older:element(),newer:element(),refresh:element(),searchControls:controls,
+  getOwner:()=>owner,invoke:(name,args)=>new Promise((resolve,reject)=>requests.push({name,args,resolve,reject}))});
+ return {controls,output,requests,rotate:()=>{owner={...owner,generation:owner.generation+1};history.updateSearchControls();},
+  find:query=>{controls.query.value=query;return controls.form.handlers.submit({preventDefault(){}});}};
+}
+test('native search sends one bounded step at a time and selects a validated UTF-16 range',async()=>{
+ const h=searchSetup(),pending=h.find('中');
+ assert.equal(h.requests[0].name,'search_local_history');
+ assert.deepEqual(h.requests[0].args.search,{id:1,query:'中',restart:true});
+ h.requests[0].resolve({kind:'more',id:1,epoch:1});await tick();
+ assert.deepEqual(h.requests[1].args.search,{id:1,query:'中',restart:false});
+ h.requests[1].resolve({kind:'match',id:1,epoch:1,snapshot:page(1,'🐍 中'),start:3,end:4});
+ await pending;
+ assert.deepEqual(h.output.selection,[3,4]);assert.equal(h.controls.older.disabled,false);
+ const next=h.controls.older.handlers.click();
+ h.requests[2].reject(Error('History changed. Start a new search.'));await next;
+ assert.match(h.controls.status.textContent,/History changed/);assert.deepEqual(h.output.selection,[3,4]);
+ assert.equal(h.controls.older.disabled,true);
+});
+test('cancel and an attachment change leave no stale search continuation or selection',async()=>{
+ const h=searchSetup();
+ const canceled=h.find('old');
+ h.controls.cancel.handlers.click();
+ h.requests[0].resolve({kind:'more',id:1,epoch:1});await canceled;
+ assert.equal(h.requests.length,1);
+ const retired=h.find('old');h.rotate();
+ const fresh=h.find('fresh');
+ h.requests[1].resolve({kind:'match',id:2,epoch:1,snapshot:page(1,'old'),start:0,end:3});
+ await retired;
+ assert.equal(h.output.value,'');
+ assert.equal(h.requests[2].args.owner.generation,2);
+ h.requests[2].resolve({kind:'match',id:3,epoch:1,snapshot:page(1,'fresh'),start:0,end:5});await fresh;
+ assert.equal(h.output.value,'fresh');
+});

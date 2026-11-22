@@ -1,4 +1,28 @@
-# Shell integration consumer baseline (2026-11-13)
+# Local shell integration
+
+**Open jsh with Blocks** starts the installed `jsh` from an absolute directory
+on Aether's PATH and enables command observation on that PTY. The session's
+shared Rust parser recognizes bounded OSC 133 A, B, C and D packets. A completed
+record requires the prompt boundary, usable command metadata, and matching
+execution IDs on C and D. An absent or ambiguous exit status stays unknown.
+The card identifies the source as **PTY-reported OSC 133**. Every field is
+display data from the PTY stream.
+
+Aether retains eight completed records per observed shell and up to 16 KiB of
+plain-text output per record. It projects parsed printable output and line
+breaks between the two matching command markers. Fullscreen, cursor edits and
+viewport resizing keep the original command status and let the terminal
+display the output. The observer reads the PTY output stream, so a password
+entered with echo disabled is absent from the record. The layout restore
+continues to start fresh plain shells.
+
+The Blocks snapshot is scoped to the exact current attachment, including its
+generation. Refresh obtains a new snapshot and keeps open cards expanded.
+**Back to live terminal** focuses the original input surface. The normal
+`/bin/sh` launch and SSH terminal use the live terminal surface.
+[Native smoke](docs/NATIVE-LOCAL-WEBKIT-SMOKE.md)
+
+## Plain-shell fallback baseline, 2026-11-13
 
 This is a deliberately fail-closed fallback contract for the fifth terminal, not a command-block feature or authenticated shell integration.
 

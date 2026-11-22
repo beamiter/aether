@@ -67,6 +67,35 @@ export function acceptUpdate(previous, update, expected = {session:'frame-demo',
   }
   return finishFrame(frame, previous.cols, rows);
 }
+const painted = new WeakMap();
+
+export function clearPaint(canvas) {
+  painted.delete(canvas);
+  canvas.width = canvas.width;
+}
+
+function paintUnderline(g, cell, x, y, width) {
+  const kind = cell.underline ?? (cell.style & 4 || cell.hyperlink_id ? 'single' : null);
+  if (!kind) return;
+  g.fillStyle = cell.underline_color ?? cell.foreground;
+  if (kind === 'curly') {
+    g.strokeStyle = g.fillStyle;
+    g.lineWidth = 1;
+    g.beginPath();g.moveTo(x,y);
+    for (let offset = 0; offset < width; offset += 4) {
+      const rise = offset % 8 === 0 ? -2 : 2;
+      g.quadraticCurveTo(x+offset+2,y+rise,x+offset+4,y);
+    }
+    g.stroke();
+  } else if (kind === 'dotted' || kind === 'dashed') {
+    const mark = kind === 'dotted' ? 1 : 4;
+    for (let offset = 0; offset < width; offset += mark+2) g.fillRect(x+offset,y,Math.min(mark,width-offset),1);
+  } else {
+    g.fillRect(x,y,width,1);
+    if (kind === 'double') g.fillRect(x,y+2,width,1);
+  }
+}
+
 export function paint(canvas, frame, scale = globalThis.devicePixelRatio || 1) {
   if (!Number.isFinite(scale) || scale <= 0 || scale > 4) scale = 1;
   const cw = 12, ch = 24;
@@ -79,6 +108,36 @@ export function paint(canvas, frame, scale = globalThis.devicePixelRatio || 1) {
   const cssWidth = frame.cols * cw, cssHeight = frame.rows.length * ch;
   const width = Math.max(1, Math.floor(cssWidth * scale));
   const height = Math.max(1, Math.floor(cssHeight * scale));
+  const last = painted.get(canvas);
+  const previous = last?.frame;
+  const rowPixels = ch * scale;
+  // Fractional row edges can blend with the next row in Canvas2D. Only
+  // clear individual rows when their boundaries align to backing pixels.
+  const full = !last || last.scale !== scale || !Number.isInteger(rowPixels) ||
+    canvas.width !== width || canvas.height !== height ||
+    previous.session !== frame.session || previous.epoch !== frame.epoch ||
+    previous.layout !== frame.layout || previous.screen !== frame.screen || previous.cols !== frame.cols ||
+    previous.rows.length !== frame.rows.length;
+  const cursorMoved = !full && (previous.cursor_row !== frame.cursor_row ||
+    previous.cursor_col !== frame.cursor_col || previous.cursor_shape !== frame.cursor_shape ||
+    previous.cursor_visible !== frame.cursor_visible);
+  const oldCursorRow = cursorMoved && previous.cursor_visible ? previous.cursor_row : -1;
+  const newCursorRow = cursorMoved && frame.cursor_visible ? frame.cursor_row : -1;
+  const dirty = [];
+  for (let y = 0; y < frame.rows.length; y++) {
+    // Accepted deltas retain the validated row references from their base.
+    // Cursor changes also invalidate both its old and new visible rows.
+    if (full || previous.rows[y] !== frame.rows[y] || y === oldCursorRow || y === newCursorRow) {
+      dirty.push(y);
+    }
+  }
+  if (!dirty.length) {
+    painted.set(canvas, {frame, scale});
+    return;
+  }
+  // Canvas mutations after this point can fail partway. A recovery must
+  // perform a full repaint even if it has the same grid and row references.
+  painted.delete(canvas);
   // Assigning a dimension clears and resets Canvas even if the value is unchanged.
   if (canvas.width !== width) canvas.width = width;
   if (canvas.height !== height) canvas.height = height;
@@ -86,14 +145,16 @@ export function paint(canvas, frame, scale = globalThis.devicePixelRatio || 1) {
   if (canvas.style.height !== `${cssHeight}px`) canvas.style.height = `${cssHeight}px`;
   const g = canvas.getContext('2d');
   g.setTransform(1, 0, 0, 1, 0, 0);
-  g.clearRect(0, 0, width, height);
+  if (dirty.length === frame.rows.length) g.clearRect(0, 0, width, height);
+  else for (const y of dirty) g.clearRect(0, y * rowPixels, width, rowPixels);
   g.setTransform(scale, 0, 0, scale, 0, 0);
   g.font = '18px monospace'; g.textBaseline = 'top';
   // All backgrounds first: a wide glyph must not be erased by its trailing cell.
-  frame.rows.forEach((row, y) => {
+  for (const y of dirty) {
+    const row = frame.rows[y];
     if (!mergeBackgrounds) {
       row.forEach((cell, x) => { g.fillStyle = cell.background; g.fillRect(x*cw, y*ch, cw, ch); });
-      return;
+      continue;
     }
     for (let start = 0; start < row.length;) {
       const background = row[start].background;
@@ -103,24 +164,25 @@ export function paint(canvas, frame, scale = globalThis.devicePixelRatio || 1) {
       g.fillRect(start*cw, y*ch, (end-start)*cw, ch);
       start = end;
     }
-  });
-  frame.rows.forEach((r,y)=>r.forEach((c,x)=>{
+  }
+  for (const y of dirty) frame.rows[y].forEach((c,x)=>{
     if(c.width===0)return;
     g.save();
     try {
       g.beginPath();g.rect(x*cw,y*ch,cw*c.width,ch);g.clip();
       g.font=`${c.style&2?'italic ':''}${c.style&1?'bold ':''}18px monospace`;
       g.globalAlpha=c.style&16?0.5:1;g.fillStyle=c.foreground;g.fillText(c.text,x*cw,y*ch+2);
-      if(c.style&4)g.fillRect(x*cw,y*ch+ch-3,cw*c.width,1);
       if(c.style&8)g.fillRect(x*cw,y*ch+ch/2,cw*c.width,1);
+      paintUnderline(g,c,x*cw,y*ch+ch-3,cw*c.width);
     } finally {
       g.restore();
     }
-  }));
-  if(frame.cursor_visible){
+  });
+  if(frame.cursor_visible && dirty.includes(frame.cursor_row)){
     const x=frame.cursor_col*cw,y=frame.cursor_row*ch,width=cw*(frame.rows[frame.cursor_row][frame.cursor_col].width===2?2:1);g.fillStyle=g.strokeStyle='#9ac6ff';
     if(frame.cursor_shape==='beam')g.fillRect(x,y,2,ch);
     else if(frame.cursor_shape==='underline')g.fillRect(x,y+ch-2,width,2);
     else g.strokeRect(x+.5,y+.5,width-1,ch-1);
   }
+  painted.set(canvas, {frame, scale});
 }

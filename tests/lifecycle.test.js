@@ -1,14 +1,18 @@
 import {installPasteReview} from '../web/paste.js';
-import {resizeQueue,cursorTarget} from '../web/viewport.js';
+import {resizeQueue,cursorTarget,terminalCellAt} from '../web/viewport.js';
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import vm from 'node:vm';
 import {installHistory} from '../web/history.js';
-import {acceptFull,acceptUpdate,paint as paintFrame} from '../web/frames.js'; import {installIme} from '../web/ime.js';
+import {installCommandBlocks} from '../web/command-blocks.js';
+import {readLocalShellLayout,saveLocalShellLayout} from '../web/local-layout.js';
+import {acceptFull,acceptUpdate,clearPaint,paint as paintFrame} from '../web/frames.js'; import {installIme} from '../web/ime.js';
+import {acceptChannelFrame,channelCounter,CHANNEL_FRAME_VERSION} from '../web/frames-v4.js';
 const tick=()=>new Promise(r=>setImmediate(r));
 const deferred=()=>{let resolve,reject;const promise=new Promise((a,b)=>{resolve=a;reject=b});return {promise,resolve,reject};};
-function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsupported:"0"}), Encoder=TextEncoder, paint=()=>{}){
+function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsupported:"0"}), Encoder=TextEncoder, paint=()=>{},storage={},Channel,animation={}){
  const invoke=async(name,args)=>{
   const {owner,...parameters}=args??{};
-  const legacy=owner?{epoch:owner.epoch,...parameters}:args;
+  const keepsOwner=['activate_local_tab','subscribe_local_shell','ack_local_stream','set_local_observer','observe_local_shell','local_command_blocks'].includes(name);
+  const legacy=owner&&!keepsOwner?{epoch:owner.epoch,...parameters}:args;
   if(name==='shell_status')return {drained:false,write_error:null,dropped_reply_bytes:'0',...await health(legacy)};
   const result=await rawInvoke(name,legacy);
   if(name==='open_shell'&&Number.isInteger(result)){
@@ -21,12 +25,153 @@ function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsuppo
   return result;
  };
  const elements=new Map(),timers=new Map();let id=0;
- const el=selector=>{if(!elements.has(selector))elements.set(selector,{disabled:false,value:'',textContent:'',style:{},handlers:{},focus(){},replaceChildren(...options){this.options=options;},addEventListener(name,fn){this.handlers[name]=fn}});return elements.get(selector)};
- const context={installFilePreviewPanel:()=>({dismiss(){}}),document:{querySelector:el,createElement:()=>({})},__TAURI__:{core:{invoke}},acceptFull,acceptUpdate,installIme,installHistory,installPasteReview,resizeQueue,cursorTarget,paint,TextEncoder:Encoder,TextDecoder,
- setInterval(fn){timers.set(++id,fn);return id},clearInterval(i){timers.delete(i)},setTimeout};
+ const element=()=>({disabled:false,value:'',textContent:'',style:{},dataset:{},handlers:{},focus(){},setAttribute(){},replaceChildren(...options){this.options=options;},addEventListener(name,fn){this.handlers[name]=fn}});
+ const el=selector=>{if(!elements.has(selector))elements.set(selector,element());return elements.get(selector)};
+ const context={installFilePreviewPanel:()=>({dismiss(){}}),document:{querySelector:el,createElement:element},__TAURI__:{core:{invoke,Channel}},acceptFull,acceptUpdate,clearPaint,acceptChannelFrame,channelCounter,CHANNEL_FRAME_VERSION,installIme,installHistory,installCommandBlocks,installPasteReview,resizeQueue,cursorTarget,terminalCellAt,paint,TextEncoder:Encoder,TextDecoder,
+ readLocalShellLayout:()=>readLocalShellLayout(storage),saveLocalShellLayout:value=>saveLocalShellLayout(value,storage),
+ setInterval(fn){timers.set(++id,fn);return id},clearInterval(i){timers.delete(i)},setTimeout,...animation};
  vm.runInNewContext(fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8').replace(/^import .*\n/gm,''),context);
  return {el,timers,click:s=>el(s).handlers.click(),submit:()=>el('#command').handlers.submit({preventDefault(){}}),submitSsh:()=>el('#ssh-terminal-form').handlers.submit({preventDefault(){}})};
 }
+
+const channelHealth=epoch=>({epoch,exited:false,drained:false,write_error:null,dropped_reply_bytes:'0',unsupported:'0'});
+function channelSnapshot(frame){
+ const {cols,rows,...stamp}=frame;
+ return JSON.stringify({kind:'snapshot',cols,rows:rows.map(cells=>({wrapped:false,cells})),
+   stamp:{...stamp,version:4,epoch:String(stamp.epoch),resource_generation:String(stamp.epoch),revision:String(stamp.revision),layout:String(stamp.layout),screen:'primary'}});
+}
+function testChannel(){
+ let number=40;
+ return class {constructor(){this.id=++number;}};
+}
+
+test('a block snapshot from an old attachment cannot populate the reconnected panel',async()=>{
+ const first={session:'a'.repeat(32),epoch:1,generation:1},next={...first,generation:3};
+ const raw=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+ const reads=[];
+ const h=harness(async(name,args)=>{
+  switch(name){
+   case 'open_shell':return first;
+   case 'poll_shell':case 'detach_shell':case 'ack_shell':return null;
+   case 'attach_shell':return {owner:next,frame:{...raw,session:next.session}};
+   case 'local_command_blocks':{
+    const pending=deferred();reads.push({owner:args.owner,...pending});return pending.promise;
+   }
+   default:throw Error('unexpected IPC '+name);
+  }
+ });
+ await h.click('#open-integrated');
+ h.click('#command-block-toggle');
+ await h.click('#detach');
+ await h.click('#attach');
+ h.click('#command-block-toggle');
+ assert.deepEqual(reads.map(read=>read.owner.generation),[1,3]);
+ reads[0].resolve({owner:first,enabled:false,blocks:[]});await tick();
+ assert.equal(h.el('#command-block-status').textContent,'');
+ reads[1].resolve({owner:next,enabled:true,blocks:[]});await tick();
+ assert.match(h.el('#command-block-status').textContent,/Waiting for a completed command/);
+ assert.equal(h.el('#input').disabled,true);
+});
+
+test('local Channel paints and acknowledges exact revisions, fencing a retired attachment',async()=>{
+ const first={session:'a'.repeat(32),epoch:1,generation:1},next={...first,generation:3};
+ const raw=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+ const frame={...raw,session:first.session};
+ const sent=[],receivers=[],painted=[],scheduled=new Map();let animation=0;
+ const h=harness(async(name,args)=>{
+  switch(name){
+   case 'open_shell':return first;
+   case 'subscribe_local_shell':assert.equal(args.frameVersion,4);receivers.push(args.stream.onmessage);return null;
+   case 'ack_local_stream':sent.push(args);return null;
+   case 'detach_shell':case 'ack_shell':return null;
+   case 'attach_shell':assert.equal(args.frameVersion,4);return {owner:next,frame:channelSnapshot(frame)};
+   default:throw Error('unexpected local IPC '+name);
+  }
+ },undefined,undefined,(_canvas,frame)=>painted.push(frame.revision),{},testChannel(),{
+  requestAnimationFrame:fn=>{scheduled.set(++animation,fn);return animation;},
+  cancelAnimationFrame:id=>scheduled.delete(id),
+ });
+ await h.click('#open');
+ const revision='9007199254740993';
+ await receivers[0]({owner:first,kind:'update',sequence:'1',frame:channelSnapshot({...frame,revision}),status:channelHealth(1)});
+ assert.equal(sent.length,0);assert.equal(painted.length,0);
+ const draw=scheduled.get(1);scheduled.delete(1);draw();await tick();
+ assert.equal(h.el('#health').dataset.transport,'channel');
+ assert.deepEqual(sent.map(({owner,streamId,sequence,revision})=>[owner.generation,streamId,sequence,revision]),[[1,41,'1',revision]]);
+ await receivers[0]({owner:first,kind:'update',sequence:'2',frame:channelSnapshot({...frame,revision:'9007199254740994'}),status:channelHealth(1)});
+ assert.equal(scheduled.size,1);
+ await h.click('#detach');assert.equal(scheduled.size,0);await h.click('#attach');
+ await receivers[0]({owner:first,kind:'update',sequence:'2',frame:null,status:channelHealth(1)});
+ assert.equal(sent.length,1);assert.equal(painted.length,2);
+ await receivers[1]({owner:next,kind:'update',sequence:'1',frame:null,status:channelHealth(1)});
+ assert.deepEqual(sent.map(({owner,streamId,sequence,revision})=>[owner.generation,streamId,sequence,revision]),[[1,41,'1',revision],[3,42,'1',null]]);
+});
+
+test('a rejected stream snapshot requires recovery before compatibility polling can resume',async()=>{
+ const first={session:'a'.repeat(32),epoch:1,generation:1},next={...first,generation:2};
+ const raw=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+ const frame={...raw,session:first.session};
+ const calls=[],painted=[];let outgoing;
+ const h=harness(async(name,args)=>{
+  calls.push(name);
+  switch(name){
+   case 'open_shell':return first;
+   case 'subscribe_local_shell':outgoing=args.stream.onmessage;return null;
+   case 'recover_shell':return {owner:next,frame,input_allowed:true};
+   case 'ack_shell':case 'poll_shell':return null;
+   default:throw Error('unexpected local IPC '+name);
+  }
+ },undefined,undefined,(_canvas,frame)=>painted.push(frame.revision),{},testChannel());
+ await h.click('#open');
+ await outgoing({owner:first,kind:'update',sequence:'1',frame:channelSnapshot(frame),status:{}});
+ assert.equal(painted.length,0);assert.equal(h.el('#input').disabled,true);
+ assert.match(h.el('#status').textContent,/Recover the output snapshot/);
+ assert.deepEqual(calls,['open_shell','subscribe_local_shell']);
+ await h.click('#recover');
+ assert.equal(h.el('#input').disabled,false);assert.equal(h.el('#health').dataset.transport,'poll');
+ assert.deepEqual(calls,['open_shell','subscribe_local_shell','recover_shell','ack_shell','poll_shell']);
+ assert.deepEqual(painted,[frame.revision]);
+});
+
+test('split observations paint the inactive shell and cannot claim live input',async()=>{
+ const a={session:'a'.repeat(32),epoch:1,generation:1},b={session:'b'.repeat(32),epoch:2,generation:2};
+ const returned={...a,generation:3};
+ const raw=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+ const frame=owner=>({...raw,session:owner.session,epoch:owner.epoch});
+ const events=[],observers=[],painted=[],adopted=[],writes=[];
+ const h=harness(async(name,args)=>{
+  switch(name){
+   case 'open_shell':return a;
+   case 'subscribe_local_shell':events.push(args.stream.onmessage);return null;
+   case 'set_local_observer':observers.push(args.observer);return null;
+   case 'ack_shell':case 'ack_local_stream':return null;
+   case 'activate_local_tab':{
+    const owner=args.targetEpoch===null?b:returned;
+    adopted.push(owner.epoch);
+    assert.equal(args.frameVersion,4);
+    return {Ok:{owner,frame:channelSnapshot(frame(owner)),input_allowed:true}};
+   }
+   case 'write_shell':writes.push(args.epoch);return args.bytes.length;
+   default:throw Error('unexpected local IPC '+name);
+  }
+ },undefined,undefined,(canvas,frame)=>painted.push({canvas,epoch:frame.epoch}),{},testChannel());
+ await h.click('#open');await h.click('#new-local-tab');await h.click('#split-local');
+ const layout=observers[0].layout;
+ assert.equal(observers[0].epoch,1);assert.equal(h.el('#terminal-panes').dataset.split,'right');
+ await events[1]({owner:b,kind:'update',sequence:'1',frame:null,preview:{layout,frame:channelSnapshot(frame(a))},status:channelHealth(2)});
+ assert.equal(painted.at(-1).canvas,h.el('#peer-canvas'));assert.equal(painted.at(-1).epoch,1);
+ assert.deepEqual(adopted,[2]);
+ h.el('#input').value='send B';await h.submit();
+ await h.click('#focus-peer-pane');
+ assert.equal(h.el('#terminal-panes').dataset.split,'left');
+ assert.equal(h.el('#peer-canvas').dataset.geometry,undefined);
+ await events[1]({owner:b,kind:'update',sequence:'2',frame:null,preview:{layout,frame:channelSnapshot(frame(a))},status:channelHealth(2)});
+ assert.equal(h.el('#peer-canvas').dataset.geometry,undefined);
+ await events[2]({owner:returned,kind:'update',sequence:'1',frame:null,preview:{layout,frame:channelSnapshot(frame(b))},status:channelHealth(1)});
+ assert.equal(painted.at(-1).canvas,h.el('#peer-canvas'));assert.equal(painted.at(-1).epoch,2);
+ h.el('#input').value='send A';await h.submit();
+ assert.deepEqual(adopted,[2,1]);assert.deepEqual(writes,[2,1]);
+});
 
 test('SSH terminal recovers the same grid on a new generation and reattaches read-only',async()=>{
  const old={session:'a'.repeat(32),epoch:1,generation:1},next={...old,generation:2},readonly={...old,generation:4};
@@ -669,41 +814,192 @@ test('local reconnect never paints or ACKs a foreign, stale, or missing retained
  assert.equal(h.el('#input').disabled,true);
 });
 
-test('explicit second local shell parks the first draft and reconnects exact selected shell view-only',async()=>{
+test('the live local roster switches directly to the selected shell view-only',async()=>{
  const first={session:'a'.repeat(32),epoch:1,generation:1};
  const second={session:'b'.repeat(32),epoch:2,generation:1};
  const frame=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
- const calls=[];
- let firstOpened=false,secondOpened=false;
+ const calls=[],painted=[],late=deferred();
+ let firstOpened=false,secondOpened=false,secondPolls=0;
  const h=harness(async(name,args)=>{
   calls.push([name,args]);
   switch(name){
     case 'open_shell':assert(!firstOpened);firstOpened=true;return first;
     case 'list_local_shells':return (secondOpened?[first,second]:[first]).map(owner=>owner.epoch);
     case 'open_second_local_shell':assert.equal(args.epoch,first.epoch);secondOpened=true;return second;
-    case 'poll_shell':case 'detach_shell':case 'ack_shell':return null;
+    case 'poll_shell':return args.epoch===second.epoch&&++secondPolls===2?late.promise:null;
+    case 'detach_shell':case 'ack_shell':return null;
     case 'attach_selected_local_shell':
       assert.equal(args.epoch,first.epoch);
       return {owner:{...first,generation:3},frame:{...frame,session:first.session,epoch:first.epoch}};
     case 'write_shell':assert.equal(args.epoch,second.epoch);return args.bytes.length;
     default:throw Error(name);
   }
- });
+ },undefined,undefined,(_canvas,frame)=>painted.push(frame.session));
  await h.click('#open');h.el('#input').value='first-only draft';
- assert.equal(h.el('#manage-local').disabled,true);
+ await h.click('#manage-local');assert.equal(h.el('#open-second-local').disabled,true);
  await h.click('#detach');
  await h.click('#manage-local');assert.equal(h.el('#open-second-local').disabled,false);
  await h.click('#open-second-local');
  assert.equal(h.el('#input').value,'');assert.equal(h.el('#input').disabled,false);
  h.el('#input').value='second command';await h.submit();
- await h.click('#detach');await h.click('#manage-local');
+ const oldPoll=[...h.timers.values()][0]();await tick();assert.equal(secondPolls,2);
+ await h.click('#manage-local');
+ assert.equal(h.el('#input').disabled,false);
  assert.equal(h.el('#attach-selected-local').disabled,true);
  assert.equal(h.el('#open-second-local').disabled,true);
+ h.el('#local-shell-selection').value=String(second.epoch);h.el('#local-shell-selection').handlers.change();
+ assert.equal(h.el('#attach-selected-local').disabled,true);
  h.el('#local-shell-selection').value=String(first.epoch);h.el('#local-shell-selection').handlers.change();
  await h.click('#attach-selected-local');
+ late.resolve({...frame,session:second.session,epoch:second.epoch});await oldPoll;
+ assert.deepEqual(painted,[first.session]);
  assert.equal(h.el('#input').value,'first-only draft');assert.equal(h.el('#input').disabled,true);
  assert.match(h.el('#status').textContent,/view-only/);
  assert.deepEqual(calls.filter(([name])=>name==='write_shell').map(([,args])=>args.epoch),[2]);
+ assert.deepEqual(calls.filter(([name])=>['detach_shell','attach_selected_local_shell'].includes(name))
+  .map(([name,args])=>[name,args.epoch]),[['detach_shell',1],['detach_shell',2],['attach_selected_local_shell',1]]);
+});
+
+test('editable tabs keep per-shell drafts and recover a lost snapshot ACK without reopening a PTY',async()=>{
+ const a={session:'a'.repeat(32),epoch:1,generation:1},b={session:'b'.repeat(32),epoch:2,generation:2};
+ const returned={...a,generation:3};
+ const raw=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+ const view=owner=>({Ok:{owner,frame:{...raw,session:owner.session,epoch:owner.epoch},input_allowed:true}});
+ const activations=[],writes=[],acknowledged=[];
+ let loseAck=true;
+ const h=harness(async(name,args)=>{
+  switch(name){
+   case 'open_shell':return a;
+   case 'poll_shell':return null;
+   case 'activate_local_tab':activations.push(args);return view(args.targetEpoch===null?b:returned);
+   case 'ack_shell':
+    acknowledged.push(args.epoch);
+    if(loseAck){loseAck=false;throw Error('ACK response lost');}
+    return null;
+   case 'write_shell':writes.push(args.epoch);return args.bytes.length;
+   case 'text_shell':throw Error('stale IME commit was submitted');
+   default:throw Error(name);
+  }
+ });
+ const input=h.el('#input'),ime=h.el('#ime-input');
+ await h.click('#open');input.value='draft A';ime.handlers.compositionstart();
+ await h.click('#new-local-tab');
+ assert.equal(input.disabled,true);assert.equal(h.el('#retry-local-tab').hidden,false);
+ await h.click('#retry-local-tab');
+ assert.equal(input.disabled,false);assert.equal(input.value,'');
+ ime.handlers.compositionend({data:'late IME'});await tick();
+ input.value='send B';await h.submit();input.value='draft B';
+ const first=h.el('#local-tab-list').options.find(tab=>tab.dataset.epoch==='1');
+ first.handlers.click();await tick();
+ assert.equal(input.disabled,false);assert.equal(input.value,'draft A');
+ await h.submit();
+ assert.deepEqual(activations.map(({owner,targetEpoch,preserveInput})=>[owner.epoch,targetEpoch,preserveInput]),[[1,null,true],[2,1,true]]);
+ assert.deepEqual(acknowledged,[2,2,1]);assert.deepEqual(writes,[2,1]);
+});
+
+function layoutStorage(layout){
+ const entries=new Map();
+ const environment={localStorage:{getItem:key=>entries.get(key),setItem:(key,value)=>entries.set(key,value),
+  removeItem:key=>entries.delete(key)}};
+ saveLocalShellLayout(layout,environment);
+ return environment;
+}
+
+test('saved two-tab layout waits for an explicit action then selects the saved fresh tab',async()=>{
+ const storage=layoutStorage({count:2,active:0});
+ const first={session:'a'.repeat(32),epoch:7,generation:1};
+ const second={session:'b'.repeat(32),epoch:8,generation:2};
+ const frame=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+ const calls=[];
+ const h=harness(async(name,args)=>{
+  calls.push([name,args]);
+  if(name==='list_local_shells')return [];
+  if(name==='open_shell')return first;
+  if(name==='activate_local_tab'){
+   const owner=args.targetEpoch===null?second:{...first,generation:3};
+   return {Ok:{owner,frame:{...frame,session:owner.session,epoch:owner.epoch},input_allowed:true}};
+  }
+  if(name==='poll_shell'||name==='ack_shell')return null;
+  throw Error(name);
+ },undefined,undefined,undefined,storage);
+ assert.equal(h.el('#saved-local-layout').hidden,false);
+ assert.deepEqual(calls,[]);
+ await h.click('#restore-local-layout');
+ assert.equal(h.el('#saved-local-layout').hidden,true);
+ assert.equal(h.el('#input').disabled,false);
+ assert.equal(h.el('#input').value,'');
+ assert.match(h.el('#status').textContent,/two fresh shells/);
+ assert.deepEqual(calls.filter(([name])=>name==='activate_local_tab').map(([,args])=>args.targetEpoch),[null,first.epoch]);
+ assert(!calls.some(([name])=>name==='write_shell'||name==='key_shell'||name==='text_shell'));
+ assert.deepEqual(readLocalShellLayout(storage),{count:2,active:0,split:false});
+});
+
+test('failure to create the second restored tab leaves the first usable and the preference intact',async()=>{
+ const storage=layoutStorage({count:2,active:1});
+ const calls=[];
+ const h=harness(async(name)=>{
+  calls.push(name);
+  if(name==='list_local_shells')return [];
+  if(name==='open_shell')return 7;
+  if(name==='activate_local_tab')return {Err:'PTY unavailable'};
+  if(name==='poll_shell')return null;
+  throw Error(name);
+ },undefined,undefined,undefined,storage);
+ await h.click('#restore-local-layout');
+ assert.match(h.el('#status').textContent,/restore incomplete.*PTY unavailable/);
+ assert.equal(h.el('#input').disabled,false);
+ assert.equal(h.el('#close').disabled,false);
+ assert.equal(h.el('#local-tab-list').options.length,1);
+ assert.equal(calls.filter(name=>name==='activate_local_tab').length,1);
+ assert.deepEqual(readLocalShellLayout(storage),{count:2,active:1,split:false});
+});
+
+test('a lost first restore reply discovers the retained shell without launching again',async()=>{
+ const storage=layoutStorage({count:1,active:0});
+ let openCalls=0;
+ const h=harness(async(name)=>{
+  if(name==='list_local_shells')return openCalls?[4]:[];
+  if(name==='open_shell'){openCalls++;throw Error('missing open reply');}
+  throw Error(name);
+ },undefined,undefined,undefined,storage);
+ await h.click('#restore-local-layout');
+ assert.match(h.el('#status').textContent,/restore incomplete.*missing open reply/);
+ assert.equal(h.el('#local-tabs').hidden,false);
+ assert.equal(h.el('#saved-local-layout').hidden,true);
+ assert.equal(h.el('#local-tab-list').options[0].dataset.epoch,'4');
+ assert.equal(openCalls,1);
+});
+
+test('unconfirmed retirement aborts the switch and recovers only the old local shell',async()=>{
+ const current={session:'a'.repeat(32),epoch:1,generation:1};
+ const frame=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+ const pending=deferred(),calls=[];
+ const h=harness(async(name,args)=>{
+  calls.push(name);
+  switch(name){
+   case 'open_shell':return current;
+   case 'list_local_shells':return [current.epoch,2];
+   case 'detach_shell':return pending.promise;
+   case 'attach_shell':
+    assert.equal(args.target.session,current.session);assert.equal(args.target.epoch,current.epoch);
+    return {owner:{...current,generation:3},frame:{...frame,session:current.session}};
+   case 'poll_shell':case 'ack_shell':return null;
+   default:throw Error(name);
+  }
+ });
+ await h.click('#open');h.el('#input').value='stay with the first shell';
+ await h.click('#manage-local');
+ h.el('#local-shell-selection').value='2';h.el('#local-shell-selection').handlers.change();
+ const switchView=h.click('#attach-selected-local');await tick();
+ assert.equal(h.el('#manage-local').disabled,true);
+ assert.equal(h.el('#input').disabled,true);
+ assert(!calls.includes('attach_selected_local_shell'));
+ pending.reject(Error('missing detach reply'));await switchView;
+ assert.match(h.el('#status').textContent,/Detach unconfirmed/);
+ assert(!calls.includes('attach_selected_local_shell'));
+ await h.click('#attach');
+ assert.equal(h.el('#input').value,'stay with the first shell');
+ assert.equal(h.el('#input').disabled,true);
 });
 
 test('lost second-open response does not retry or present another shell as writable',async()=>{

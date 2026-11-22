@@ -11,23 +11,410 @@
   <label>SSH host <input id="ssh-terminal-host" placeholder="Host alias or user@host" maxlength="255" spellcheck="false" autocomplete="off" required></label>
   <button id="open-ssh" type="submit" disabled>Open SSH shell</button>
 </form>
-<button id="recover">Recover output snapshot</button> <button id="demo">Load frame</button> <button id="open" disabled>Open experimental shell</button> <button id="detach" disabled>Detach view</button> <button id="attach" disabled>Reconnect view</button> <button id="close" disabled>Close shell</button> <label>Columns <input id="cols" type="number" min="1" max="256" step="1" value="100"></label> <label>Rows <input id="rows" type="number" min="1" max="128" step="1" value="24"></label> <button id="resize" disabled>Apply size</button> <button id="reveal-cursor">Show cursor</button><p id="cursor-status"></p><p id="status" role="status">Ready. ANSI parsing never runs in this WebView.</p>
+<button id="recover">Recover output snapshot</button> <button id="demo">Load frame</button> <button id="open" disabled>Open experimental shell</button> <button id="open-integrated" type="button" disabled>Open jsh with Blocks</button> <button id="detach" disabled>Detach view</button> <button id="attach" disabled>Reconnect view</button> <button id="close" disabled>Close shell</button> <label>Columns <input id="cols" type="number" min="1" max="256" step="1" value="100"></label> <label>Rows <input id="rows" type="number" min="1" max="128" step="1" value="24"></label> <button id="resize" disabled>Apply size</button> <button id="reveal-cursor">Show cursor</button><p id="cursor-status"></p><p id="status" role="status">Ready. ANSI parsing never runs in this WebView.</p>
 <section id="local-shells" hidden aria-label="Retained local shells">
+  <div id="saved-local-layout" hidden>
+    <button id="restore-local-layout" type="button" aria-describedby="restore-local-note">Restore shell tabs</button>
+    <p class="note" id="restore-local-note">Opens fresh local shells with the saved tab count and selected position.</p>
+  </div>
+  <nav id="local-tabs" hidden aria-label="Local shell tabs">
+    <div id="local-tab-list"></div>
+    <button id="new-local-tab" type="button">New shell tab</button>
+    <button id="split-local" type="button" aria-pressed="false" disabled>Split panes</button>
+    <button id="retry-local-tab" type="button" hidden>Retry tab switch</button>
+  </nav>
   <button id="manage-local" type="button" disabled>Show retained local shells</button>
   <div id="local-shell-options" hidden>
     <label>Retained local shell <select id="local-shell-selection"></select></label>
     <button id="attach-selected-local" type="button" disabled>Reconnect selected view-only</button>
     <button id="open-second-local" type="button" disabled>Open second local shell</button>
-    <p class="note">Detach the current view first. A new shell accepts input; retained shells reconnect view-only. At most two local shells, with one view at a time.</p>
+    <p class="note">Select a different shell to switch views. Detach before opening a second shell. Reconnected views are read-only.</p>
   </div>
 </section>
-<p class="note">The scrollable canvas shows the live grid only. Show cursor brings its position into view without changing terminal state. Archived history is a separate snapshot below.</p><div class="viewport"><p id="health" aria-live="polite"></p>
-<canvas tabindex="0" aria-label="Experimental terminal; click to focus keyboard and composition input"></canvas></div>
-<label>Terminal keyboard / IME (experimental)<textarea id="ime-input" rows="2" spellcheck="false" autocomplete="off" aria-label="Terminal keyboard and input method composition"></textarea></label>
+<p class="note">The scrollable canvas shows the live grid only. Show cursor brings its position into view without changing terminal state. Archived history is a separate snapshot below.</p>
+<div id="terminal-panes">
+  <section id="active-pane" aria-label="Active terminal pane">
+    <div class="viewport"><p id="health" aria-live="polite"></p>
+      <canvas tabindex="0" aria-label="Active terminal keyboard and composition input"></canvas>
+      <textarea id="ime-input" rows="1" wrap="off" spellcheck="false" autocomplete="off" aria-label="Terminal input"></textarea>
+      <span id="terminal-preedit" aria-label="Terminal composition" hidden></span>
+    </div>
+  </section>
+  <section id="peer-pane" hidden aria-label="Inactive terminal pane">
+    <button id="focus-peer-pane" type="button">Focus other shell</button>
+    <div class="viewport"><canvas id="peer-canvas" aria-label="Inactive terminal output"></canvas></div>
+  </section>
+</div>
+<section id="command-blocks" hidden aria-label="Local command blocks">
+  <button id="command-block-toggle" type="button" aria-controls="command-block-panel" aria-expanded="false">Command blocks</button>
+  <div id="command-block-panel" hidden>
+    <div class="command-block-controls">
+      <button id="command-block-refresh" type="button">Refresh blocks</button>
+      <button id="command-block-return" type="button">Back to live terminal</button>
+    </div>
+    <p id="command-block-status" role="status"></p>
+    <form id="command-review-form" hidden>
+      <label>Before <select id="command-review-before" disabled></select></label>
+      <label>After <select id="command-review-after" disabled></select></label>
+      <button id="command-review-compare" type="submit" disabled>Compare captured outputs</button>
+    </form>
+    <section id="command-review" aria-labelledby="command-review-title" hidden>
+      <h3 id="command-review-title">Frozen output comparison</h3>
+      <p id="command-review-summary"></p>
+      <pre id="command-review-diff" tabindex="0" aria-label="Frozen output comparison"></pre>
+      <button id="command-review-markdown" type="button">Export Markdown</button>
+      <button id="command-review-json" type="button">Export JSON</button>
+    </section>
+    <p id="command-review-status" role="status"></p>
+    <div id="command-block-list"></div>
+  </div>
+</section>
 <section id="paste-review" hidden aria-label="Review multiline paste"><h2>Review multiline paste</h2><p>Newlines may execute commands. Verify every line before sending. This review applies even when bracketed paste is enabled; terminal modes can change.</p><textarea id="paste-preview" readonly rows="6" spellcheck="false" aria-label="Clipboard text with visual line breaks" aria-describedby="paste-line-endings"></textarea><p id="paste-line-endings">The preview displays CR, LF and CRLF as line breaks. The original clipboard text is shown below as a quoted string: \r means carriage return, \n means line feed, \t means tab and \\ means a literal backslash. Unicode format characters, including bidirectional controls and zero-width joiners, appear as \uXXXX escapes (two escapes for a supplementary character); this does not remove them from the paste. Other characters remain literal, so this is not a complete code-point listing. On delivery, each CRLF pair, lone CR or LF becomes one carriage return. Bracketed paste markers depend on the terminal mode at delivery.</p><pre id="paste-escaped" tabindex="0" role="region" aria-label="Original clipboard text with escaped line endings and format characters" aria-describedby="paste-line-endings"></pre><button id="paste-confirm" type="button" disabled>Send reviewed paste</button> <button id="paste-cancel" type="button">Cancel paste</button></section>
-<section><button id="copy-visible">Snapshot visible text</button> <button id="history-older">Older 20 rows</button> <button id="history-newer">Newer 20 rows</button> <button id="history-refresh">Refresh history / copy snapshot</button><p id="history-label">Bounded snapshot, select and copy manually.</p><textarea id="history-output" readonly rows="12" spellcheck="false" aria-label="Terminal history text snapshot for selection and copy"></textarea></section>
+<section aria-label="Terminal history">
+  <button id="copy-visible">Snapshot visible text</button> <button id="history-older">Older 20 rows</button> <button id="history-newer">Newer 20 rows</button> <button id="history-refresh">Refresh history / copy snapshot</button>
+  <form id="history-find-form" hidden>
+    <label>Find in local history <input id="history-find-query" type="search" maxlength="128" autocomplete="off" spellcheck="false"></label>
+    <button id="history-find" type="submit">Find</button>
+    <button id="history-find-older" type="button" disabled>Older match</button>
+    <button id="history-find-cancel" type="button" disabled>Cancel</button>
+  </form>
+  <p id="history-find-status" role="status"></p>
+  <p id="history-label">Bounded snapshot, select and copy manually.</p>
+  <textarea id="history-output" readonly rows="12" wrap="off" spellcheck="false" aria-label="Terminal history text snapshot for selection and copy"></textarea>
+</section>
 <form id="command"><label>Shell command <input id="input" autocomplete="off" placeholder="printf hello" disabled></label> <button id="send" disabled>Send line</button></form><p class="note">Experimental: fixed /bin/sh; focus terminal for logical keyboard input. Multiline clipboard paste requires review before sending; newlines may execute commands when bracketed paste is off. Still required: production process containment, Unicode shaping, native keyboard/IME acceptance and broad Vim compatibility, IME and accessibility.</p></main>
-<section aria-label="Explicit local file preview"><h2>Local file preview (experimental)</h2><p>This opt-in preview reads only files selected below. Ctrl+left-click an exact visible relative file name to select it, then confirm Preview selected file. The confirmation is required because terminal output cannot prove a local or remote identity. Positive :line or :line:column suffixes select the same file (no line navigation). Wrapped paths, absolute paths and OSC 8 links are not resolved. Markdown, TSX, HTML and SVG are plain source text, never executed. Static PNG and baseline JPEG are limited to 2 MiB, 4096 per side and 4 megapixels. Other image formats are not decoded. Re-select the folder to refresh its snapshot.</p><label>Select a trusted local folder (at most 2048 total files) <input id="preview-folder" type="file" webkitdirectory multiple></label><label>Select one file (large projects, no folder enumeration) <input id="preview-single" type="file"></label><label>Preview file <select id="preview-files" disabled></select></label><button id="preview-show" type="button" disabled>Preview selected file</button> <button id="preview-clear" type="button">Clear local access</button><p id="preview-notice" role="status">No local files authorized.</p></section><aside id="file-preview" hidden aria-label="Local source preview"><button id="preview-close" type="button">Close preview</button><h2 id="preview-title"></h2><div id="preview-confirmation" hidden><p>Confirm this reference belongs to your selected local folder, not a remote session.</p><button id="preview-confirm-local" type="button">Preview selected local file</button></div><canvas id="preview-raster" hidden aria-label="Selected local raster image"></canvas><pre id="preview-source" tabindex="0" aria-label="Source text, not executable"></pre></aside>
+<details id="agent-workspace" hidden>
+  <summary>Agent Workspace</summary>
+  <div class="workspace-controls">
+    <button id="workspace-refresh" type="button">Refresh CLI sessions</button>
+    <button id="workspace-more" type="button" disabled>Next page</button>
+    <label>Conversation <select id="workspace-conversation" disabled></select></label>
+    <button id="workspace-attach" type="button" disabled>Attach terminal</button>
+    <button id="workspace-detach" type="button" disabled>Detach terminal</button>
+  </div>
+  <p id="workspace-selection"></p>
+  <p id="workspace-status" role="status"></p>
+  <section id="workspace-view" aria-label="Workspace CLI terminal" hidden>
+    <div class="viewport"><canvas id="workspace-canvas" aria-label="Workspace CLI terminal output"></canvas></div>
+    <label>Workspace terminal input <textarea id="workspace-input" rows="2" spellcheck="false" autocomplete="off" disabled></textarea></label>
+    <button id="workspace-copy-visible" type="button">Snapshot visible text</button>
+    <textarea id="workspace-output" rows="6" readonly aria-label="Workspace terminal visible text snapshot" hidden></textarea>
+  </section>
+  <details id="workspace-api" hidden>
+    <summary>API conversations</summary>
+    <div class="workspace-controls">
+      <button id="chat-new" type="button">New conversation</button>
+      <button id="chat-refresh" type="button">Refresh conversations</button>
+      <button id="chat-more" type="button" disabled>Next page</button>
+      <label>Conversation <select id="chat-select" disabled></select></label>
+      <button id="chat-open" type="button" disabled>Open conversation</button>
+      <button id="chat-detach" type="button" disabled>Detach conversation</button>
+    </div>
+    <p id="chat-status" role="status"></p>
+    <section id="chat-view" aria-label="API conversation" hidden>
+      <h2 id="chat-title"></h2>
+      <p id="chat-context" hidden>This conversation includes attached terminal context.</p>
+      <p id="chat-older" hidden>Showing the latest saved exchanges.</p>
+      <div id="chat-history" aria-label="Saved exchanges"></div>
+      <section id="chat-live" aria-label="Current API request" hidden>
+        <p id="chat-job-status" role="status"></p>
+        <pre id="chat-job-prompt"></pre>
+        <pre id="chat-preview"></pre>
+        <button id="chat-cancel" type="button" disabled>Cancel request</button>
+      </section>
+      <form id="chat-form">
+        <label>Message draft <textarea id="chat-draft" rows="4" maxlength="65536" spellcheck="true"></textarea></label>
+        <div class="workspace-controls">
+          <button id="chat-save" type="button" disabled>Save draft</button>
+          <button id="chat-send" type="submit" disabled>Send message</button>
+          <button id="chat-reload" type="button">Reload conversation</button>
+        </div>
+      </form>
+    </section>
+  </details>
+  <details id="workspace-native" hidden>
+    <summary>Native tasks</summary>
+    <div class="workspace-controls">
+      <button id="native-refresh" type="button">Refresh native tasks</button>
+      <button id="native-more" type="button" disabled>Next page</button>
+      <label>Saved task <select id="native-select" disabled></select></label>
+      <button id="native-open" type="button" disabled>Open task</button>
+      <button id="native-detach" type="button" disabled>Detach task view</button>
+    </div>
+    <form id="native-create">
+      <label>Local Git repository <input id="native-repository" maxlength="4096" placeholder="/absolute/project/path" required></label>
+      <label>Task title <input id="native-title" maxlength="160" required></label>
+      <label>Task goal <textarea id="native-goal" rows="4" maxlength="16384" required></textarea></label>
+      <label>Verification command (optional, <code>/bin/sh</code> in the worktree)
+        <input id="native-verification-recipe" maxlength="65536" spellcheck="false" autocomplete="off">
+      </label>
+      <label class="native-consent"><input id="native-consent" type="checkbox" required> Share the goal, optional verification command and new isolated worktree with Codex</label>
+      <button id="native-start" type="submit" disabled>Create and start native task</button>
+      <button id="native-save-draft" type="button" disabled>Save task draft</button>
+    </form>
+    <p id="native-status" role="status"></p>
+    <section id="native-view" aria-label="Native task" hidden>
+      <h2 id="native-task-title"></h2>
+      <p id="native-worktree"></p>
+      <p id="native-lifecycle" role="status"></p>
+      <p id="native-detail"></p>
+      <pre id="native-draft-goal" aria-label="Saved task goal" hidden></pre>
+      <pre id="native-output" aria-label="Native provider output"></pre>
+      <div id="native-approvals" aria-label="Pending native approval requests"></div>
+      <section id="native-verification" aria-labelledby="native-verification-title" hidden>
+        <h3 id="native-verification-title">Verification</h3>
+        <p id="native-verification-shell"></p>
+        <pre id="native-verification-command" aria-label="Authored verification command"></pre>
+        <p id="native-verification-status" role="status"></p>
+        <pre id="native-verification-output" aria-label="Verification output"></pre>
+        <button id="native-verify" type="button" disabled>Run verification</button>
+      </section>
+      <div class="workspace-controls">
+        <button id="native-stop" type="button" disabled>Stop task</button>
+        <button id="native-finish" type="button" disabled>Finish native session</button>
+        <button id="native-inspect" type="button" disabled>Inspect result</button>
+      </div>
+      <details id="native-context">
+        <summary>Task context</summary>
+        <label>Handoff goal <textarea id="native-context-goal" rows="3" maxlength="65536" disabled></textarea></label>
+        <label>Completed <textarea id="native-context-completed" rows="2" maxlength="65536" disabled></textarea></label>
+        <label>Remaining <textarea id="native-context-remaining" rows="2" maxlength="65536" disabled></textarea></label>
+        <label>Constraints <textarea id="native-context-constraints" rows="2" maxlength="65536" disabled></textarea></label>
+        <div id="native-context-materials" aria-label="Saved context materials"></div>
+        <label>Add a note <textarea id="native-context-note" rows="2" maxlength="65536" disabled></textarea></label>
+        <div class="workspace-controls">
+          <button id="native-context-save" type="button" disabled>Save context</button>
+          <button id="native-context-reload" type="button" disabled>Reload saved context</button>
+          <button id="native-context-preview" type="button" disabled>Preview Codex handoff</button>
+        </div>
+        <p id="native-context-status" role="status"></p>
+        <section id="native-context-packet" aria-label="Handoff preview" hidden>
+          <pre id="native-context-body"></pre>
+          <button id="native-context-use" type="button" disabled>Open new task draft</button>
+        </section>
+      </details>
+      <section id="native-result" aria-label="Worktree inspection" hidden>
+        <h3>Worktree inspection</h3>
+        <p id="native-validation"></p>
+        <pre id="native-diff"></pre>
+        <button id="native-accept-verified" type="button" hidden disabled>Accept verified work</button>
+        <button id="native-accept-reviewed" type="button" hidden disabled>Accept reviewed work</button>
+      </section>
+    </section>
+  </details>
+  <details id="workspace-mission" hidden>
+    <summary>Missions</summary>
+    <div class="workspace-controls">
+      <label>Saved Mission <select id="mission-select" disabled></select></label>
+      <button id="mission-open" type="button" disabled>Open Mission</button>
+      <button id="mission-refresh" type="button">Refresh Missions</button>
+    </div>
+    <form id="mission-create" aria-label="Create Mission from a native task">
+      <p id="mission-source"></p>
+      <label>Mission title <input id="mission-title" maxlength="256" required></label>
+      <label>Acceptance goal <textarea id="mission-goal" rows="3" maxlength="16384" required></textarea></label>
+      <label>Repository identity <input id="mission-repository" placeholder="owner/repository" maxlength="256" required></label>
+      <label>Delivery branch ref <input id="mission-target" value="refs/heads/master" maxlength="512" required></label>
+      <button id="mission-new" type="submit" disabled>Create Mission from selected task</button>
+    </form>
+    <p id="mission-status" role="status"></p>
+    <section id="mission-view" aria-label="Selected Mission" hidden>
+      <h2 id="mission-selected-title"></h2>
+      <form id="mission-edit">
+        <label>Mission title <input id="mission-edit-title" maxlength="256" required></label>
+        <label>Acceptance goal <textarea id="mission-edit-goal" rows="3" maxlength="16384" required></textarea></label>
+        <button id="mission-save" type="submit" disabled>Save changes</button>
+      </form>
+      <div id="mission-repositories"></div>
+      <div class="workspace-controls">
+        <button id="mission-inspect" type="button" disabled>Inspect delivery evidence</button>
+        <button id="mission-freeze" type="button" disabled>Freeze observed candidates</button>
+      </div>
+      <section id="mission-report" aria-label="Mission evidence" hidden>
+        <h3 id="mission-report-title"></h3>
+        <p id="mission-evidence-state"></p>
+        <div id="mission-evidence"></div>
+      </section>
+    </section>
+  </details>
+  <details id="workspace-tools" hidden>
+    <summary>Tools</summary>
+    <form id="tools-search" aria-label="Search Workspace evidence">
+      <label>Search indexed evidence <input id="tools-query" type="search" maxlength="4096" required></label>
+      <label><input id="tools-scope" type="checkbox" disabled> Selected native task only</label>
+      <label><input id="tools-archived" type="checkbox"> Include archived conversations</label>
+      <button id="tools-submit" type="submit">Search</button>
+    </form>
+    <p id="tools-status" role="status"></p>
+    <p id="tools-coverage"></p>
+    <ol id="tools-results" aria-label="Evidence search results"></ol>
+    <button id="tools-more" type="button" disabled>Older results</button>
+    <section id="tools-document" aria-labelledby="tools-document-source" hidden>
+      <h2 id="tools-document-source"></h2>
+      <p id="tools-document-identity"></p>
+      <pre id="tools-document-text" tabindex="0"></pre>
+    </section>
+  </details>
+  <details id="workspace-queue" hidden>
+    <summary>Task queue</summary>
+    <button id="queue-refresh" type="button">Refresh queue</button>
+    <p id="queue-status" role="status"></p>
+    <ul id="queue-entries" aria-label="Task readiness"></ul>
+    <section id="queue-selected" aria-labelledby="queue-task-title" hidden>
+      <h2 id="queue-task-title"></h2>
+      <label>Dependencies <select id="queue-dependencies" multiple size="5" disabled></select></label>
+      <div class="workspace-controls">
+        <button id="queue-save" type="button" disabled>Save queue plan</button>
+        <button id="queue-remove" type="button" disabled>Remove from queue</button>
+      </div>
+      <div id="queue-launch-controls" hidden>
+        <label><input id="queue-confirm" type="checkbox" disabled> Share the saved goal, verification command and worktree with Codex</label>
+        <button id="queue-launch" type="button" disabled>Start queued task</button>
+      </div>
+    </section>
+  </details>
+</details>
+<details id="ssh-files" hidden>
+  <summary>SSH Files</summary>
+  <form id="files-connect" class="workspace-controls">
+    <label>SSH host <input id="files-host" maxlength="255" autocomplete="off" spellcheck="false" required></label>
+    <label>Project directory <input id="files-root" placeholder="/home/user/project" maxlength="4096" spellcheck="false" required></label>
+    <button id="files-open">Open SSH project</button>
+  </form>
+  <div id="files-browser" hidden>
+    <p id="files-source"></p>
+    <div class="workspace-controls">
+      <button id="files-parent" type="button">Parent folder</button>
+      <button id="files-refresh" type="button">Refresh folder</button>
+      <button id="files-next" type="button">Next entries</button>
+      <button id="files-close" type="button">Close SSH project</button>
+    </div>
+    <label>Remote entries <select id="files-entries" size="6"></select></label>
+    <div class="workspace-controls">
+      <button id="files-enter" type="button">Open folder</button>
+      <button id="files-preview" type="button">Preview text</button>
+      <button id="files-download" type="button">Download file</button>
+    </div>
+    <form id="files-new-directory" class="workspace-controls">
+      <label>New folder name <input id="files-name" maxlength="255" required></label>
+      <button id="files-mkdir">Create folder</button>
+    </form>
+    <form id="files-upload-form" class="workspace-controls">
+      <label>Local file (up to 1 MiB) <input id="files-local" type="file" required></label>
+      <button id="files-upload">Upload as new file</button>
+    </form>
+    <section id="files-snapshot" aria-label="SSH file snapshot" hidden>
+      <p id="files-version"></p><pre id="files-text" tabindex="0"></pre>
+    </section>
+  </div>
+  <p id="files-status" role="status"></p>
+</details>
+<details id="ssh-workspace" hidden>
+  <summary>Remote Workspace (read-only)</summary>
+  <form id="rws-connect" class="workspace-controls">
+    <label>SSH alias <input id="rws-alias" maxlength="255" required></label>
+    <label>Remote Workspace executable <input id="rws-executable" placeholder="/usr/bin/jterm-sessiond" maxlength="4096" required></label>
+    <label>Expected Workspace host ID <input id="rws-host-id" required></label>
+    <button id="rws-open">Connect to Workspace</button>
+  </form>
+  <div id="rws-browser" hidden>
+    <p id="rws-source"></p>
+    <div class="workspace-controls">
+      <button id="rws-refresh" type="button">Refresh catalog</button>
+      <button id="rws-next" type="button">Next catalog page</button>
+      <button id="rws-disconnect" type="button">Disconnect Workspace</button>
+    </div>
+    <form id="rws-search" class="workspace-controls">
+      <label>Conversation <select id="rws-conversation"></select></label>
+      <label>Search evidence <input id="rws-query" type="search" maxlength="1024"></label>
+      <button id="rws-submit">Search</button>
+    </form>
+    <p id="rws-row"></p>
+    <p id="rws-coverage"></p><ul id="rws-hits"></ul>
+    <button id="rws-more" type="button" hidden>Next results</button>
+    <section id="rws-document" aria-label="Remote Workspace evidence" hidden>
+      <p id="rws-anchor"></p><pre id="rws-text" tabindex="0"></pre>
+    </section>
+  </div>
+  <p id="rws-status" role="status"></p>
+</details>
+<details id="local-notebook" hidden>
+  <summary>Notebook</summary>
+  <form id="notebook-open-form">
+    <label>Local .jtnb.md notebook <input id="notebook-file" type="file" accept=".md,text/markdown" disabled></label>
+    <button id="notebook-open" type="submit" disabled>Open notebook</button>
+    <button id="notebook-close" type="button" disabled>Close notebook</button>
+  </form>
+  <p class="note">Review each cell before running it. Cells run with your local account in a new working directory for each opened snapshot. Open and reopen only read the selected snapshot.</p>
+  <p id="notebook-status" role="status"></p>
+  <article id="notebook-document" hidden>
+    <h2 id="notebook-title"></h2>
+    <p class="note" id="notebook-source-id"></p>
+    <div id="notebook-parts"></div>
+    <section id="notebook-run-result" hidden aria-labelledby="notebook-run-title">
+      <h3 id="notebook-run-title"></h3>
+      <div class="notebook-streams">
+        <div><h4>stdout</h4><pre id="notebook-stdout" aria-label="Standard output" tabindex="0"></pre></div>
+        <div><h4>stderr</h4><pre id="notebook-stderr" aria-label="Standard error" tabindex="0"></pre></div>
+      </div>
+      <p id="notebook-output-limit" class="note" hidden>Output exceeded 256 KiB. The retained prefix is shown.</p>
+    </section>
+  </article>
+</details>
+<details id="vim9-workbench" hidden>
+  <summary>Vim9 Workbench</summary>
+  <div id="vim9-toolbar">
+    <button id="vim9-open" type="button" disabled>Open local file in Vim9</button>
+    <button id="vim9-save" type="button" disabled>Save in Vim</button>
+    <button id="vim9-quit" type="button" disabled>Quit Vim</button>
+    <button id="vim9-release" type="button" disabled>Close workbench</button>
+    <label><input id="vim9-fallback" type="checkbox" disabled> Show live terminal</label>
+  </div>
+  <p id="vim9-status" role="status"></p>
+  <p id="vim9-error" role="alert"></p>
+  <details id="vim9-project" hidden>
+    <summary>Project tools</summary>
+    <p id="vproject-root"></p>
+    <form id="vproject-lookup" class="workspace-controls">
+      <label>File or command <input id="vproject-query" placeholder="path:line:column or >command" maxlength="256" autocomplete="off"></label>
+      <button>Find</button>
+      <button id="vproject-parent" type="button">Parent folder</button>
+      <button id="vproject-refresh" type="button">Refresh project files</button>
+    </form>
+    <div id="vproject-choices" aria-label="Vim project choices"></div>
+    <form id="vproject-search" class="workspace-controls">
+      <label>Search project text <input id="vproject-search-query" maxlength="1024" required></label>
+      <button>Search project</button><button id="vproject-stop-search" type="button">Stop search</button>
+    </form>
+    <form id="vproject-build" class="workspace-controls">
+      <label>Build command <input id="vproject-build-command" maxlength="4096" required autocomplete="off" spellcheck="false"></label>
+      <button>Run build</button><button id="vproject-stop-build" type="button">Stop build</button>
+    </form>
+    <p id="vproject-jobs" role="status"></p>
+    <pre id="vproject-output" tabindex="0" aria-label="Vim build output"></pre>
+    <div class="workspace-controls">
+      <button id="vproject-prev" type="button">Previous problem</button>
+      <button id="vproject-next" type="button">Next problem</button>
+    </div>
+    <ul id="vproject-diagnostics" aria-label="Vim diagnostics"></ul>
+    <p id="vproject-status" role="status"></p>
+  </details>
+  <div id="vim9-viewport" class="viewport" hidden>
+    <div id="vim9-screen" data-source="terminal">
+      <canvas id="vim9-terminal" aria-label="Live Vim terminal"></canvas>
+      <canvas id="vim9-render" aria-hidden="true" hidden></canvas>
+      <textarea id="vim9-input" aria-label="Type in Vim" autocomplete="off" autocapitalize="off" spellcheck="false" disabled></textarea>
+      <div id="vim9-preedit" aria-hidden="true" hidden></div>
+    </div>
+  </div>
+  <section id="vim9-paste-review" hidden aria-label="Vim paste review">
+    <label>Paste text <textarea id="vim9-paste-preview" readonly></textarea></label>
+    <pre id="vim9-paste-escaped"></pre>
+    <button id="vim9-paste-confirm" type="button">Paste in Vim</button>
+    <button id="vim9-paste-cancel" type="button">Cancel paste</button>
+  </section>
+</details>
+<section aria-label="Explicit local file preview"><h2>Local file preview (experimental)</h2><p>This opt-in preview reads only files selected below. Ctrl+left-click an exact visible relative file name to select it, then confirm Preview selected file. The confirmation is required because terminal output cannot prove a local or remote identity. Positive :line or :line:column suffixes are passed to Vim when you choose the matching file in its native chooser. Wrapped paths, absolute paths and OSC 8 links are not resolved. Markdown, TSX, HTML and SVG are plain source text, never executed. Static PNG and baseline JPEG are limited to 2 MiB, 4096 per side and 4 megapixels. Other image formats are not decoded. Re-select the folder to refresh its snapshot.</p><label>Select a trusted local folder (at most 2048 total files) <input id="preview-folder" type="file" webkitdirectory multiple></label><label>Select one file (large projects, no folder enumeration) <input id="preview-single" type="file"></label><label>Preview file <select id="preview-files" disabled></select></label><button id="preview-show" type="button" disabled>Preview selected file</button> <button id="preview-clear" type="button">Clear local access</button><p id="preview-notice" role="status">No local files authorized.</p></section><aside id="file-preview" hidden aria-label="Local source preview"><button id="preview-close" type="button">Close preview</button> <button id="preview-vim9" type="button" hidden>Open verified local file in Vim9…</button><h2 id="preview-title"></h2><div id="preview-confirmation" hidden><p>Confirm this reference belongs to your selected local folder, not a remote session.</p><button id="preview-confirm-local" type="button">Preview selected local file</button></div><canvas id="preview-raster" hidden aria-label="Selected local raster image"></canvas><pre id="preview-source" tabindex="0" aria-label="Source text, not executable"></pre></aside>
 </div>
 <section id="remote-panel" hidden aria-labelledby="remote-title">
   <h1 id="remote-title">Remote Desktop</h1>
@@ -72,4 +459,11 @@
   </div>
 </section>
 <script type="module" src="app.js"></script>
+<script type="module" src="agent-workspace.js"></script>
+<script type="module" src="workspace-chat.js"></script>
+<script type="module" src="workspace-native.js"></script>
+<script type="module" src="notebook-panel.js"></script>
+<script type="module" src="vim9-workbench.js"></script>
+<script type="module" src="ssh-files.js"></script>
+<script type="module" src="remote-workspace.js"></script>
 <script type="module" src="remote-desktop.js"></script></html>

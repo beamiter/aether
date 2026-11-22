@@ -2,6 +2,7 @@
 use super::{
     invalid, read_record, write_record, Command, Reply, Request, MAX_REPLY, MAX_REQUEST, VERSION,
 };
+use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use std::{
     io::{self, BufReader, Read, Write},
@@ -27,6 +28,19 @@ impl Endpoint {
         helper: Option<&Path>,
         socket: Option<&Path>,
     ) -> Result<Self, String> {
+        Self::helper(destination, helper, "stdio", socket)
+    }
+
+    pub fn files(destination: &str, helper: Option<&Path>) -> Result<Self, String> {
+        Self::helper(destination, helper, "files", None)
+    }
+
+    fn helper(
+        destination: &str,
+        helper: Option<&Path>,
+        mode: &str,
+        socket: Option<&Path>,
+    ) -> Result<Self, String> {
         let destination = destination.trim();
         if destination.is_empty()
             || destination.len() > 255
@@ -42,8 +56,8 @@ impl Endpoint {
             return Err("Enter an SSH host alias or user@host.".into());
         }
         let mut remote_command = match helper {
-            Some(path) => format!("exec {} stdio", quote_absolute_path(path)?),
-            None => "exec aether-terminal-host stdio".to_string(),
+            Some(path) => format!("exec {} {mode}", quote_absolute_path(path)?),
+            None => format!("exec aether-terminal-host {mode}"),
         };
         if let Some(socket) = socket {
             remote_command.push(' ');
@@ -157,6 +171,15 @@ impl Relay {
     /// An I/O error ends the relay. The caller can recover the known session
     /// on a new relay without retransmitting the interrupted operation.
     pub fn call(&mut self, command: Command) -> io::Result<Result<Value, String>> {
+        self.exchange(command, MAX_REQUEST, MAX_REPLY)
+    }
+
+    pub(crate) fn exchange<C: Serialize, T: DeserializeOwned>(
+        &mut self,
+        command: C,
+        request_limit: usize,
+        response_limit: usize,
+    ) -> io::Result<Result<T, String>> {
         let request = self.next_request;
         self.next_request = request
             .checked_add(1)
@@ -169,9 +192,9 @@ impl Relay {
                 request,
                 command,
             },
-            MAX_REQUEST,
+            request_limit,
         )?;
-        let reply: Reply = read_record(&mut self.channel, MAX_REPLY)?.ok_or_else(|| {
+        let reply: Reply<T> = read_record(&mut self.channel, response_limit)?.ok_or_else(|| {
             io::Error::new(io::ErrorKind::UnexpectedEof, "SSH terminal relay closed")
         })?;
         if reply.protocol != VERSION || reply.request != request {

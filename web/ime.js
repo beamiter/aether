@@ -1,10 +1,19 @@
-// Desktop composition ordering adapter. Only committed text leaves this module.
-// Native WebKit/platform IME behavior still requires real-window acceptance.
-export function installIme(element,{getEpoch,commit}){
- let active=false,owner=null,duplicate=null,discard=false;
+// Desktop composition ordering adapter. Preedit stays in the view.
+export function installIme(element,{getEpoch,commit,preedit=()=>{},afterEnd=callback=>callback(),canCommit=()=>true}){
+ let active=false,owner=null,duplicate=null,discard=false,pending=null;
  const clear=()=>{element.value='';};
- const reset=()=>{active=false;owner=null;duplicate=null;discard=true;clear();};
- element.addEventListener('compositionstart',()=>{active=true;owner=getEpoch();duplicate=null;discard=false;});
+ const flush=()=>{
+   const completed=pending;pending=null;
+   if(completed&&completed.epoch===getEpoch()&&canCommit())commit(completed.text,completed.epoch);
+ };
+ const reset=()=>{active=false;owner=null;duplicate=null;discard=true;pending=null;clear();preedit('');};
+ element.addEventListener('compositionstart',()=>{
+   flush();active=true;owner=getEpoch();duplicate=null;discard=false;preedit('');
+ });
+ element.addEventListener('compositionupdate',event=>{
+   const text=event.data??'';
+   preedit(active&&owner!==null&&owner===getEpoch()&&text.length<=4096?text:'');
+ });
  element.addEventListener('compositionend',event=>{
    if(!active){clear();return;}
    active=false;const epoch=owner;owner=null;const text=event.data||'';
@@ -12,16 +21,22 @@ export function installIme(element,{getEpoch,commit}){
    // retain an unbounded rejected composition just to recognize its duplicate.
    // A boolean quarantine drops late input until a new key/composition/reset.
    if(text.length>4096){duplicate=null;discard=true;}else duplicate=text;
-   clear();
-   if(epoch!==null&&epoch===getEpoch()&&text)commit(text,epoch);
-   else discard=true;
+   clear();preedit('');
+   if(epoch===null||epoch!==getEpoch()||!text){discard=true;return;}
+   if(text.length>4096){commit(text,epoch);return;}
+   const completed={text,epoch};pending=completed;
+   // A blur-generated end can precede the browser's focus events. The
+   // caller waits for focus to settle, while reset can revoke this candidate.
+   afterEnd(()=>{if(pending===completed)flush();});
  });
  element.addEventListener('keydown',event=>{
    // A consumed shortcut is not fresh typing and cannot release late input.
    if(event.defaultPrevented)return;
    // Some IMEs report keyCode 229 without isComposing or a Process key.
    // It is not a new ordinary key and must not release late-input guards.
-   if(!active&&!event.isComposing&&event.keyCode!==229&&event.key!=='Process'&&event.key!=='Dead'){duplicate=null;discard=false;}
+   if(!active&&!event.isComposing&&event.keyCode!==229&&event.key!=='Process'&&event.key!=='Dead'){
+     flush();duplicate=null;discard=false;
+   }
  });
  element.addEventListener('input',event=>{
    if(active||event.isComposing)return;
@@ -32,6 +47,7 @@ export function installIme(element,{getEpoch,commit}){
    // Composition commits are delivered exclusively by compositionend above.
    if(event.inputType!=='insertText')return;
    if(duplicate!==null){const previous=duplicate;duplicate=null;if(text===previous)return;}
+   flush();
    const epoch=getEpoch();if(epoch!==null&&text)commit(text,epoch);
  });
  element.addEventListener('blur',reset);

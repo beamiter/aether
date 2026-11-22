@@ -1,4 +1,4 @@
-//! Owns an explicit local command's unwritten suffix, never schedules a write.
+//! Retains an exact attachment's unwritten raw suffix until it retries or retires.
 
 const MAX_RAW_BYTES: usize = 4096;
 
@@ -15,6 +15,10 @@ pub(super) enum RawSuffix<Owner> {
 }
 
 impl<Owner: PartialEq> RawSuffix<Owner> {
+    pub(super) fn is_idle(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
     pub(super) fn write(
         &mut self,
         owner: Owner,
@@ -32,15 +36,11 @@ impl<Owner: PartialEq> RawSuffix<Owner> {
                 prefix_accepted,
             } => {
                 if *expected != owner || &**unsent != bytes.as_slice() {
-                    return Err(
-                        "local command continuation does not match its pending suffix".into(),
-                    );
+                    return Err("raw input continuation does not match its pending suffix".into());
                 }
                 *prefix_accepted
             }
-            Self::Interrupted => {
-                return Err("local command input interrupted; close the shell".into())
-            }
+            Self::Interrupted => return Err("raw input interrupted; close the shell".into()),
         };
         let accepted = match send(&bytes) {
             Ok(count) if count <= bytes.len() => count,
@@ -77,12 +77,6 @@ impl<Owner: PartialEq> RawSuffix<Owner> {
             };
         }
     }
-
-    pub(super) fn retain_only_current(&mut self, current: &Owner) {
-        if matches!(self, Self::Pending { owner, .. } if owner != current) {
-            self.retire_view();
-        }
-    }
 }
 
 #[cfg(test)]
@@ -116,7 +110,6 @@ mod tests {
         assert!(q
             .write(first, line.to_vec(), |_| panic!("cannot replay prefix"))
             .is_err());
-        q.retain_only_current(&first);
         assert_eq!(
             q.write(first, line[1..].to_vec(), |offered| {
                 wire.extend_from_slice(offered);
@@ -135,7 +128,7 @@ mod tests {
         q.retire_view();
         assert!(matches!(q, RawSuffix::None));
         assert_eq!(q.write(2, b"b\n".to_vec(), |_| Ok(1)), Ok(1));
-        q.retain_only_current(&3);
+        q.retire_view();
         assert!(matches!(q, RawSuffix::Interrupted));
         assert!(q
             .write(3, b"\n".to_vec(), |_| panic!("retired suffix"))

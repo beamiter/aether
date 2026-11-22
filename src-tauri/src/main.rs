@@ -1,20 +1,22 @@
 use local_sessions::LocalSessions;
 use std::sync::{Arc, Mutex};
+use tauri::ipc::Channel;
 use tauri_terminal_frame_bridge::{
+    history_search::{HistorySearchRequest, HistorySearchResponse},
     live::{LiveBridge, SessionStatus},
     semantic::{Attachment, Resume, SessionSelector, Update},
-    DemoBridge, WireFrame,
+    DemoBridge, LocalSnapshot, SnapshotFormat, SnapshotRevision, WireFrame,
 };
 
-#[path = "../vendor/jwm-remote/client.rs"]
-#[allow(
-    dead_code,
-    reason = "Other frontends use the shared client's native clipboard controls."
-)]
-mod jwm_remote_session;
+use jterm_remote_client as jwm_remote_session;
+mod agent_workspace;
 mod local_sessions;
+mod notebook_panel;
+mod output_review;
 mod remote_desktop;
+mod ssh_files;
 mod ssh_terminal;
+mod vim9_workbench;
 #[tauri::command]
 async fn demo_frame(bridge: tauri::State<'_, Arc<Mutex<DemoBridge>>>) -> Result<WireFrame, String> {
     run_bridge(bridge.inner().clone(), move |bridge| bridge.next_frame()).await
@@ -34,10 +36,16 @@ async fn acknowledge(
 #[tauri::command]
 async fn open_shell<R: tauri::Runtime>(
     window: tauri::WebviewWindow<R>,
+    integrated: Option<bool>,
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<Attachment, String> {
     require_terminal_window(&window)?;
-    run_bridge(bridge.inner().clone(), LocalSessions::open).await
+    let shared = bridge.inner().clone();
+    let weak = Arc::downgrade(&shared);
+    run_bridge(shared, move |bridge| {
+        bridge.open(integrated.unwrap_or(false), weak)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -47,10 +55,9 @@ async fn open_second_local_shell<R: tauri::Runtime>(
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<Attachment, String> {
     require_terminal_window(&window)?;
-    run_bridge(bridge.inner().clone(), move |bridge| {
-        bridge.open_second(epoch)
-    })
-    .await
+    let shared = bridge.inner().clone();
+    let weak = Arc::downgrade(&shared);
+    run_bridge(shared, move |bridge| bridge.open_second(epoch, weak)).await
 }
 
 #[tauri::command]
@@ -63,14 +70,35 @@ async fn list_local_shells<R: tauri::Runtime>(
 }
 
 #[tauri::command]
+async fn activate_local_tab<R: tauri::Runtime>(
+    window: tauri::WebviewWindow<R>,
+    owner: Option<Attachment>,
+    target_epoch: Option<u32>,
+    preserve_input: bool,
+    frame_version: Option<u8>,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
+) -> Result<Result<local_sessions::AttachedView, String>, String> {
+    require_terminal_window(&window)?;
+    let format = SnapshotFormat::negotiate(frame_version)?;
+    let shared = bridge.inner().clone();
+    let weak = Arc::downgrade(&shared);
+    run_bridge(shared, move |bridge| {
+        Ok(bridge.activate_tab(owner.as_ref(), target_epoch, preserve_input, format, weak))
+    })
+    .await
+}
+
+#[tauri::command]
 async fn attach_selected_local_shell<R: tauri::Runtime>(
     window: tauri::WebviewWindow<R>,
     epoch: u32,
+    frame_version: Option<u8>,
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
-) -> Result<Option<Resume>, String> {
+) -> Result<Option<Resume<LocalSnapshot>>, String> {
     require_terminal_window(&window)?;
+    let format = SnapshotFormat::negotiate(frame_version)?;
     run_bridge(bridge.inner().clone(), move |bridge| {
-        bridge.attach_selected(epoch)
+        bridge.attach_selected(epoch, format)
     })
     .await
 }
@@ -79,11 +107,13 @@ async fn attach_selected_local_shell<R: tauri::Runtime>(
 async fn attach_shell<R: tauri::Runtime>(
     window: tauri::WebviewWindow<R>,
     target: Option<SessionSelector>,
+    frame_version: Option<u8>,
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
-) -> Result<Option<Resume>, String> {
+) -> Result<Option<Resume<LocalSnapshot>>, String> {
     require_terminal_window(&window)?;
+    let format = SnapshotFormat::negotiate(frame_version)?;
     run_bridge(bridge.inner().clone(), move |bridge| {
-        bridge.attach(target.as_ref())
+        bridge.attach(target.as_ref(), format)
     })
     .await
 }
@@ -103,8 +133,103 @@ async fn poll_shell(
     owner: Attachment,
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<Option<Update>, String> {
-    run_attached(bridge.inner().clone(), owner, LiveBridge::poll_update).await
+    run_bridge(bridge.inner().clone(), move |bridge| bridge.poll(&owner)).await
 }
+
+#[tauri::command]
+async fn subscribe_local_shell<R: tauri::Runtime>(
+    window: tauri::WebviewWindow<R>,
+    owner: Attachment,
+    stream: Channel<local_sessions::StreamEvent>,
+    observer: Option<local_sessions::ObserverTarget>,
+    frame_version: u8,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
+) -> Result<(), String> {
+    require_terminal_window(&window)?;
+    if frame_version != tauri_terminal_frame_bridge::protocol_v4::VERSION {
+        return Err("unsupported terminal Channel version".into());
+    }
+    let shared = bridge.inner().clone();
+    let weak = Arc::downgrade(&shared);
+    run_bridge(shared, move |bridge| {
+        bridge.subscribe(owner, stream, observer, weak)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn observe_local_shell<R: tauri::Runtime>(
+    window: tauri::WebviewWindow<R>,
+    owner: Attachment,
+    epoch: u32,
+    revision: Option<u32>,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
+) -> Result<Option<WireFrame>, String> {
+    require_terminal_window(&window)?;
+    run_bridge(bridge.inner().clone(), move |bridge| {
+        bridge.observe_shell(&owner, epoch, revision)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn set_local_observer<R: tauri::Runtime>(
+    window: tauri::WebviewWindow<R>,
+    owner: Attachment,
+    stream_id: u32,
+    observer: Option<local_sessions::ObserverTarget>,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
+) -> Result<(), String> {
+    require_terminal_window(&window)?;
+    run_bridge(bridge.inner().clone(), move |bridge| {
+        bridge.set_observer(&owner, stream_id, observer)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn ack_local_stream<R: tauri::Runtime>(
+    window: tauri::WebviewWindow<R>,
+    owner: Attachment,
+    stream_id: u32,
+    sequence: local_sessions::Counter,
+    revision: Option<local_sessions::Counter>,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
+) -> Result<(), String> {
+    require_terminal_window(&window)?;
+    run_bridge(bridge.inner().clone(), move |bridge| {
+        bridge.acknowledge_stream(&owner, stream_id, sequence, revision)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn open_terminal_hyperlink<R: tauri::Runtime>(
+    window: tauri::WebviewWindow<R>,
+    owner: Attachment,
+    revision: local_sessions::Counter,
+    row: u16,
+    col: u16,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
+) -> Result<(), String> {
+    require_terminal_window(&window)?;
+    let target = run_attached(bridge.inner().clone(), owner, move |bridge, _| {
+        let target =
+            bridge.acknowledged_hyperlink(revision.get(), usize::from(row), usize::from(col))?;
+        if !jterm_core::link::is_openable_url(target) {
+            return Err("terminal hyperlink is not allowed".into());
+        }
+        Ok(target.to_owned())
+    })
+    .await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        gtk::gio::AppInfo::launch_default_for_uri(&target, None::<&gtk::gio::AppLaunchContext>)
+            .map_err(|_| "could not open terminal hyperlink".to_owned())
+    })
+    .await
+    .map_err(|_| "terminal hyperlink opener unavailable".to_owned())?
+}
+
 #[tauri::command]
 async fn shell_status(
     owner: Attachment,
@@ -118,11 +243,11 @@ async fn shell_status(
 #[tauri::command]
 async fn ack_shell(
     owner: Attachment,
-    revision: u32,
+    revision: SnapshotRevision,
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<(), String> {
-    run_attached(bridge.inner().clone(), owner, move |bridge, epoch| {
-        bridge.acknowledge(epoch, revision)
+    run_bridge(bridge.inner().clone(), move |bridge| {
+        bridge.acknowledge_frame(&owner, revision.get())
     })
     .await
 }
@@ -203,12 +328,58 @@ async fn history_shell(
     })
     .await
 }
+
+#[tauri::command]
+async fn local_command_blocks<R: tauri::Runtime>(
+    window: tauri::WebviewWindow<R>,
+    owner: Attachment,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
+) -> Result<tauri_terminal_frame_bridge::live::CommandBlockSnapshot, String> {
+    require_terminal_window(&window)?;
+    run_attached(bridge.inner().clone(), owner, |bridge, epoch| {
+        bridge.command_blocks(epoch)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn search_local_history<R: tauri::Runtime>(
+    window: tauri::WebviewWindow<R>,
+    owner: Attachment,
+    search: HistorySearchRequest,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
+) -> Result<HistorySearchResponse, String> {
+    require_terminal_window(&window)?;
+    run_attached(bridge.inner().clone(), owner, move |bridge, epoch| {
+        bridge.search_history(epoch, search)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn recall_local_command<R: tauri::Runtime>(
+    window: tauri::WebviewWindow<R>,
+    owner: Attachment,
+    selection: tauri_terminal_frame_bridge::live::BlockSelection,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
+) -> Result<Option<&'static str>, String> {
+    require_terminal_window(&window)?;
+    run_input(bridge.inner().clone(), owner, move |bridge, epoch| {
+        bridge.recall_command(epoch, &selection)
+    })
+    .await
+}
 #[tauri::command]
 async fn recover_shell(
     owner: Attachment,
+    frame_version: Option<u8>,
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
-) -> Result<Resume, String> {
-    run_bridge(bridge.inner().clone(), move |bridge| bridge.recover(&owner)).await
+) -> Result<local_sessions::AttachedView, String> {
+    let format = SnapshotFormat::negotiate(frame_version)?;
+    run_bridge(bridge.inner().clone(), move |bridge| {
+        bridge.recover(&owner, format)
+    })
+    .await
 }
 
 fn require_terminal_window<R: tauri::Runtime>(
@@ -256,9 +427,18 @@ where
 }
 fn application<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     builder
+        .manage(agent_workspace::Workspace::default())
         .manage(Arc::new(Mutex::new(DemoBridge::default())))
         .manage(Arc::new(Mutex::new(LocalSessions::default())))
+        .manage(Arc::new(Mutex::new(
+            notebook_panel::NotebookPanel::default(),
+        )))
+        .manage(Arc::new(
+            Mutex::new(output_review::OutputReviews::default()),
+        ))
+        .manage(Arc::new(Mutex::new(vim9_workbench::Workbench::default())))
         .manage(Arc::new(Mutex::new(ssh_terminal::SshTerminal::default())))
+        .manage(Arc::new(Mutex::new(ssh_files::Files::default())))
         .manage(Arc::new(
             Mutex::new(remote_desktop::WindowRemote::default()),
         ))
@@ -269,12 +449,21 @@ fn application<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<
             open_shell,
             open_second_local_shell,
             list_local_shells,
+            activate_local_tab,
             attach_selected_local_shell,
             attach_shell,
             detach_shell,
             poll_shell,
+            subscribe_local_shell,
+            observe_local_shell,
+            set_local_observer,
+            ack_local_stream,
+            open_terminal_hyperlink,
             shell_status,
             history_shell,
+            local_command_blocks,
+            recall_local_command,
+            search_local_history,
             ack_shell,
             recover_shell,
             write_shell,
@@ -283,12 +472,34 @@ fn application<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<
             text_shell,
             paste_shell,
             close_shell,
+            agent_workspace::workspace_catalog,
+            agent_workspace::workspace_attach,
+            agent_workspace::workspace_terminal,
+            agent_workspace::workspace_chat,
+            agent_workspace::workspace_native,
+            agent_workspace::workspace_mission,
+            agent_workspace::workspace_tools,
+            agent_workspace::workspace_queue,
+            agent_workspace::workspace_remote,
+            notebook_panel::local_notebook,
+            output_review::compare_local_output,
+            output_review::export_local_output,
+            vim9_workbench::local_vim9,
             ssh_terminal::ssh_terminal,
+            ssh_files::ssh_files,
             remote_desktop::remote_desktop
         ])
 }
 
 fn main() {
+    jterm_core::identity::init(jterm_core::identity::AppIdentity {
+        app_name: "aether",
+        app_id: "local.jterm.frame-lab",
+        app_version: env!("CARGO_PKG_VERSION"),
+    });
+    if let Some(code) = jterm_core::agent_workspace::run_embedded_if_requested() {
+        std::process::exit(code);
+    }
     application(tauri::Builder::default())
         .run(tauri::generate_context!())
         .expect("Tauri runtime");

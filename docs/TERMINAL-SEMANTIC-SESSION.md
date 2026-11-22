@@ -13,7 +13,7 @@ updates across OpenSSH. Agent Workspace attachment remains integration work.
   polling, history and terminal input require the current session, epoch and
   generation. `close_shell` targets the session and epoch so a close already
   requested for that PTY can finish if recovery rotates the view first.
-- A fresh view attaches from a full snapshot and has read-only authorization.
+- An explicit reconnect attaches from a full snapshot and has read-only authorization.
   Recovery from the current view preserves its input authorization and existing
   frontend safety locks. An uncertain input operation is never retransmitted.
 - A lost recovery response can be retried using the previous attachment until
@@ -30,11 +30,42 @@ WebView validates the identity, base, revisions, row indices, cell values and
 cursor before replacing its current state. It acknowledges a frame after applying
 and painting it.
 
+The local desktop requests frame version 4 through `subscribe_local_shell`.
+The registry's worker advances the PTY and sends frame and shell status updates
+through a Tauri Channel. Each new stream starts with a full snapshot. A v4
+snapshot and delta carry the screen, wide-cell spans, full underline type and
+color, and physical row wrap flags. The visible copy action uses the flags to
+keep a soft-wrapped line together. Aether's local v4 stream preserves bounded
+Unicode clusters across PTY reads, including combining marks and wide joined
+emoji. Cell spans currently follow the first graphic scalar in the cluster.
+
+Local OSC 8 links use the same validated absolute HTTP(S) target policy as
+Ember. Each v4 update carries the targets named by its rows. The WebView keeps
+targets only while decoded rows reference them and rejects a changed target for
+an existing ID within the same session incarnation. Ctrl-click resolves the
+cell in the exact acknowledged frame under the current owner before asking
+the desktop's default URI handler to open it. Hyperlink targets and terminal
+cell text have independent byte budgets.
+
+The WebView checks the encoded frame against an 8 MiB budget before decoding,
+then checks the cluster, total text and grid budgets. Frame revision, layout,
+publication sequence and ACK use canonical positive u64 decimal strings. The
+WebView compares them at full precision and validates the attachment, sequence,
+frame and status. It applies and paints the frame at the next animation callback
+before sending `ack_local_stream` with the channel ID, sequence and frame
+revision, when present. An idle healthy session sends a status heartbeat. A slow
+view holds one envelope in flight.
+The worker keeps parsing and draining the PTY, then publishes the latest grid
+against the acknowledged base. Local tab activation, attach and recovery can
+negotiate v4 full snapshots and acknowledge their decimal revision before
+opening the stream. An unconfirmed Channel can recover a compatibility snapshot
+under a new generation and continue by polling. If v3 cannot represent its
+counters, recovery uses v4. SSH retains its existing polling and wire contracts.
+
 The publisher keeps one acknowledged base and one in-flight frame. The coherent
 recovery snapshot shares the in-flight frame where applicable. A grid permits up
 to 128 rows, 256 columns and 32,768 cells. Each delta replaces at most one copy
-of each row. The existing input queue is limited to 16 KiB and output is drained
-through the bounded PTY path while a view polls. A detached local desktop PTY
+of each row. The existing input queue is limited to 16 KiB. A detached local desktop PTY
 can also drain under the same owner if there is no reader and no outstanding
 raw or logical write boundary. Each turn reads at most 64 KiB and may send only
 the parser's bounded protocol replies. It does not publish, acknowledge, or
@@ -42,29 +73,70 @@ resume input. If the writer is interrupted or its input boundary is uncertain,
 the detached owner stops polling rather than sending more bytes; the PTY may
 wait for kernel buffer capacity until a view reconnects or it is explicitly
 closed. Closing Aether ends the local owner's attachment lifetime. SSH and
-standalone helper polling are unchanged.
+standalone helper retain their v3 request and frame contracts.
 
-## Local command line suffix ownership
+## Local history search
+
+`search_local_history` uses the current attachment to search the shared engine's
+primary-screen archive. It accepts a literal query of up to 128 UTF-8 bytes and
+checks at most 64 source rows per step. Matching text uses the engine's copy
+projection, including soft wraps and certified wide-character margin gaps. A
+matching window returns its immutable text and UTF-16 selection range. A miss
+advances the search without transferring the page to the WebView.
+
+The search begins with the newest retained output. A search ID orders requests
+within the current attachment, and the first result fixes an engine revision.
+If output or geometry changes during navigation, start a new search. The
+current selection remains valid in the displayed snapshot. Cancel stops the
+next step, and a replacement attachment discards the old search.
+
+## Raw input suffix ownership
 
 The desktop form sends the same UTF-8 bytes (including its appended LF) through
-local `write_shell`. A zero or short accepted count retains only the exact
-unwritten bytes for that view attachment. A later call must supply that exact
-suffix; it is not a new command or a request to replay the accepted prefix.
-The owner never writes the retained bytes on its own. A replaced/detached
-attachment cannot continue them. If a prefix was accepted or the count was
-invalid/failed, this raw command route stays interrupted until explicit close.
-A successful complete count does not deduplicate a lost full reply; the form
-still locks instead of automatically retrying a failed request. This neither
-proves that kernel-accepted bytes were executed nor changes the terminal query
-reply order during an active raw command. SSH transport has not changed.
+local `write_shell`. The SSH host uses the same boundary for its raw write
+request. A zero or short count retains the exact unwritten bytes for that view
+attachment. Each retry must send that suffix explicitly. The runtime holds
+terminal replies between an accepted prefix and its final byte. A successful
+count records bytes accepted by the kernel. The form locks after an uncertain
+receipt to prevent replay. Retiring a started prefix revokes input until close
+and allows the PTY's output to keep draining.
 
 ## Two local shells (desktop only)
 
+**New shell tab** adds a second PTY without a separate detach step. Selecting
+an inactive tab uses `activate_local_tab`, which moves the reader under the
+local registry mutex and publishes a full snapshot for a fresh generation.
+The outgoing input lease is retired. A tab parked with confirmed, idle input
+and healthy raw and logical writers may reclaim input after acknowledging its
+snapshot. A locked, interrupted, or explicitly detached view cannot gain input
+through this path. Only one tab owns input and resize authority at a time.
+
+If the activation reply is lost, the same request retrieves the same pending
+snapshot until ACK. If the ACK reply is lost, the WebView retries that exact
+ACK. A tab switch never resends shell input from the previous view or starts a
+duplicate PTY. After closing one tab, the remaining tab can be selected with
+its parked grant. Tab processes and drafts live only in the current desktop
+process.
+
+**Split panes** places two local shells side by side in stable tab order. The
+inactive shell contributes a read-only snapshot to the active Channel delivery.
+The envelope uses the same single delivery credit for both panes. Compatibility
+polling reads the inactive snapshot separately. Clicking the inactive pane
+selects it through the same tab-activation and input lease path. Only the
+selected shell accepts input and manual geometry changes.
+
+The WebView profile stores a versioned shell layout with the tab count,
+selected position, and split choice. Version one records open in single-pane
+tab mode. After a desktop restart, **Restore shell tabs** creates fresh local
+PTYs following the saved layout. An unconfirmed launch is discovered through
+the live roster. If the second launch fails, the first remains available and
+the saved layout survives for a later restart.
+
 With the current view detached, select **Show retained local shells**. If
 exactly one local shell exists, **Open second local shell** explicitly starts
-one more writable shell without closing the first. Detach again and choose a
-shell by its local number to reconnect view-only. Only one view can be attached
-at a time. Reconnecting view-only does not grant resize or input authority;
+one more writable shell without closing the first. Choose a retained local
+number through the list for explicit view-only reconnect. Reconnecting
+view-only does not grant resize or input authority;
 ordinary Open won't start a new shell while any local shell remains. Use
 **Close shell** on the view you intend to close. If an open response is lost,
 list and choose the exact local shell; the app does not automatically open
@@ -96,7 +168,10 @@ ACK. Input resumes after this ACK if the session was writable and the old
 input state was certain. **Detach view** closes the relay. **Reconnect view**
 opens a read-only attachment, and **Close shell** closes the identified PTY.
 Closing Aether closes its relay. The remote PTY remains with the owner until
-explicit close or the inactivity timeout.
+explicit close or the inactivity timeout. While no relay is attached, the
+owner continues bounded PTY reads and ordered protocol replies, retaining the
+latest complete paint boundary for recovery. Status and paint ACKs do not
+gate this background progress.
 
 An application launcher can set `AETHER_SSH_TERMINAL_HELPER` and
 `AETHER_SSH_TERMINAL_SOCKET` to absolute paths on the SSH host for a private

@@ -17,15 +17,155 @@ has an empty HOME, XDG directories and fixed shell fixture paths.
 
 The smoke clicks the actual local shell controls, then types fixed commands
 through WebDriver. Each owned local shell must show its own structured marker
-and a distinct color in the actual WebKit canvas backing store. The test
+and a distinct color in the actual WebKit canvas backing store after receiving
+its frames over the native Tauri Channel. A subsequent
+PTY update changes one row's color without disturbing the original marker or
+background, and the change survives reattaching to that shell. The test
 checks that an ambiguous roster preselects neither shell and disallows a third
-open, explicitly reconnects both views, checks isolated drafts and disabled
-input/resize, and verifies that no draft command executed. It closes both
-selected local shells and waits for each distinct recorded direct-child
+open, switches both attached views from the roster, checks isolated drafts and
+disabled input and resize, and verifies that no draft command executed. It
+closes both selected local shells and waits for each distinct recorded direct-child
 identity to disappear. WebDriver closes the session; the launcher also owns
 bounded process-group cleanup.
+
+The writable-tab journey opens two new local shells through the tab controls.
+It submits input after switching in each direction and after closing a tab.
+Each write comes from the same recorded child, drafts stay with their shell,
+and closing the last tab reaps the surviving child.
+
+The split journey checks two side-by-side Canvas surfaces, presents new output
+from the inactive PTY, changes only the selected PTY's geometry, and transfers
+keyboard focus to the other shell. Frame colors and PTY identities remain
+distinct through the focus transfer.
+
+The history journey searches text produced by a real PTY and selects the
+newest matching text in the native textarea. **Older match** reaches a prior
+history window, and searching the same term in the other shell finds no match.
+
+The restart journey closes the desktop with two writable tabs and the first
+selected, waits for both original child identities to disappear, and launches
+the same binary in the same private profile. **Restore shell tabs** opens two
+fresh writable PTYs, restores the split, and selects the first tab. Both new child identities are
+distinct, the old draft stays out of the restored view, and explicit close
+reaps both children.
+
+Add `--jsh /absolute/path/to/jsh` to the driver invocation to include the
+command-block journey. The isolated application PATH resolves that executable
+through the normal Aether launch path. The journey exercises the real jsh OSC
+133 markers, plain-text copying, hidden-input isolation, Vim on the alternate
+screen, and session-local records while switching split-pane focus. It
+requires Vim and uses the same WebKitGTK driver, private display and exact
+binary as the rest of the smoke.
+It recalls a command into the editable jsh prompt, appends another expression
+before submitting, and checks that a foreground process waiting for hidden
+input receives only the explicitly typed reply.
+
+Add `--notebook` to select an actual local `.jtnb.md` input through the
+WebKit file control and verify its exact SHA-256. The journey explicitly
+runs a shell fence, checks separate stdout and stderr and exit code 17,
+then stops another fence after partial output arrives. It checks the
+stopped process group's child never writes its delayed marker and reopening
+the same selected file leaves every cell idle.
+
+Add `--output-review` together with `--jsh` to compare two completed local
+PTY blocks, generate enough new commands to evict both original blocks, then
+download the frozen Markdown and JSON. The fixture reads both files and
+checks the original revisions and diff after eviction.
+
+Add `--vim9` with Vim 9 and `xdotool` installed to select a real file in
+the GTK chooser. The fixture checks authenticated Vim9 Canvas painting,
+edits that file through the buffer view and the fallback PTY, checks exact
+Unicode bytes after native saves, and verifies Vim exits and its view clears.
+It then closes the reopened Vim's GUI channel and saves through the same
+editor's live terminal to verify the automatic fallback.
+The same fixture navigates a project tree and a UTF-8 byte column, splits a
+window from Vim's palette, searches into quickfix, observes build output and
+exit code 7, and stops a running build. It also selects a text preview, rejects
+a different file with the same basename, then opens the matching snapshot in Vim.
+
+Add `--workspace` to include the shared CLI Workspace journey. It starts the
+embedded protocol-2 host with an isolated schema-6 SQLite directory, two
+synthetic provider-history files with the same native UUID, and a controlled
+local provider script in a real PTY. An existing embedded terminal holds the
+lease first. Aether sees the conflict, attaches after release, and displays the
+same provider output. The journey verifies explicit detach, closing the app
+while attached, reopening that same provider, and exact input and exit.
+
+Add `--api-chat` to run an API conversation against a private loopback
+streaming provider. The real Workspace host acknowledges a multiline draft,
+rejects a competing controller, a stale draft save, and a duplicate
+submission while the first request streams. Reopening Aether recovers that
+same stream and the newer saved draft. The fixture releases the stream,
+reads the completed exchange from SQLite, and checks explicit cancellation
+and draft restoration on a second submission.
+
+Add `--native-task` for the scoped native Codex approval journey. It requires
+a working user systemd manager with delegated cgroup support. It uses a
+disposable Git repository, a deterministic local app-server fixture and the
+real Workspace native runtime. The test closes Aether during a pending
+approval, reopens the same task, verifies one explicit decline passed to the
+provider, releases the scope and reads the isolated worktree diff. It starts
+the separately authored verification command, reopens during the running
+verification without executing it twice, and checks that a worktree change
+after inspection blocks acceptance. A fresh verification and inspection lets
+the host accept the task. Aether reopens the same completed task.
+The fixture then saves and reopens task context, checks shared revision
+conflicts and redaction, and previews a Codex handoff. Opening the draft
+preserves the source task and waits for separate consent and start. The
+second scoped provider receives the reviewed text in its own worktree.
+The follow-up has no verification recipe. Its human acceptance rejects edits
+made after the first inspection and persists after inspecting and accepting
+the changed worktree.
+The Mission journey links the exact native worktree and run, rejects a stale
+plan edit, inspects real local Git evidence, freezes the observed clean
+candidate and retains the older verification as stale. After reopening, the
+saved report requires fresh inspection to confirm delivery.
+The Tools journey pages through the actual shared index to real verification
+output. It rejects an imported record replaced since search, then compares
+the opened validation text and exact revision with the host receipt.
+The queue journey saves two authored drafts before provider launch, observes
+dependency blockage, rejects an older revision, and reopens the saved draft.
+An accepted dependency enables an explicit launch of that same task and
+worktree. The other draft remains idle.
 
 This scope is real Linux WebKitGTK/X11 under Xvfb, not a physical pointing
 device, a compositor screenshot comparison, IME or Wayland coverage. The
 normal mock-window PTY pressure regression separately covers detached output
 beyond kernel capacity. No SSH host or user shell profile is used.
+
+The smoke sends real SGR and wide text through a local PTY. It checks the exact
+two double-underline pixel rows in the native Canvas, changes the explicit
+color without changing the glyphs, and copies a line across a soft wrap.
+An isolated desktop URI handler records one explicit OSC 8 Ctrl-click. The
+test also verifies that hovering and a rejected userinfo target launch nothing.
+
+`scripts/test-wayland-ime.py` exercises the same desktop build in a private
+Sway session with XWayland disabled. It checks that preedit appears at the
+visible terminal caret, the compositor receives a matching text-input-v3
+rectangle, and the PTY receives the committed character exactly once. Its
+second stage opens two real PTYs and cancels a pending preedit when switching
+tabs. Fresh input reaches the newly selected shell. The input-method fixture
+is built from Frost's `scripts/native-ime-client.c`.
+
+## SSH Files and remote Workspace
+
+Build the desktop and the `aether-terminal-host` helper. Supply their absolute
+paths to the driver. It uses WebKitWebDriver, bubblewrap, an OpenSSH client
+and server, and a private D-Bus session. The X11 variant needs Xvfb. The
+Wayland variant starts a headless Sway compositor with `wtype` and XWayland
+disabled. If using an extracted Sway build, pass its library directory with
+`--compositor-libraries`.
+
+```sh
+dbus-run-session -- xvfb-run -a -s '-screen 0 1440x1100x24' \
+  python3 scripts/test-remote-project-webkit.py "$desktop" "$helper"
+dbus-run-session -- python3 scripts/test-remote-project-webkit.py \
+  "$desktop" "$helper" --backend wayland
+```
+
+The fixture pins an ephemeral loopback host key, creates separate local and
+remote Workspace stores, and reads back the actual downloaded bytes. It checks
+same-name local and remote files, changed file versions, directory navigation,
+binary transfer and no-overwrite upload. It checks the expected host ID, both
+kinds of pagination, stale search selections, and the document's exact revision.
+Successful output includes the case ID, display backend and both binary hashes.

@@ -12,7 +12,7 @@ export function installPasteReview({panel,preview,escaped,confirm,cancel,getEpoc
   let pending=null;
   function reset(){pending=null;preview.value='';escaped.textContent='';panel.hidden=true;confirm.disabled=true;}
   reset();
-  function offer(text,returnFocus=null){
+  function offer(text,returnFocus=null,deliver=send){
     // A new clipboard event supersedes an earlier review, including invalid data.
     reset();
     const epoch=getEpoch();if(epoch===null)return;
@@ -22,11 +22,11 @@ export function installPasteReview({panel,preview,escaped,confirm,cancel,getEpoc
     // Reject controls early without locking an otherwise healthy terminal.
     if(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(text)){onError('Paste contains unsupported control characters; nothing sent.');return;}
     if(!text)return;
-    if(!/[\r\n]/.test(text)){send(text,epoch);return;}
+    if(!/[\r\n]/.test(text)){deliver(text,epoch);return;}
     // Textarea value normalizes CR/CRLF. Keep an escaped original separately,
     // using textContent (never HTML), and never send either rendered preview.
     // The original has already passed the 4096-byte guard above.
-    pending={text,epoch,returnFocus};preview.value=text;escaped.textContent=quotedOriginal(text);panel.hidden=false;confirm.disabled=false;
+    pending={text,epoch,returnFocus,deliver};preview.value=text;escaped.textContent=quotedOriginal(text);panel.hidden=false;confirm.disabled=false;
   }
   function finish(deliver){
     const item=pending;
@@ -35,7 +35,7 @@ export function installPasteReview({panel,preview,escaped,confirm,cancel,getEpoc
     const ownedFocus=panel.contains?.(panel.ownerDocument?.activeElement)===true;
     reset();
     if(!item||item.epoch!==getEpoch())return;
-    if(deliver)send(item.text,item.epoch);
+    if(deliver)item.deliver(item.text,item.epoch);
     if(ownedFocus&&item.epoch===getEpoch()&&item.returnFocus?.isConnected)
       item.returnFocus.focus();
   }

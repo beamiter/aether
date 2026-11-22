@@ -49,6 +49,10 @@ impl<T, const LIMIT: usize> SessionTable<T, LIMIT> {
         self.sessions.get_mut(id).map(|owned| &mut owned.value)
     }
 
+    pub(super) fn values_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.sessions.values_mut().map(|owned| &mut owned.value)
+    }
+
     pub(super) fn remove(&mut self, id: &str) {
         self.sessions.remove(id);
     }

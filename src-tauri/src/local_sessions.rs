@@ -1,16 +1,19 @@
 //! Local desktop ownership, separate from the SSH transport.
-mod detached_worker;
-mod raw_suffix;
-use detached_worker::DetachedWorker;
-use raw_suffix::RawSuffix;
+mod stream;
+mod worker;
 use std::{
     collections::{btree_map::Entry, BTreeMap},
     sync::{Mutex, Weak},
 };
+pub(crate) use stream::{Counter, ObserverTarget, StreamEvent};
+use stream::{Delivery, LocalStream, PeerUpdate, Receipt};
+use tauri::ipc::Channel;
 use tauri_terminal_frame_bridge::{
     live::{CloseStatus, LiveBridge},
-    semantic::{Attachment, Resume, SessionSelector},
+    semantic::{Attachment, Resume, SessionSelector, Update},
+    snapshot_encoder, LocalSnapshot, SnapshotFormat, WireFrame,
 };
+use worker::LocalWorker;
 
 /// Stable PTY ownership and the single reader lease. View generations and
 /// input permissions remain inside each bridge, not in the table key.
@@ -129,9 +132,23 @@ impl<T, const LIMIT: usize> Registry<T, LIMIT> {
 
 struct OwnedLocalPty {
     bridge: LiveBridge,
-    raw: RawSuffix<Attachment>,
     target: SessionSelector,
     pump_candidate: bool,
+    parked_input: bool,
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct AttachedView {
+    #[serde(flatten)]
+    view: Resume<LocalSnapshot>,
+    input_allowed: bool,
+}
+
+struct PendingTab {
+    source: Option<Attachment>,
+    requested_epoch: Option<u32>,
+    target: Attachment,
+    input_allowed: bool,
 }
 
 #[derive(Default)]
@@ -139,24 +156,34 @@ pub(crate) struct LocalSessions {
     registry: Registry<OwnedLocalPty, 2>,
     last_epoch: u32,
     pump_after: Option<String>,
-    detached_worker: Option<DetachedWorker>,
+    worker: Option<LocalWorker>,
+    pending_tab: Option<PendingTab>,
+    stream: Option<LocalStream>,
 }
 
 impl LocalSessions {
-    pub(crate) fn open(&mut self) -> Result<Attachment, String> {
+    pub(crate) fn open(
+        &mut self,
+        integrated: bool,
+        shared: Weak<Mutex<Self>>,
+    ) -> Result<Attachment, String> {
         // Keep the ordinary opener fail-closed if *any* PTY remains.
         if !self.registry.sessions.is_empty() {
             return Err("close the existing session first".into());
         }
-        self.open_fresh()
+        self.open_fresh(integrated, shared)
     }
 
-    pub(crate) fn open_second(&mut self, retained_epoch: u32) -> Result<Attachment, String> {
+    pub(crate) fn open_second(
+        &mut self,
+        retained_epoch: u32,
+        shared: Weak<Mutex<Self>>,
+    ) -> Result<Attachment, String> {
         if self.registry.sessions.len() != 1 || self.registry.reader.is_some() {
             return Err("detach the single existing local shell before opening a second".into());
         }
         self.target_for_epoch(retained_epoch)?;
-        self.open_fresh()
+        self.open_fresh(false, shared)
     }
 
     pub(crate) fn list_epochs(&self) -> Vec<u32> {
@@ -181,46 +208,165 @@ impl LocalSessions {
             .ok_or_else(|| "no such retained local shell".into())
     }
 
-    pub(crate) fn attach_selected(&mut self, epoch: u32) -> Result<Option<Resume>, String> {
+    pub(crate) fn attach_selected(
+        &mut self,
+        epoch: u32,
+        format: SnapshotFormat,
+    ) -> Result<Option<Resume<LocalSnapshot>>, String> {
         let target = self.target_for_epoch(epoch)?;
-        self.attach(Some(&target))
+        self.attach(Some(&target), format)
     }
 
-    fn open_fresh(&mut self) -> Result<Attachment, String> {
+    fn open_fresh(
+        &mut self,
+        integrated: bool,
+        shared: Weak<Mutex<Self>>,
+    ) -> Result<Attachment, String> {
+        self.ensure_worker(shared)?;
         let prev_epoch = self.last_epoch;
         let owner = self.registry.open(|| {
-            let mut bridge = LiveBridge::local_desktop_after(prev_epoch);
-            let epoch = bridge.open(24, 80)?;
-            let owner = bridge.attachment(epoch)?;
-            let owned = OwnedLocalPty {
-                bridge,
-                raw: RawSuffix::default(),
-                target: SessionSelector {
-                    session: owner.session.clone(),
-                    epoch,
-                },
-                pump_candidate: false,
-            };
+            let (owned, owner) = Self::spawn(prev_epoch, integrated)?;
             Ok((owner.session.clone(), owned, owner))
         })?;
         self.last_epoch = owner.epoch;
+        self.worker.as_ref().unwrap().wake();
         Ok(owner)
+    }
+
+    fn spawn(prev_epoch: u32, integrated: bool) -> Result<(OwnedLocalPty, Attachment), String> {
+        let mut bridge = LiveBridge::local_desktop_after(prev_epoch);
+        bridge.set_hyperlink_policy(jterm_core::link::is_openable_osc8);
+        let epoch = if integrated {
+            bridge.open_integrated(24, 80)?
+        } else {
+            bridge.open(24, 80)?
+        };
+        let owner = bridge.attachment(epoch)?;
+        let owned = OwnedLocalPty {
+            bridge,
+            target: SessionSelector {
+                session: owner.session.clone(),
+                epoch,
+            },
+            pump_candidate: false,
+            parked_input: false,
+        };
+        Ok((owned, owner))
+    }
+
+    pub(crate) fn activate_tab(
+        &mut self,
+        owner: Option<&Attachment>,
+        target_epoch: Option<u32>,
+        preserve_input: bool,
+        format: SnapshotFormat,
+        shared: Weak<Mutex<Self>>,
+    ) -> Result<AttachedView, String> {
+        if let Some(pending) = self.pending_tab.as_ref().filter(|pending| {
+            pending.source.as_ref() == owner && pending.requested_epoch == target_epoch
+        }) {
+            let owned = self.registry.reader(&pending.target.session)?;
+            return Ok(AttachedView {
+                view: Resume {
+                    owner: pending.target.clone(),
+                    frame: owned
+                        .bridge
+                        .pending_local_tab_with(&pending.target, snapshot_encoder(format))?,
+                },
+                input_allowed: pending.input_allowed,
+            });
+        }
+
+        let preserve_input = if let Some(owner) = owner {
+            let source = self.registry.reader(&owner.session)?;
+            source.bridge.next_detached_generation(owner)?;
+            if preserve_input && !source.bridge.can_park_local_input(owner) {
+                return Err("Wait for the current shell input before switching tabs.".into());
+            }
+            preserve_input
+        } else if self.registry.reader.is_some() {
+            return Err("a local shell tab is already active".into());
+        } else {
+            false
+        };
+        let target = match target_epoch {
+            Some(epoch) if !owner.is_some_and(|owner| owner.epoch == epoch) => {
+                Some(self.target_for_epoch(epoch)?)
+            }
+            Some(_) => return Err("local tab already active".into()),
+            None if owner.is_none() => return Err("select an existing shell tab".into()),
+            None if self.registry.sessions.len() < 2 => None,
+            None => return Err("only two local shell tabs can be open".into()),
+        };
+        self.ensure_worker(shared)?;
+
+        let (view, input_allowed) = if let Some(target) = target {
+            let owned = self.registry.owned(&target.session)?;
+            let grant_input = owned.parked_input;
+            let activated = owned.bridge.activate_local_tab_with(
+                &target,
+                grant_input,
+                snapshot_encoder(format),
+            )?;
+            owned.pump_candidate = false;
+            owned.parked_input = false;
+            activated
+        } else {
+            let (mut owned, original) = Self::spawn(self.last_epoch, false)?;
+            let Entry::Vacant(entry) = self.registry.sessions.entry(original.session) else {
+                return Err("terminal session ID collision".into());
+            };
+            let activated = owned.bridge.activate_local_tab_with(
+                &owned.target,
+                true,
+                snapshot_encoder(format),
+            )?;
+            entry.insert(owned);
+            self.last_epoch = original.epoch;
+            activated
+        };
+
+        // This runs under the same registry mutex as preflight and target
+        // publication. The validated source could not have changed in between.
+        if let Some(owner) = owner {
+            self.retire_view(owner, preserve_input)?;
+        }
+        let target = &view.owner;
+        self.registry.reader = Some(target.session.clone());
+        self.pending_tab = Some(PendingTab {
+            source: owner.cloned(),
+            requested_epoch: target_epoch,
+            target: target.clone(),
+            input_allowed,
+        });
+        self.worker.as_ref().unwrap().wake();
+        Ok(AttachedView {
+            view,
+            input_allowed,
+        })
     }
 
     pub(crate) fn attach(
         &mut self,
         target: Option<&SessionSelector>,
-    ) -> Result<Option<Resume>, String> {
-        self.registry
-            .attach(target.map(|target| target.session.as_str()), |owned| {
-                let view = owned
-                    .bridge
-                    .attach_read_only(target)?
-                    .ok_or("terminal session closed")?;
-                owned.raw.retain_only_current(&view.owner);
-                owned.pump_candidate = false;
-                Ok(view)
-            })
+        format: SnapshotFormat,
+    ) -> Result<Option<Resume<LocalSnapshot>>, String> {
+        let attached =
+            self.registry
+                .attach(target.map(|target| target.session.as_str()), |owned| {
+                    let view = owned
+                        .bridge
+                        .attach_read_only_with(target, snapshot_encoder(format))?
+                        .ok_or("terminal session closed")?;
+                    owned.pump_candidate = false;
+                    owned.parked_input = false;
+                    Ok(view)
+                })?;
+        if let Some(view) = &attached {
+            self.retire_stale_stream(&view.owner);
+            self.worker.as_ref().unwrap().wake();
+        }
+        Ok(attached)
     }
 
     pub(crate) fn detach(
@@ -233,23 +379,38 @@ impl LocalSessions {
         self.registry
             .reader(&owner.session)?
             .bridge
-            .validate_attachment(owner)?;
-        if self.detached_worker.is_none() {
-            self.detached_worker = Some(DetachedWorker::start(shared)?);
+            .next_detached_generation(owner)?;
+        self.ensure_worker(shared)?;
+        self.retire_view(owner, false)
+    }
+
+    fn ensure_worker(&mut self, shared: Weak<Mutex<Self>>) -> Result<(), String> {
+        if self.worker.is_none() {
+            self.worker = Some(LocalWorker::start(shared)?);
         }
+        Ok(())
+    }
+
+    fn retire_view(&mut self, owner: &Attachment, parked_input: bool) -> Result<(), String> {
         self.registry.detach(&owner.session, |owned| {
             owned.bridge.detach(owner)?;
-            owned.raw.retire_view();
-            owned.pump_candidate = matches!(owned.raw, RawSuffix::None);
+            owned.pump_candidate = true;
+            owned.parked_input = parked_input;
             Ok(())
         })?;
-        self.detached_worker.as_ref().unwrap().wake();
+        if self
+            .stream
+            .as_ref()
+            .is_some_and(|stream| stream.owner == *owner)
+        {
+            self.stream = None;
+        }
+        self.worker.as_ref().unwrap().wake();
         Ok(())
     }
 
     fn pump_detached(&mut self) -> bool {
-        let eligible =
-            |owned: &OwnedLocalPty| owned.pump_candidate && matches!(owned.raw, RawSuffix::None);
+        let eligible = |owned: &OwnedLocalPty| owned.pump_candidate;
         let Some((id, owned)) = self
             .registry
             .next_inactive(self.pump_after.as_deref(), eligible)
@@ -269,15 +430,203 @@ impl LocalSessions {
                 .is_some()
     }
 
-    pub(crate) fn recover(&mut self, owner: &Attachment) -> Result<Resume, String> {
+    fn retire_stale_stream(&mut self, current: &Attachment) {
+        if self
+            .stream
+            .as_ref()
+            .is_some_and(|stream| stream.owner != *current)
+        {
+            self.stream = None;
+        }
+    }
+
+    pub(crate) fn subscribe(
+        &mut self,
+        owner: Attachment,
+        sink: Channel<StreamEvent>,
+        observer: Option<ObserverTarget>,
+        shared: Weak<Mutex<Self>>,
+    ) -> Result<(), String> {
+        let bridge = &self.registry.reader(&owner.session)?.bridge;
+        bridge.validate_attachment(&owner)?;
+        if self.stream.is_some() || bridge.has_unacknowledged_frame() {
+            return Err("recover the local view before subscribing again".into());
+        }
+        self.validate_observer(&owner, observer)?;
+        self.ensure_worker(shared)?;
+        let mut stream = LocalStream::new(owner, sink);
+        stream.set_observer(observer);
+        self.stream = Some(stream);
+        self.worker.as_ref().unwrap().wake();
+        Ok(())
+    }
+
+    fn pump(&mut self) -> (bool, Option<Delivery>) {
+        let detached = self.pump_detached();
+        let preview = self
+            .stream
+            .as_ref()
+            .and_then(LocalStream::observe_next)
+            .and_then(|(target, revision)| {
+                self.retained_bridge(target.epoch)
+                    .and_then(|bridge| bridge.observe_channel_frame(target.epoch, revision))
+                    .ok()
+                    .flatten()
+                    .map(|(revision, frame)| {
+                        (
+                            revision,
+                            PeerUpdate {
+                                layout: target.layout,
+                                frame,
+                            },
+                        )
+                    })
+            });
+        let Some(stream) = self.stream.as_mut() else {
+            let active = self
+                .registry
+                .reader
+                .as_ref()
+                .and_then(|id| self.registry.sessions.get_mut(id))
+                .is_some_and(|owned| owned.bridge.pump_unpublished().unwrap_or(false));
+            return (active || detached, None);
+        };
+        let Ok(owned) = self.registry.reader(&stream.owner.session) else {
+            self.stream = None;
+            return (detached, None);
+        };
+        if owned.bridge.validate_attachment(&stream.owner).is_err() {
+            self.stream = None;
+            return (detached, None);
+        }
+        let (active, delivery) = stream.pump(&mut owned.bridge, preview);
+        (active || detached, delivery)
+    }
+
+    fn validate_observer(
+        &self,
+        owner: &Attachment,
+        observer: Option<ObserverTarget>,
+    ) -> Result<(), String> {
+        if let Some(target) = observer {
+            if target.epoch == owner.epoch || target.layout == 0 {
+                return Err("invalid split pane observation".into());
+            }
+            self.target_for_epoch(target.epoch)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_observer(
+        &mut self,
+        owner: &Attachment,
+        stream_id: u32,
+        target: Option<ObserverTarget>,
+    ) -> Result<(), String> {
+        self.registry
+            .reader(&owner.session)?
+            .bridge
+            .validate_attachment(owner)?;
+        self.validate_observer(owner, target)?;
+        let stream = self
+            .stream
+            .as_mut()
+            .filter(|stream| stream.owner == *owner && stream.id() == stream_id)
+            .ok_or("stale local stream")?;
+        stream.set_observer(target);
+        self.worker.as_ref().unwrap().wake();
+        Ok(())
+    }
+
+    pub(crate) fn observe_shell(
+        &mut self,
+        owner: &Attachment,
+        epoch: u32,
+        revision: Option<u32>,
+    ) -> Result<Option<WireFrame>, String> {
+        self.registry
+            .reader(&owner.session)?
+            .bridge
+            .validate_attachment(owner)?;
+        if self.stream.is_some() || epoch == owner.epoch {
+            return Err("invalid split pane observation".into());
+        }
+        self.observe_snapshot(epoch, revision)
+    }
+
+    fn observe_snapshot(
+        &self,
+        epoch: u32,
+        revision: Option<u32>,
+    ) -> Result<Option<WireFrame>, String> {
+        self.retained_bridge(epoch)?.observe_frame(epoch, revision)
+    }
+
+    fn retained_bridge(&self, epoch: u32) -> Result<&LiveBridge, String> {
+        self.registry
+            .sessions
+            .values()
+            .find(|owned| owned.target.epoch == epoch)
+            .map(|owned| &owned.bridge)
+            .ok_or_else(|| "no such retained local shell".into())
+    }
+
+    pub(crate) fn acknowledge_stream(
+        &mut self,
+        owner: &Attachment,
+        stream_id: u32,
+        sequence: Counter,
+        revision: Option<Counter>,
+    ) -> Result<(), String> {
+        let owned = self.registry.reader(&owner.session)?;
+        owned.bridge.validate_attachment(owner)?;
+        let stream = self
+            .stream
+            .as_mut()
+            .filter(|stream| stream.owner == *owner && stream.id() == stream_id)
+            .ok_or("stale local stream")?;
+        stream.acknowledge(&mut owned.bridge, Receipt { sequence, revision })?;
+        self.worker.as_ref().unwrap().wake();
+        Ok(())
+    }
+
+    pub(crate) fn poll(&mut self, owner: &Attachment) -> Result<Option<Update>, String> {
+        if self.stream.is_some() {
+            return Err("local channel owns frame publication".into());
+        }
+        self.attached(owner, LiveBridge::poll_update)
+    }
+
+    pub(crate) fn acknowledge_frame(
+        &mut self,
+        owner: &Attachment,
+        revision: u64,
+    ) -> Result<(), String> {
+        if self.stream.is_some() {
+            return Err("local channel owns frame publication".into());
+        }
+        self.attached(owner, |bridge, epoch| {
+            bridge.acknowledge_publication(epoch, revision)
+        })
+    }
+
+    pub(crate) fn recover(
+        &mut self,
+        owner: &Attachment,
+        format: SnapshotFormat,
+    ) -> Result<AttachedView, String> {
         // Keep LiveBridge's idempotent previous-generation recovery rules.
         let owned = self.registry.reader(&owner.session)?;
         let view = owned
             .bridge
-            .resume(Some(owner))?
+            .resume_with(Some(owner), snapshot_encoder(format))?
             .ok_or("terminal session closed")?;
-        owned.raw.retain_only_current(&view.owner);
-        Ok(view)
+        let input_allowed = owned.bridge.can_resume_local_input();
+        self.retire_stale_stream(&view.owner);
+        Ok(AttachedView {
+            view,
+            input_allowed,
+        })
     }
 
     pub(crate) fn attached<R>(
@@ -295,17 +644,14 @@ impl LocalSessions {
         owner: &Attachment,
         operation: impl FnOnce(&mut LiveBridge, u32) -> Result<R, String>,
     ) -> Result<R, String> {
-        let bridge = &mut self.registry.reader(&owner.session)?.bridge;
-        let epoch = bridge.validate_input(owner)?;
-        operation(bridge, epoch)
+        let owned = self.registry.reader(&owner.session)?;
+        let epoch = owned.bridge.validate_logical_input(owner)?;
+        operation(&mut owned.bridge, epoch)
     }
 
     pub(crate) fn write_raw(&mut self, owner: Attachment, bytes: Vec<u8>) -> Result<usize, String> {
         let owned = self.registry.reader(&owner.session)?;
-        let epoch = owned.bridge.validate_input(&owner)?;
-        owned
-            .raw
-            .write(owner, bytes, |bytes| owned.bridge.write(epoch, bytes))
+        owned.bridge.write_owned_raw(owner, bytes)
     }
 
     pub(crate) fn close(&mut self, owner: &Attachment) -> Result<CloseStatus, String> {
@@ -315,7 +661,14 @@ impl LocalSessions {
             let epoch = owned.bridge.validate_session(owner)?;
             owned.bridge.close(epoch)
         })?;
-        if let Some(worker) = &self.detached_worker {
+        if self
+            .stream
+            .as_ref()
+            .is_some_and(|stream| stream.owner.session == owner.session)
+        {
+            self.stream = None;
+        }
+        if let Some(worker) = &self.worker {
             worker.wake();
         }
         Ok(result)

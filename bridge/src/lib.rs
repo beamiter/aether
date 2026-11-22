@@ -1,46 +1,43 @@
 //! Rust frame bridge and limited Linux PTY spike, not a full terminal.
+pub mod history_search;
 pub mod live;
+#[cfg(target_os = "linux")]
+pub mod remote_files;
 pub mod semantic;
+mod semantic_v4;
 #[cfg(target_os = "linux")]
 pub mod terminal_transport;
 use jterm_engine::{
     frame::{CellFrame, Cursor, Limits, Row, Screen, Stamp},
     CursorShape, TerminalGrid,
 };
-use serde::Serialize;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Serialize)]
-pub struct WireCell {
-    pub text: String,
-    pub foreground: String,
-    pub background: String,
-    pub width: u8,
-    /// bold=1, italic=2, underline=4, strike=8, dim=16.
-    pub style: u8,
+pub use jterm_protocol::file_reference;
+pub use jterm_protocol::terminal as protocol;
+pub use jterm_protocol::terminal_v4 as protocol_v4;
+pub use protocol::{CursorShape as WireCursorShape, WireCell, WireFrame};
+pub use protocol_v4::{LocalSnapshot, SnapshotFormat, SnapshotRevision};
+
+pub fn snapshot_encoder(
+    format: SnapshotFormat,
+) -> impl FnOnce(&CellFrame, &str, u32) -> Result<LocalSnapshot, String> {
+    move |frame, session, epoch| match format {
+        SnapshotFormat::Compatibility => {
+            from_engine(frame, session, epoch).map(LocalSnapshot::Compatibility)
+        }
+        SnapshotFormat::Channel => semantic_v4::encode(None, frame, session)
+            .map(|(_, frame)| LocalSnapshot::Channel(frame)),
+    }
 }
-#[derive(Debug, Clone, Serialize)]
-pub struct WireFrame {
-    pub version: u8,
-    pub session: String,
-    pub epoch: u32,
-    pub revision: u32,
-    pub layout: u32,
-    pub cols: usize,
-    pub rows: Vec<Vec<WireCell>>,
-    pub cursor_row: usize,
-    pub cursor_col: usize,
-    pub cursor_visible: bool,
-    pub cursor_shape: &'static str,
-    pub pending_wrap: bool,
-}
+
 /// Resolve a host-owned immutable frame into paint-only values. No ANSI reaches JS.
 pub fn from_engine(frame: &CellFrame, session: &str, epoch: u32) -> Result<WireFrame, String> {
     semantic::validate_grid(frame)?;
     let revision = u32::try_from(frame.stamp().revision).map_err(|_| "revision exhausted")?;
     let layout = u32::try_from(frame.stamp().layout).map_err(|_| "layout exhausted")?;
     Ok(WireFrame {
-        version: 3,
+        version: protocol::VERSION,
         session: session.into(),
         epoch,
         revision,
@@ -58,11 +55,11 @@ pub fn from_engine(frame: &CellFrame, session: &str, epoch: u32) -> Result<WireF
         pending_wrap: frame.cursor().pending_wrap,
     })
 }
-fn cursor_shape(shape: CursorShape) -> &'static str {
+fn cursor_shape(shape: CursorShape) -> WireCursorShape {
     match shape {
-        CursorShape::Block => "block",
-        CursorShape::Underline => "underline",
-        CursorShape::Beam => "beam",
+        CursorShape::Block => WireCursorShape::Block,
+        CursorShape::Underline => WireCursorShape::Underline,
+        CursorShape::Beam => WireCursorShape::Beam,
     }
 }
 
@@ -80,13 +77,7 @@ fn wire_row(row: &Row, cols: usize) -> Vec<WireCell> {
                 text: c.character.to_string(),
                 foreground: fg,
                 background: bg,
-                width: if c.flags.wide_continuation() {
-                    0
-                } else if c.flags.wide() && column + 1 < cols {
-                    2
-                } else {
-                    1
-                },
+                width: cell_width(c.flags, column, cols),
                 style: u8::from(c.flags.bold())
                     | (u8::from(c.flags.italic()) << 1)
                     | (u8::from(c.flags.underline() != jterm_engine::UnderlineStyle::None) << 2)
@@ -95,6 +86,16 @@ fn wire_row(row: &Row, cols: usize) -> Vec<WireCell> {
             }
         })
         .collect()
+}
+
+fn cell_width(flags: jterm_engine::StyleFlags, column: usize, cols: usize) -> u8 {
+    if flags.wide_continuation() {
+        0
+    } else if flags.wide() && column + 1 < cols {
+        2
+    } else {
+        1
+    }
 }
 
 fn color(c: jterm_engine::Color, foreground: bool) -> String {
@@ -226,9 +227,9 @@ mod tests {
     fn cursor_shape_and_wrap_reach_wire_without_inference() {
         let mut terminal = jterm_headless_session_spike::Terminal::new(2, 4).unwrap();
         for (sequence, expected) in [
-            ("\x1b[2 q", "block"),
-            ("\x1b[4 q", "underline"),
-            ("\x1b[6 q", "beam"),
+            ("\x1b[2 q", WireCursorShape::Block),
+            ("\x1b[4 q", WireCursorShape::Underline),
+            ("\x1b[6 q", WireCursorShape::Beam),
         ] {
             terminal.feed(sequence.as_bytes()).unwrap();
             assert_eq!(

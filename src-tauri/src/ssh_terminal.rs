@@ -222,8 +222,14 @@ impl RemoteSession {
             },
             true,
         )?;
+        let host_allowed = match result.get("input_allowed") {
+            Some(Value::Bool(allowed)) => *allowed,
+            None => true, // Older helpers do not send an explicit grant.
+            Some(_) => return Err("Invalid SSH terminal recovery input grant.".into()),
+        };
         self.install_snapshot(&result, &previous)?;
         self.recovered_from = Some(previous);
+        self.input_uncertain |= !host_allowed;
         result
             .as_object_mut()
             .ok_or("Invalid SSH terminal recovery result.")?

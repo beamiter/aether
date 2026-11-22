@@ -4,6 +4,35 @@ test('Chinese preedit never submits; end then final input commits exactly once',
  const h=setup();h.event('compositionstart');h.el.value='zhong';h.event('input',{data:'zhong',isComposing:true});assert.deepEqual(h.sent,[]);
  h.event('compositionend',{data:'中文'});h.event('input',{data:'中文',inputType:'insertText'});assert.deepEqual(h.sent,[[1,'中文']]);assert.equal(h.el.value,'');
 });
+test('the visible preedit is cleared when its owner changes before the late commit',()=>{
+ const events=new Map(),rendered=[];let epoch=1;
+ const field={value:'',addEventListener(name,listener){events.set(name,listener);}};
+ installIme(field,{getEpoch:()=>epoch,commit:()=>assert.fail('stale composition committed'),
+   preedit:text=>rendered.push(text)});
+ events.get('compositionstart')();
+ events.get('compositionupdate')({data:'ni'});
+ epoch=2;
+ events.get('compositionupdate')({data:'你'});
+ events.get('compositionend')({data:'你'});
+ assert.deepEqual(rendered,['','ni','','']);
+});
+test('a deferred compositionend is canceled by blur and ordered before fresh typing',()=>{
+ const events=new Map(),callbacks=[],written=[];
+ const field={value:'',addEventListener(name,listener){events.set(name,listener);}};
+ installIme(field,{getEpoch:()=>1,commit:text=>written.push(text),afterEnd:callback=>callbacks.push(callback)});
+ events.get('compositionstart')();
+ events.get('compositionend')({data:'ni'});
+ events.get('blur')();
+ callbacks.shift()();
+ assert.deepEqual(written,[]);
+ events.get('compositionstart')();
+ events.get('compositionend')({data:'你'});
+ events.get('input')({inputType:'insertText',data:'你'});
+ events.get('keydown')({key:'x'});
+ events.get('input')({inputType:'insertText',data:'x'});
+ callbacks.shift()();
+ assert.deepEqual(written,['你','x']);
+});
 test('final input before compositionend also commits once',()=>{
  const h=setup();h.event('compositionstart');h.event('input',{data:'你好',inputType:'insertFromComposition',isComposing:false});h.event('compositionend',{data:'你好'});assert.deepEqual(h.sent,[[1,'你好']]);
 });

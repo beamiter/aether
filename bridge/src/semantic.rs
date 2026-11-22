@@ -1,62 +1,10 @@
 //! Bounded semantic publication over a transport chosen by the host.
-use crate::{cursor_shape, from_engine, wire_row, WireCell, WireFrame};
+use crate::{cursor_shape, from_engine, protocol, wire_row};
 use jterm_engine::frame::CellFrame;
-use serde::{Deserialize, Serialize};
+pub use protocol::{Attachment, ChangedRow, Resume, SessionSelector, Update, WireDelta};
 
-/// The session ID names a PTY for its lifetime. An attachment names one
-/// receiver's current snapshot and invalidates its previous in-flight work.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Attachment {
-    pub session: String,
-    pub epoch: u32,
-    pub generation: u32,
-}
-
-/// Names the retained PTY independently of any writable view generation.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SessionSelector {
-    pub session: String,
-    pub epoch: u32,
-}
-
-#[derive(Debug, Serialize)]
-pub struct Resume {
-    pub owner: Attachment,
-    pub frame: WireFrame,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Update {
-    Snapshot { frame: WireFrame },
-    Delta { frame: WireDelta },
-}
-
-#[derive(Debug, Serialize)]
-pub struct WireDelta {
-    pub version: u8,
-    pub session: String,
-    pub epoch: u32,
-    pub base_revision: u32,
-    pub revision: u32,
-    pub layout: u32,
-    pub cursor_row: usize,
-    pub cursor_col: usize,
-    pub cursor_visible: bool,
-    pub cursor_shape: &'static str,
-    pub pending_wrap: bool,
-    pub rows: Vec<ChangedRow>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ChangedRow {
-    pub index: usize,
-    pub cells: Vec<WireCell>,
-}
-
-pub(crate) fn update(
+/// Produce a v3 snapshot or delta from immutable frames for a native producer.
+pub fn update(
     previous: Option<&CellFrame>,
     frame: &CellFrame,
     id: &str,
@@ -69,7 +17,7 @@ pub(crate) fn update(
         if delta.rows.len() < frame.rows().len() {
             return Ok(Update::Delta {
                 frame: WireDelta {
-                    version: 3,
+                    version: protocol::VERSION,
                     session: id.to_owned(),
                     epoch,
                     base_revision: revision(delta.base.revision)?,
@@ -100,7 +48,10 @@ pub(crate) fn update(
 pub(crate) fn validate_grid(frame: &CellFrame) -> Result<(), String> {
     let rows = frame.rows().len();
     let cols = frame.cols();
-    if rows <= 128 && cols <= 256 && rows * cols <= 32_768 {
+    if rows <= protocol::MAX_ROWS
+        && cols <= protocol::MAX_COLUMNS
+        && rows * cols <= protocol::MAX_CELLS
+    {
         Ok(())
     } else {
         Err("terminal grid exceeds wire limit".into())

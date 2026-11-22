@@ -4,6 +4,12 @@ use tauri_terminal_frame_bridge::terminal_transport;
 fn run() -> io::Result<()> {
     let mut args = std::env::args_os().skip(1);
     let action = args.next();
+    if action.as_deref() == Some(std::ffi::OsStr::new("files")) && args.len() == 0 {
+        return tauri_terminal_frame_bridge::remote_files::serve(
+            io::stdin().lock(),
+            io::stdout().lock(),
+        );
+    }
     let socket = args
         .next()
         .map(PathBuf::from)
@@ -19,7 +25,7 @@ fn run() -> io::Result<()> {
     }
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: aether-terminal-host {serve|stdio} [absolute-socket-path]",
+        "usage: aether-terminal-host {serve|stdio} [absolute-socket-path] | files",
     ))
 }
 

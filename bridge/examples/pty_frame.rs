@@ -3,13 +3,14 @@ use tauri_terminal_frame_bridge::live::LiveBridge;
 fn main() -> Result<(), String> {
     let mut b = LiveBridge::default();
     let epoch = b.open(12, 80)?;
+    let owner = b.attachment(epoch)?;
     let bytes = b"printf 'RUST_PTY_FRAME_OK_271828\\n'; exit\n";
     let mut at = 0;
     let start = std::time::Instant::now();
     let mut latest = None;
     while start.elapsed() < std::time::Duration::from_secs(3) {
         if at < bytes.len() {
-            at += b.write(epoch, &bytes[at..])?;
+            at += b.write_owned_raw(owner.clone(), bytes[at..].to_vec())?;
         }
         if let Some(frame) = b.poll(epoch)? {
             b.acknowledge(epoch, frame.revision)?;

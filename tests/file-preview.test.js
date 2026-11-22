@@ -38,7 +38,7 @@ test('only one pending read is admitted across repeated requests and root replac
  await h.show('new.md');assert.equal(h.shown.at(-1).text,'new');
 });
 
-import {selectedPathAtCell} from '../web/file-preview.js';
+import {selectedPathAtCell,selectedReferenceAtCell} from '../web/file-preview.js';
 const frame=text=>({cols:[...text].length,rows:[[...text].map(text=>({text,width:1}))]});
 test('Ctrl-click candidate lookup matches selected exact tokens only',()=>{
  const f=frame('open `src/App.tsx` and README.md');
@@ -48,15 +48,35 @@ test('Ctrl-click candidate lookup matches selected exact tokens only',()=>{
  assert.equal(selectedPathAtCell(frame('./src/App.tsx'),0,4,['src/App.tsx']), 'src/App.tsx');
  assert.equal(selectedPathAtCell(f,1,8,['src/App.tsx']),null);
 });
+test('Vim receives a location only when it belongs to the chosen snapshot path',()=>{
+ const visible=frame('a.md:12:3');
+ assert.deepEqual(selectedReferenceAtCell(visible,0,7,['a.md']),{path:'a.md',line:12,column:3});
+ assert.deepEqual(selectedReferenceAtCell(visible,0,7,['a.md','a.md:12:3']),{path:'a.md:12:3',line:null,column:null});
+ assert.equal(selectedReferenceAtCell(frame('a.md:0'),0,1,['a.md']),null);
+});
 import {installFilePreviewPanel} from '../web/file-preview-panel.js';
-function panelHarness(){
+function panelHarness(options={}){
  const elements=new Map();let epoch=1,current={...frame('src/App.tsx'),session:'pty-demo',epoch:1};
  const el=selector=>{if(!elements.has(selector))elements.set(selector,{value:'',textContent:'',hidden:false,handlers:{},addEventListener(n,fn){this.handlers[n]=fn;},replaceChildren(){this.children=[];},append(x){this.children.push(x);},focus(){this.focused=true;doc.activeElement=this;},contains(node){return ['#preview-close','#preview-confirm-local','#preview-source','#preview-raster'].some(id=>elements.get(id)===node);},getBoundingClientRect(){return {left:0,top:0,width:120,height:24};}});return elements.get(selector);};
  const doc={querySelector:el,createElement:()=>({})};
- const api=installFilePreviewPanel(doc,{getFrame:()=>current,getEpoch:()=>epoch,getSession:()=>'pty-demo'});
+ const api=installFilePreviewPanel(doc,{getFrame:()=>current,getEpoch:()=>epoch,getSession:()=>'pty-demo',...options});
  const click=(extra={})=>el('canvas').handlers.click({button:0,ctrlKey:true,currentTarget:el('canvas'),clientX:30,clientY:10,preventDefault(){},...extra});
  return {el,api,click,setEpoch:e=>epoch=e,setFrame:f=>current=f};
 }
+test('a verified editor request carries the original raw byte digest and the selected local origin',async()=>{
+ const opened=[];let isLocal=true;
+ const h=panelHarness({openInVim:(...args)=>{opened.push(args);return true;},isLocalTerminal:()=>isLocal});
+ const raw=new Uint8Array([0xef,0xbb,0xbf,65,13,10]);
+ h.setFrame({...frame('src/App.tsx:2:1'),session:'pty-demo',epoch:1});
+ h.el('#preview-folder').files=[{webkitRelativePath:'root/src/App.tsx',size:raw.length,arrayBuffer:async()=>raw.buffer}];
+ h.el('#preview-folder').handlers.change();h.click();await h.el('#preview-confirm-local').handlers.click();
+ const edit=h.el('#preview-vim9');
+ assert.equal(opened.length,0);isLocal=false;await edit.handlers.click();assert.equal(opened.length,0);
+ isLocal=true;await edit.handlers.click();assert.equal(opened.length,1);
+ const expected=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',raw)),b=>b.toString(16).padStart(2,'0')).join('');
+ assert.deepEqual(opened[0],[{source:'local_snapshot',directory:'root',path:'src/App.tsx',version:{bytes:6,sha256:expected}},2,1]);
+ h.api.dismiss();await edit.handlers.click();assert.equal(opened.length,1);
+});
 test('actual panel controller requires explicit local confirmation after Ctrl-left-click',async()=>{
  let reads=0;const h=panelHarness(),f=file('root/src/App.tsx','<script>not executed</script>');f.arrayBuffer=async()=>{reads++;return bytes('<script>not executed</script>');};
  h.el('#preview-folder').files=[f];h.el('#preview-folder').handlers.change();h.click();

@@ -229,6 +229,7 @@ def exercise(destination, binary):
             f"(n=0; while [ ! -f {quote(str(root / 'proceed'))} ] && [ \"$n\" -lt 100 ]; "
             "do n=$((n+1)); sleep 0.05; done; "
             f"if [ -f {quote(str(root / 'proceed'))} ]; then "
+            "awk 'BEGIN { for (i=0; i<8192; i++) printf \"%c[12;1H%64s\", 27, \"\" }' || exit; "
             "printf '\\033[7;1H\\033[2K%s\\r\\n' DETACHED_OUTPUT; "
             f"printf done > {quote(str(root / 'written'))}; fi) &",
         )
@@ -278,6 +279,7 @@ def exercise(destination, binary):
         return dict(
             ssh_transports=4, initial_snapshot_bytes=snapshot_size, lost_delta_bytes=delta_size,
             same_shell_after_network_cut=True, detached_output_recovered=True,
+            detached_output_bytes=8192 * (len("\x1b[12;1H") + 64),
             recovery_snapshot_retried=True, stale_ack_write_and_close_rejected=True,
             new_attachment_read_only=True, owned_pty_reaped=True,
         )

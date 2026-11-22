@@ -33,3 +33,9 @@ export function cursorTarget(frame,canvas,viewport) {
   return {left:Math.max(0,Math.min(left-viewport.clientWidth/2,viewport.scrollWidth-viewport.clientWidth)),
     top:Math.max(0,Math.min(top-viewport.clientHeight/2,viewport.scrollHeight-viewport.clientHeight))};
 }
+
+export function terminalCellAt(frame,canvas,x,y) {
+  const rect=canvas.getBoundingClientRect();
+  if(rect.width<=0||rect.height<=0||x<rect.left||y<rect.top||x>=rect.left+rect.width||y>=rect.top+rect.height)return null;
+  return {col:Math.floor((x-rect.left)/rect.width*frame.cols),row:Math.floor((y-rect.top)/rect.height*frame.rows.length)};
+}

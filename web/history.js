@@ -11,10 +11,87 @@ export function acceptHistory(value, epoch) {
 // Mirrors the fixed page size in LiveBridge::history (bridge/src/live.rs).
 const HISTORY_PAGE_ROWS=128;
 const oldestOffset=total=>Math.max(0,total-HISTORY_PAGE_ROWS);
-export function installHistory({older,newer,refresh,output,label,invoke,getOwner}) {
-  let group=null;
+export function installHistory({older,newer,refresh,output,label,invoke,getOwner,searchControls}) {
+  let group=null,activeSearch=null,searchId=0;
+
+  function updateSearchControls(){
+    if(!searchControls)return;
+    const owner=getOwner(),enabled=owner!==null&&searchControls.enabled(owner);
+    if(activeSearch&&activeSearch.owner!==owner){
+      activeSearch=null;
+      searchControls.status.textContent='Search again in the current view.';
+    }
+    searchControls.form.hidden=!enabled;
+    searchControls.find.disabled=!enabled||!!activeSearch?.busy;
+    searchControls.older.disabled=!enabled||!activeSearch?.hasHit||activeSearch.busy;
+    searchControls.cancel.disabled=!enabled||!activeSearch?.busy;
+  }
+
+  function stopSearch(message=''){
+    activeSearch=null;
+    if(searchControls)searchControls.status.textContent=message;
+    updateSearchControls();
+  }
+
+  async function find(restart){
+    const owner=getOwner();
+    if(owner===null||!searchControls.enabled(owner)||activeSearch?.busy)return;
+    if(restart){
+      const query=searchControls.query.value;
+      if(!query||query.length>128||new TextEncoder().encode(query).length>128||/[\x00-\x1f\x7f-\x9f]/.test(query)){
+        stopSearch('Enter a literal history query of 1–128 UTF-8 bytes without control characters.');
+        return;
+      }
+      activeSearch={id:++searchId,owner,query,busy:false,hasHit:false};
+    }
+    const current=activeSearch;
+    if(!current||current.owner!==owner||(!restart&&!current.hasHit))return;
+    const isCurrent=()=>activeSearch===current&&getOwner()===owner;
+    current.busy=true;group=null;updateSearchControls();
+    searchControls.status.textContent='Searching retained history…';
+    try{
+      // A search visits at most 1,024 rows in 64-row windows. One extra
+      // request can exhaust the previously visible window.
+      for(let steps=0;steps<17;steps++){
+        const result=await invoke('search_local_history',{owner,search:{id:current.id,query:current.query,restart}});
+        if(!isCurrent())return;
+        restart=false;
+        if(!result||result.id!==current.id||result.epoch!==owner.epoch)throw new Error('invalid history search response');
+        if(result.kind==='more')continue;
+        if(result.kind==='end'){
+          searchControls.status.textContent=current.hasHit?'No older match in retained history.':'No matches in retained history.';
+          current.hasHit=false;
+          return;
+        }
+        if(result.kind!=='match')throw new Error('invalid history search response');
+        const page=acceptHistory(result.snapshot,owner.epoch);
+        const {start,end}=result;
+        if(!Number.isInteger(start)||!Number.isInteger(end)||start<0||end>page.text.length||
+            end<=start||page.text.slice(start,end)!==current.query)throw new Error('invalid history search range');
+        if(output.value!==page.text)output.value=page.text;
+        output.focus();output.setSelectionRange(start,end);
+        const lineHeight=parseFloat(globalThis.getComputedStyle?.(output)?.lineHeight);
+        if(Number.isFinite(lineHeight)&&output.clientHeight){
+          const line=page.text.slice(0,start).split('\n').length-1;
+          output.scrollTop=Math.max(0,line*lineHeight-output.clientHeight/2);
+        }
+        label.textContent=`History snapshot ${page.revision}. Select or copy the matching text.`;
+        searchControls.status.textContent='Match selected in retained history.';
+        group={owner,offset:page.offset,total:page.total_rows,desired:page.offset,pending:null,promise:null};
+        current.hasHit=true;
+        return;
+      }
+      throw new Error('History search exceeded its page limit.');
+    }catch(error){
+      if(isCurrent())stopSearch(String(error?.message??error));
+    }finally{
+      if(isCurrent()){current.busy=false;updateSearchControls();}
+    }
+  }
+
   function load(delta) {
     const owner=getOwner();if(owner===null)return Promise.resolve();
+    stopSearch();
     if(group?.owner!==owner){
       const sameShell=group?.owner.session===owner.session&&group.owner.epoch===owner.epoch;
       // Recovery can rotate the attachment without replacing the PTY. Keep
@@ -73,5 +150,15 @@ export function installHistory({older,newer,refresh,output,label,invoke,getOwner
     return current.promise;
   }
   older.addEventListener('click',()=>load(20));newer.addEventListener('click',()=>load(-20));refresh.addEventListener('click',()=>load(0));
-  return {reset(){group=null;output.value='';label.textContent='Snapshot cleared. Refresh to view current session.';}};
+  if(searchControls){
+    searchControls.form.addEventListener('submit',event=>{event.preventDefault();return find(true);});
+    searchControls.older.addEventListener('click',()=>find(false));
+    searchControls.cancel.addEventListener('click',()=>stopSearch('Search canceled.'));
+    searchControls.query.addEventListener('input',()=>stopSearch());
+    updateSearchControls();
+  }
+  return {
+    updateSearchControls,
+    reset(){group=null;stopSearch();output.value='';label.textContent='Snapshot cleared. Refresh to view current session.';},
+  };
 }

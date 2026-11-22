@@ -13,8 +13,8 @@ export function localSnapshotPath(path){
 }
 const IMAGE_EXT=/\.(?:png|jpe?g)$/i;
 export function createFilePreview({render,onError,decodeImage=decodeRaster}){
- let files=new Map(),root=null,generation=0,reading=false;
- function clear(){generation++;files=new Map();root=null;render(null);}
+ let files=new Map(),root=null,generation=0,reading=false,single=false;
+ function clear(){generation++;files=new Map();root=null;single=false;render(null);}
  function select(list){
   clear();
   if(!list||!Number.isInteger(list.length)||list.length>MAX_FILES){onError('Folder exceeds the 2048-file limit. Choose a smaller folder or use Select one source file without enumerating the project.');return [];}
@@ -35,7 +35,7 @@ export function createFilePreview({render,onError,decodeImage=decodeRaster}){
   if(!file||!localSnapshotPath(file.name)||file.name.includes('/')){
    onError('Select one source file with a safe basename.');return [];
   }
-  root='Explicit single-file snapshot';files.set(file.name,file);
+  single=true;root='Explicit single-file snapshot';files.set(file.name,file);
   return [file.name];
  }
  async function show(path){
@@ -64,7 +64,7 @@ export function createFilePreview({render,onError,decodeImage=decodeRaster}){
    const text=new TextDecoder('utf-8',{fatal:true}).decode(bytes);
    if(text.includes('\0'))throw Error('Binary content is not a text preview.');
    // The renderer uses textContent, including for Markdown, TSX, HTML and SVG.
-   render({path,text,root:owner});
+   render({path,text,root:owner},{directory:single?null:owner,path,bytes});
   }catch(error){if(ticket===generation&&owner===root){render(null);onError(String(error?.message??error));}}
   finally{reading=false;}
  }
@@ -73,10 +73,13 @@ export function createFilePreview({render,onError,decodeImage=decodeRaster}){
 }
 
 // Match only exact names in the explicitly selected snapshot. This is not a
-// generic path parser or OSC 8 resolver. Numeric location suffixes select the
-// same authorized file, not a filesystem fallback or an editor navigation.
+// generic path parser or OSC 8 resolver. Positive location suffixes belong
+// only to the matched browser-authorized file.
 // Authorized literal numeric-colon filenames win over location interpretations. Wrapped paths still wait for trusted source identity.
 export function selectedPathAtCell(frame,row,column,paths){
+ return selectedReferenceAtCell(frame,row,column,paths)?.path??null;
+}
+export function selectedReferenceAtCell(frame,row,column,paths){
  if(!frame||!Number.isInteger(row)||!Number.isInteger(column)||row<0||column<0||column>=frame.cols||!frame.rows[row])return null;
  let text='',at=-1;
  frame.rows[row].forEach((cell,col)=>{if(cell.width===0){if(col===column)at=Math.max(0,text.length-1);return;}if(col===column)at=text.length;text+=cell.text;});
@@ -87,20 +90,20 @@ export function selectedPathAtCell(frame,row,column,paths){
   if(!localSnapshotPath(path))continue;
   for(const token of [path,'./'+path]){
    for(let start=text.indexOf(token);start!==-1;start=text.indexOf(token,start+1)){
-    let end=start+token.length,hasLocation=false;
+    let end=start+token.length,line=null,byteColumn=null;
     if(text[end]===':'){
      // Keep location parsing bounded and reject partial matches such as
      // :0, :12:bad, :12:3:4, huge integers, or URI-like suffixes.
      const location=/^:([1-9][0-9]{0,9})(?::([1-9][0-9]{0,9}))?/.exec(text.slice(end,end+22));
      if(!location||Number(location[1])>4294967295||(location[2]&&Number(location[2])>4294967295))continue;
-     end+=location[0].length;hasLocation=true;
+     end+=location[0].length;line=Number(location[1]);byteColumn=location[2]?Number(location[2]):null;
     }
     // A punctuation suffix is prose only when the whole run reaches a
     // boundary. Never peel a prefix from README.md.js or README.md,backup.
     let contextEnd=end;
     while(contextEnd<text.length&&/[.,;!?，。；！？、]/u.test(text[contextEnd]))contextEnd++;
     if(at>=start&&at<contextEnd&&boundary(text[start-1])&&boundary(text[contextEnd]))
-     matches.push({path,end,hasLocation,start,contextEnd});
+     matches.push({path,end,line,byteColumn,start});
 
    }
   }
@@ -108,6 +111,7 @@ export function selectedPathAtCell(frame,row,column,paths){
  // Literal authorized names may themselves include punctuation. Reject
  // competing interpretations even when clicking their punctuation, rather
  // than choosing the shorter prose interpretation or longest filename.
- const candidates=matches.filter(m=>!m.hasLocation||!matches.some(exact=>!exact.hasLocation&&exact.start===m.start&&exact.end===m.end));
- return new Set(candidates.map(m=>m.path)).size===1&&candidates.some(m=>at<m.end)?candidates[0].path:null;
+ const candidates=matches.filter(m=>m.line===null||!matches.some(exact=>exact.line===null&&exact.start===m.start&&exact.end===m.end));
+ const match=candidates.find(m=>at<m.end);
+ return match&&new Set(candidates.map(m=>m.path)).size===1?{path:match.path,line:match.line,column:match.byteColumn}:null;
 }

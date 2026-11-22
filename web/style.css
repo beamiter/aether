@@ -1,8 +1,81 @@
 :root{color-scheme:dark;font:16px system-ui;background:#0b1118;color:#d9e5ef}body{margin:0}main{max-width:1000px;margin:32px auto;padding:0 24px}.tag{color:#94b5dd;font-size:12px;letter-spacing:.16em}h1{font-size:30px;margin:.4em 0}p{color:#acbacb;line-height:1.5}button{background:#a5c7fa;color:#0b1118;border:0;border-radius:7px;padding:10px 16px;font-weight:650}button:disabled{opacity:.6}.viewport{overflow:auto;border:1px solid #2d3c4f;border-radius:8px;padding:12px;background:#111820}canvas{display:block}.note{font-size:13px;max-width:800px}
+/* GTK WebKit reports text-input rectangles in document coordinates. Keep
+   document origin at the surface and scroll the body contents inside it. */
+html,body{height:100%}html{overflow:hidden}body{overflow:auto}
 form{display:flex;gap:12px;align-items:center;margin-top:16px}label{flex:1}input{box-sizing:border-box;width:75%;background:#111820;color:#d9e5ef;border:1px solid #52627a;border-radius:5px;padding:9px}
 #ssh-terminal-form[hidden]{display:none}#ssh-terminal-form{margin:12px 0;flex-wrap:wrap}#ssh-terminal-form label{display:flex;gap:8px;align-items:center;flex:0 1 25rem}#ssh-terminal-host{flex:1;min-width:8rem}
+#local-tabs:not([hidden]),#local-tab-list{display:flex;align-items:center;flex-wrap:wrap;gap:6px}
+#local-tabs:not([hidden]){margin:8px 0}
+#local-tab-list button:not([aria-current]){background:#1b2b3e;color:#d9e5ef}
+#split-local[aria-pressed="true"]{background:#d0e6ff}
+#terminal-panes:is([data-split="left"],[data-split="right"]){display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+#terminal-panes > section{min-width:0}
+#terminal-panes[data-split="right"] #active-pane{order:1}
+#peer-pane:not([hidden]) .viewport{margin-top:4px}
+#peer-canvas{cursor:pointer}
+#history-find-form[hidden],#history-find-status:empty{display:none}
+#history-find-form{flex-wrap:wrap}
+#history-output{line-height:1.4}
+#command-blocks:not([hidden]){margin:12px 0}
+#command-block-panel{margin:8px 0}
+.command-block-controls{display:flex;flex-wrap:wrap;gap:8px}
+.command-block{margin:6px 0;padding:10px;border:1px solid #52627a;border-radius:6px;background:#111820}
+.command-block summary{cursor:pointer;overflow-wrap:anywhere}
+.command-block-command{white-space:pre-wrap;unicode-bidi:isolate}
+.command-block-outcome{margin-inline:10px;color:#a5c7fa;font-size:13px}
+.command-block-meta{font-size:13px;overflow-wrap:anywhere;unicode-bidi:plaintext}
+.command-block textarea{margin-bottom:8px;unicode-bidi:plaintext}
+#agent-workspace{max-width:1000px;margin:0 auto 24px;padding:0 24px}
+#agent-workspace > summary{cursor:pointer;font-weight:650}
+.workspace-controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:12px 0}
+.workspace-controls label{min-width:180px}
+#workspace-conversation{display:block;max-width:100%;min-height:32px}
+#workspace-selection{overflow-wrap:anywhere}
+#workspace-copy-visible{margin-top:8px}
+#workspace-output[hidden]{display:none}
+#workspace-api{margin-top:14px}
+#workspace-api > summary{cursor:pointer;font-weight:650}
+#chat-form{display:block}
+#chat-history article,#chat-live{padding:8px 12px;margin:8px 0;border:1px solid #52627a;border-radius:6px}
+#chat-history pre,#chat-live pre{white-space:pre-wrap;overflow-wrap:anywhere;unicode-bidi:plaintext}
+#chat-history{max-height:28rem;overflow:auto}
+#workspace-native{margin-top:14px}
+#workspace-native > summary{cursor:pointer;font-weight:650}
+#native-create{display:grid;gap:10px;margin:12px 0;max-width:780px}
+#native-create label:not(.native-consent){display:grid;gap:3px}
+#native-create input:not([type="checkbox"]){width:100%}
+#native-create button{justify-self:start}
+.native-consent input{width:auto}
+#native-view pre{white-space:pre-wrap;overflow-wrap:anywhere;unicode-bidi:plaintext}
+#native-worktree{overflow-wrap:anywhere}
+#native-approvals article,#native-result,#native-context{padding:8px 12px;margin:8px 0;border:1px solid #52627a;border-radius:6px}
+#native-output,#native-verification-command,#native-verification-output,#native-diff,#native-context-body,#native-context-materials{max-height:26rem;overflow:auto}
+#native-context > label{display:block;margin-top:8px}
+#workspace-mission{margin-top:14px}
+#workspace-mission > summary{cursor:pointer;font-weight:650}
+#mission-create,#mission-edit{display:grid;gap:10px;margin:12px 0;max-width:780px}
+#mission-create label,#mission-edit label{display:grid;gap:3px}
+#mission-create button,#mission-edit button{justify-self:start}
+#mission-repositories article,#mission-evidence article{padding:8px 12px;margin:8px 0;border:1px solid #52627a;border-radius:6px;overflow-wrap:anywhere;unicode-bidi:plaintext}
+#workspace-tools{margin-top:14px}
+#workspace-tools > summary{cursor:pointer;font-weight:650}
+#tools-search{display:grid;gap:10px;margin:12px 0;max-width:780px}
+#tools-search label:first-child{display:grid;gap:3px}
+#tools-search button{justify-self:start}
+#tools-results li{margin:8px 0}
+#tools-results p,#tools-document-text{white-space:pre-wrap;overflow-wrap:anywhere;unicode-bidi:plaintext}
+#tools-document{margin-top:12px}
+#tools-document-text{max-height:26rem;overflow:auto}
+#workspace-queue{margin-top:14px}
+#workspace-queue > summary{cursor:pointer;font-weight:650}
+#queue-dependencies{display:block;max-width:100%;margin:8px 0}
+#queue-entries li{margin:8px 0;overflow-wrap:anywhere}
+#native-draft-goal{max-height:18rem;overflow:auto}
 
 textarea{display:block;box-sizing:border-box;width:100%;background:#111820;color:#d9e5ef;border:1px solid #52627a;margin-top:8px;padding:8px;font:16px monospace}
+#ime-input,#terminal-preedit{position:absolute;pointer-events:none;font:18px/24px monospace}
+#ime-input{width:72px;height:24px;margin:0;padding:0;border:0;outline:0;resize:none;overflow:hidden;background:transparent;color:transparent;caret-color:transparent}
+#terminal-preedit{z-index:1;max-width:100%;overflow:hidden;white-space:pre;background:#263748;color:#edf4ff;text-decoration:underline}
 
 .viewport{position:relative;max-height:480px;overscroll-behavior:contain}#cols,#rows{width:6em}#cursor-status{font:13px monospace}
 
@@ -36,3 +109,47 @@ textarea{display:block;box-sizing:border-box;width:100%;background:#111820;color
 #remote-metrics { margin:6px 0; font:12px monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
 #remote-feedback { overflow-wrap:anywhere; }
 @media(max-width:550px) { .remote-fields, .remote-result { grid-template-columns:minmax(0,1fr); } }
+
+#local-notebook{margin-top:14px}
+#local-notebook>summary{cursor:pointer;font-weight:650}
+#notebook-open-form{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:10px}
+#notebook-parts{display:grid;gap:12px}
+#notebook-parts>section,#notebook-run-result{padding:12px;border:1px solid #2d3c4f;border-radius:8px;background:#111820}
+#notebook-parts h3,#notebook-run-result h3,.notebook-streams h4{margin:0 0 8px}
+#notebook-parts pre,.notebook-streams pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:18em;overflow:auto}
+#notebook-parts>pre{margin:0;padding:5px 0}
+#notebook-parts button{margin-right:8px}
+#notebook-source-id{overflow-wrap:anywhere}
+#notebook-run-result{margin-top:12px}
+.notebook-streams{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(16rem,100%),1fr));gap:12px}
+.notebook-streams pre{padding:8px;margin:0;min-height:2.5em;background:#0b1118;border-radius:5px}
+
+#command-review-form{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:8px 0}
+#command-review-form[hidden]{display:none}
+#command-review-form select{max-width:min(64vw,26rem)}
+#command-review{border:1px solid #2d3c4f;border-radius:8px;padding:12px;margin:10px 0}
+#command-review h3{margin:0}
+#command-review-diff{white-space:pre-wrap;overflow-wrap:anywhere;overflow:auto;max-height:22rem;background:#111820;padding:8px}
+
+#vim9-workbench{margin-top:14px}
+#vim9-workbench>summary{cursor:pointer;font-weight:650}
+#vim9-toolbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:10px 0}
+#vim9-screen{position:relative;width:max-content}
+#vim9-terminal{cursor:text}
+#vim9-render,#vim9-input,#vim9-preedit{position:absolute;top:0;left:0;pointer-events:none}
+#vim9-render[hidden]{display:none}
+#vim9-input,#vim9-preedit{font:18px/24px monospace}
+#vim9-input{width:72px;height:24px;margin:0;padding:0;border:0;outline:0;resize:none;overflow:hidden;background:transparent;color:transparent;caret-color:transparent}
+#vim9-preedit{z-index:1;white-space:pre;background:#263748;color:#edf4ff;text-decoration:underline}
+#vim9-paste-review{padding:10px;margin-top:10px;border:1px solid #2d3c4f;border-radius:8px}
+#vim9-paste-review pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:16em;overflow:auto}
+
+#ssh-files,#ssh-workspace{max-width:1000px;margin:0 auto 24px;padding:0 24px}
+#ssh-files > summary,#ssh-workspace > summary{cursor:pointer;font-weight:650}
+#ssh-files form[hidden],#ssh-workspace form[hidden]{display:none}
+#files-entries{display:block;min-width:min(30em,100%);max-width:100%}
+#files-text,#rws-text{max-height:24em;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;unicode-bidi:plaintext}
+#files-source,#files-version,#rws-source,#rws-row,#rws-anchor{overflow-wrap:anywhere;unicode-bidi:plaintext}
+#vproject-choices{display:flex;flex-wrap:wrap;gap:6px;margin:.6em 0}
+#vproject-output{max-height:14em;overflow:auto;white-space:pre-wrap;unicode-bidi:plaintext}
+#vproject-output:empty,#vproject-diagnostics:empty{display:none}

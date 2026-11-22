@@ -25,13 +25,15 @@ const MAX_INPUT: usize = 16 * 1024;
 const MAX_SESSIONS: usize = 4;
 const INACTIVITY: Duration = Duration::from_secs(10 * 60);
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(3);
+const ACTIVE_IO_TICK: Duration = Duration::from_millis(25);
+const IDLE_OWNER_TICK: Duration = Duration::from_millis(1000);
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct Request {
+pub struct Request<C = Command> {
     pub protocol: u8,
     pub request: u32,
-    pub command: Command,
+    pub command: C,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -96,10 +98,10 @@ pub enum Command {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct Reply {
+pub struct Reply<T = Value> {
     pub protocol: u8,
     pub request: u32,
-    pub result: Result<Value, String>,
+    pub result: Result<T, String>,
 }
 
 #[derive(Default)]
@@ -130,6 +132,14 @@ fn check_input(length: usize) -> Result<(), String> {
 impl Host {
     fn expire(&mut self, now: Instant) {
         self.sessions.expire(now, INACTIVITY);
+    }
+
+    fn pump(&mut self) -> bool {
+        let mut active = false;
+        for bridge in self.sessions.values_mut() {
+            active |= bridge.pump_unpublished().unwrap_or(false);
+        }
+        active
     }
 
     fn reply(&mut self, request: Request) -> Reply {
@@ -170,7 +180,13 @@ impl Host {
                 (session, reply_value(bridge.resume(None)?)?)
             }
             Command::Recover { owner } => {
-                let result = reply_value(self.bridge(&owner.session)?.resume(Some(&owner))?)?;
+                let bridge = self.bridge(&owner.session)?;
+                let resume = bridge
+                    .resume(Some(&owner))?
+                    .ok_or("terminal session unavailable")?;
+                let input_allowed = bridge.recovered_input_allowed(&resume.owner);
+                let mut result = reply_value(resume)?;
+                result["input_allowed"] = Value::Bool(input_allowed);
                 (owner.session, result)
             }
             Command::Detach { owner } => {
@@ -193,9 +209,10 @@ impl Host {
             }
             Command::Write { owner, bytes } => {
                 check_input(bytes.len())?;
-                self.attached(owner, true, |bridge, epoch| {
-                    reply_value(bridge.write(epoch, &bytes)?)
-                })?
+                let result = self
+                    .bridge(&owner.session)?
+                    .write_owned_raw(owner.clone(), bytes)?;
+                (owner.session, reply_value(result)?)
             }
             Command::Key {
                 owner,
@@ -246,7 +263,7 @@ impl Host {
     ) -> Result<(String, Value), String> {
         let bridge = self.bridge(&owner.session)?;
         let epoch = if input {
-            bridge.validate_input(&owner)?
+            bridge.validate_logical_input(&owner)?
         } else {
             bridge.validate_attachment(&owner)?
         };
@@ -258,7 +275,7 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-fn read_record<T: DeserializeOwned>(
+pub(crate) fn read_record<T: DeserializeOwned>(
     reader: &mut impl BufRead,
     limit: usize,
 ) -> io::Result<Option<T>> {
@@ -275,7 +292,11 @@ fn read_record<T: DeserializeOwned>(
         .map_err(|_| invalid("malformed terminal transport JSON"))
 }
 
-fn write_record(writer: &mut impl Write, value: &impl Serialize, limit: usize) -> io::Result<()> {
+pub(crate) fn write_record(
+    writer: &mut impl Write,
+    value: &impl Serialize,
+    limit: usize,
+) -> io::Result<()> {
     let data = serde_json::to_vec(value)
         .map_err(|_| invalid("terminal transport serialization failed"))?;
     if data.len() >= limit {
@@ -327,10 +348,20 @@ fn check_socket(socket: &Path) -> io::Result<fs::Metadata> {
     Ok(metadata)
 }
 
+struct OwnerLock(File);
+
+impl Drop for OwnerLock {
+    fn drop(&mut self) {
+        // PTY children can inherit the open file description briefly between
+        // fork and exec. Closing our descriptor alone leaves their lock live.
+        let _ = File::unlock(&self.0);
+    }
+}
+
 struct BoundSocket {
     path: PathBuf,
     identity: (u64, u64),
-    _lock: File,
+    _lock: OwnerLock,
 }
 
 impl Drop for BoundSocket {
@@ -359,6 +390,7 @@ fn bind(socket: &Path) -> io::Result<(UnixListener, BoundSocket)> {
         ));
     }
     lock.try_lock()?;
+    let lock = OwnerLock(lock);
     match check_socket(socket) {
         Ok(_) => match UnixStream::connect(socket) {
             Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
@@ -400,8 +432,18 @@ pub fn serve(socket: &Path) -> io::Result<()> {
         events: libc::POLLIN,
         revents: 0,
     };
+    let mut next_tick = Instant::now();
     loop {
-        host.expire(Instant::now());
+        let now = Instant::now();
+        if now >= next_tick {
+            host.expire(now);
+            next_tick = now
+                + if host.pump() {
+                    ACTIVE_IO_TICK
+                } else {
+                    IDLE_OWNER_TICK
+                };
+        }
         match listener.accept() {
             Ok((mut peer, _)) => {
                 if limit_socket(&peer).is_ok() {
@@ -409,13 +451,18 @@ pub fn serve(socket: &Path) -> io::Result<()> {
                     {
                         let reply = host.reply(request);
                         let _ = write_record(&mut peer, &reply, MAX_REPLY);
+                        next_tick = next_tick.min(Instant::now() + ACTIVE_IO_TICK);
                     }
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 // SAFETY: readiness is a valid writable pollfd for the owned listener.
-                // Wake periodically to expire detached sessions, including with no traffic.
-                if unsafe { libc::poll(&mut readiness, 1, 1000) } < 0 {
+                // Wake for PTY reads and expiry even with no relay traffic.
+                let timeout = next_tick
+                    .saturating_duration_since(Instant::now())
+                    .as_millis()
+                    .max(1);
+                if unsafe { libc::poll(&mut readiness, 1, timeout as i32) } < 0 {
                     let error = io::Error::last_os_error();
                     if error.kind() != io::ErrorKind::Interrupted {
                         return Err(error);
@@ -459,6 +506,25 @@ pub fn stdio(socket: &Path, mut reader: impl BufRead, mut writer: impl Write) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn releasing_owner_unlocks_even_if_a_fork_inherited_the_descriptor() {
+        let file = std::env::temp_dir().join(format!(
+            "aether-owner-lock-{}",
+            crate::semantic::session_id().unwrap(),
+        ));
+        let owned = File::create_new(&file).unwrap();
+        let inherited = owned.try_clone().unwrap();
+        let contender = File::options().read(true).write(true).open(&file).unwrap();
+        fs::remove_file(&file).unwrap();
+
+        owned.try_lock().unwrap();
+        let owner = OwnerLock(owned);
+        assert!(contender.try_lock().is_err());
+        drop(owner);
+        contender.try_lock().unwrap();
+        drop(inherited);
+    }
 
     #[test]
     fn malformed_and_oversized_records_do_not_reach_the_owner() {
@@ -516,6 +582,7 @@ mod tests {
             open(&mut host).unwrap();
         }
         let mut resumed = host.execute(Command::Recover { owner: a.clone() }).unwrap();
+        assert_eq!(resumed["input_allowed"], true);
         let resumed: Attachment = serde_json::from_value(resumed["owner"].take()).unwrap();
         assert_eq!(resumed.session, a.session);
         assert_eq!(resumed.epoch, a.epoch);
@@ -565,6 +632,40 @@ mod tests {
     }
 
     #[test]
+    fn recovery_after_child_exit_keeps_the_snapshot_read_only() {
+        let mut host = Host::default();
+        let opened = host.execute(Command::Open { rows: 8, cols: 80 }).unwrap();
+        let owner: Attachment = serde_json::from_value(opened).unwrap();
+        let bytes = b"printf '%s%s\\n' EXIT_ WITNESS; exit\n";
+        assert_eq!(
+            host.execute(Command::Write {
+                owner: owner.clone(),
+                bytes: bytes.to_vec(),
+            })
+            .unwrap(),
+            bytes.len()
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while host.pump() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let result = host
+            .execute(Command::Recover {
+                owner: owner.clone(),
+            })
+            .unwrap();
+        assert_eq!(result["input_allowed"], false);
+        let recovered: crate::semantic::Resume = serde_json::from_value(result.clone()).unwrap();
+        assert!(recovered.frame.rows.iter().any(|row| row
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect::<String>()
+            .contains("EXIT_WITNESS")));
+        assert_eq!(host.execute(Command::Recover { owner }).unwrap(), result);
+    }
+
+    #[test]
     fn owner_rejects_foreign_paths_and_replaces_only_a_stale_owned_socket() {
         struct Directory(PathBuf);
         impl Drop for Directory {
@@ -585,7 +686,14 @@ mod tests {
         assert!(bind(&path).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"unrelated");
         fs::remove_file(&path).unwrap();
-        drop(UnixListener::bind(&path).unwrap());
+        let stale = UnixListener::bind(&path).unwrap();
+        // Stop accepting before dropping the descriptor. A parallel PTY test
+        // can briefly inherit this descriptor between fork and exec.
+        assert_eq!(
+            unsafe { libc::shutdown(stale.as_raw_fd(), libc::SHUT_RDWR) },
+            0
+        );
+        drop(stale);
         let (listener, socket_file) = bind(&path).unwrap();
         assert_eq!(check_socket(&path).unwrap().mode() & 0o777, 0o600);
         assert!(bind(&path).is_err());

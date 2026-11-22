@@ -1,42 +1,18 @@
-//! Linux-only limited PTY integration. Not a production process owner.
+//! Attachment and frame publication over the shared Linux runtime.
 use crate::{
     from_engine,
+    history_search::{HistorySearch, HistorySearchRequest, HistorySearchResponse},
     semantic::{self, Attachment, Resume, SessionSelector, Update},
     WireFrame,
 };
 use jterm_engine::frame::CellFrame;
 use jterm_headless_session_spike::Session;
-mod input_queue;
-use input_queue::InputQueue;
-use std::time::{Duration, Instant};
+mod command_blocks;
+mod raw_suffix;
+pub use crate::protocol::{CloseStatus, HistorySnapshot, SessionStatus};
+pub use command_blocks::{BlockSelection, CommandBlockSnapshot, RetainedBlock};
+use raw_suffix::RawSuffix;
 
-const INPUT_BOUNDARY_TIMEOUT: Duration = Duration::from_secs(2);
-const BOUNDARY_STALLED: &str = "logical input boundary stalled; input disabled until shell closes";
-const BOUNDARY_RETIRED: &str =
-    "logical input boundary interrupted by view change; input disabled until shell closes";
-const BOUNDARY_FAILED: &str =
-    "terminal stopped during logical input boundary; input disabled until shell closes";
-#[derive(Debug, serde::Serialize)]
-pub struct SessionStatus {
-    pub epoch: u32,
-    pub exited: bool,
-    pub drained: bool,
-    pub write_error: Option<String>,
-    pub dropped_reply_bytes: String,
-    pub unsupported: String,
-}
-#[derive(Debug, serde::Serialize)]
-pub struct HistorySnapshot {
-    pub epoch: u32,
-    pub revision: String,
-    pub offset: usize,
-    pub total_rows: usize,
-    pub text: String,
-}
-#[derive(Debug, serde::Serialize)]
-pub struct CloseStatus {
-    pub cleanup_pending: bool,
-}
 #[derive(Default)]
 pub struct LiveBridge {
     session: Option<Session>,
@@ -44,13 +20,16 @@ pub struct LiveBridge {
     epoch: u32,
     generation: u32,
     input_attached: bool,
+    input_waits_for_snapshot: bool,
     resumed_from: Option<u32>,
     flight: Option<CellFrame>,
     accepted: Option<CellFrame>,
-    input: InputQueue,
-    input_boundary: Option<Instant>,
-    order_partial_input: bool,
+    local_desktop: bool,
+    unpublished_background: bool,
+    hyperlink_policy: Option<jterm_engine::hyperlink::HyperlinkPolicy>,
     stable: Option<CellFrame>,
+    history_search: Option<HistorySearch>,
+    raw: RawSuffix<Attachment>,
 }
 impl LiveBridge {
     /// Use only for the local desktop owner that reports sticky write health.
@@ -66,29 +45,81 @@ impl LiveBridge {
     pub fn local_desktop_after(last_epoch: u32) -> Self {
         Self {
             epoch: last_epoch,
-            order_partial_input: true,
+            local_desktop: true,
             ..Self::default()
         }
     }
 
+    pub fn set_hyperlink_policy(&mut self, policy: jterm_engine::hyperlink::HyperlinkPolicy) {
+        self.hyperlink_policy = Some(policy);
+    }
+
     pub fn open(&mut self, rows: usize, cols: usize) -> Result<u32, String> {
+        self.open_shell(rows, cols, false)
+    }
+
+    pub fn open_integrated(&mut self, rows: usize, cols: usize) -> Result<u32, String> {
+        self.open_shell(rows, cols, true)
+    }
+
+    fn open_shell(&mut self, rows: usize, cols: usize, integrated: bool) -> Result<u32, String> {
+        self.open_session(|epoch| {
+            if integrated {
+                Session::spawn_integrated_with_epoch(rows, cols, epoch)
+            } else {
+                Session::spawn_with_epoch(rows, cols, epoch)
+            }
+        })
+    }
+
+    /// Launch a dedicated local editor from a host-authorized argv and cwd.
+    /// A fresh bridge's first epoch matches the prepared Session's epoch.
+    pub fn open_prepared_editor(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        argv: &[std::ffi::OsString],
+        cwd: &std::path::Path,
+        env: &[(std::ffi::OsString, std::ffi::OsString)],
+    ) -> Result<u32, String> {
+        if self.epoch != 0 {
+            return Err("A prepared editor requires a fresh terminal owner.".into());
+        }
+        self.open_session(|_| Session::spawn_command(rows, cols, argv, Some(cwd), env))
+    }
+
+    fn open_session(
+        &mut self,
+        spawn: impl FnOnce(std::num::NonZeroU64) -> Result<Session, String>,
+    ) -> Result<u32, String> {
         if self.session.is_some() {
             return Err("close the existing session first".into());
         }
         let epoch = self.epoch.checked_add(1).ok_or("epoch exhausted")?;
         let id = semantic::session_id()?;
-        let session = Session::spawn(rows, cols)?;
+        let frame_epoch = std::num::NonZeroU64::new(u64::from(epoch)).ok_or("invalid epoch")?;
+        let mut session = spawn(frame_epoch)?;
+        session.enable_ordered_input();
+        if self.local_desktop {
+            session.enable_underline_colors();
+            session.enable_grapheme_clusters();
+        }
+        if let Some(policy) = self.hyperlink_policy {
+            session.enable_hyperlinks(policy);
+        }
         self.stable = Some(session.terminal().frame()?);
+        self.unpublished_background = false;
         self.epoch = epoch;
         self.id = id;
         self.generation = 1;
         self.input_attached = true;
+        self.input_waits_for_snapshot = false;
         self.resumed_from = None;
         self.session = Some(session);
         self.flight = None;
         self.accepted = None;
-        self.input.clear();
-        self.input_boundary = None;
+        self.history_search = None;
+        self.raw = RawSuffix::default();
         Ok(epoch)
     }
     fn check(&self, epoch: u32) -> Result<(), String> {
@@ -125,10 +156,18 @@ impl LiveBridge {
         &mut self,
         target: Option<&SessionSelector>,
     ) -> Result<Option<Resume>, String> {
+        self.attach_read_only_with(target, from_engine)
+    }
+
+    pub fn attach_read_only_with<F>(
+        &mut self,
+        target: Option<&SessionSelector>,
+        encode: impl FnOnce(&CellFrame, &str, u32) -> Result<F, String>,
+    ) -> Result<Option<Resume<F>>, String> {
         if let Some(target) = target {
             self.validate_session_identity(&target.session, target.epoch)?;
         }
-        self.resume(None)
+        self.resume_with(None, encode)
     }
 
     pub fn validate_attachment(&self, owner: &Attachment) -> Result<u32, String> {
@@ -141,23 +180,127 @@ impl LiveBridge {
 
     pub fn validate_input(&self, owner: &Attachment) -> Result<u32, String> {
         let epoch = self.validate_attachment(owner)?;
-        if self.input_attached {
-            Ok(epoch)
-        } else {
-            Err("reconnected terminal view is read-only".into())
+        if !self.input_attached {
+            return Err("reconnected terminal view is read-only".into());
         }
+        if self.input_waits_for_snapshot && self.accepted.is_none() {
+            return Err("acknowledge the local tab snapshot before sending input".into());
+        }
+        Ok(epoch)
+    }
+
+    pub fn next_detached_generation(&self, owner: &Attachment) -> Result<u32, String> {
+        self.validate_attachment(owner)?;
+        self.generation
+            .checked_add(1)
+            .ok_or_else(|| "attachment exhausted".into())
+    }
+
+    pub fn validate_logical_input(&self, owner: &Attachment) -> Result<u32, String> {
+        let epoch = self.validate_input(owner)?;
+        if !self.raw.is_idle() {
+            return Err("finish the pending raw input event first".into());
+        }
+        Ok(epoch)
+    }
+
+    /// Order an editor-channel action after input already admitted to its PTY.
+    pub fn flush_editor_input(&mut self, owner: &Attachment) -> Result<(), String> {
+        self.validate_logical_input(owner)?;
+        if !self.session.as_ref().unwrap().input_idle() {
+            self.pump_unpublished()?;
+        }
+        let session = self.session.as_ref().unwrap();
+        if session.is_exited() || session.write_error().is_some() {
+            return Err("The editor PTY can no longer deliver input.".into());
+        }
+        if !session.input_idle() {
+            return Err("Vim is still receiving terminal input. Retry the editor action.".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn recovered_input_allowed(&self, owner: &Attachment) -> bool {
+        self.validate_logical_input(owner).is_ok()
+            && self
+                .session
+                .as_ref()
+                .is_some_and(|session| !session.is_exited() && session.write_error().is_none())
+    }
+
+    /// Only the desktop owner may park an already-writable tab. Queued input,
+    /// partial writes, and known write failures cannot acquire another lease.
+    pub fn can_park_local_input(&self, owner: &Attachment) -> bool {
+        self.validate_input(owner).is_ok() && self.local_input_idle()
+    }
+
+    fn local_input_idle(&self) -> bool {
+        self.local_desktop
+            && self.raw.is_idle()
+            && self.session.as_ref().is_some_and(|session| {
+                session.input_idle() && !session.is_exited() && session.write_error().is_none()
+            })
+    }
+
+    pub fn can_resume_local_input(&self) -> bool {
+        self.input_attached && self.local_input_idle()
+    }
+
+    /// This publication is scoped to the local desktop tab registry. A
+    /// reconnect outside that registry continues to be read-only.
+    pub fn activate_local_tab(
+        &mut self,
+        target: &SessionSelector,
+        grant_input: bool,
+    ) -> Result<(Resume, bool), String> {
+        self.activate_local_tab_with(target, grant_input, from_engine)
+    }
+
+    pub fn activate_local_tab_with<F>(
+        &mut self,
+        target: &SessionSelector,
+        grant_input: bool,
+        encode: impl FnOnce(&CellFrame, &str, u32) -> Result<F, String>,
+    ) -> Result<(Resume<F>, bool), String> {
+        let view = self
+            .attach_read_only_with(Some(target), encode)?
+            .ok_or("terminal session closed")?;
+        let writable = grant_input && self.local_input_idle();
+        self.input_attached = writable;
+        self.input_waits_for_snapshot = writable;
+        Ok((view, writable))
+    }
+
+    /// Retrying the exact unacknowledged local activation returns the same
+    /// publication. Once acknowledged or replaced, the old view has no grant.
+    pub fn pending_local_tab(&self, owner: &Attachment) -> Result<WireFrame, String> {
+        self.pending_local_tab_with(owner, from_engine)
+    }
+
+    pub fn pending_local_tab_with<F>(
+        &self,
+        owner: &Attachment,
+        encode: impl FnOnce(&CellFrame, &str, u32) -> Result<F, String>,
+    ) -> Result<F, String> {
+        self.validate_attachment(owner)?;
+        if self.accepted.is_some() {
+            return Err("local tab activation already acknowledged".into());
+        }
+        let frame = self
+            .flight
+            .as_ref()
+            .ok_or("no pending local tab snapshot")?;
+        encode(frame, &self.id, self.epoch)
     }
 
     pub fn detach(&mut self, owner: &Attachment) -> Result<(), String> {
-        self.validate_attachment(owner)?;
-        self.generation = self
-            .generation
-            .checked_add(1)
-            .ok_or("attachment exhausted")?;
-        self.seal_input_boundary(BOUNDARY_RETIRED);
+        self.generation = self.next_detached_generation(owner)?;
+        self.session.as_mut().unwrap().retire_pending_input();
+        self.raw.retire_view();
         self.input_attached = false;
         self.flight = None;
         self.accepted = None;
+        self.history_search = None;
         self.resumed_from = None;
         Ok(())
     }
@@ -165,13 +308,21 @@ impl LiveBridge {
     /// A reconnect starts with a snapshot and no dependency on the old viewer's
     /// data. A retry of an unacknowledged recovery gets the same attachment.
     pub fn resume(&mut self, expected: Option<&Attachment>) -> Result<Option<Resume>, String> {
+        self.resume_with(expected, from_engine)
+    }
+
+    pub fn resume_with<F>(
+        &mut self,
+        expected: Option<&Attachment>,
+        encode: impl FnOnce(&CellFrame, &str, u32) -> Result<F, String>,
+    ) -> Result<Option<Resume<F>>, String> {
         if let Some(owner) = expected {
             self.validate_session(owner)?;
             if self.resumed_from == Some(owner.generation) && self.accepted.is_none() {
                 if let Some(frame) = self.flight.as_ref() {
                     return Ok(Some(Resume {
                         owner: self.attachment(self.epoch)?,
-                        frame: from_engine(frame, &self.id, self.epoch)?,
+                        frame: encode(frame, &self.id, self.epoch)?,
                     }));
                 }
             }
@@ -183,103 +334,32 @@ impl LiveBridge {
             .generation
             .checked_add(1)
             .ok_or("attachment exhausted")?;
-        let frame = self.recover_frame(self.epoch)?;
+        let frame = self.recover_frame_with(self.epoch, encode)?;
         self.generation = generation;
-        self.seal_input_boundary(BOUNDARY_RETIRED);
-        self.input_attached &= expected.is_some();
+        let session = self.session.as_mut().unwrap();
+        if expected.is_none() {
+            session.retire_pending_input();
+            self.input_attached = false;
+        } else if session.retire_partial_input() {
+            self.input_attached = false;
+        }
+        self.raw.retire_view();
         self.resumed_from = expected.map(|owner| owner.generation);
         self.accepted = None;
+        self.history_search = None;
         Ok(Some(Resume {
             owner: self.attachment(self.epoch)?,
             frame,
         }))
     }
 
-    fn seal_input_boundary(&mut self, reason: &'static str) {
-        if self.input_boundary.take().is_some() {
-            self.input_attached = false;
-            self.session.as_mut().unwrap().fail_input_boundary(reason);
-        }
-    }
-
-    fn expire_input_boundary(&mut self, now: Instant) {
-        if self
-            .input_boundary
-            .is_some_and(|start| now.duration_since(start) >= INPUT_BOUNDARY_TIMEOUT)
-        {
-            self.seal_input_boundary(BOUNDARY_STALLED);
-        }
-    }
-
-    fn poll_io(&mut self, mut now: impl FnMut() -> Instant) -> Result<(), String> {
-        let capture = self.flight.is_none();
-        self.expire_input_boundary(now());
-        let held = self.input_boundary.is_some();
+    fn poll_io(&mut self, capture: bool) -> Result<(), String> {
         let session = self.session.as_mut().unwrap();
-        let reads = if held {
-            session.poll_holding_replies(capture)
-        } else {
-            session.poll_with_sync_capture(capture)
-        };
-        if let Err(error) = reads {
-            self.seal_input_boundary(BOUNDARY_FAILED);
-            return Err(error);
+        let result = session.drive_with_sync_capture(capture);
+        if session.write_error().is_some() {
+            self.input_attached = false;
         }
-        if session.is_exited() || session.write_error().is_some() {
-            self.seal_input_boundary(BOUNDARY_FAILED);
-            self.input.clear();
-            return Ok(());
-        }
-
-        if !held {
-            if !self.input.is_empty() {
-                let _ = self.input.flush(|bytes| session.write(bytes));
-                if session.write_error().is_some() {
-                    self.input.clear();
-                } else if self.order_partial_input && self.input.partial_remaining().is_some() {
-                    self.input_boundary = Some(now());
-                }
-            }
-            return Ok(());
-        }
-
-        self.expire_input_boundary(now());
-        if self.input_boundary.is_none() {
-            self.input.clear();
-            return Ok(());
-        }
-        if self.input.partial_remaining().is_some()
-            && self
-                .input
-                .flush_partial(|bytes, prefix, remaining| {
-                    self.session
-                        .as_mut()
-                        .unwrap()
-                        .continue_partial_input(bytes, prefix, remaining)
-                })
-                .is_err()
-        {
-            self.seal_input_boundary(BOUNDARY_FAILED);
-            self.input.clear();
-            return Ok(());
-        }
-
-        // A short write must never release replies inside the pending head.
-        // After completion, release only replies (never a fresh user event).
-        self.expire_input_boundary(now());
-        if self.input_boundary.is_some() && self.input.partial_remaining().is_none() {
-            let session = self.session.as_mut().unwrap();
-            let released = session.release_held_replies();
-            if session.write_error().is_some() {
-                self.seal_input_boundary(BOUNDARY_FAILED);
-            } else if released {
-                self.input_boundary = None;
-            }
-        }
-        if self.session.as_ref().unwrap().write_error().is_some() {
-            self.input.clear();
-        }
-        Ok(())
+        result.map(|_| ())
     }
 
     /// A local desktop owner may drain a detached PTY after witnessing that
@@ -287,11 +367,7 @@ impl LiveBridge {
     /// Never consumes logical input or touches frame publication/ACK state.
     #[doc(hidden)]
     pub fn pump_detached_idle(&mut self) -> Result<bool, String> {
-        if !self.order_partial_input
-            || self.input_attached
-            || !self.input.is_empty()
-            || self.input_boundary.is_some()
-        {
+        if !self.local_desktop || self.input_attached {
             return Ok(false);
         }
         match &mut self.session {
@@ -300,9 +376,76 @@ impl LiveBridge {
         }
     }
 
-    fn poll_frame(&mut self, epoch: u32) -> Result<Option<CellFrame>, String> {
+    /// Keep a local attached PTY advancing while publication is backpressured.
+    pub fn pump_attached_io(&mut self, epoch: u32) -> Result<bool, String> {
         self.check(epoch)?;
-        self.poll_io(Instant::now)?;
+        self.poll_io(false)?;
+        Ok(!self.session.as_ref().unwrap().is_drained())
+    }
+
+    /// Advance the owner while no receiver is issuing publications. Retain
+    /// the last paint boundary across synchronized-output holds.
+    pub fn pump_unpublished(&mut self) -> Result<bool, String> {
+        let Some(session) = self.session.as_ref() else {
+            return Ok(false);
+        };
+        if session.is_drained() {
+            return Ok(false);
+        }
+        self.unpublished_background = true;
+        self.poll_io(true)?;
+        let session = self.session.as_mut().unwrap();
+        let completed = session.take_completed_sync_frame();
+        let active = !session.is_drained();
+        if !active || !session.terminal().publication_held() {
+            self.stable = Some(session.terminal().frame()?);
+        } else if let Some(frame) = completed {
+            self.stable = Some(frame);
+        }
+        Ok(active)
+    }
+
+    pub fn has_unacknowledged_frame(&self) -> bool {
+        self.flight.is_some()
+    }
+
+    /// Resolve a click only against the exact acknowledged publication.
+    pub fn acknowledged_hyperlink(
+        &self,
+        revision: u64,
+        row: usize,
+        mut col: usize,
+    ) -> Result<&str, String> {
+        let frame = self
+            .accepted
+            .as_ref()
+            .filter(|frame| frame.stamp().revision == revision)
+            .ok_or("terminal hyperlink frame changed")?;
+        let line = frame
+            .rows()
+            .get(row)
+            .ok_or("terminal hyperlink outside view")?;
+        if line
+            .cells
+            .get(col)
+            .is_some_and(|cell| cell.flags.wide_continuation())
+        {
+            col = col
+                .checked_sub(1)
+                .ok_or("terminal hyperlink outside view")?;
+        }
+        let cell = line
+            .cells
+            .get(col)
+            .ok_or("terminal hyperlink outside view")?;
+        frame
+            .hyperlink_target(cell.hyperlink_id)
+            .ok_or_else(|| "no hyperlink at this cell".into())
+    }
+
+    fn poll_frame(&mut self, epoch: u32, snapshot: bool) -> Result<Option<CellFrame>, String> {
+        self.check(epoch)?;
+        self.poll_io(self.flight.is_none())?;
         let session = self.session.as_mut().unwrap();
         if self.flight.is_some() {
             return Ok(None);
@@ -311,15 +454,19 @@ impl LiveBridge {
         let frame = if !session.is_drained() && session.terminal().publication_held() {
             match completed {
                 Some(frame) => frame,
+                None if snapshot || self.unpublished_background => {
+                    self.stable.clone().ok_or("missing stable frame")?
+                }
                 None => return Ok(None),
             }
         } else {
             session.terminal().frame()?
         };
-        if self
-            .accepted
-            .as_ref()
-            .is_some_and(|last| frame.stamp().revision == last.stamp().revision)
+        if !snapshot
+            && self
+                .accepted
+                .as_ref()
+                .is_some_and(|last| frame.stamp().revision == last.stamp().revision)
         {
             return Ok(None);
         }
@@ -332,7 +479,7 @@ impl LiveBridge {
     }
 
     pub fn poll(&mut self, epoch: u32) -> Result<Option<WireFrame>, String> {
-        let Some(frame) = self.poll_frame(epoch)? else {
+        let Some(frame) = self.poll_frame(epoch, false)? else {
             return Ok(None);
         };
         let wire = from_engine(&frame, &self.id, epoch)?;
@@ -341,26 +488,88 @@ impl LiveBridge {
     }
 
     pub fn poll_update(&mut self, epoch: u32) -> Result<Option<Update>, String> {
-        let Some(frame) = self.poll_frame(epoch)? else {
+        let Some(frame) = self.poll_frame(epoch, false)? else {
             return Ok(None);
         };
         let update = semantic::update(self.accepted.as_ref(), &frame, &self.id, epoch)?;
         self.publish(frame);
         Ok(Some(update))
     }
+
+    /// Start the Channel with its own full base even if a compatibility
+    /// snapshot for the same state was already applied during tab activation.
+    pub fn poll_channel_frame(
+        &mut self,
+        epoch: u32,
+        snapshot: bool,
+    ) -> Result<Option<(crate::protocol_v4::Counter, String)>, String> {
+        let Some(frame) = self.poll_frame(epoch, snapshot)? else {
+            return Ok(None);
+        };
+        let previous = if snapshot {
+            None
+        } else {
+            self.accepted.as_ref()
+        };
+        let update = crate::semantic_v4::encode(previous, &frame, &self.id)?;
+        self.publish(frame);
+        Ok(Some(update))
+    }
     /// Explicit full-snapshot recovery after lost delivery/ACK. Never changes PTY or input.
     /// Caller must discard older outstanding transport callbacks before applying this frame.
     pub fn recover_frame(&mut self, epoch: u32) -> Result<WireFrame, String> {
+        self.recover_frame_with(epoch, from_engine)
+    }
+
+    fn recover_frame_with<F>(
+        &mut self,
+        epoch: u32,
+        encode: impl FnOnce(&CellFrame, &str, u32) -> Result<F, String>,
+    ) -> Result<F, String> {
         self.check(epoch)?;
-        let session = self.session.as_ref().unwrap();
-        let frame = if !session.is_drained() && session.terminal().publication_held() {
-            self.stable.clone().ok_or("missing stable frame")?
-        } else {
-            session.terminal().frame()?
-        };
-        let wire = from_engine(&frame, &self.id, epoch)?;
+        let frame = self.current_snapshot()?;
+        let wire = encode(&frame, &self.id, epoch)?;
         self.publish(frame);
         Ok(wire)
+    }
+
+    /// Read-only split observation. It neither advances the PTY nor changes
+    /// the acknowledged base, recovery receipt, or input attachment.
+    pub fn observe_frame(
+        &self,
+        epoch: u32,
+        revision: Option<u32>,
+    ) -> Result<Option<WireFrame>, String> {
+        self.check(epoch)?;
+        let frame = self.current_snapshot()?;
+        if revision.is_some_and(|revision| u64::from(revision) >= frame.stamp().revision) {
+            return Ok(None);
+        }
+        from_engine(&frame, &self.id, epoch).map(Some)
+    }
+
+    pub fn observe_channel_frame(
+        &self,
+        epoch: u32,
+        revision: Option<crate::protocol_v4::Counter>,
+    ) -> Result<Option<(crate::protocol_v4::Counter, String)>, String> {
+        self.check(epoch)?;
+        let frame = self.current_snapshot()?;
+        if revision.is_some_and(|revision| revision.get() >= frame.stamp().revision) {
+            return Ok(None);
+        }
+        crate::semantic_v4::encode(None, &frame, &self.id).map(Some)
+    }
+
+    fn current_snapshot(&self) -> Result<CellFrame, String> {
+        let session = self.session.as_ref().unwrap();
+        if !session.is_drained() && session.terminal().publication_held() {
+            self.stable
+                .clone()
+                .ok_or_else(|| "missing stable frame".into())
+        } else {
+            session.terminal().frame()
+        }
     }
     /// Independent immutable history snapshot; does not consume or acknowledge a live frame.
     pub fn history(&self, epoch: u32, offset: usize) -> Result<HistorySnapshot, String> {
@@ -379,6 +588,31 @@ impl LiveBridge {
             text: page.text,
         })
     }
+
+    pub fn search_history(
+        &mut self,
+        epoch: u32,
+        request: HistorySearchRequest,
+    ) -> Result<HistorySearchResponse, String> {
+        self.check(epoch)?;
+        request.validate()?;
+        if request.restart {
+            if self
+                .history_search
+                .as_ref()
+                .is_some_and(|search| search.id >= request.id)
+            {
+                return Err("stale history search".into());
+            }
+            self.history_search = Some(HistorySearch::new(request.id, request.query.clone()));
+        }
+        let search = self
+            .history_search
+            .as_mut()
+            .filter(|search| search.id == request.id && search.query == request.query)
+            .ok_or("start a new history search")?;
+        search.step(self.session.as_ref().unwrap().terminal(), epoch)
+    }
     pub fn status(&self, epoch: u32) -> Result<SessionStatus, String> {
         self.check(epoch)?;
         let session = self.session.as_ref().unwrap();
@@ -389,22 +623,27 @@ impl LiveBridge {
             write_error: session.write_error().map(str::to_owned),
             dropped_reply_bytes: session.dropped_reply_bytes().to_string(),
             unsupported: session.terminal().unsupported_count().to_string(),
+            command_blocks_enabled: session.terminal().completed_command_blocks().is_some(),
         })
     }
     pub fn acknowledge(&mut self, epoch: u32, revision: u32) -> Result<(), String> {
+        self.acknowledge_publication(epoch, u64::from(revision))
+    }
+
+    pub fn acknowledge_publication(&mut self, epoch: u32, revision: u64) -> Result<(), String> {
         self.check(epoch)?;
         if self.flight.is_none()
             && self
                 .accepted
                 .as_ref()
-                .is_some_and(|frame| frame.stamp().revision == u64::from(revision))
+                .is_some_and(|frame| frame.stamp().revision == revision)
         {
             return Ok(()); // retry of a successfully applied but lost ACK response
         }
         if self
             .flight
             .as_ref()
-            .is_none_or(|frame| frame.stamp().revision != u64::from(revision))
+            .is_none_or(|frame| frame.stamp().revision != revision)
         {
             return Err("wrong frame ACK".into());
         }
@@ -414,11 +653,7 @@ impl LiveBridge {
     }
     fn enqueue(&mut self, epoch: u32, bytes: Vec<u8>) -> Result<(), String> {
         self.check(epoch)?;
-        let session = self.session.as_ref().unwrap();
-        if session.is_exited() || session.write_error().is_some() {
-            return Err("input unavailable".into());
-        }
-        self.input.enqueue(bytes)
+        self.session.as_mut().unwrap().submit_input(bytes)
     }
     pub fn key(
         &mut self,
@@ -457,12 +692,16 @@ impl LiveBridge {
             .encode_paste(text)?;
         self.enqueue(epoch, bytes)
     }
-    pub fn write(&mut self, epoch: u32, text: &[u8]) -> Result<usize, String> {
-        self.check(epoch)?;
-        if !self.input.is_empty() {
-            return Ok(0);
-        }
-        self.session.as_mut().unwrap().write(text)
+    pub fn write_owned_raw(&mut self, owner: Attachment, bytes: Vec<u8>) -> Result<usize, String> {
+        self.validate_input(&owner)?;
+        let session = self.session.as_mut().unwrap();
+        self.raw
+            .write(owner, bytes, |bytes| session.write_transaction_chunk(bytes))
+    }
+
+    #[cfg(test)]
+    fn write(&mut self, epoch: u32, text: &[u8]) -> Result<usize, String> {
+        self.write_owned_raw(self.attachment(epoch)?, text.to_vec())
     }
     pub fn resize(&mut self, epoch: u32, rows: usize, cols: usize) -> Result<(), String> {
         self.check(epoch)?;
@@ -476,17 +715,61 @@ impl LiveBridge {
         self.id.clear();
         self.input_attached = false;
         self.stable = None;
-        self.input.clear();
-        self.input_boundary = None;
         self.flight = None;
         self.accepted = None;
         self.resumed_from = None;
+        self.history_search = None;
+        self.raw = RawSuffix::default();
         Ok(CloseStatus { cleanup_pending })
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_editor_launch_has_its_own_epoch_and_uses_exact_argv() {
+        use std::ffi::OsString;
+        let cwd = std::env::temp_dir();
+        let argv = [
+            "/bin/sh",
+            "-c",
+            "printf '%s' \"$1\"",
+            "sh",
+            "AETHER PREPARED; EDITOR",
+        ]
+        .map(OsString::from);
+        let mut bridge = LiveBridge::local_desktop();
+        let epoch = bridge
+            .open_prepared_editor(4, 32, &argv, &cwd, &[])
+            .unwrap();
+        let owner = bridge.attachment(epoch).unwrap();
+        assert_eq!(owner.epoch, 1);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let active = bridge.pump_unpublished().unwrap();
+            if !active {
+                break;
+            }
+            assert!(std::time::Instant::now() < until);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let (_, frame) = bridge.observe_channel_frame(epoch, None).unwrap().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(json["stamp"]["epoch"], "1");
+        assert_eq!(json["stamp"]["session"], owner.session);
+        let first_row: String = json["rows"][0]["cells"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|cell| cell["text"].as_str().unwrap())
+            .collect();
+        assert!(first_row.starts_with("AETHER PREPARED; EDITOR"));
+        bridge.close(epoch).unwrap();
+        assert!(bridge
+            .open_prepared_editor(4, 32, &argv, &cwd, &[])
+            .is_err());
+    }
 
     #[test]
     fn semantic_stream_reconnects_to_the_same_pty_after_lost_delta_and_ack() {
@@ -857,20 +1140,17 @@ mod tests {
         let epoch = bridge.open(8, 64).unwrap();
         bridge.enqueue(epoch, vec![b'a'; 16384]).unwrap();
         assert!(bridge.key(epoch, "a", false, false, false).is_err());
-        assert_eq!(bridge.input.len(), 16384);
+        assert!(!bridge.session.as_ref().unwrap().input_idle());
         assert!(bridge.paste(epoch + 1, "hello").is_err());
+        bridge.detach(&bridge.attachment(epoch).unwrap()).unwrap();
+        assert!(bridge.session.as_ref().unwrap().input_idle());
+        assert!(bridge.status(epoch).unwrap().write_error.is_none());
         bridge.close(epoch).unwrap();
-        assert!(bridge.input.is_empty());
         let next = bridge.open(8, 64).unwrap();
+        assert!(bridge.session.as_ref().unwrap().input_idle());
         assert!(bridge.key(epoch, "a", false, false, false).is_err());
         bridge.key(next, "ArrowUp", false, false, false).unwrap();
-        bridge
-            .input
-            .flush(|bytes| {
-                assert_eq!(bytes, b"\x1b[A");
-                Ok(0)
-            })
-            .unwrap();
+        assert!(!bridge.session.as_ref().unwrap().input_idle());
         bridge.close(next).unwrap();
     }
     #[test]
