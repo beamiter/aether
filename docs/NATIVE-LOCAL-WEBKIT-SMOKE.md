@@ -1,8 +1,8 @@
 # Native local-shell WebKitGTK smoke
 
 Run **Desktop WebKitGTK acceptance** manually on Ubuntu 24.04. It also runs
-on a push to `master` that changes the smoke workflow or driver script, but
-not on ordinary application changes. It builds and hashes the exact
+when a push to `master` changes the native workflow, a driver script or any
+of the three Cargo lockfiles. It builds and hashes the exact
 checkout’s Aether desktop binary and verifies that the embedded Aether page,
 not MiniBrowser or a mock runtime, is under automation.
 

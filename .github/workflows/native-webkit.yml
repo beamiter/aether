@@ -10,6 +10,9 @@ on:
       - 'scripts/test-two-local-webkit.py'
       - 'scripts/test-remote-project-webkit.py'
       - 'scripts/test-workspace-rollback.py'
+      - 'bridge/Cargo.lock'
+      - 'session/Cargo.lock'
+      - 'src-tauri/Cargo.lock'
 
 permissions:
   contents: read
