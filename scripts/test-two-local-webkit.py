@@ -48,6 +48,7 @@ return {
   choose: !document.querySelector('#attach-selected-local').disabled,
   second: !document.querySelector('#open-second-local').disabled,
   tabs: Array.from(document.querySelectorAll('#local-tab-list button'), tab => tab.dataset.epoch),
+  available_tabs: Array.from(document.querySelectorAll('#local-tab-list button:enabled'), tab => tab.dataset.epoch),
   current_tab: document.querySelector('#local-tab-list [aria-current]')?.dataset.epoch || null,
   split: document.querySelector('#terminal-panes').dataset.split || '',
   peer_geometry: peer.dataset.geometry || '',
@@ -177,13 +178,29 @@ def write_from_current_tab(driver, pid_file, color=None):
 
 def click_tab(driver, number):
     assert re.fullmatch(r"[1-9][0-9]{0,9}", number)
-    driver.click(f'#local-tab-list [data-epoch="{number}"]')
-
-    def active():
-        status = driver.execute(READ)
-        return status["current_tab"] == number and status["writable"]
-
-    wait_for(active, "selected tab never regained input")
+    selector = f'#local-tab-list [data-epoch="{number}"]'
+    wait_messages = {
+        "Wait for the current input request to finish before switching shells.",
+        "Wait for the current shell input before switching tabs.",
+    }
+    last_click = None
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        state = driver.execute(READ)
+        if state["current_tab"] == number and state["writable"]:
+            return
+        retry_requested = state["status"] in wait_messages and time.monotonic() - (last_click or 0) >= .25
+        if (number in state["available_tabs"] and state["current_tab"] != number
+                and (last_click is None or retry_requested)):
+            try:
+                driver.click(selector)
+                last_click = time.monotonic()
+            except ProtocolError as error:
+                if error.error != "stale element reference":
+                    raise
+        time.sleep(.08)
+    raise AssertionError(f"Shell {number} did not regain input: active={state['current_tab']}, "
+                         f"writable={state['writable']}, status={state['status']!r}")
 
 
 def exercise(driver, owned):
@@ -2074,6 +2091,56 @@ def exercise_vim9_project(driver, source):
     print(json.dumps({"native_vim9_project": ["tree", "file:line:byte-column", "palette", "quickfix search", "build exit/output", "cancel"]}), flush=True)
 
 
+def exercise_vim9_overlays(driver, owned):
+    setup = owned / "native-vim9-overlays.vim"
+    accepted = owned / "accepted-completion"
+    selection = owned / "vim-menu-selection"
+    setup.write_text(
+        "set completeopt=menuone,noinsert,noselect\n"
+        "new\nsetlocal buftype=nofile bufhidden=wipe noswapfile\n"
+        "highlight AetherPopup guifg=#ffffff guibg=#963c2d gui=NONE\n"
+        "highlight Pmenu guifg=#ffffff guibg=#335577 gui=NONE\n"
+        "highlight PmenuSel guifg=#ffffff guibg=#448866 gui=NONE\n"
+        "highlight! link PmenuMatch Pmenu | highlight! link PmenuMatchSel PmenuSel\n"
+        f"autocmd CompleteChanged * call writefile([string(complete_info(['selected']).selected)], '{selection}')\n"
+        f"command! ProbeChoice call writefile([getline(1)], '{accepted}')\n"
+        "inoremap <F6> <C-R>=[complete(col('.'), ['chooseAlpha','chooseBeta']), ''][1]<CR>\n"
+        "let g:aether_popup = popup_create(['Native popup'], {'line':4,'col':6,'minwidth':16,'highlight':'AetherPopup'})\n"
+        "call setwinvar(g:aether_popup, 'jterm_native_popup', 1)\n")
+
+    def has_color(red, green, blue):
+        return driver.execute(f"""
+          const screen=document.querySelector('#vim9-screen'), canvas=document.querySelector('#vim9-render');
+          if(screen.dataset.source!=='vim9'||canvas.hidden)return false;
+          const data=canvas.getContext('2d').getImageData(0,0,canvas.width,canvas.height).data;
+          let count=0;
+          for(let i=0;i<data.length;i+=4)
+            if(data[i]==={red}&&data[i+1]==={green}&&data[i+2]==={blue}&&data[i+3]===255&&++count>150)return true;
+          return false;
+        """)
+    driver.type("#vim9-input", f":source {setup}\ue007")
+    wait_for(lambda: has_color(0x96, 0x3c, 0x2d), "authenticated Vim popup pixels did not reach the native Canvas")
+    driver.type("#vim9-input", ":call popup_close(g:aether_popup)\ue007")
+    wait_for(lambda: not has_color(0x96, 0x3c, 0x2d), "closed Vim popup remained painted")
+    driver.type("#vim9-input", "A\ue036")
+    wait_for(lambda: has_color(0x33, 0x55, 0x77), "Vim completion menu was not painted on the native Canvas")
+    def control_key(key):
+        driver.command("POST", "/actions", {"actions": [{"type":"key","id":"editor-keyboard","actions":[
+            {"type":"keyDown","value":"\ue009"}, {"type":"keyDown","value":key},
+            {"type":"keyUp","value":key}, {"type":"keyUp","value":"\ue009"}]}]})
+    assert driver.execute("return document.activeElement.id") == "vim9-input"
+    control_key("n")
+    wait_for(lambda: selection.is_file() and selection.read_text().strip() == "0", "Vim did not select the first completion")
+    control_key("y")
+    driver.type("#vim9-input", "\ue00c")
+    wait_for(lambda: not has_color(0x33, 0x55, 0x77), "accepted completion remained visible")
+    driver.type("#vim9-input", ":ProbeChoice\ue007")
+    wait_for(accepted.is_file, "Vim did not write its completion selection")
+    assert accepted.read_text() == "chooseAlpha\n", accepted.read_text()
+    driver.type("#vim9-input", ":close!\ue007")
+    print(json.dumps({"native_vim9_overlays": ["popup pixels and dismissal", "completion pixels", "selection in Vim's own buffer"]}), flush=True)
+
+
 def exercise_vim9_workbench(driver, owned):
     project = owned / "vim-project"
     (project / "src").mkdir(parents=True)
@@ -2130,6 +2197,8 @@ def exercise_vim9_workbench(driver, owned):
         final = first_edit + "AETHER_VIM9_PTY_你\n"
         wait_for(lambda: source.read_text() == final, "Vim did not save both edits to the chosen local file")
         exercise_vim9_project(driver, source)
+        exercise_vim9_overlays(driver, owned)
+        wait_for(renderer_ready, "Vim did not restore the chosen file after closing the scratch window")
         driver.click("#vim9-quit")
         wait_for(lambda: editor()["released"], "workbench did not receive the Vim/PTy exit")
         driver.click("#vim9-release")

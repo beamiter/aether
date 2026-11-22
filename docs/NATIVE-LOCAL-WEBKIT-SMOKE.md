@@ -1,6 +1,6 @@
 # Native local-shell WebKitGTK smoke
 
-Run **Local desktop WebKitGTK smoke** manually on Ubuntu 24.04. It also runs
+Run **Desktop WebKitGTK acceptance** manually on Ubuntu 24.04. It also runs
 on a push to `master` that changes the smoke workflow or driver script, but
 not on ordinary application changes. It builds and hashes the exact
 checkout’s Aether desktop binary and verifies that the embedded Aether page,
@@ -82,6 +82,8 @@ The same fixture navigates a project tree and a UTF-8 byte column, splits a
 window from Vim's palette, searches into quickfix, observes build output and
 exit code 7, and stops a running build. It also selects a text preview, rejects
 a different file with the same basename, then opens the matching snapshot in Vim.
+It samples distinct plugin popup and completion-menu colors from the native
+Canvas, dismisses the popup, and verifies the chosen completion in Vim's buffer.
 
 Add `--workspace` to include the shared CLI Workspace journey. It starts the
 embedded protocol-2 host with an isolated schema-6 SQLite directory, two
@@ -169,3 +171,5 @@ same-name local and remote files, changed file versions, directory navigation,
 binary transfer and no-overwrite upload. It checks the expected host ID, both
 kinds of pagination, stale search selections, and the document's exact revision.
 Successful output includes the case ID, display backend and both binary hashes.
+The desktop workflow runs both displays against the same build. Its X11 local
+journey also exercises Notebook and the Vim9 workbench.

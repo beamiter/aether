@@ -176,6 +176,8 @@ def exercise_workspace(driver, binary, host_id, store):
 def exercise(app, helper, backend, compositor_libraries):
     uid = os.getuid()
     runtime = Path(f"/run/user/{uid}")
+    if not runtime.is_dir() or runtime.stat().st_uid != uid:
+        runtime = Path(tempfile.gettempdir())
     with tempfile.TemporaryDirectory(prefix="aether-remote-", dir=runtime) as temporary, contextlib.ExitStack() as stack:
         owned = Path(temporary)
         def start(argv, log, env=None):

@@ -1,4 +1,4 @@
-name: Local desktop WebKitGTK smoke
+name: Desktop WebKitGTK acceptance
 
 # Keep the desktop smoke separate from ordinary application pushes.
 on:
@@ -8,13 +8,14 @@ on:
     paths:
       - '.github/workflows/native-webkit.yml'
       - 'scripts/test-two-local-webkit.py'
+      - 'scripts/test-remote-project-webkit.py'
 
 permissions:
   contents: read
 
 jobs:
   two-local-webkit:
-    name: Two local shells in the native WebKitGTK window
+    name: Local and SSH project journeys
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
@@ -29,7 +30,9 @@ jobs:
           sudo apt-get install --yes --no-install-recommends \
             build-essential pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev \
             librsvg2-dev libxdo-dev libssl-dev webkit2gtk-driver \
-            xvfb xauth dbus-daemon fonts-dejavu-core
+            xvfb xauth dbus-daemon fonts-dejavu-core xdotool ripgrep vim \
+            openssh-client openssh-server bubblewrap sway wtype
+          sudo install -d -m 0755 /run/sshd
           dpkg-query -W libwebkit2gtk-4.1-0 webkit2gtk-driver xvfb
       - name: Build desktop at the workflow revision
         run: |
@@ -38,9 +41,10 @@ jobs:
           python3 scripts/check-core-pin.py
           export CARGO_TARGET_DIR="${RUNNER_TEMP:?}/aether-native-build"
           cargo build --locked --manifest-path src-tauri/Cargo.toml --bin tauri-terminal-lab
+          cargo build --locked --manifest-path bridge/Cargo.toml --bin aether-terminal-host
           printf 'CARGO_TARGET_DIR=%s\n' "$CARGO_TARGET_DIR" >> "$GITHUB_ENV"
-      - name: Native window and owned local PTY acceptance (not SSH)
-        timeout-minutes: 4
+      - name: Local PTYs, notebook and Vim9 on X11
+        timeout-minutes: 5
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           app="${CARGO_TARGET_DIR:?}/debug/tauri-terminal-lab"
@@ -48,5 +52,17 @@ jobs:
           test ! -L "$app"
           sha256sum "$app"
           xvfb-run --auto-servernum --server-args="-screen 0 1600x1200x24 -nolisten tcp" \
-            dbus-run-session -- timeout --kill-after=25s 120s \
-              /usr/bin/python3 -B scripts/test-two-local-webkit.py "$app"
+            dbus-run-session -- timeout --kill-after=25s 240s \
+              /usr/bin/python3 -B scripts/test-two-local-webkit.py "$app" --notebook --vim9
+      - name: SSH files and read-only Workspace on X11
+        timeout-minutes: 4
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1440x1100x24 -nolisten tcp" \
+            dbus-run-session -- python3 -B scripts/test-remote-project-webkit.py \
+              "$CARGO_TARGET_DIR/debug/tauri-terminal-lab" "$CARGO_TARGET_DIR/debug/aether-terminal-host"
+      - name: SSH files and read-only Workspace on native Wayland
+        timeout-minutes: 4
+        run: |
+          dbus-run-session -- python3 -B scripts/test-remote-project-webkit.py \
+            "$CARGO_TARGET_DIR/debug/tauri-terminal-lab" "$CARGO_TARGET_DIR/debug/aether-terminal-host" \
+            --backend wayland

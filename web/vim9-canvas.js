@@ -7,16 +7,24 @@ const integerAtLeast = (value, minimum) => Number.isSafeInteger(value) && value 
 
 export function canPaintVim9(frame, metrics, terminal) {
   if (!frame?.supported || !metrics || !terminal || frame.rows !== terminal.rows.length ||
-      frame.columns !== terminal.cols || !integerAtLeast(frame.revision, 1) || frame.completion ||
-      !Array.isArray(frame.popups) || frame.popups.length || !Array.isArray(frame.windows) ||
+      frame.columns !== terminal.cols || !integerAtLeast(frame.revision, 1) ||
+      !Array.isArray(frame.popups) || frame.popups.length > 8 || !Array.isArray(frame.windows) ||
       !Array.isArray(frame.runs) || frame.runs.length > 32768 ||
       ![metrics.origin_x, metrics.origin_y, metrics.cell_width, metrics.line_height].every(Number.isFinite) ||
       metrics.origin_x < 0 || metrics.origin_y < 0 || metrics.cell_width <= 0 || metrics.cell_width > 64 ||
       metrics.line_height <= 0 || metrics.line_height > 64) return false;
   const views = frame.windows.length ? frame.windows.map(window => window.view) : [frame.view];
-  return views.every(rect => rect && integerAtLeast(rect.row, 0) && integerAtLeast(rect.column, 0) &&
+  const validRect = rect => !!rect && integerAtLeast(rect.row, 0) && integerAtLeast(rect.column, 0) &&
     integerAtLeast(rect.rows, 1) && integerAtLeast(rect.columns, 1) &&
-    rect.row + rect.rows <= frame.rows && rect.column + rect.columns <= frame.columns);
+    rect.row + rect.rows <= frame.rows && rect.column + rect.columns <= frame.columns;
+  const validOverlay = overlay => validRect(overlay?.view) && Array.isArray(overlay.runs) &&
+    overlay.runs.length <= 4096 && overlay.runs.every(run => typeof run?.text === 'string' &&
+      integerAtLeast(run.row, overlay.view.row) && run.row < overlay.view.row + overlay.view.rows &&
+      integerAtLeast(run.column, overlay.view.column) && integerAtLeast(run.cells, 1) &&
+      run.column + run.cells <= overlay.view.column + overlay.view.columns);
+  return views.every(validRect) && (!frame.completion || validOverlay(frame.completion)) &&
+    frame.popups.every(popup => validOverlay(popup) && integerAtLeast(popup.id, 1) &&
+      integerAtLeast(popup.zindex, 1) && popup.zindex <= 32000);
 }
 
 function colors(style, inherit) {
@@ -46,13 +54,15 @@ export function paintVim9(canvas, frame, metrics, dpr = globalThis.devicePixelRa
   context.clip();
   context.fillStyle = base.background;
   context.fillRect(0, 0, width, height);
-  context.textBaseline = 'middle';
-  for (const run of frame.runs) {
+  function paintRun(run, inherit, text) {
     const style = run.style || {};
-    const palette = colors(style, base);
+    const palette = colors(style, inherit);
     const startX = x(run.column), startY = y(run.row), runWidth = run.cells * cell;
-    context.fillStyle = palette.background;
-    context.fillRect(startX, startY, runWidth, line);
+    if (!text) {
+      context.fillStyle = palette.background;
+      context.fillRect(startX, startY, runWidth, line);
+      return;
+    }
     context.fillStyle = palette.foreground;
     context.font = `${style.italic ? 'italic ' : ''}${style.bold ? 'bold ' : ''}${line * .75}px monospace`;
     if (run.text.length === run.cells && /^[\x20-\x7e]+$/.test(run.text)) {
@@ -72,6 +82,13 @@ export function paintVim9(canvas, frame, metrics, dpr = globalThis.devicePixelRa
       context.fillRect(startX, startY + line / 2, runWidth, lineWidth);
     }
   }
+  function paintRuns(runs, inherit) {
+    // Overlays can contain whole-row backgrounds followed by individual glyphs.
+    context.textBaseline = 'middle';
+    for (const run of runs) paintRun(run, inherit, false);
+    for (const run of runs) paintRun(run, inherit, true);
+  }
+  paintRuns(frame.runs, base);
   const cursor = frame.cursor;
   if (cursor?.visible) {
     const startX = x(cursor.column), startY = y(cursor.row), cursorWidth = Math.max(1, cursor.width) * cell;
@@ -89,4 +106,20 @@ export function paintVim9(canvas, frame, metrics, dpr = globalThis.devicePixelRa
     }
   }
   context.restore();
+  function paintOverlay(overlay) {
+    const view = overlay.view, palette = colors(overlay.default_style || {}, base);
+    const rect = [x(view.column), y(view.row), view.columns * cell, view.rows * line];
+    context.save();
+    context.beginPath();
+    context.rect(...rect);
+    context.clip();
+    context.fillStyle = palette.background;
+    context.fillRect(...rect);
+    paintRuns(overlay.runs, palette);
+    context.restore();
+  }
+  const popups = [...frame.popups].sort((a, b) => a.zindex - b.zindex || b.id - a.id);
+  for (const popup of popups) if (popup.zindex < 100) paintOverlay(popup);
+  if (frame.completion) paintOverlay(frame.completion);
+  for (const popup of popups) if (popup.zindex >= 100) paintOverlay(popup);
 }

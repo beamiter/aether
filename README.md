@@ -8,7 +8,7 @@ ANSI parser. **This is not a daily-use terminal.**
 ## Shared core
 
 The three Cargo manifests pin the shared crates to
-`466e4ea5dc1e4df12432291a11514c8402db148a`. `jterm_runtime` owns the local PTY, direct child and
+`dfc87c88acf3f9877680d2dad6a5885eb7209974`. `jterm_runtime` owns the local PTY, direct child and
 output drain. Its `jterm_engine::terminal::Terminal` owns parsing, screen
 state, input encoding, history and immutable frames. The session host supplies
 each frame stream's epoch. Run `python3 scripts/check-core-pin.py` to verify
@@ -298,8 +298,9 @@ still use Vim's own save rules. **Close workbench** releases the view after the
 PTY exits. **Project tools** lets you browse folders, jump to
 `path:line:byte-column`, or type `>command` to use Vim's palette. Search
 fills Vim's quickfix list. A build shows its output and exit status and can
-be stopped while running. Completion and popup surfaces use the live Vim
-terminal when the Canvas cannot represent them.
+be stopped while running. The Canvas paints Vim's completion menu and
+supported plugin popups in Vim's stacking order. Vim handles selection and
+dismissal. Unsupported frames switch to the live terminal.
 
 ## Experimental local source preview
 

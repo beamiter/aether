@@ -39,3 +39,22 @@ test('native render data draws exact runs, clips the editor area and preserves c
   ]);
   assert.deepEqual(calls.filter(call => call[0] === 'fillRect').at(-1), ['fillRect', 36, 24, 3, 24]);
 });
+
+test('Vim overlays clip to screen rectangles and stack by z-index then oldest popup', () => {
+  const labels = [];
+  const context = new Proxy({fillText: value => labels.push(value)}, {
+    get: (object, name) => object[name] ?? (() => {}),
+  });
+  const overlay = (label, id, zindex) => ({
+    id, zindex, view: {row: 3, column: 1, rows: 1, columns: 4},
+    runs: [{row: 3, column: 2, cells: 1, text: label}],
+  });
+  const scene = {...frame, completion: overlay('M'), popups: [
+    overlay('A', 4, 100), overlay('B', 8, 100), overlay('L', 3, 40),
+  ]};
+  assert.ok(canPaintVim9(scene, metrics, terminal));
+  paintVim9({style: {}, getContext: () => context}, scene, metrics);
+  assert.deepEqual(labels.slice(-4), ['L', 'M', 'B', 'A']);
+  scene.completion.runs[0].row = 2;
+  assert.equal(canPaintVim9(scene, metrics, terminal), false);
+});
