@@ -785,3 +785,85 @@ test('confirmed local close clears only B draft; targetless reattach restores A 
  assert.equal(h.el('#input').disabled,true);
  assert.equal(bCloseCalls,2);
 });
+
+test('confirmed close clears closed Canvas, cursor and health; a failed close leaves presentation intact',async()=>{
+ const fixture=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+ let displayed=null,width=300,clears=0,closeCalls=0;
+ const h=harness(async(name)=>{
+  if(name==='open_shell')return 1;
+  if(name==='poll_shell')return {...fixture,epoch:1};
+  if(name==='ack_shell')return null;
+  if(name==='close_shell'){
+   if(++closeCalls===1)throw Error('unconfirmed');
+   return {cleanup_pending:true};
+  }
+  throw Error(name);
+ },undefined,undefined,(_canvas,frame)=>{displayed=frame;});
+ Object.defineProperty(h.el('canvas'),'width',{
+  get:()=>width,set:value=>{width=value;clears++;displayed=null;}
+ });
+ await h.click('#open');
+ assert(displayed);
+ const paint=displayed;
+ const cursor=h.el('#cursor-status').textContent,health=h.el('#health').textContent;
+ assert(cursor&&health);
+ await h.click('#close');
+ assert.equal(clears,0);
+ assert.equal(displayed,paint);
+ assert.equal(h.el('#cursor-status').textContent,cursor);
+ assert.equal(h.el('#health').textContent,health);
+ await h.click('#close');
+ assert.equal(clears,1);
+ assert.equal(displayed,null);
+ assert.equal(h.el('#cursor-status').textContent,'');
+ assert.equal(h.el('#health').textContent,'');
+ assert.equal(h.el('#history-output').value,'');
+ assert.match(h.el('#status').textContent,/Terminal closed/);
+});
+
+test('a late closed SSH snapshot cannot paint into a retained local shell that shares its epoch',async()=>{
+ const fixture=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+ const a={session:'a'.repeat(32),epoch:1,generation:1};
+ const b={session:'b'.repeat(32),epoch:2,generation:1};
+ const ssh={session:'c'.repeat(32),epoch:1,generation:1};
+ const localFrame={...fixture,session:a.session,epoch:a.epoch,revision:10};
+ const remoteFrame={...fixture,session:ssh.session,epoch:ssh.epoch,revision:11};
+ const late=deferred(),painted=[],localAcks=[];
+ let sshPolls=0,localPolls=0,readOnlyAttached=false;
+ const h=harness(async(name,args)=>{
+  switch(name){
+   case 'open_shell':return a;
+   case 'detach_shell':assert.equal(args.epoch,a.epoch);return null;
+   case 'list_local_shells':return [a.epoch];
+   case 'open_second_local_shell':assert.equal(args.epoch,a.epoch);return b;
+   case 'close_shell':assert.equal(args.epoch,b.epoch);return {cleanup_pending:true};
+   case 'attach_shell':
+    readOnlyAttached=true;return {owner:{...a,generation:3},frame:localFrame};
+   case 'poll_shell':if(readOnlyAttached)localPolls++;return null;
+   case 'ack_shell':localAcks.push(args.revision);return null;
+   case 'ssh_terminal': {
+    const {action}=args;
+    if(action.operation==='open')return ssh;
+    if(action.command.kind==='poll')return ++sshPolls===1?null:late.promise;
+    if(action.command.kind==='status')return {epoch:1,drained:false,exited:false,write_error:null,dropped_reply_bytes:'0',unsupported:'0'};
+    if(action.command.kind==='close')return {cleanup_pending:true};
+    throw Error(action.command.kind);
+   }
+   default:throw Error(name);
+  }
+ },undefined,undefined,(_canvas,frame)=>painted.push(frame.session));
+ await h.click('#open');await h.click('#detach');await h.click('#manage-local');
+ await h.click('#open-second-local');await h.click('#close');
+ h.el('#ssh-terminal-host').value='fixture';
+ await h.submitSsh();
+ const inFlight=[...h.timers.values()][0]();
+ await tick();assert.equal(sshPolls,2);
+ await h.click('#close');await h.click('#attach');
+ const freshPolls=localPolls;
+ late.resolve({kind:'snapshot',frame:remoteFrame});await inFlight;
+ assert.deepEqual(painted,[a.session]);
+ assert.deepEqual(localAcks,[localFrame.revision]);
+ assert.equal(freshPolls,1);
+ assert.equal(h.el('#input').disabled,true);
+ assert.match(h.el('#status').textContent,/view-only/);
+});

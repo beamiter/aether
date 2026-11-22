@@ -190,6 +190,11 @@ async function reconnect(selected=null){
   }catch(e){if(generation===attempt)status.textContent=String(e?.message??e);}
   finally{if(generation===attempt&&epoch===null){setOpenDisabled(sshSession!==null);attach.disabled=false;button.disabled=sshSession!==null;}}
 }
+function clearTerminalPaint(){
+  canvas.width=canvas.width;
+  document.querySelector('#cursor-status').textContent='';
+  document.querySelector('#health').textContent='';
+}
 detach.addEventListener('click',async()=>{
   if(!owner||detach.disabled||recovery?.epoch===epoch)return;
   const attempt=++generation,previous=owner;
@@ -199,9 +204,7 @@ detach.addEventListener('click',async()=>{
   owner=null;epoch=null;state=null;transport++;
   clearInterval(timer);sshInputSuspended=false;filePreview.dismiss();pasteReview.reset();ime.reset();history.reset();
   resize.disabled=close.disabled=detach.disabled=input.disabled=send.disabled=true;
-  canvas.width=canvas.width;
-  document.querySelector('#cursor-status').textContent='';
-  document.querySelector('#health').textContent='';
+  clearTerminalPaint();
   try {
     await invokeAttached('detach_shell',{epoch:previous.epoch},previous);
     status.textContent='View detached. Reconnect to see the running shell.';
@@ -212,8 +215,10 @@ detach.addEventListener('click',async()=>{
   }
 });
 close.addEventListener('click',async()=>{
-  generation++;filePreview.dismiss();pasteReview.reset();ime.reset();history.reset();clearInterval(timer);const old=epoch,oldOwner=owner;epoch=null;owner=null;resize.disabled=close.disabled=detach.disabled=input.disabled=send.disabled=true;
-  try{const result=await invokeAttached('close_shell',{epoch:old},oldOwner);if(oldOwner.session!==sshSession){input.value='';localDrafts.delete(oldOwner.session);}status.textContent=result?.cleanup_pending===false?'Terminal closed; direct child reaped. Descendant containment is not provided.':'Terminal closed; direct-child cleanup handed to bounded supervisor and may still be pending. Descendant containment is not provided.';state=null;sshSession=null;sshInputSuspended=false;setOpenDisabled(false);attach.disabled=button.disabled=false;}
+  // SSH and local shells can have the same numeric epoch. Retire the poll
+  // before Close can give up that view, even if the close response is lost.
+  generation++;transport++;polling=null;filePreview.dismiss();pasteReview.reset();ime.reset();history.reset();clearInterval(timer);const old=epoch,oldOwner=owner;epoch=null;owner=null;resize.disabled=close.disabled=detach.disabled=input.disabled=send.disabled=true;
+  try{const result=await invokeAttached('close_shell',{epoch:old},oldOwner);if(oldOwner.session!==sshSession){input.value='';localDrafts.delete(oldOwner.session);}status.textContent=result?.cleanup_pending===false?'Terminal closed; direct child reaped. Descendant containment is not provided.':'Terminal closed; direct-child cleanup handed to bounded supervisor and may still be pending. Descendant containment is not provided.';state=null;clearTerminalPaint();sshSession=null;sshInputSuspended=false;setOpenDisabled(false);attach.disabled=button.disabled=false;}
   catch(e){epoch=old;owner=oldOwner;close.disabled=detach.disabled=false;status.textContent=`Close error: ${String(e?.message??e)}. Retry Close to finish cleanup.`;}
 });
 document.querySelector('#command').addEventListener('submit',async event=>{

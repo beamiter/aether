@@ -20,6 +20,8 @@ ELEMENT = "element-6066-11e4-a52e-4f735466cecf"
 READ = """
 return {
   status: document.querySelector('#status').textContent,
+  health: document.querySelector('#health').textContent,
+  cursor: document.querySelector('#cursor-status').textContent,
   draft: document.querySelector('#input').value,
   writable: !document.querySelector('#input').disabled &&
             !document.querySelector('#send').disabled,
@@ -130,6 +132,13 @@ def exercise(driver, owned):
     def state():
         return driver.execute(READ)
 
+    def close_without_stale_presentation():
+        driver.click("#close")
+        wait_for(lambda: state()["status"].startswith("Terminal closed"), "selected shell did not close")
+        closed = state()
+        assert closed["pixel"] == [0, 0, 0, 0], "a closed shell left pixels in the WebKit canvas"
+        assert closed["cursor"] == closed["health"] == closed["dump"] == "", "closed shell status or text remains visible"
+
     def marker_on_screen(marker, absent, color):
         def sample():
             s = state()
@@ -224,20 +233,19 @@ def exercise(driver, owned):
     assert birth(b_pid) == b_birth
     assert not current["writable"] and not current["resize"] and current["draft"] == draft_b
     assert not forbidden_a.exists() and not forbidden_b.exists(), "a parked draft executed"
-    driver.click("#close")
-    wait_for(lambda: state()["status"].startswith("Terminal closed"), "second exact close failed")
+    close_without_stale_presentation()
     wait_for(lambda: birth(b_pid) != b_birth, "second owned shell not reaped")
     select(list_shells(1)["options"][0])
     marker_on_screen(a, b, red)
     assert state()["draft"] == draft_a and birth(a_pid) == a_birth
-    driver.click("#close")
-    wait_for(lambda: state()["status"].startswith("Terminal closed"), "first exact close failed")
+    close_without_stale_presentation()
     wait_for(lambda: birth(a_pid) != a_birth, "first owned shell not reaped")
     list_shells(0)
     assert not forbidden_a.exists() and not forbidden_b.exists(), "a parked draft executed"
     print(json.dumps({"native_webkitgtk": True, "owned_local_ptys": 2,
                       "distinct_canvas_colors_and_markers": True, "explicit_view_only_reattach": True,
-                      "parked_drafts_isolated": True, "owned_direct_children_reaped": True}), flush=True)
+                      "parked_drafts_isolated": True, "closed_canvas_and_status_cleared": True,
+                      "owned_direct_children_reaped": True}), flush=True)
 
 
 def stop_driver(child):
