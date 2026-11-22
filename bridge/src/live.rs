@@ -6,7 +6,8 @@ use crate::{
 };
 use jterm_engine::frame::CellFrame;
 use jterm_headless_session_spike::Session;
-use std::collections::VecDeque;
+mod input_queue;
+use input_queue::InputQueue;
 #[derive(Debug, serde::Serialize)]
 pub struct SessionStatus {
     pub epoch: u32,
@@ -38,7 +39,7 @@ pub struct LiveBridge {
     resumed_from: Option<u32>,
     flight: Option<CellFrame>,
     accepted: Option<CellFrame>,
-    input: VecDeque<u8>,
+    input: InputQueue,
     stable: Option<CellFrame>,
 }
 impl LiveBridge {
@@ -168,11 +169,8 @@ impl LiveBridge {
         let session = self.session.as_mut().unwrap();
         session.poll_with_sync_capture(self.flight.is_none())?;
         if !self.input.is_empty() && !session.is_exited() && session.write_error().is_none() {
-            let limit = 4096.min(self.input.len());
             // A sticky writer failure must not stop read-side draining.
-            if let Ok(n) = session.write(&self.input.make_contiguous()[..limit]) {
-                self.input.drain(..n);
-            }
+            let _ = self.input.flush(|bytes| session.write(bytes));
         }
         if session.is_exited() || session.write_error().is_some() {
             self.input.clear();
@@ -291,11 +289,7 @@ impl LiveBridge {
         if session.is_exited() || session.write_error().is_some() {
             return Err("input unavailable".into());
         }
-        if self.input.len() + bytes.len() > 16384 {
-            return Err("input queue full; event not accepted".into());
-        }
-        self.input.extend(bytes);
-        Ok(())
+        self.input.enqueue(bytes)
     }
     pub fn key(
         &mut self,
@@ -740,7 +734,13 @@ mod tests {
         let next = bridge.open(8, 64).unwrap();
         assert!(bridge.key(epoch, "a", false, false, false).is_err());
         bridge.key(next, "ArrowUp", false, false, false).unwrap();
-        assert_eq!(bridge.input.iter().copied().collect::<Vec<_>>(), b"\x1b[A");
+        bridge
+            .input
+            .flush(|bytes| {
+                assert_eq!(bytes, b"\x1b[A");
+                Ok(0)
+            })
+            .unwrap();
         bridge.close(next).unwrap();
     }
     #[test]
