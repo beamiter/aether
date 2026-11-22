@@ -2,10 +2,10 @@ import {installPasteReview} from '../web/paste.js';
 import {resizeQueue,cursorTarget} from '../web/viewport.js';
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import vm from 'node:vm';
 import {installHistory} from '../web/history.js';
-import {acceptFull,acceptUpdate} from '../web/frames.js'; import {installIme} from '../web/ime.js';
+import {acceptFull,acceptUpdate,paint as paintFrame} from '../web/frames.js'; import {installIme} from '../web/ime.js';
 const tick=()=>new Promise(r=>setImmediate(r));
 const deferred=()=>{let resolve,reject;const promise=new Promise((a,b)=>{resolve=a;reject=b});return {promise,resolve,reject};};
-function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsupported:"0"}), Encoder=TextEncoder){
+function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsupported:"0"}), Encoder=TextEncoder, paint=()=>{}){
  const invoke=async(name,args)=>{
   const {owner,...parameters}=args??{};
   const legacy=owner?{epoch:owner.epoch,...parameters}:args;
@@ -22,7 +22,7 @@ function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsuppo
  };
  const elements=new Map(),timers=new Map();let id=0;
  const el=selector=>{if(!elements.has(selector))elements.set(selector,{disabled:false,value:'',textContent:'',style:{},handlers:{},focus(){},addEventListener(name,fn){this.handlers[name]=fn}});return elements.get(selector)};
- const context={installFilePreviewPanel:()=>({dismiss(){}}),document:{querySelector:el},__TAURI__:{core:{invoke}},acceptFull,acceptUpdate,installIme,installHistory,installPasteReview,resizeQueue,cursorTarget,paint(){},TextEncoder:Encoder,TextDecoder,
+ const context={installFilePreviewPanel:()=>({dismiss(){}}),document:{querySelector:el},__TAURI__:{core:{invoke}},acceptFull,acceptUpdate,installIme,installHistory,installPasteReview,resizeQueue,cursorTarget,paint,TextEncoder:Encoder,TextDecoder,
  setInterval(fn){timers.set(++id,fn);return id},clearInterval(i){timers.delete(i)},setTimeout};
  vm.runInNewContext(fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8').replace(/^import .*\n/gm,''),context);
  return {el,timers,click:s=>el(s).handlers.click(),submit:()=>el('#command').handlers.submit({preventDefault(){}}),submitSsh:()=>el('#ssh-terminal-form').handlers.submit({preventDefault(){}})};
@@ -427,4 +427,50 @@ test('visible grid copy removes only ASCII padding, preserving deliberate Unicod
  await h.click('#open');h.click('#copy-visible');
  assert.deepEqual(seen,[frame.revision]);
  assert.equal(h.el('#history-output').value,'A\u00a0\n界\u3000\nB \u202f\n');
+});
+
+test('live paint failure is not ACKed; same-geometry recovery and detach retain their semantics',async()=>{
+ const initial=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+ initial.session='1'.padStart(32,'0');
+ const cells=initial.rows[0].map((c,i)=>i===0?{...c,text:'X'}:c);
+ const delta={kind:'delta',frame:{...initial,base_revision:1,revision:2,rows:[{index:0,cells}]}};
+ const recovered={...initial,revision:3,rows:[cells,...initial.rows.slice(1)]};
+ const acknowledgements=[], resizes=[];
+ let polls=0, fail=false, pixels=[], clip=0, width=300, height=150;
+ const h=harness(async(name,args)=>{
+  if(name==='open_shell')return 1;
+  if(name==='poll_shell'){polls++;return polls===1?initial:polls===2?delta:null;}
+  if(name==='recover_shell')return recovered;
+  if(name==='detach_shell')return;
+  if(name==='ack_shell'){
+   assert.equal(clip,0);assert.equal(pixels.length,initial.rows.length*initial.cols);
+   acknowledgements.push([args.revision,pixels[0]]);
+   return;
+  }
+  throw Error(name);
+ },undefined,undefined,paintFrame);
+ const canvas=h.el('canvas');
+ Object.defineProperties(canvas,{
+  width:{get:()=>width,set:x=>{width=x;pixels=[];clip=0;resizes.push('width');}},
+  height:{get:()=>height,set:x=>{height=x;pixels=[];clip=0;resizes.push('height');}},
+ });
+ canvas.getContext=()=>({
+  setTransform(){},scale(){},clearRect(){assert.equal(clip,0);pixels=[];},
+  fillRect(){},beginPath(){},rect(){},clip(){},strokeRect(){},
+  save(){clip++;},restore(){clip--;},
+  fillText(text){if(fail)throw Error('paint interrupted');pixels.push(text);},
+ });
+ await h.click('#open');
+ assert.deepEqual(acknowledgements,[[1,initial.rows[0][0].text]]);
+ fail=true;await [...h.timers.values()][0]();
+ assert.match(h.el('#status').textContent,/paint interrupted/);
+ assert.deepEqual(acknowledgements,[[1,initial.rows[0][0].text]]);
+ assert.equal(h.el('#input').disabled,true);
+ fail=false;await h.click('#recover');
+ assert.deepEqual(acknowledgements,[[1,initial.rows[0][0].text],[3,'X']]);
+ assert.equal(h.el('#input').disabled,true,'local recovery does not clear input safety locks');
+ assert.deepEqual(resizes,['width','height'],'same-geometry update and recovery retain buffers');
+ await h.click('#detach');
+ assert.deepEqual(resizes,['width','height','width'],'detach still explicitly discards pixels');
+ assert.equal(pixels.length,0);
 });

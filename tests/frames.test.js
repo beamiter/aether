@@ -1,5 +1,6 @@
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';
 import {acceptFull,acceptUpdate,paint} from '../web/frames.js';
+import {cursorTarget} from '../web/viewport.js';
 const demo=()=>JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
 test('accept actual Rust engine fixture and isolate external mutation',()=>{const raw=demo(),f=acceptFull(null,raw);raw.rows[0][0].text='X';assert.notEqual(f.rows[0][0].text,'X');assert.equal(f.cols,64);});
 
@@ -26,20 +27,20 @@ test('semantic deltas update only validated rows and require the exact base',()=
 });
 test('reject foreign session/epoch, stale revisions and invalid sizes atomically',()=>{const old=acceptFull(null,demo());for(const change of [{session:'other'},{epoch:2},{revision:0},{revision:1},{revision:2,cols:0},{revision:2,cursor_col:999}]){assert.throws(()=>acceptFull(old,{...demo(),...change}));assert.equal(old.revision,1);}});
 test('reject malformed cells and non-advanced layout resize',()=>{for(const text of ['\x1b','xx','']){const f=demo();f.rows[0][0].text=text;assert.throws(()=>acceptFull(null,f));}const f=demo();f.revision=2;f.rows.pop();assert.throws(()=>acceptFull(acceptFull(null,demo()),f));});
-test('paint uses cell-local canvas operations, no terminal interpretation',()=>{let texts=0;const g={scale(){},fillRect(){},save(){},beginPath(){},rect(){},clip(){},fillText(){texts++},restore(){},strokeRect(){}};const canvas={style:{},getContext:()=>g};paint(canvas,acceptFull(null,demo()),2);assert.equal(texts,512);assert.equal(canvas.width,1536);});
+test('paint uses cell-local canvas operations, no terminal interpretation',()=>{let texts=0;const g={setTransform(){},clearRect(){},scale(){},fillRect(){},save(){},beginPath(){},rect(){},clip(){},fillText(){texts++},restore(){},strokeRect(){}};const canvas={style:{},getContext:()=>g};paint(canvas,acceptFull(null,demo()),2);assert.equal(texts,512);assert.equal(canvas.width,1536);});
 
-test('Rust-owned hidden cursor is not painted',()=>{let cursors=0;const g={scale(){},fillRect(){},save(){},beginPath(){},rect(){},clip(){},fillText(){},restore(){},strokeRect(){cursors++}};const canvas={style:{},getContext:()=>g};paint(canvas,acceptFull(null,{...demo(),cursor_visible:false}));assert.equal(cursors,0);assert.throws(()=>acceptFull(null,{...demo(),cursor_visible:0}));});
+test('Rust-owned hidden cursor is not painted',()=>{let cursors=0;const g={setTransform(){},clearRect(){},scale(){},fillRect(){},save(){},beginPath(){},rect(){},clip(){},fillText(){},restore(){},strokeRect(){cursors++}};const canvas={style:{},getContext:()=>g};paint(canvas,acceptFull(null,{...demo(),cursor_visible:false}));assert.equal(cursors,0);assert.throws(()=>acceptFull(null,{...demo(),cursor_visible:0}));});
 
 test('reject control and unpaired scalar cells; allow astral Unicode',()=>{for(const text of ['\u0085','\ud800','\udfff']){const f=demo();f.rows[0][0].text=text;assert.throws(()=>acceptFull(null,f));}const f=demo();f.rows[0][0].text='😀';assert.equal(acceptFull(null,f).rows[0][0].text,'😀');});
-test('canvas scale is bounded even with hostile or invalid device scale',()=>{const g={scale(x){assert.equal(x,1)},fillRect(){},save(){},beginPath(){},rect(){},clip(){},fillText(){},restore(){},strokeRect(){}};for(const scale of [Infinity,NaN,-1,1000]){const canvas={style:{},getContext:()=>g};paint(canvas,acceptFull(null,demo()),scale);assert.equal(canvas.width,768);}});
-test('largest permitted grid stays under 16 megapixel backing allocation',()=>{const g={scale(){},fillRect(){},save(){},beginPath(){},rect(){},clip(){},fillText(){},restore(){},strokeRect(){}};const raw=demo();raw.cols=256;raw.rows=Array.from({length:128},()=>Array.from({length:256},()=>({text:' ',foreground:'#ffffff',background:'#000000',width:1,style:0})));const canvas={style:{},getContext:()=>g};paint(canvas,acceptFull(null,raw),4);assert.ok(canvas.width*canvas.height<=16777216);});
+test('canvas scale is bounded even with hostile or invalid device scale',()=>{const g={setTransform(x){assert.equal(x,1)},clearRect(){},scale(x){assert.equal(x,1)},fillRect(){},save(){},beginPath(){},rect(){},clip(){},fillText(){},restore(){},strokeRect(){}};for(const scale of [Infinity,NaN,-1,1000]){const canvas={style:{},getContext:()=>g};paint(canvas,acceptFull(null,demo()),scale);assert.equal(canvas.width,768);}});
+test('largest permitted grid stays under 16 megapixel backing allocation',()=>{const g={setTransform(){},clearRect(){},scale(){},fillRect(){},save(){},beginPath(){},rect(){},clip(){},fillText(){},restore(){},strokeRect(){}};const raw=demo();raw.cols=256;raw.rows=Array.from({length:128},()=>Array.from({length:256},()=>({text:' ',foreground:'#ffffff',background:'#000000',width:1,style:0})));const canvas={style:{},getContext:()=>g};paint(canvas,acceptFull(null,raw),4);assert.ok(canvas.width*canvas.height<=16777216);});
 test('actual Rust Unicode frame keeps two-column paint and styled colors',()=>{
  const raw=JSON.parse(fs.readFileSync(new URL('../web/unicode-frame.json',import.meta.url),'utf8'));
  const f=acceptFull(null,raw,{session:'unicode-demo',epoch:1});
  assert.equal(f.rows[0][0].text,'中');assert.equal(f.rows[0][0].width,2);assert.equal(f.rows[0][1].width,0);
  assert.equal(f.rows[0][0].foreground,'#123456');assert.equal(f.rows[0][0].background,'#ff0000');assert.equal(f.rows[0][0].style,15);
  assert.equal(f.rows[1][0].foreground,'#2472c8');assert.equal(f.rows[1][0].background,'#cd3131');
- const calls=[];const g={scale(){},fillRect(...args){calls.push(['background-or-decoration',...args]);},save(){},beginPath(){},rect(...args){calls.push(['clip',...args]);},clip(){},fillText(text){calls.push(['glyph',text,this.font,this.globalAlpha]);},restore(){},strokeRect(){}};
+ const calls=[];const g={setTransform(){},clearRect(){},scale(){},fillRect(...args){calls.push(['background-or-decoration',...args]);},save(){},beginPath(){},rect(...args){calls.push(['clip',...args]);},clip(){},fillText(text){calls.push(['glyph',text,this.font,this.globalAlpha]);},restore(){},strokeRect(){}};
  paint({style:{},getContext:()=>g},f);
  const firstGlyph=calls.findIndex(c=>c[0]==='glyph');assert.ok(firstGlyph>=4*24);
  assert.deepEqual(calls.find(c=>c[0]==='clip'),['clip',0,0,24,24]);
@@ -48,7 +49,7 @@ test('actual Rust Unicode frame keeps two-column paint and styled colors',()=>{
  assert.ok(calls.some(c=>c[0]==='glyph'&&c[1]==='D'&&c[3]===0.5));
 });
 test('reject inconsistent wide-pair geometry atomically',()=>{for(const mutate of [f=>f.rows[0][0].width=0,f=>f.rows[0][0].width=2,f=>f.rows[0][63].width=2,f=>f.rows[0][0].style=32]){const f=demo();mutate(f);assert.throws(()=>acceptFull(null,f));}});
-test('Rust cursor shapes paint at exact cell geometry and invalid shapes reject',()=>{const raw=demo();raw.cursor_row=2;raw.cursor_col=3;for(const shape of ['block','beam','underline']){const fills=[],strokes=[];const g={scale(){},fillRect(...x){fills.push(x)},save(){},beginPath(){},rect(){},clip(){},fillText(){},restore(){},strokeRect(...x){strokes.push(x)}};paint({style:{},getContext:()=>g},acceptFull(null,{...raw,cursor_shape:shape}));if(shape==='block')assert.deepEqual(strokes.at(-1),[36.5,48.5,11,23]);if(shape==='beam')assert.deepEqual(fills.at(-1),[36,48,2,24]);if(shape==='underline')assert.deepEqual(fills.at(-1),[36,70,12,2]);}assert.throws(()=>acceptFull(null,{...raw,cursor_shape:'invalid'}));assert.throws(()=>acceptFull(null,{...raw,pending_wrap:1}));});
+test('Rust cursor shapes paint at exact cell geometry and invalid shapes reject',()=>{const raw=demo();raw.cursor_row=2;raw.cursor_col=3;for(const shape of ['block','beam','underline']){const fills=[],strokes=[];const g={setTransform(){},clearRect(){},scale(){},fillRect(...x){fills.push(x)},save(){},beginPath(){},rect(){},clip(){},fillText(){},restore(){},strokeRect(...x){strokes.push(x)}};paint({style:{},getContext:()=>g},acceptFull(null,{...raw,cursor_shape:shape}));if(shape==='block')assert.deepEqual(strokes.at(-1),[36.5,48.5,11,23]);if(shape==='beam')assert.deepEqual(fills.at(-1),[36,48,2,24]);if(shape==='underline')assert.deepEqual(fills.at(-1),[36,70,12,2]);}assert.throws(()=>acceptFull(null,{...raw,cursor_shape:'invalid'}));assert.throws(()=>acceptFull(null,{...raw,pending_wrap:1}));});
 
 
 test('oversized cell text is rejected before Unicode iteration and leaves old frame intact',()=>{
@@ -60,4 +61,76 @@ test('oversized cell text is rejected before Unicode iteration and leaves old fr
  assert.equal(visited,0,'invalid text must be rejected without a scalar array');
  assert.equal(old.revision,1);
  assert.equal(acceptFull(old,{...demo(),revision:2}).revision,2);
+});
+
+// Model the destructive Canvas dimension setter separately from a physical clear.
+function observedCanvas() {
+ const writes=[], css=[], draws=[];
+ let w=300,h=150,scale=1,level=0;
+ const g={
+  setTransform(a,b,c,d,e,f){assert.deepEqual([b,c,d,e,f],[0,0,a,0,0]);scale=a;},
+  scale(x){scale*=x;},
+  clearRect(x,y,width,height){assert.equal(level,0);assert.deepEqual([x,y,width,height,scale],[0,0,w,h,1]);draws.length=0;draws.push(['clear',width,height]);},
+  fillRect(...args){draws.push(['fill',scale,this.fillStyle,...args]);},
+  fillText(text){draws.push(['text',scale,this.fillStyle,text]);},
+  save(){level++;},restore(){level--;},beginPath(){},rect(){},clip(){assert.equal(level,1);},
+  strokeRect(...args){draws.push(['cursor',scale,...args]);},
+ };
+ const style=new Proxy({}, {set(target,key,value){css.push([key,value]);target[key]=value;return true;}});
+ const canvas={style,getContext(){return g;},offsetLeft:4,offsetTop:6,
+  get width(){return w;},set width(x){w=x;scale=1;level=0;draws.length=0;writes.push(['width',x]);},
+  get height(){return h;},set height(x){h=x;scale=1;level=0;draws.length=0;writes.push(['height',x]);}};
+ return {canvas,g,writes,css,draws,get clipDepth(){return level;}};
+}
+function smallPaintFrame({cols=2,rows=2,cursor_visible=true,background='#112233',text='X'}={}) {
+ const cell={text,width:1,style:0,foreground:'#ffffff',background};
+ return acceptFull(null,{...demo(),cols,rows:Array.from({length:rows},()=>Array(cols).fill(cell)),
+  cursor_row:0,cursor_col:0,cursor_visible});
+}
+test('same backing size avoids dimension writes but repaints colors and clears stale cursor and overlays',()=>{
+ const {canvas,writes,css,draws}=observedCanvas();
+ paint(canvas,smallPaintFrame(),1);
+ assert.deepEqual(writes,[['width',24],['height',48]]);
+ assert.deepEqual(css,[['width','24px'],['height','48px']]);
+ assert.ok(draws.some(([kind])=>kind==='cursor'));
+ draws.push(['stale-overlay']);
+ // Fractional DPR changes the transform, but rounds to the same pixel size.
+ paint(canvas,smallPaintFrame({cursor_visible:false,background:'#445566',text:'Y'}),1.01);
+ assert.deepEqual(writes,[['width',24],['height',48]]);
+ assert.deepEqual(css,[['width','24px'],['height','48px']]);
+ assert.deepEqual(draws[0],['clear',24,48]);
+ assert.deepEqual(draws.slice(1,5).map(op=>op.slice(0,3)),Array(4).fill(['fill',1.01,'#445566']));
+ assert.equal(draws.filter(op=>op[0]==='text'&&op[1]===1.01&&op[3]==='Y').length,4);
+ assert.ok(!draws.some(([kind])=>kind==='cursor'||kind==='stale-overlay'));
+ paint(canvas,smallPaintFrame(),1.01);
+ assert.equal(draws.find(op=>op[0]==='text')[1],1.01,'transform must not accumulate across frames');
+});
+
+test('DPR and grid changes resize only affected dimensions and preserve CSS-space viewport targets',()=>{
+ const {canvas,writes,css,draws}=observedCanvas();
+ const initial=smallPaintFrame();
+ const viewport={clientWidth:4,clientHeight:6,scrollWidth:50,scrollHeight:65};
+ const position=cursorTarget(initial,canvas,viewport);
+ paint(canvas,initial,1);
+ paint(canvas,initial,2);
+ assert.deepEqual(writes,[['width',24],['height',48],['width',48],['height',96]]);
+ assert.deepEqual(css,[['width','24px'],['height','48px']]);
+ assert.deepEqual(cursorTarget(initial,canvas,viewport),position);
+ paint(canvas,smallPaintFrame({cols:3}),2);
+ assert.deepEqual(writes.at(-1),['width',72]);assert.equal(writes.length,5);
+ assert.deepEqual(css.at(-1),['width','36px']);assert.equal(css.length,3);
+ assert.deepEqual(draws[0],['clear',72,96]);
+ assert.equal(draws.filter(op=>op[0]==='text').length,6);
+});
+
+test('failed paint unwinds the cell clip before a same-geometry full repaint',()=>{
+ const h=observedCanvas(), frame=smallPaintFrame();
+ const fill=h.g.fillText;
+ h.g.fillText=()=>{throw new Error('transient paint failure');};
+ assert.throws(()=>paint(h.canvas,frame),/transient paint failure/);
+ assert.equal(h.clipDepth,0);
+ h.g.fillText=fill;
+ paint(h.canvas,frame);
+ assert.equal(h.writes.length,2);assert.equal(h.clipDepth,0);
+ assert.equal(h.draws.filter(op=>op[0]==='text').length,4);
 });

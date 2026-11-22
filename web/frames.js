@@ -72,19 +72,33 @@ export function paint(canvas, frame, scale = globalThis.devicePixelRatio || 1) {
   const cw = 12, ch = 24;
   // Cap backing allocation independently of viewport dimensions and device DPR.
   scale = Math.min(scale, Math.sqrt(16777216 / (frame.cols*cw*frame.rows.length*ch)));
-  canvas.width = Math.max(1,Math.floor(frame.cols * cw * scale)); canvas.height = Math.max(1,Math.floor(frame.rows.length * ch * scale));
-  canvas.style.width = `${frame.cols*cw}px`; canvas.style.height = `${frame.rows.length*ch}px`;
-  const g = canvas.getContext('2d'); g.scale(scale,scale); g.font = '18px monospace'; g.textBaseline = 'top';
+  const cssWidth = frame.cols * cw, cssHeight = frame.rows.length * ch;
+  const width = Math.max(1, Math.floor(cssWidth * scale));
+  const height = Math.max(1, Math.floor(cssHeight * scale));
+  // Assigning a dimension clears and resets Canvas even if the value is unchanged.
+  if (canvas.width !== width) canvas.width = width;
+  if (canvas.height !== height) canvas.height = height;
+  if (canvas.style.width !== `${cssWidth}px`) canvas.style.width = `${cssWidth}px`;
+  if (canvas.style.height !== `${cssHeight}px`) canvas.style.height = `${cssHeight}px`;
+  const g = canvas.getContext('2d');
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.clearRect(0, 0, width, height);
+  g.setTransform(scale, 0, 0, scale, 0, 0);
+  g.font = '18px monospace'; g.textBaseline = 'top';
   // All backgrounds first: a wide glyph must not be erased by its trailing cell.
   frame.rows.forEach((r,y)=>r.forEach((c,x)=>{g.fillStyle=c.background;g.fillRect(x*cw,y*ch,cw,ch);}));
   frame.rows.forEach((r,y)=>r.forEach((c,x)=>{
     if(c.width===0)return;
-    g.save();g.beginPath();g.rect(x*cw,y*ch,cw*c.width,ch);g.clip();
-    g.font=`${c.style&2?'italic ':''}${c.style&1?'bold ':''}18px monospace`;
-    g.globalAlpha=c.style&16?0.5:1;g.fillStyle=c.foreground;g.fillText(c.text,x*cw,y*ch+2);
-    if(c.style&4)g.fillRect(x*cw,y*ch+ch-3,cw*c.width,1);
-    if(c.style&8)g.fillRect(x*cw,y*ch+ch/2,cw*c.width,1);
-    g.restore();
+    g.save();
+    try {
+      g.beginPath();g.rect(x*cw,y*ch,cw*c.width,ch);g.clip();
+      g.font=`${c.style&2?'italic ':''}${c.style&1?'bold ':''}18px monospace`;
+      g.globalAlpha=c.style&16?0.5:1;g.fillStyle=c.foreground;g.fillText(c.text,x*cw,y*ch+2);
+      if(c.style&4)g.fillRect(x*cw,y*ch+ch-3,cw*c.width,1);
+      if(c.style&8)g.fillRect(x*cw,y*ch+ch/2,cw*c.width,1);
+    } finally {
+      g.restore();
+    }
   }));
   if(frame.cursor_visible){
     const x=frame.cursor_col*cw,y=frame.cursor_row*ch,width=cw*(frame.rows[frame.cursor_row][frame.cursor_col].width===2?2:1);g.fillStyle=g.strokeStyle='#9ac6ff';
