@@ -1251,6 +1251,7 @@ pub struct Session {
     reap_ticket: Arc<reaper::Ticket>,
     terminal: Terminal,
     replies: VecDeque<u8>,
+    holding_replies: bool,
     exited: bool,
     closed: bool,
     read_eof: bool,
@@ -1317,6 +1318,7 @@ impl Session {
             reap_ticket,
             terminal,
             replies: VecDeque::new(),
+            holding_replies: false,
             exited: false,
             closed: false,
             read_eof: false,
@@ -1358,6 +1360,7 @@ impl Session {
         }
         self.dropped_reply_bytes = self.dropped_reply_bytes.saturating_add(self.replies.len());
         self.replies.clear();
+        self.holding_replies = false;
         self.writer.take();
     }
     pub fn write(&mut self, input: &[u8]) -> Result<usize, String> {
@@ -1367,6 +1370,9 @@ impl Session {
         if input.len() > MAX_INPUT {
             return Err("input byte limit".into());
         }
+        if self.holding_replies {
+            return Ok(0);
+        }
         self.flush_replies();
         if let Some(error) = &self.write_error {
             return Err(error.clone());
@@ -1374,6 +1380,35 @@ impl Session {
         if !self.replies.is_empty() {
             return Ok(0);
         }
+        self.write_bytes(input)
+    }
+
+    /// Bridge-only continuation of the already-started, exact logical head.
+    /// It does not flush replies into that event, and cannot offer a new head.
+    #[doc(hidden)]
+    pub fn continue_partial_input(
+        &mut self,
+        suffix: &[u8],
+        accepted_prefix: std::num::NonZeroU16,
+        remaining: usize,
+    ) -> Result<usize, String> {
+        if self.closed || self.exited {
+            return Err("session is closed".into());
+        }
+        if !self.holding_replies
+            || remaining == 0
+            || remaining > MAX_INPUT - usize::from(accepted_prefix.get()).min(MAX_INPUT)
+            || suffix.len() != remaining.min(4096)
+        {
+            return Err("partial input continuation size".into());
+        }
+        if let Some(error) = &self.write_error {
+            return Err(error.clone());
+        }
+        self.write_bytes(suffix)
+    }
+
+    fn write_bytes(&mut self, input: &[u8]) -> Result<usize, String> {
         // Caller owns unaccepted suffix. Interrupted/WouldBlock consume no input.
         match bounded_write(self.writer.as_mut().ok_or("writer closed")?, input) {
             Ok(n) => Ok(n),
@@ -1427,13 +1462,45 @@ impl Session {
     }
     /// Opt-in bounded snapshot at first completed sync block. Parsing never stops.
     pub fn poll_with_sync_capture(&mut self, capture: bool) -> Result<usize, String> {
+        self.poll_output(capture, !self.holding_replies)
+    }
+
+    /// Parse/drain with the ordinary budgets, but hold protocol writes until
+    /// the sole bridge has confirmed the active logical frame boundary.
+    #[doc(hidden)]
+    pub fn poll_holding_replies(&mut self, capture: bool) -> Result<usize, String> {
+        self.holding_replies = self.write_error.is_none();
+        self.poll_output(capture, false)
+    }
+
+    /// Release deferred replies after a known event boundary, never input.
+    #[doc(hidden)]
+    pub fn release_held_replies(&mut self) -> bool {
+        self.flush_replies();
+        if self.replies.is_empty() {
+            self.holding_replies = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Retire write authority without closing the child or its readable tail.
+    #[doc(hidden)]
+    pub fn fail_input_boundary(&mut self, reason: &'static str) {
+        self.fail_writer(reason.into());
+    }
+
+    fn poll_output(&mut self, capture: bool, flush_replies: bool) -> Result<usize, String> {
         self.terminal.completed_sync_frame = None;
         self.terminal.capture_sync_end = capture;
         if self.closed {
             return Err("session is closed".into());
         }
         // A reply failure must never prevent draining the PTY's final output.
-        self.flush_replies();
+        if flush_replies {
+            self.flush_replies();
+        }
         let mut total = 0;
         for _ in 0..64 {
             if self.read_eof || total >= READ_BUDGET {
@@ -1455,7 +1522,9 @@ impl Session {
                     total += n;
                     let replies = self.terminal.feed(&bytes[..n])?;
                     self.queue_replies(replies);
-                    self.flush_replies();
+                    if flush_replies {
+                        self.flush_replies();
+                    }
                 }
                 Err(e) if e.raw_os_error() == Some(libc::EIO) => {
                     // Linux PTY master reports EIO after the final slave closes.
@@ -1573,6 +1642,64 @@ mod tests {
             std::io::ErrorKind::WriteZero
         );
     }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn held_reply_waits_for_a_confirmed_continuation_before_ordinary_input() {
+        use std::io::{Cursor, ErrorKind};
+        use std::sync::Mutex;
+
+        struct Available(Cursor<&'static [u8]>);
+        impl Read for Available {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.0.read(bytes)?;
+                if n == 0 {
+                    return Err(ErrorKind::WouldBlock.into());
+                }
+                Ok(n)
+            }
+        }
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut session = Session::spawn(4, 80).unwrap();
+        let wire = Arc::new(Mutex::new(Vec::new()));
+        session.writer = Some(Box::new(Capture(wire.clone())));
+        session.reader = Some(Box::new(Available(Cursor::new(b"\x1b[6n"))));
+        let prefix = std::num::NonZeroU16::new(6).unwrap();
+        let tail = b"OWNED\x1b[201~";
+        assert_eq!(session.write(b"\x1b[200~").unwrap(), 6);
+        assert!(session
+            .continue_partial_input(tail, prefix, tail.len())
+            .is_err());
+        assert_eq!(session.poll_holding_replies(false).unwrap(), 4);
+        assert_eq!(session.write(b"FRESH").unwrap(), 0);
+        assert_eq!(&*wire.lock().unwrap(), b"\x1b[200~");
+        assert!(session
+            .continue_partial_input(&tail[..1], prefix, tail.len())
+            .is_err());
+        assert_eq!(
+            session
+                .continue_partial_input(tail, prefix, tail.len())
+                .unwrap(),
+            tail.len()
+        );
+        assert!(session.release_held_replies());
+        assert_eq!(session.write(b"FRESH").unwrap(), 5);
+        assert_eq!(
+            &*wire.lock().unwrap(),
+            b"\x1b[200~OWNED\x1b[201~\x1b[1;1RFRESH"
+        );
+        session.close().unwrap();
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn broken_reply_writer_does_not_hide_output_tail() {

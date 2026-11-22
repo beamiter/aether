@@ -40,6 +40,26 @@ impl InputQueue {
         Ok(())
     }
 
+    pub(super) fn partial_remaining(&self) -> Option<usize> {
+        if self.head_written == 0 {
+            return None;
+        }
+        Some(usize::from(
+            self.lengths.front().unwrap().get() - self.head_written,
+        ))
+    }
+
+    pub(super) fn flush_partial(
+        &mut self,
+        write: impl FnOnce(&[u8], NonZeroU16, usize) -> Result<usize, String>,
+    ) -> Result<(), String> {
+        let remaining = self
+            .partial_remaining()
+            .ok_or("missing partial input head")?;
+        let prefix = NonZeroU16::new(self.head_written).unwrap();
+        self.flush(|offer| write(&offer[..offer.len().min(remaining)], prefix, remaining))
+    }
+
     pub(super) fn flush(
         &mut self,
         write: impl FnOnce(&[u8]) -> Result<usize, String>,

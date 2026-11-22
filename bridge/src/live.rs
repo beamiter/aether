@@ -8,6 +8,14 @@ use jterm_engine::frame::CellFrame;
 use jterm_headless_session_spike::Session;
 mod input_queue;
 use input_queue::InputQueue;
+use std::time::{Duration, Instant};
+
+const INPUT_BOUNDARY_TIMEOUT: Duration = Duration::from_secs(2);
+const BOUNDARY_STALLED: &str = "logical input boundary stalled; input disabled until shell closes";
+const BOUNDARY_RETIRED: &str =
+    "logical input boundary interrupted by view change; input disabled until shell closes";
+const BOUNDARY_FAILED: &str =
+    "terminal stopped during logical input boundary; input disabled until shell closes";
 #[derive(Debug, serde::Serialize)]
 pub struct SessionStatus {
     pub epoch: u32,
@@ -40,9 +48,21 @@ pub struct LiveBridge {
     flight: Option<CellFrame>,
     accepted: Option<CellFrame>,
     input: InputQueue,
+    input_boundary: Option<Instant>,
+    order_partial_input: bool,
     stable: Option<CellFrame>,
 }
 impl LiveBridge {
+    /// Use only for the local desktop owner that reports sticky write health.
+    /// Standalone/SSH transport retains its existing recovery contract.
+    #[doc(hidden)]
+    pub fn local_desktop() -> Self {
+        Self {
+            order_partial_input: true,
+            ..Self::default()
+        }
+    }
+
     pub fn open(&mut self, rows: usize, cols: usize) -> Result<u32, String> {
         if self.session.is_some() {
             return Err("close the existing session first".into());
@@ -60,6 +80,7 @@ impl LiveBridge {
         self.flight = None;
         self.accepted = None;
         self.input.clear();
+        self.input_boundary = None;
         Ok(epoch)
     }
     fn check(&self, epoch: u32) -> Result<(), String> {
@@ -125,6 +146,7 @@ impl LiveBridge {
             .generation
             .checked_add(1)
             .ok_or("attachment exhausted")?;
+        self.seal_input_boundary(BOUNDARY_RETIRED);
         self.input_attached = false;
         self.flight = None;
         self.accepted = None;
@@ -155,6 +177,7 @@ impl LiveBridge {
             .ok_or("attachment exhausted")?;
         let frame = self.recover_frame(self.epoch)?;
         self.generation = generation;
+        self.seal_input_boundary(BOUNDARY_RETIRED);
         self.input_attached &= expected.is_some();
         self.resumed_from = expected.map(|owner| owner.generation);
         self.accepted = None;
@@ -164,17 +187,97 @@ impl LiveBridge {
         }))
     }
 
-    fn poll_frame(&mut self, epoch: u32) -> Result<Option<CellFrame>, String> {
-        self.check(epoch)?;
+    fn seal_input_boundary(&mut self, reason: &'static str) {
+        if self.input_boundary.take().is_some() {
+            self.input_attached = false;
+            self.session.as_mut().unwrap().fail_input_boundary(reason);
+        }
+    }
+
+    fn expire_input_boundary(&mut self, now: Instant) {
+        if self
+            .input_boundary
+            .is_some_and(|start| now.duration_since(start) >= INPUT_BOUNDARY_TIMEOUT)
+        {
+            self.seal_input_boundary(BOUNDARY_STALLED);
+        }
+    }
+
+    fn poll_io(&mut self, mut now: impl FnMut() -> Instant) -> Result<(), String> {
+        let capture = self.flight.is_none();
+        self.expire_input_boundary(now());
+        let held = self.input_boundary.is_some();
         let session = self.session.as_mut().unwrap();
-        session.poll_with_sync_capture(self.flight.is_none())?;
-        if !self.input.is_empty() && !session.is_exited() && session.write_error().is_none() {
-            // A sticky writer failure must not stop read-side draining.
-            let _ = self.input.flush(|bytes| session.write(bytes));
+        let reads = if held {
+            session.poll_holding_replies(capture)
+        } else {
+            session.poll_with_sync_capture(capture)
+        };
+        if let Err(error) = reads {
+            self.seal_input_boundary(BOUNDARY_FAILED);
+            return Err(error);
         }
         if session.is_exited() || session.write_error().is_some() {
+            self.seal_input_boundary(BOUNDARY_FAILED);
+            self.input.clear();
+            return Ok(());
+        }
+
+        if !held {
+            if !self.input.is_empty() {
+                let _ = self.input.flush(|bytes| session.write(bytes));
+                if session.write_error().is_some() {
+                    self.input.clear();
+                } else if self.order_partial_input && self.input.partial_remaining().is_some() {
+                    self.input_boundary = Some(now());
+                }
+            }
+            return Ok(());
+        }
+
+        self.expire_input_boundary(now());
+        if self.input_boundary.is_none() {
+            self.input.clear();
+            return Ok(());
+        }
+        if self.input.partial_remaining().is_some()
+            && self
+                .input
+                .flush_partial(|bytes, prefix, remaining| {
+                    self.session
+                        .as_mut()
+                        .unwrap()
+                        .continue_partial_input(bytes, prefix, remaining)
+                })
+                .is_err()
+        {
+            self.seal_input_boundary(BOUNDARY_FAILED);
+            self.input.clear();
+            return Ok(());
+        }
+
+        // A short write must never release replies inside the pending head.
+        // After completion, release only replies (never a fresh user event).
+        self.expire_input_boundary(now());
+        if self.input_boundary.is_some() && self.input.partial_remaining().is_none() {
+            let session = self.session.as_mut().unwrap();
+            let released = session.release_held_replies();
+            if session.write_error().is_some() {
+                self.seal_input_boundary(BOUNDARY_FAILED);
+            } else if released {
+                self.input_boundary = None;
+            }
+        }
+        if self.session.as_ref().unwrap().write_error().is_some() {
             self.input.clear();
         }
+        Ok(())
+    }
+
+    fn poll_frame(&mut self, epoch: u32) -> Result<Option<CellFrame>, String> {
+        self.check(epoch)?;
+        self.poll_io(Instant::now)?;
+        let session = self.session.as_mut().unwrap();
         if self.flight.is_some() {
             return Ok(None);
         }
@@ -348,6 +451,7 @@ impl LiveBridge {
         self.input_attached = false;
         self.stable = None;
         self.input.clear();
+        self.input_boundary = None;
         self.flight = None;
         self.accepted = None;
         self.resumed_from = None;

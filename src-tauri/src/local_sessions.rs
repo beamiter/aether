@@ -109,7 +109,7 @@ impl LocalSessions {
     pub(crate) fn open(&mut self) -> Result<Attachment, String> {
         let vacant = &mut self.vacant;
         self.registry.open(|| {
-            let bridge = vacant.get_or_insert_with(LiveBridge::default);
+            let bridge = vacant.get_or_insert_with(LiveBridge::local_desktop);
             let epoch = bridge.open(24, 80)?;
             let owner = bridge.attachment(epoch)?;
             Ok((owner.session.clone(), vacant.take().unwrap(), owner))
