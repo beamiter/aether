@@ -42,7 +42,10 @@ test('actual Rust Unicode frame keeps two-column paint and styled colors',()=>{
  assert.equal(f.rows[1][0].foreground,'#2472c8');assert.equal(f.rows[1][0].background,'#cd3131');
  const calls=[];const g={setTransform(){},clearRect(){},scale(){},fillRect(...args){calls.push(['background-or-decoration',...args]);},save(){},beginPath(){},rect(...args){calls.push(['clip',...args]);},clip(){},fillText(text){calls.push(['glyph',text,this.font,this.globalAlpha]);},restore(){},strokeRect(){}};
  paint({style:{},getContext:()=>g},f);
- const firstGlyph=calls.findIndex(c=>c[0]==='glyph');assert.ok(firstGlyph>=4*24);
+ const firstGlyph=calls.findIndex(c=>c[0]==='glyph');
+ const backgroundCoverage=calls.slice(0,firstGlyph).filter(c=>c[0]==='background-or-decoration')
+  .reduce((cells,[,,,w,h])=>{assert.equal(h,24);return cells+w/12;},0);
+ assert.equal(backgroundCoverage,4*24);
  assert.deepEqual(calls.find(c=>c[0]==='clip'),['clip',0,0,24,24]);
  assert.deepEqual(calls.find(c=>c[0]==='glyph'),['glyph','中','italic bold 18px monospace',1]);
  assert.equal(calls.filter(c=>c[0]==='glyph'&&c[1]==='中').length,1);
@@ -133,4 +136,78 @@ test('failed paint unwinds the cell clip before a same-geometry full repaint',()
  paint(h.canvas,frame);
  assert.equal(h.writes.length,2);assert.equal(h.clipDepth,0);
  assert.equal(h.draws.filter(op=>op[0]==='text').length,4);
+});
+
+function paintCalls(frame,scale) {
+ const backgrounds=[],glyphs=[],clears=[];
+ let drawingText=false,transform=1;
+ const g={
+  setTransform(dpr){transform=dpr;},clearRect(...rect){drawingText=false;clears.push([transform,...rect]);},
+  fillRect(x,y,w,h){if(!drawingText)backgrounds.push([this.fillStyle,transform,x,y,w,h]);},
+  save(){drawingText=true;},restore(){},beginPath(){},rect(){},clip(){},strokeRect(){},
+  fillText(text,x,y){glyphs.push([text,x,y]);},
+ };
+ const canvas={style:{},getContext:()=>g};
+ paint(canvas,frame,scale);
+ return {backgrounds,glyphs,clears,canvas};
+}
+
+test('opaque background spans match the per-cell physical pixel model at integer DPR',()=>{
+ const raw=demo(), cols=9, rows=3;
+ const colors=['#000000','#112233','#aa4411'];
+ const palettes=[[0,0,1,1,1,2,2,0,0],[2,2,1,0,0,2,0,0,0],[1,1,1,1,1,1,1,1,1]];
+ const cells=palettes.map(row=>row.map(index=>({text:'·',width:1,style:0,foreground:'#010203',background:colors[index]})));
+ cells[0][1]={...cells[0][1],text:'界',width:2};
+ cells[0][2]={...cells[0][2],text:' ',width:0}; // Separate background is preserved under a wide glyph.
+ const frame=acceptFull(null,{...raw,cols,rows:cells,cursor_row:0,cursor_col:1,cursor_visible:false});
+ for(const dpr of [1,2,3,4]){
+  const {backgrounds,clears,glyphs,canvas}=paintCalls(frame,dpr);
+  const tileWidth=12*dpr,tileHeight=24*dpr;
+  assert.deepEqual(clears,[[1,0,0,cols*tileWidth,rows*tileHeight]]);
+  assert.equal(backgrounds.length,10);
+  assert.equal(glyphs.length,cols*rows-1);
+  assert.deepEqual(glyphs.filter(([text])=>text==='界'),[['界',12,2]]);
+  const buffer=new Uint8Array(canvas.width*canvas.height);
+  for(const [color,scale,x,y,w,h] of backgrounds){
+   assert.equal(scale,dpr);assert.equal(h,24,'never merge vertically');
+   assert.equal(x%12,0);assert.equal(w%12,0);assert.ok(x+w<=cols*12);
+   for(let yy=y*dpr;yy<(y+h)*dpr;yy++){
+    for(let xx=x*dpr;xx<(x+w)*dpr;xx++){
+     const index=yy*canvas.width+xx;
+     assert.equal(buffer[index],0,'each physical pixel receives exactly one background');
+     buffer[index]=colors.indexOf(color)+1;
+    }
+   }
+  }
+  for(let y=0;y<canvas.height;y++){
+   for(let x=0;x<canvas.width;x++){
+    assert.equal(buffer[y*canvas.width+x],1+palettes[Math.floor(y/tileHeight)][Math.floor(x/tileWidth)]);
+   }
+  }
+ }
+});
+
+test('Rust demo and PTY frames reduce fillRect calls from cells to rows without skipping glyphs',()=>{
+ for(const [file,oldCalls,spans] of [['demo',512,8],['pty-smoke',960,12]]){
+  const raw=JSON.parse(fs.readFileSync(new URL(`../web/${file}-frame.json`,import.meta.url),'utf8'));
+  const frame=acceptFull(null,raw,{session:raw.session,epoch:raw.epoch});
+  const {backgrounds,glyphs,clears}=paintCalls(frame,1);
+  assert.equal(frame.cols*frame.rows.length,oldCalls);
+  assert.equal(backgrounds.length,spans);
+  const visibleGlyphs=frame.rows.flat().filter(c=>c.width>0).length;
+  assert.equal(glyphs.length,visibleGlyphs);
+  assert.deepEqual(clears,[[1,0,0,frame.cols*12,frame.rows.length*24]]);
+  assert.ok(backgrounds.every(([,,x,,w,h])=>x===0&&w===frame.cols*12&&h===24));
+ }
+});
+
+test('fractional and allocation-clamped DPR preserve cell-by-cell background rasterization',()=>{
+ const fractional=paintCalls(smallPaintFrame({cols:8,rows:2}),1.25);
+ assert.equal(fractional.backgrounds.length,16);
+ assert.ok(fractional.backgrounds.every(([_,dpr,__,___,w,h])=>dpr===1.25&&w===12&&h===24));
+ const large=paintCalls(smallPaintFrame({cols:256,rows:128}),4);
+ assert.equal(large.backgrounds.length,32768);
+ const ratio=Math.sqrt(16777216/(256*12*128*24));
+ assert.ok(large.backgrounds.every(([_,dpr,__,___,w,h])=>dpr===ratio&&w===12&&h===24));
+ assert.ok(large.canvas.width*large.canvas.height<=16777216);
 });

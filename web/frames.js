@@ -71,7 +71,11 @@ export function paint(canvas, frame, scale = globalThis.devicePixelRatio || 1) {
   if (!Number.isFinite(scale) || scale <= 0 || scale > 4) scale = 1;
   const cw = 12, ch = 24;
   // Cap backing allocation independently of viewport dimensions and device DPR.
-  scale = Math.min(scale, Math.sqrt(16777216 / (frame.cols*cw*frame.rows.length*ch)));
+  const limit = Math.sqrt(16777216 / (frame.cols * cw * frame.rows.length * ch));
+  // Merge only on an unclamped integer DPR: all opaque cell edges then
+  // land on physical pixels, without changing fractional-edge rasterization.
+  const mergeBackgrounds = Number.isInteger(scale) && scale <= limit;
+  scale = Math.min(scale, limit);
   const cssWidth = frame.cols * cw, cssHeight = frame.rows.length * ch;
   const width = Math.max(1, Math.floor(cssWidth * scale));
   const height = Math.max(1, Math.floor(cssHeight * scale));
@@ -86,7 +90,20 @@ export function paint(canvas, frame, scale = globalThis.devicePixelRatio || 1) {
   g.setTransform(scale, 0, 0, scale, 0, 0);
   g.font = '18px monospace'; g.textBaseline = 'top';
   // All backgrounds first: a wide glyph must not be erased by its trailing cell.
-  frame.rows.forEach((r,y)=>r.forEach((c,x)=>{g.fillStyle=c.background;g.fillRect(x*cw,y*ch,cw,ch);}));
+  frame.rows.forEach((row, y) => {
+    if (!mergeBackgrounds) {
+      row.forEach((cell, x) => { g.fillStyle = cell.background; g.fillRect(x*cw, y*ch, cw, ch); });
+      return;
+    }
+    for (let start = 0; start < row.length;) {
+      const background = row[start].background;
+      let end = start + 1;
+      while (end < row.length && row[end].background === background) end++;
+      g.fillStyle = background;
+      g.fillRect(start*cw, y*ch, (end-start)*cw, ch);
+      start = end;
+    }
+  });
   frame.rows.forEach((r,y)=>r.forEach((c,x)=>{
     if(c.width===0)return;
     g.save();
