@@ -1682,7 +1682,9 @@ mod tests {
 
         let mut session = Session::spawn(4, 80).unwrap();
         let wire = Arc::new(Mutex::new(Vec::new()));
-        session.writer = Some(Box::new(Capture(wire.clone())));
+        // portable-pty sends VEOF when the original writer is dropped.
+        // Keep the real shell alive while the scripted handles test ordering.
+        let original_writer = session.writer.replace(Box::new(Capture(wire.clone())));
         session.reader = Some(Box::new(Available(Cursor::new(b"\x1b[6n"))));
         let prefix = std::num::NonZeroU16::new(6).unwrap();
         let tail = b"OWNED\x1b[201~";
@@ -1691,6 +1693,7 @@ mod tests {
             .continue_partial_input(tail, prefix, tail.len())
             .is_err());
         assert_eq!(session.poll_holding_replies(false).unwrap(), 4);
+        assert!(!session.is_exited());
         assert_eq!(session.write(b"FRESH").unwrap(), 0);
         assert_eq!(&*wire.lock().unwrap(), b"\x1b[200~");
         assert!(session
@@ -1708,7 +1711,9 @@ mod tests {
             &*wire.lock().unwrap(),
             b"\x1b[200~OWNED\x1b[201~\x1b[1;1RFRESH"
         );
+        session.writer = original_writer;
         session.close().unwrap();
+        await_cleanup(&session);
     }
 
     #[test]
