@@ -274,6 +274,24 @@ impl LiveBridge {
         Ok(())
     }
 
+    /// A local desktop owner may drain a detached PTY after witnessing that
+    /// no raw input transaction or reader is active under its registry lock.
+    /// Never consumes logical input or touches frame publication/ACK state.
+    #[doc(hidden)]
+    pub fn pump_detached_idle(&mut self) -> Result<bool, String> {
+        if !self.order_partial_input
+            || self.input_attached
+            || !self.input.is_empty()
+            || self.input_boundary.is_some()
+        {
+            return Ok(false);
+        }
+        match &mut self.session {
+            Some(session) => session.poll_detached_idle(),
+            None => Ok(false),
+        }
+    }
+
     fn poll_frame(&mut self, epoch: u32) -> Result<Option<CellFrame>, String> {
         self.check(epoch)?;
         self.poll_io(Instant::now)?;

@@ -34,9 +34,15 @@ The publisher keeps one acknowledged base and one in-flight frame. The coherent
 recovery snapshot shares the in-flight frame where applicable. A grid permits up
 to 128 rows, 256 columns and 32,768 cells. Each delta replaces at most one copy
 of each row. The existing input queue is limited to 16 KiB and output is drained
-through the bounded PTY path while a view polls. While detached, the live PTY may
-wait for capacity in its kernel buffers until a view reconnects. Closing the
-Aether application ends the local owner process and its attachment lifetime.
+through the bounded PTY path while a view polls. A detached local desktop PTY
+can also drain under the same owner if there is no reader and no outstanding
+raw or logical write boundary. Each turn reads at most 64 KiB and may send only
+the parser's bounded protocol replies. It does not publish, acknowledge, or
+resume input. If the writer is interrupted or its input boundary is uncertain,
+the detached owner stops polling rather than sending more bytes; the PTY may
+wait for kernel buffer capacity until a view reconnects or it is explicitly
+closed. Closing Aether ends the local owner's attachment lifetime. SSH and
+standalone helper polling are unchanged.
 
 ## Local command line suffix ownership
 

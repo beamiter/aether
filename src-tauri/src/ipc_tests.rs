@@ -399,3 +399,161 @@ fn tauri_ipc_real_pty_lifecycle_and_wire_contract() {
     );
     invoke(&window, "close_shell", json!({"owner": next}));
 }
+
+#[test]
+fn detached_local_pty_drains_past_kernel_capacity_without_frontend_poll() {
+    use std::{
+        os::unix::fs::DirBuilderExt,
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    struct Scratch(PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let path = std::env::temp_dir().join(format!(
+        "aether-local-pressure-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&path)
+        .unwrap();
+    let temp = Scratch(path);
+    let script = temp.0.join("pressure.sh");
+    let gate = temp.0.join("go");
+    let armed = temp.0.join("armed");
+    let payload = temp.0.join("payload");
+    std::fs::write(&payload, vec![b'X'; 256 * 1024]).unwrap();
+    let written = temp.0.join("done");
+    fn quote(path: &std::path::Path) -> String {
+        format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"))
+    }
+    std::fs::write(
+        &script,
+        format!(
+            r#"original=$(stty -g) || return 1
+stty -echo -icanon min 1 time 0 || return 1
+printf '%s' "$$" > {armed}
+printf '\nAETHER_PRESSURE_ARMED\n'
+n=0
+while [ ! -f {gate} ] && [ "$n" -lt 300 ]; do sleep .05; n=$((n+1)); done
+[ -f {gate} ] || return 1
+cat {payload} || return 1
+printf '\nAETHER_PRESSURE_END\n\033[H\033[6n' || return 1
+# Exact parser reply proves the owner reached the marker before reattach.
+reply=$(timeout 4 dd bs=1 count=6 2>/dev/null | od -An -tx1 | tr -d ' \n')
+stty "$original" || return 1
+[ "$reply" = 1b5b313b3152 ] || return 1
+printf '%s' "$$" > {written}
+"#,
+            gate = quote(&gate),
+            armed = quote(&armed),
+            payload = quote(&payload),
+            written = quote(&written)
+        ),
+    )
+    .unwrap();
+    let app = super::application(tauri::test::mock_builder())
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .unwrap();
+    let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build()
+        .unwrap();
+    let owner = invoke(&window, "open_shell", json!({}));
+    invoke(
+        &window,
+        "text_shell",
+        json!({"owner": owner, "text": format!(". {}",quote(&script))}),
+    );
+    invoke(
+        &window,
+        "key_shell",
+        json!({"owner": owner, "name":"Enter", "shift":false, "alt":false, "ctrl":false}),
+    );
+    fn marker_rows(rows: &serde_json::Value, expected: &str) -> bool {
+        rows.as_array().is_some_and(|rows| {
+            rows.iter().any(|row| {
+                row.as_array()
+                    .or_else(|| row["cells"].as_array())
+                    .is_some_and(|cells| {
+                        cells
+                            .iter()
+                            .filter_map(|cell| cell["text"].as_str())
+                            .collect::<String>()
+                            .contains(expected)
+                    })
+            })
+        })
+    }
+    let poll_marker = |owner: &serde_json::Value, label| {
+        let update = invoke(&window, "poll_shell", json!({"owner": owner}));
+        if update.is_null() {
+            return false;
+        }
+        invoke(
+            &window,
+            "ack_shell",
+            json!({"owner":owner,"revision":update["frame"]["revision"]}),
+        );
+        marker_rows(&update["frame"]["rows"], label)
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !poll_marker(&owner, "AETHER_PRESSURE_ARMED") {
+        assert!(
+            Instant::now() < deadline,
+            "pressure shell did not reach gate"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let expected_pid = std::fs::read_to_string(&armed).unwrap();
+    assert!(!expected_pid.is_empty() && expected_pid.bytes().all(|byte| byte.is_ascii_digit()));
+    invoke(&window, "detach_shell", json!({"owner":owner}));
+    std::fs::write(&gate, b"go").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let completed_without_view = loop {
+        // Intentionally no poll, status, attach, callback, or other IPC here.
+        if std::fs::read_to_string(&written).is_ok_and(|pid| pid == expected_pid) {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let resumed = invoke(
+        &window,
+        "attach_shell",
+        json!({"target":{"session":owner["session"],"epoch":owner["epoch"]}}),
+    );
+    let attached = &resumed["owner"];
+    let end_seen = marker_rows(&resumed["frame"]["rows"], "AETHER_PRESSURE_END");
+    let old_ack = json!({"owner":owner,"revision":resumed["frame"]["revision"]});
+    assert!(tauri::test::get_ipc_response(&window, request("ack_shell", old_ack)).is_err());
+    let readonly = json!({"owner":attached,"bytes":[120]});
+    assert!(tauri::test::get_ipc_response(&window, request("write_shell", readonly)).is_err());
+    invoke(
+        &window,
+        "ack_shell",
+        json!({"owner":attached,"revision":resumed["frame"]["revision"]}),
+    );
+    // Retire the owned fixture before failing the negative baseline.
+    let closed = invoke(&window, "close_shell", json!({"owner":attached}));
+    assert!(closed["cleanup_pending"].is_boolean());
+    assert!(invoke(&window, "attach_shell", json!({})).is_null());
+    assert_eq!(attached["session"], owner["session"]);
+    assert_eq!(attached["epoch"], owner["epoch"]);
+    assert_ne!(attached["generation"], owner["generation"]);
+    assert!(
+        completed_without_view,
+        "detached writer stalled without a frontend read"
+    );
+    assert!(
+        end_seen,
+        "retained PTY did not return the final pressure marker"
+    );
+}

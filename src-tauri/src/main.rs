@@ -58,7 +58,9 @@ async fn detach_shell(
     owner: Attachment,
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<(), String> {
-    run_bridge(bridge.inner().clone(), move |bridge| bridge.detach(&owner)).await
+    let shared = bridge.inner().clone();
+    let weak = Arc::downgrade(&shared);
+    run_bridge(shared, move |bridge| bridge.detach(&owner, weak)).await
 }
 
 #[tauri::command]

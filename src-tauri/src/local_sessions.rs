@@ -1,7 +1,12 @@
 //! Local desktop ownership, separate from the SSH transport.
+mod detached_worker;
 mod raw_suffix;
+use detached_worker::DetachedWorker;
 use raw_suffix::RawSuffix;
-use std::collections::{btree_map::Entry, BTreeMap};
+use std::{
+    collections::{btree_map::Entry, BTreeMap},
+    sync::{Mutex, Weak},
+};
 use tauri_terminal_frame_bridge::{
     live::{CloseStatus, LiveBridge},
     semantic::{Attachment, Resume, SessionSelector},
@@ -84,6 +89,16 @@ impl<T, const LIMIT: usize> Registry<T, LIMIT> {
         Ok(Some(result))
     }
 
+    fn detached(&mut self) -> Option<&mut T> {
+        // The desktop registry is a singleton, and may have no session.
+        // Do not implicitly select an owner if a future multi-PTY registry
+        // has several retained sessions; that needs its own fair scheduler.
+        if self.reader.is_some() || self.sessions.len() != 1 {
+            return None;
+        }
+        self.sessions.values_mut().next()
+    }
+
     fn close<R>(
         &mut self,
         id: &str,
@@ -110,6 +125,7 @@ pub(crate) struct LocalSessions {
     registry: Registry<OwnedLocalPty, 1>,
     // Recycle the empty bridge on close to preserve legacy increasing epochs.
     vacant: Option<LiveBridge>,
+    detached_worker: Option<DetachedWorker>,
 }
 
 impl LocalSessions {
@@ -142,12 +158,34 @@ impl LocalSessions {
             })
     }
 
-    pub(crate) fn detach(&mut self, owner: &Attachment) -> Result<(), String> {
+    pub(crate) fn detach(
+        &mut self,
+        owner: &Attachment,
+        shared: Weak<Mutex<Self>>,
+    ) -> Result<(), String> {
+        // Thread creation is fallible. Do it only for an actual owner and
+        // before detach changes the lease, so the caller can retry safely.
+        self.registry
+            .reader(&owner.session)?
+            .bridge
+            .validate_attachment(owner)?;
+        if self.detached_worker.is_none() {
+            self.detached_worker = Some(DetachedWorker::start(shared)?);
+        }
         self.registry.detach(&owner.session, |owned| {
             owned.bridge.detach(owner)?;
             owned.raw.retire_view();
             Ok(())
-        })
+        })?;
+        self.detached_worker.as_ref().unwrap().wake();
+        Ok(())
+    }
+
+    fn pump_detached(&mut self) -> bool {
+        let Some(owned) = self.registry.detached() else {
+            return false;
+        };
+        matches!(owned.raw, RawSuffix::None) && owned.bridge.pump_detached_idle().unwrap_or(false)
     }
 
     pub(crate) fn recover(&mut self, owner: &Attachment) -> Result<Resume, String> {
@@ -197,6 +235,9 @@ impl LocalSessions {
             owned.bridge.close(epoch)
         })?;
         self.vacant = Some(owned.bridge);
+        if let Some(worker) = &self.detached_worker {
+            worker.wake();
+        }
         Ok(result)
     }
 }

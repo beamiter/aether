@@ -1460,6 +1460,17 @@ impl Session {
     pub fn poll(&mut self) -> Result<usize, String> {
         self.poll_with_sync_capture(false)
     }
+    /// Only the owning detached desktop bridge has checked input boundaries.
+    /// Do not make frame captures or release held/failed reply writers.
+    #[doc(hidden)]
+    pub fn poll_detached_idle(&mut self) -> Result<bool, String> {
+        if self.holding_replies || self.write_error.is_some() || self.is_drained() {
+            return Ok(false);
+        }
+        self.poll()?;
+        Ok(self.write_error.is_none() && !self.is_drained())
+    }
+
     /// Opt-in bounded snapshot at first completed sync block. Parsing never stops.
     pub fn poll_with_sync_capture(&mut self, capture: bool) -> Result<usize, String> {
         self.poll_output(capture, !self.holding_replies)
