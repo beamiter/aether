@@ -95,16 +95,17 @@ there and press Enter to run it.
 ### Eva Companion
 
 Launch Aether with `EVA_COMPANION_MODE=shared` in the graphical session that
-runs `jcompaniond`. The **Eva** control shows or hides its native slot in this
-window. Eva follows the selected local shell. When jsh reports a finished
+runs `jcompaniond` with host feature negotiation. The **Eva** control shows
+or hides its native slot in this window. Eva follows the selected local shell.
+When jsh reports a finished
 command, the slot shows its success or failure and the daemon receives the
 outcome with an opaque command ID. The feedback clears when the active tab
 changes or enters an alternate-screen program.
 
-Eva is available in Wayland sessions whose compositor provides
-`wp_presentation`. Aether waits for the compositor's presentation feedback
-before requesting a shared body. Closing a window that owns one waits for
-the cleared frame's feedback and the daemon's acceptance.
+Eva requires `wp_presentation` on Wayland or extended `_NET_WM_FRAME_TIMINGS`
+from a compositing window manager such as JWM on X11. Aether waits for
+presentation feedback before requesting a shared body. Closing a window that
+owns one waits for the cleared frame's feedback and the daemon's acceptance.
 
 ## SSH files and read-only Workspace
 

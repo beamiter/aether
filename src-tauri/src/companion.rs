@@ -267,7 +267,7 @@ impl Companion {
         } else if !enabled {
             ""
         } else if !self.presentation.supported_backend() {
-            "Eva requires Wayland presentation feedback."
+            "Native presentation feedback is unavailable on this display."
         } else if !self.presentation.proven() {
             "Waiting for native presentation feedback."
         } else if self.feedback.session.is_none() {

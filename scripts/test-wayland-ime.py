@@ -33,30 +33,35 @@ def native_surface_presentations(trace):
     return max(presented.values(), default=0)
 
 
-def exercise_companion(driver, fixtures, profile, compositor_ipc, compositor_tools):
+def exercise_companion(driver, fixtures, profile, close_window, handoff=None):
     import gi
 
     gi.require_version("Atspi", "2.0")
-    from gi.repository import Atspi
+    from gi.repository import Atspi, GLib
 
     Atspi.init()
     wait_for = fixtures["wait_for"]
 
-    def named(role, name):
+    def named(role, name, process=None):
         pending = [Atspi.get_desktop(0)]
         while pending:
             node = pending.pop()
             if node is None:
                 continue
-            actual = node.get_role()
-            if actual == role and node.get_name() == name and node.get_state_set().contains(Atspi.StateType.SHOWING):
-                return node
-            if actual not in (Atspi.Role.DOCUMENT_WEB, Atspi.Role.DOCUMENT_FRAME):
-                pending.extend(node.get_child_at_index(i) for i in range(node.get_child_count()))
+            try:
+                actual = node.get_role()
+                if (actual == role and node.get_name() == name and node.get_state_set().contains(Atspi.StateType.SHOWING)
+                        and (process is None or node.get_process_id() == process)):
+                    return node
+                if actual not in (Atspi.Role.DOCUMENT_WEB, Atspi.Role.DOCUMENT_FRAME):
+                    pending.extend(node.get_child_at_index(i) for i in range(node.get_child_count()))
+            except GLib.Error as error:
+                if error.domain != "atspi_error" or error.message != "The application no longer exists":
+                    raise
         return None
 
     def label(text):
-        return named(Atspi.Role.LABEL, text)
+        return named(Atspi.Role.LABEL, text, process)
 
     def residence():
         return json.loads((profile / "residence.json").read_text())
@@ -69,7 +74,8 @@ def exercise_companion(driver, fixtures, profile, compositor_ipc, compositor_too
 
     def retired(token):
         current = residence()
-        return current["possible_body"] is None and token in current["retired_tokens"]
+        expected_owner = current["possible_body"] is None or (handoff and current["possible_body"] != token)
+        return expected_owner and token in current["retired_tokens"]
 
     def state():
         return driver.execute(fixtures["READ"])
@@ -120,15 +126,14 @@ def exercise_companion(driver, fixtures, profile, compositor_ipc, compositor_too
     assert not label("Command failed")
     assert marker not in (profile / "dialogue-index.json").read_text()
 
-    swaymsg = shutil.which("swaymsg")
-    assert swaymsg
-    subprocess.run([swaymsg, "-s", str(compositor_ipc), f"[pid={process}] kill"],
-                   env=compositor_tools, check=True, capture_output=True, timeout=5)
+    if handoff:
+        live_token = handoff(process, live_token)
+        wait_for(lambda: label("Eva ready"), "Aether did not resume its native slot after the handoff")
+    close_window(process)
     wait_for(lambda: retired(live_token), "closing Aether did not retire its exact presented body")
-    wait_for(lambda: not named(Atspi.Role.TOGGLE_BUTTON, "Eva"), "Aether stayed open after withdrawal was accepted")
+    wait_for(lambda: not named(Atspi.Role.TOGGLE_BUTTON, "Eva", process), "Aether stayed open after withdrawal was accepted")
     driver.session = None
-    return {"case_id": "PRODUCT.COMPANION.001.NATIVE.001", "backend": "wayland", "result": "passed",
-            "compositor_output": "x11", "presentation_protocol": "wp_presentation",
+    return {"case_id": "PRODUCT.COMPANION.001.NATIVE.001", "result": "passed",
             "native_body_presented_and_retired": True, "split_feedback_isolated": True,
             "opaque_success_and_failure_recorded": True, "window_closes_after_withdrawal": True}
 
@@ -234,10 +239,16 @@ def run(args):
         wait_for(lambda: fixtures["opened_page"](driver), "embedded Aether page did not load")
         if args.companion_daemon:
             compositor_ipc = wait_for(lambda: next(runtime.glob("sway-ipc.*.sock"), None), "no private compositor IPC")
-            result = exercise_companion(driver, fixtures, profile, compositor_ipc, compositor_env)
+
+            def close_window(process):
+                subprocess.run(["swaymsg", "-s", str(compositor_ipc), f"[pid={process}] kill"],
+                               env=compositor_env, check=True, capture_output=True, timeout=5)
+
+            result = exercise_companion(driver, fixtures, profile, close_window)
             presentations = native_surface_presentations(root / "sway.log")
             assert presentations >= 3, "Sway did not present the probe, body, and clearance on the same surface"
-            result.update(binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
+            result.update(backend="wayland", compositor_output="x11", presentation_protocol="wp_presentation",
+                          binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
                           daemon_sha256=hashlib.sha256(daemon.read_bytes()).hexdigest(),
                           presented_surface_commits=presentations)
             (root / "result.json").write_text(json.dumps(result, indent=2) + "\n")

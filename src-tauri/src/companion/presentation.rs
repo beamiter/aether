@@ -8,7 +8,13 @@ use std::{ffi::c_void, ptr::NonNull};
 pub(super) struct Surface {
     window: gdk::Window,
     clock: gdk::FrameClock,
-    native: NonNull<c_void>,
+    native: NativeSurface,
+}
+
+#[derive(Clone, PartialEq)]
+enum NativeSurface {
+    Wayland(NonNull<c_void>),
+    X11,
 }
 
 impl Surface {
@@ -17,11 +23,86 @@ impl Surface {
         if !area.is_mapped() || window.is_destroyed() {
             return None;
         }
+        let native = if window.is::<gdkx11::X11Window>() {
+            NativeSurface::X11
+        } else {
+            NativeSurface::Wayland(wayland::surface(&window)?)
+        };
         Some(Self {
-            native: wayland::surface(&window)?,
+            native,
             window,
             clock: area.frame_clock()?,
         })
+    }
+}
+
+enum Backend {
+    Wayland(wayland::Receipts),
+    X11 {
+        drawn: gdk::Atom,
+        timings: gdk::Atom,
+    },
+}
+
+impl Backend {
+    fn new(display: gdk::Display) -> Option<Self> {
+        if display.is::<gdkx11::X11Display>() {
+            Some(Self::X11 {
+                drawn: gdk::Atom::intern("_NET_WM_FRAME_DRAWN"),
+                timings: gdk::Atom::intern("_NET_WM_FRAME_TIMINGS"),
+            })
+        } else {
+            wayland::Receipts::new(display).map(Self::Wayland)
+        }
+    }
+
+    fn ready(&self, surface: &Surface) -> bool {
+        match self {
+            Self::Wayland(receipts) => receipts.ready(),
+            Self::X11 { drawn, timings } => surface
+                .window
+                .screen()
+                .downcast::<gdkx11::X11Screen>()
+                .is_ok_and(|screen| {
+                    screen.upcast_ref::<gdk::Screen>().is_composited()
+                        && screen.supports_net_wm_hint(drawn)
+                        && screen.supports_net_wm_hint(timings)
+                }),
+        }
+    }
+
+    fn track(&self, surface: &Surface, serial: u64) -> bool {
+        match self {
+            Self::Wayland(receipts) => receipts.request(&surface.window, serial).is_some(),
+            Self::X11 { .. } => self.ready(surface),
+        }
+    }
+
+    fn poll(&mut self, surface: Option<&Surface>, frames: &[PaintedFrame]) -> Vec<(u64, bool)> {
+        match self {
+            Self::Wayland(receipts) => receipts.poll(),
+            Self::X11 { .. } => {
+                if frames.is_empty() {
+                    return Vec::new();
+                }
+                let Some(surface) = surface.filter(|surface| self.ready(surface)) else {
+                    return frames.iter().map(|frame| (frame.serial, false)).collect();
+                };
+                frames
+                    .iter()
+                    .filter_map(|frame| {
+                        let Some(timing) = surface.clock.timings(frame.counter) else {
+                            return Some((frame.serial, false));
+                        };
+                        // GTK's X11 backend correlates extended WM frame timing
+                        // messages with the submitted XSync frame cookie.
+                        timing
+                            .is_complete()
+                            .then(|| (frame.serial, timing.presentation_time().is_some()))
+                    })
+                    .collect()
+            }
+        }
     }
 }
 
@@ -46,7 +127,7 @@ struct Evidence {
 #[derive(Default)]
 pub(super) struct Presentation {
     surface: Option<Surface>,
-    receipts: Option<wayland::Receipts>,
+    backend: Option<Backend>,
     frames: Vec<PaintedFrame>,
     last_counter: Option<i64>,
     serial: u64,
@@ -57,7 +138,7 @@ pub(super) struct Presentation {
 impl Presentation {
     pub(super) fn new(display: gdk::Display) -> Self {
         Self {
-            receipts: wayland::Receipts::new(display),
+            backend: Backend::new(display),
             ..Self::default()
         }
     }
@@ -83,13 +164,17 @@ impl Presentation {
     }
 
     pub(super) fn supported_backend(&self) -> bool {
-        self.receipts.is_some()
+        self.backend.is_some()
     }
 
     pub(super) fn needs_draw(&self) -> bool {
-        self.receipts.as_ref().is_some_and(wayland::Receipts::ready)
-            && self.frames.len() < 8
+        self.frames.len() < 8
             && !self.frames.iter().any(|frame| frame.evidence.is_some())
+            && self
+                .backend
+                .as_ref()
+                .zip(self.surface.as_ref())
+                .is_some_and(|(backend, surface)| backend.ready(surface))
     }
 
     pub(super) fn can_draw(&self, token: &Token) -> bool {
@@ -117,8 +202,8 @@ impl Presentation {
         }
     }
 
-    /// Associate a full-slot paint with the compositor's next commit on the
-    /// same wl_surface. The frame clock is only used to identify GTK draws.
+    /// Track a full-slot paint until the native backend confirms presentation
+    /// on the same window.
     pub(super) fn painted(&mut self, mut client: Option<&mut SharedHost>, body: Option<Token>) {
         let Some(surface) = &self.surface else { return };
         let counter = surface.clock.frame_counter();
@@ -147,9 +232,9 @@ impl Presentation {
         if evidence.is_some()
             && self.frames.len() < 8
             && self
-                .receipts
+                .backend
                 .as_ref()
-                .is_some_and(|receipts| receipts.request(&surface.window, self.serial).is_some())
+                .is_some_and(|backend| backend.track(surface, self.serial))
         {
             self.frames.push(PaintedFrame {
                 counter,
@@ -202,10 +287,10 @@ impl Presentation {
             }
         }
         let same_surface = self.matches(current);
-        let Some(receipts) = self.receipts.as_mut() else {
+        let Some(backend) = self.backend.as_mut() else {
             return;
         };
-        for (serial, presented) in receipts.poll() {
+        for (serial, presented) in backend.poll(current.filter(|_| same_surface), &self.frames) {
             let Some(index) = self.frames.iter().position(|frame| frame.serial == serial) else {
                 continue;
             };

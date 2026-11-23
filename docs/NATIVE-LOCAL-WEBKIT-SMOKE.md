@@ -94,6 +94,20 @@ verifies that the surviving tab starts with fresh feedback. Closing the native
 window waits for the same body token to be retired. The desktop workflow
 uploads the desktop and daemon hashes with the journey result.
 
+To run the same journey on X11, build JWM with `backend-x11rb` and pass the
+three fixture executables. The test starts JWM with software GLX compositing
+on a private Xvfb and checks its extended frame timing. Repeat with
+`--without-frame-feedback` to verify that jsh stays usable while the shared
+body remains unplaced. `--peer-forge /absolute/path/to/forge` also verifies
+the same Eva identity moves to Forge and back, with both previous tokens
+retired before the next host presents it.
+
+```sh
+xvfb-run -a -s '-screen 0 1600x1200x24 -nolisten tcp' \
+  dbus-run-session -- /usr/bin/python3 -B scripts/test-x11-companion.py "$desktop" \
+  --daemon "$jcompaniond" --jwm "$jwm" --jsh "$jsh" --output "$evidence"
+```
+
 Build the native desktop from the Aether checkout using its published core pin.
 
 ```sh
