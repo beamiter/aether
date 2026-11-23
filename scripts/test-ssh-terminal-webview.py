@@ -24,6 +24,7 @@ return {
     writable: !document.querySelector('#input').disabled &&
               !document.querySelector('#send').disabled,
     draft: document.querySelector('#input').value,
+    focused: document.hasFocus() ? document.activeElement?.id : null,
     snapshot: document.querySelector('#history-output').value,
     pixel: Array.from(document.querySelector('main canvas')
                       .getContext('2d').getImageData(2, 2, 1, 1).data),
@@ -154,10 +155,15 @@ def exercise(app, destination, helper):
             except subprocess.CalledProcessError:
                 return ""
 
+        def focused_control(control):
+            wait(lambda: state()["focused"] == control, f"native WebView did not focus {control}")
+
         def submit(command):
             assert state()["writable"], "view lost input rights before command"
+            run("xdotool", "windowactivate", "--sync", window)
             driver.clear("#input")
-            driver.click("#input")
+            # Home focuses the command control without submitting any text.
+            driver.type("#input", "\ue011")
             owner = subprocess.Popen(["xclip", "-selection", "clipboard", "-i", "-quiet"],
                                      env=env, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL)
@@ -165,11 +171,18 @@ def exercise(app, destination, helper):
                 with owner.stdin as writer:
                     writer.write(command.encode())
                 wait(lambda: clipboard() == command, "X11 clipboard did not take ownership")
+                focused_control("input")
                 run("xdotool", "key", "--clearmodifiers", "ctrl+v")
                 wait(lambda: state()["draft"] == command, "native WebView did not paste clipboard")
+            except AssertionError:
+                current = state()
+                print("SSH paste state:", current["status"], "focused:", current["focused"],
+                      "writable:", current["writable"], "draft length:", len(current["draft"]), flush=True)
+                snap("paste-failed")
+                raise
             finally:
                 stop(owner)
-            driver.click("#send")
+            driver.type("#send", "\ue007")
             try:
                 wait(lambda: not state()["draft"], "native WebView did not send pasted command")
             except AssertionError:
@@ -186,6 +199,7 @@ def exercise(app, destination, helper):
 
         def assert_clipboard(lines):
             driver.click("#history-output")
+            focused_control("history-output")
             run("xdotool", "key", "--clearmodifiers", "ctrl+a", "ctrl+c")
             wait(lambda: [line.strip() for line in clipboard().splitlines()] == lines,
                  "native WebView did not copy the recovered grid to X11")
