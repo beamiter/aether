@@ -127,7 +127,7 @@ PTY blocks, generate enough new commands to evict both original blocks, then
 download the frozen Markdown and JSON. The fixture reads both files and
 checks the original revisions and diff after eviction.
 
-Add `--vim9` with Vim 9, `xdotool` and the Python AT-SPI bindings installed
+Add `--vim9` with Vim 9, `xdotool`, ripgrep and the Python AT-SPI bindings installed
 to select a real file in the GTK chooser. The fixture verifies the entered
 path and activates the dialog's Open button through its accessibility interface.
 It checks authenticated Vim9 Canvas painting,
@@ -141,6 +141,12 @@ exit code 7, and stops a running build. It also selects a text preview, rejects
 a different file with the same basename, then opens the matching snapshot in Vim.
 It samples distinct plugin popup and completion-menu colors from the native
 Canvas, dismisses the popup, and verifies the chosen completion in Vim's buffer.
+
+Use `--vim9` with `scripts/test-wayland-ime.py` to run the workbench on a private
+Wayland compositor with XWayland disabled. The fixture checks one native
+input-method commit, severs the Vim bridge, and checks the process identity
+and PTY before saving from the live terminal. The workflow preserves its
+`result.json` with the app binary digest.
 
 Add `--workspace` to include the shared CLI Workspace journey. It starts the
 embedded protocol-2 host with an isolated schema-6 SQLite directory, two

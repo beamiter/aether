@@ -25,6 +25,7 @@ on:
       - 'src-tauri/src/local_sessions/**'
       - 'src-tauri/src/local_block_search.rs'
       - 'src-tauri/src/local_workflows.rs'
+      - 'src-tauri/src/vim9_workbench.rs'
       - 'src-tauri/src/companion.rs'
       - 'src-tauri/src/companion/**'
       - 'src-tauri/src/main.rs'
@@ -113,6 +114,22 @@ jobs:
             "$CARGO_TARGET_DIR/debug/tauri-terminal-lab" --output "$fixture_dir/evidence" \
             --ime-client "$fixture_dir/clients/native-ime-client" \
             --jsh "$RUNNER_TEMP/aether-shell-fixture/bin/jsh"
+      - name: Vim9 composition and PTY continuity after bridge loss on Wayland
+        id: wayland-vim9
+        if: ${{ !cancelled() && steps.wayland-fixtures.outcome == 'success' }}
+        timeout-minutes: 2
+        run: |
+          fixture_dir="${AETHER_WAYLAND_FIXTURES:?}"
+          dbus-run-session -- /usr/bin/python3 -B scripts/test-wayland-ime.py \
+            "$CARGO_TARGET_DIR/debug/tauri-terminal-lab" --output "$fixture_dir/vim9-evidence" \
+            --ime-client "$fixture_dir/clients/native-ime-client" --vim9
+      - name: Upload the Wayland Vim9 journey result
+        if: ${{ !cancelled() && steps.wayland-vim9.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: aether-wayland-vim9-result
+          path: ${{ env.AETHER_WAYLAND_FIXTURES }}/vim9-evidence/result.json
+          if-no-files-found: error
       - name: Native Eva feedback, split ownership and window retirement on Wayland
         id: wayland-eva
         if: ${{ !cancelled() && steps.wayland-fixtures.outcome == 'success' }}

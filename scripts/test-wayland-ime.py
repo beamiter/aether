@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify native Wayland composition reaches the Aether-owned PTY exactly once."""
+"""Exercise native Aether input and PTY ownership on a private Wayland compositor."""
 import argparse
 from collections import Counter
 import contextlib
@@ -138,6 +138,129 @@ def exercise_companion(driver, fixtures, profile, close_window, handoff=None):
             "opaque_success_and_failure_recorded": True, "window_closes_after_withdrawal": True}
 
 
+
+def exercise_vim9(driver, fixtures, root, control, ime, keyboard, compositor):
+    import gi
+
+    gi.require_version("Atspi", "2.0")
+    from gi.repository import Atspi
+
+    Atspi.init()
+    wait_for = fixtures["wait_for"]
+    source = root / "Vim9 Wayland edit.txt"
+    original = "AETHER_VIM9_WAYLAND\n"
+    source.write_text(original, encoding="utf-8")
+
+    def focused_window(node):
+        if node["focused"]:
+            return node
+        for child in node["nodes"] + node["floating_nodes"]:
+            window = focused_window(child)
+            if window:
+                return window
+        return None
+
+    def chooser_pid():
+        window = focused_window(compositor("-t", "get_tree"))
+        if window and window["name"] == "Open local file in Vim9":
+            return window["pid"]
+        return None
+
+    def editor():
+        return driver.execute("""
+            const get = id => document.getElementById(id);
+            const gui = get('vim9-render');
+            return {source: get('vim9-screen').dataset.source, status: get('vim9-status').textContent,
+                guiPainted: !gui.hidden && gui.getContext('2d').getImageData(0,0,32,32).data
+                    .some((value,index) => index % 4 === 3 && value > 0),
+                error: get('vim9-error').textContent, save: !get('vim9-save').disabled,
+                release: !get('vim9-release').disabled, manual: get('vim9-fallback').checked};
+        """)
+
+    def vim_string(value):
+        return "'" + str(value).replace("'", "''") + "'"
+
+    def command(text):
+        driver.type("#vim9-input", text + "\ue007")
+
+    def identity(name):
+        receipt = root / name
+        command(f":call writefile([string(getpid())], {vim_string(receipt)})")
+        wait_for(lambda: receipt.is_file() and receipt.read_text().strip().isdigit(),
+                 "Vim did not write its process identity")
+        pid, birth = fixtures["shell_identity"](receipt)
+        tty = Path(f"/proc/{pid}/fd/0").readlink()
+        assert birth and tty.as_posix().startswith("/dev/pts/"), (pid, birth, tty)
+        return pid, birth, tty
+
+    driver.click("#vim9-workbench > summary")
+    driver.type("#vim9-open", "\ue007")
+    pid = wait_for(chooser_pid, "the native Wayland Vim9 chooser did not receive focus")
+    dialog = wait_for(lambda: fixtures["vim9_file_chooser"](Atspi, pid),
+                      "the Wayland file chooser did not expose its accessible window")
+    keyboard("-k", "slash")
+    fixtures["accept_vim9_file"](Atspi, dialog, source)
+    wait_for(lambda: not fixtures["vim9_file_chooser"](Atspi, pid),
+             "the Wayland file chooser did not accept the selected file")
+    try:
+        def native_editor():
+            view = editor()
+            return view["source"] == "vim9" and view["guiPainted"] and view["save"] and source.name in view["status"]
+
+        wait_for(native_editor, "the selected file was not painted by the native Vim9 buffer", timeout=20)
+        original_identity = identity("vim-identity-before")
+        keyboard("i")
+        wait_for(lambda: editor()["status"].split(" · ")[-1] == "i", "Vim did not enter insert mode")
+        (control / "start").touch()
+        wait_for((control / "preedit").exists, "the input method did not send Vim preedit")
+        wait_for(lambda: driver.execute("""
+            const preedit = document.querySelector('#vim9-preedit');
+            return document.activeElement.id === 'vim9-input' && !preedit.hidden && preedit.textContent === 'ni';
+        """), "the native Vim9 input did not display the Wayland preedit")
+        (control / "commit").touch()
+        wait_for((control / "committed").exists, "the input method did not send Vim commit")
+        wait_for(lambda: driver.execute("return document.querySelector('#vim9-preedit').hidden;"),
+                 "Vim preedit did not clear after commit")
+        assert ime.wait(timeout=5) == 0
+        trace = (root / "webdriver.log").read_text(errors="replace")
+        preedit = re.search(r'(zwp_text_input_v3[@#]\d+)\.preedit_string\("ni", 2, 2\)', trace)
+        assert preedit, "WebKit did not receive the native Wayland Vim9 preedit"
+        commits = re.findall(rf'{re.escape(preedit[1])}\.commit_string\("([^"]*)"\)', trace[preedit.end():])
+        assert commits == ["你"], commits
+        keyboard("-k", "Escape")
+        command(":w")
+        first_edit = "你" + original
+        wait_for(lambda: source.read_text(encoding="utf-8") == first_edit,
+                 "native Vim did not save exactly one composed character")
+
+        disconnect = root / "disconnect-vim.vim"
+        disconnect.write_text(
+            "let sid = getscriptinfo({'name': 'vim9-ide-bridge.vim'})[0].sid\n"
+            "call ch_close(getscriptinfo({'sid': sid})[0].variables.bridge)\n", encoding="utf-8")
+        command(f":execute 'source ' .. fnameescape({vim_string(disconnect)})")
+
+        def automatic_fallback():
+            view = editor()
+            return view["source"] == "terminal" and not view["guiPainted"] and not view["manual"] and not view["save"]
+
+        wait_for(automatic_fallback, "disconnecting the bridge did not expose the live Vim terminal")
+        assert identity("vim-identity-after") == original_identity, "the live fallback replaced the Vim PTY"
+        driver.type("#vim9-input", "GoAETHER_VIM9_AFTER_BRIDGE_LOSS\ue00c:wq\ue007")
+        wait_for(lambda: source.read_text(encoding="utf-8") == first_edit + "AETHER_VIM9_AFTER_BRIDGE_LOSS\n",
+                 "the original Vim PTY did not save the edit after its bridge closed")
+        wait_for(lambda: editor()["release"], "Vim exit did not drain its terminal")
+        assert fixtures["birth"](original_identity[0]) is None, "the exited Vim process was not reaped"
+        driver.type("#vim9-release", "\ue007")
+        wait_for(lambda: driver.execute("return document.querySelector('#vim9-viewport').hidden;"),
+                 "releasing the drained Vim terminal did not clear its workbench")
+    except Exception:
+        print("Vim9 editor state:", editor(), flush=True)
+        raise
+    return {"case_id": "PRODUCT.VIM.001.NATIVE.001", "result": "passed",
+            "native_chooser_and_buffer_painted": True, "exact_wayland_ime_commit": True,
+            "automatic_bridge_loss_fallback": True, "same_vim_pid_and_pty": True,
+            "saved_from_fallback_and_reaped": True}
+
 def run(args):
     fixtures = runpy.run_path(str(Path(__file__).with_name("test-two-local-webkit.py")))
     wait_for = fixtures["wait_for"]
@@ -214,6 +337,9 @@ def run(args):
                 return eva_socket.is_socket()
 
             wait_for(eva_ready, "the private Eva daemon did not listen")
+        if args.vim9:
+            env["AT_SPI_BUS_ADDRESS"] = os.environ["AT_SPI_BUS_ADDRESS"] = fixtures["private_accessibility_address"]()
+            env["NO_AT_BRIDGE"] = "0"
         control = root / "control"
         control.mkdir()
         ime = spawn([ime_client, control], "ime.log")
@@ -251,6 +377,23 @@ def run(args):
                           binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
                           daemon_sha256=hashlib.sha256(daemon.read_bytes()).hexdigest(),
                           presented_surface_commits=presentations)
+            (root / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+            print(json.dumps(result), flush=True)
+            return
+        if args.vim9:
+            compositor_ipc = wait_for(lambda: next(runtime.glob("sway-ipc.*.sock"), None),
+                                      "no private compositor IPC")
+            swaymsg = Path(args.sway).with_name("swaymsg")
+
+            def compositor(*arguments):
+                return json.loads(subprocess.check_output([swaymsg, "-s", compositor_ipc, *arguments],
+                                                          env=compositor_env, timeout=5))
+
+            def keyboard(*arguments):
+                subprocess.run([args.wtype, "-s", "70", *arguments], env=env, check=True, timeout=5)
+
+            result = exercise_vim9(driver, fixtures, root, control, ime, keyboard, compositor)
+            result.update(backend="wayland", binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest())
             (root / "result.json").write_text(json.dumps(result, indent=2) + "\n")
             print(json.dumps(result), flush=True)
             return
@@ -444,7 +587,9 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--ime-client", type=Path, required=True)
     parser.add_argument("--jsh", type=Path, help="installed jsh for Terminal Chat and workflows")
-    parser.add_argument("--companion-daemon", type=Path, help="run the private native Eva journey instead of the IME journey")
+    journey = parser.add_mutually_exclusive_group()
+    journey.add_argument("--companion-daemon", type=Path, help="run the private native Eva journey")
+    journey.add_argument("--vim9", action="store_true", help="run the real Vim9 Wayland composition and bridge-loss journey")
     parser.add_argument("--sway", default="sway")
     parser.add_argument("--wtype", default="wtype")
     parser.add_argument("--compositor-libraries", type=Path)

@@ -2744,6 +2744,42 @@ def exercise_vim9_overlays(driver, owned):
     print(json.dumps({"native_vim9_overlays": ["popup pixels and dismissal", "completion pixels", "selection in Vim's own buffer"]}), flush=True)
 
 
+def vim9_file_chooser(atspi, pid):
+    desktop = atspi.get_desktop(0)
+    for index in range(desktop.get_child_count()):
+        app = desktop.get_child_at_index(index)
+        if app is None or app.get_process_id() != pid:
+            continue
+        for child in range(app.get_child_count()):
+            window = app.get_child_at_index(child)
+            if (window is not None and window.get_name() == "Open local file in Vim9"
+                    and window.get_state_set().contains(atspi.StateType.SHOWING)):
+                return window
+    return None
+
+
+def accept_vim9_file(atspi, dialog, path):
+    def descendants(node):
+        for index in range(node.get_child_count()):
+            child = node.get_child_at_index(index)
+            if child is not None:
+                yield child
+                yield from descendants(child)
+
+    location = wait_for(lambda: next((node for node in descendants(dialog)
+                        if node.get_state_set().contains(atspi.StateType.FOCUSED)
+                        and node.get_state_set().contains(atspi.StateType.EDITABLE)), None),
+                        "GTK file chooser did not focus its location field")
+    assert location.get_editable_text_iface().set_text_contents(str(path))
+    wait_for(lambda: atspi.Text.get_text(location.get_text_iface(), 0, -1) == str(path),
+             "GTK location differs from the fixture")
+    accept = wait_for(lambda: next((node for node in descendants(dialog)
+                      if node.get_role() == atspi.Role.PUSH_BUTTON and node.get_name() == "Open"
+                      and node.get_state_set().contains(atspi.StateType.SENSITIVE)), None),
+                      "GTK file chooser did not enable Open")
+    assert accept.get_action_iface().do_action(0)
+
+
 def exercise_vim9_workbench(driver, owned):
     import gi
     gi.require_version("Atspi", "2.0")
@@ -2757,43 +2793,18 @@ def exercise_vim9_workbench(driver, owned):
     source.write_text("AETHER_VIM9_ORIGINAL\n")
     driver.click("#vim9-workbench > summary")
 
-    def children(node):
-        for index in range(node.get_child_count()):
-            child = node.get_child_at_index(index)
-            if child is not None:
-                yield child
-
-    def descendants(node):
-        for child in children(node):
-            yield child
-            yield from descendants(child)
-
     def choose(button="#vim9-open", path=source):
         driver.click(button)
         chooser = subprocess.check_output(
             ["xdotool", "search", "--sync", "--onlyvisible", "--name", "^Open local file in Vim9$"],
             timeout=10, text=True).splitlines()[-1]
         pid = int(subprocess.check_output(["xdotool", "getwindowpid", chooser], text=True, timeout=5))
-        def dialog():
-            return next((window for app in children(Atspi.get_desktop(0)) if app.get_process_id() == pid
-                         for window in children(app) if window.get_name() == "Open local file in Vim9"
-                         and window.get_state_set().contains(Atspi.StateType.SHOWING)), None)
-        native_dialog = wait_for(dialog, "GTK file chooser did not expose its accessible window")
+        dialog = wait_for(lambda: vim9_file_chooser(Atspi, pid),
+                          "GTK file chooser did not expose its accessible window")
         subprocess.run(["xdotool", "windowfocus", "--sync", chooser], check=True, timeout=5)
         subprocess.run(["xdotool", "key", "ctrl+l"], check=True, timeout=5)
-        location = wait_for(lambda: next((node for node in descendants(native_dialog)
-                            if node.get_state_set().contains(Atspi.StateType.FOCUSED)
-                            and node.get_state_set().contains(Atspi.StateType.EDITABLE)), None),
-                            "GTK file chooser did not focus its location field")
-        assert location.get_editable_text_iface().set_text_contents(str(path))
-        wait_for(lambda: Atspi.Text.get_text(location.get_text_iface(), 0, -1) == str(path),
-                 "GTK location differs from the fixture")
-        accept = wait_for(lambda: next((node for node in descendants(native_dialog)
-                          if node.get_role() == Atspi.Role.PUSH_BUTTON and node.get_name() == "Open"
-                          and node.get_state_set().contains(Atspi.StateType.SENSITIVE)), None),
-                          "GTK file chooser did not enable Open")
-        assert accept.get_action_iface().do_action(0)
-        wait_for(lambda: not dialog(), "GTK file chooser did not accept the selected file")
+        accept_vim9_file(Atspi, dialog, path)
+        wait_for(lambda: not vim9_file_chooser(Atspi, pid), "GTK file chooser did not accept the selected file")
 
     def editor():
         return driver.execute("""
@@ -2900,13 +2911,16 @@ def run(binary, jsh, workspace, api, native, notebook=False, output_review=False
         env.update({"HOME": scratch, "PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8",
                     "GDK_BACKEND": "x11", "LIBGL_ALWAYS_SOFTWARE": "1",
                     "TAURI_WEBVIEW_AUTOMATION": "true"})
-        if jsh or workspace or native:
+        if jsh or workspace or native or vim9:
             launch = owned / "bin"
             launch.mkdir()
             env["PATH"] = f"{launch}:/usr/bin:/bin"
         if jsh:
             (launch / "jsh").symlink_to(jsh)
+        if jsh or vim9:
             (launch / "vim").symlink_to(Path(shutil.which("vim")).resolve())
+        if vim9:
+            (launch / "rg").symlink_to(Path(shutil.which("rg")).resolve())
         transcripts = prepare_workspace(owned, env, launch) if workspace else None
         native_fixture = prepare_native_task(owned, env, launch) if native else None
         if api and not workspace:
@@ -2996,7 +3010,7 @@ if __name__ == "__main__":
         parser.error("--jsh requires an absolute installed jsh executable and Vim")
     if args.output_review and not args.jsh:
         parser.error("--output-review requires --jsh")
-    if args.vim9 and (not shutil.which("vim") or not shutil.which("xdotool")):
-        parser.error("--vim9 requires Vim 9 and xdotool for native file chooser input")
+    if args.vim9 and any(not shutil.which(tool) for tool in ("vim", "rg", "xdotool")):
+        parser.error("--vim9 requires Vim 9, ripgrep and xdotool")
     signal.signal(signal.SIGTERM, interrupted)
     run(args.binary, args.jsh, args.workspace, args.api_chat, args.native_task, args.notebook, args.output_review, args.vim9)
