@@ -314,9 +314,28 @@ def known_owned_shell(identity):
 def close_without_stale_presentation(driver, state, selected, peer, reap_label):
     pid, expected_birth = selected
     before = {"selected":known_owned_shell(selected), "peer":known_owned_shell(peer)}
+
+    # WebKitGTK can dispatch an element click at the old viewport position
+    # after it scrolls an offscreen element into view. Settle the scroll and
+    # confirm the point hits Close before sending a trusted pointer gesture.
+    driver.command("POST", "/execute/sync", {"script": """
+        document.querySelector('#close').scrollIntoView({block:'center', inline:'nearest'});
+    """, "args": []})
+    point = wait_for(lambda: driver.execute("""
+        const button = document.querySelector('#close');
+        const rect = button.getBoundingClientRect();
+        const x = Math.floor((rect.left + rect.right) / 2);
+        const y = Math.floor((rect.top + rect.bottom) / 2);
+        return !button.disabled && button.contains(document.elementFromPoint(x, y)) ? {x, y} : null;
+    """), "Close has no visible clickable point")
     optional_close_evidence(driver, CLOSE_EVIDENCE_START)
     try:
-        driver.click("#close")
+        driver.command("POST", "/actions", {"actions": [{"type": "pointer", "id": "close-pointer",
+                        "parameters": {"pointerType": "mouse"}, "actions": [
+                            {"type": "pointerMove", "origin": "viewport", **point},
+                            {"type": "pointerDown", "button": 0}, {"type": "pointerUp", "button": 0},
+                        ]}]})
+        driver.command("DELETE", "/actions")
         wait_for(lambda: state()["status"].startswith("Terminal closed"), "selected shell did not close")
         closed = state()
         assert closed["pixel"] == [0, 0, 0, 0], "a closed shell left pixels in the WebKit canvas"
