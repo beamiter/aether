@@ -2,10 +2,24 @@ import {acceptFull,acceptUpdate,clearPaint,paint} from './frames.js';
 import {installIme} from './ime.js';
 
 const uint=value=>Number.isInteger(value)&&value>0&&value<=0xffffffff;
-const conversationId=value=>typeof value==='string'&&value.startsWith('jterm:cli:v1:')&&value.length<=32768;
+const CLI_ID_PREFIX='jterm:cli:v1:';
+const conversationId=value=>typeof value==='string'&&value.startsWith(CLI_ID_PREFIX)&&value.length<=32768;
 const boundedText=(value,limit)=>typeof value==='string'&&value.length<=limit;
 const CATALOG_PAGE_MEMORY=4;
 const keys=/^(Arrow(Up|Down|Left|Right)|Home|End|Insert|Delete|PageUp|PageDown|F([1-9]|1[0-2])|Enter|Escape|Backspace|Tab)$/;
+
+// Shared Catalog CLI source IDs contain [provider, host, home, native ID].
+// Group local profiles for display only; never surface any namespace part.
+function localProfileKey(row){
+  if(!row.reopenable)return null;
+  try{
+    const source=JSON.parse(row.id.slice(CLI_ID_PREFIX.length));
+    if(!Array.isArray(source)||source.length!==4||source[0]!==row.provider||
+       !source.every(part=>typeof part==='string'&&part.length>0&&part.length<=8192))return null;
+    const home=source[2];
+    return home.startsWith('/')&&!home.includes('\0')?JSON.stringify([row.provider,home]):null;
+  }catch{return null;}
+}
 
 export function validateWorkspacePage(page){
   if(!uint(page?.generation)||!Array.isArray(page.rows)||page.rows.length>32||
@@ -43,7 +57,7 @@ export function installWorkspace(document,invoke){
   const canvas=byId('workspace-canvas'),input=byId('workspace-input'),output=byId('workspace-output');
   const encoder=new TextEncoder();
   let request=0,loading=false,attempt=null,opening=false,active=null,detaching=false;
-  let pages=[],pageIndex=-1,evictedOlderPages=false;
+  let pages=[],pageIndex=-1,evictedOlderPages=false,sourceLabels=new Map();
   const page=()=>pages[pageIndex];
 
   const ime=installIme(input,{getEpoch:()=>!input.disabled?active:null,commit:(text,view)=>{
@@ -73,16 +87,31 @@ export function installWorkspace(document,invoke){
 
   function showSelection(){
     const row=selected();
-    selection.textContent=row?[`${row.provider} · ${row.status}`,row.directory].filter(Boolean).join(' · '):'';
+    const label=row&&sourceLabels.get(row.id);
+    selection.textContent=row?[`${row.provider} · ${row.status}`,row.directory,
+      label?`${label} (on this page)`:null].filter(Boolean).join(' · '):'';
     attempt=null;
     controls();
   }
 
   function displayPage(){
     const current=page();
+    const title=row=>row.title||'Untitled conversation';
+    const counts=new Map(),profiles=new Map(),entries=new Map();
+    for(const row of current.receipt.rows)counts.set(title(row),(counts.get(title(row))??0)+1);
+    sourceLabels=new Map();
     const options=current.receipt.rows.map(row=>{
-      const option=document.createElement('option');
-      option.value=row.id;option.textContent=row.title||'Untitled conversation';
+      const option=document.createElement('option'),name=title(row);
+      option.value=row.id;option.textContent=name;
+      if(counts.get(name)>1){
+        const index=(entries.get(name)??0)+1;
+        entries.set(name,index);
+        const profile=localProfileKey(row);
+        if(profile!==null&&!profiles.has(profile))profiles.set(profile,profiles.size+1);
+        const label=profile===null?`Entry ${index}`:`Profile ${profiles.get(profile)} · Entry ${index}`;
+        sourceLabels.set(row.id,label);
+        option.textContent+=` · ${label}`;
+      }
       return option;
     });
     select.replaceChildren(...options);
@@ -115,7 +144,7 @@ export function installWorkspace(document,invoke){
       // A failed or lost request can already have advanced the shared
       // catalog generation or server cursor. Retire the local navigation
       // receipts instead of replaying the same cursor or allowing attachment.
-      pages=[];pageIndex=-1;evictedOlderPages=false;
+      pages=[];pageIndex=-1;evictedOlderPages=false;sourceLabels.clear();
       select.replaceChildren();showSelection();
       status.textContent=`${String(error?.message??error)} Refresh the catalog to continue.`;
     }finally{loading=false;controls();}

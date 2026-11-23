@@ -232,3 +232,34 @@ test('Workspace attach cannot steal focus after the user moves away before first
     }
   }
 });
+
+test('same-title Workspace choices distinguish source profiles without revealing their names',async()=>{
+  const third='jterm:cli:v1:'+JSON.stringify(['Codex','fixture-host','/home/one','local-other-id']);
+  const metadataOnly=profile('/home/private-metadata');
+  const malformed='jterm:cli:v1:not-a-source-tuple';
+  const unique=profile('/home/unique');
+  const rows=[row(first),row(second),row(third),{...row(metadataOnly),reopenable:false},{...row(malformed),reopenable:false},
+    {...row(unique),title:'Unique session'}];
+  const h=catalogHarness((command,args)=>{
+    if(command==='workspace_attach')throw new Error('fixture blocks the lease');
+    assert.equal(command,'workspace_catalog');assert.equal(args.cursor,null);
+    return {generation:1,rows,next_before:null};
+  });
+  await h.act('refresh');
+  const labels=h.button('conversation').children.map(option=>option.textContent);
+  assert.deepEqual(labels,[
+    'Conversation · Profile 1 · Entry 1',
+    'Conversation · Profile 2 · Entry 2',
+    'Conversation · Profile 1 · Entry 3',
+    'Conversation · Entry 4',
+    'Conversation · Entry 5',
+    'Unique session',
+  ]);
+  h.pick(second);
+  const detail=h.button('selection').textContent;
+  assert.match(detail,/Profile 2 · Entry 2 \(on this page\)$/);
+  assert.doesNotMatch([detail,...labels].join('\n'),/\/home\/|fixture-host|11111111|local-other-id/);
+  assert.equal(h.calls.length,1,'selecting a display label must not invoke or attach');
+  await h.act('attach');
+  assert.deepEqual(h.calls.at(-1),['workspace_attach',{request:2,conversation:second,catalogGeneration:1}]);
+});
