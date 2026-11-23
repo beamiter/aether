@@ -165,6 +165,24 @@ pub(crate) struct LocalSessions {
 }
 
 impl LocalSessions {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn companion_shell(&self) -> Option<crate::companion::ShellView> {
+        let id = self.registry.reader.as_ref()?;
+        let pty = self.registry.sessions.get(id)?;
+        if !pty.bridge.has_acknowledged_frame() {
+            return None;
+        }
+        let activity = pty.bridge.command_activity(pty.target.epoch).ok()?;
+        if activity.alternate_screen {
+            return None;
+        }
+        Some(crate::companion::ShellView {
+            session: id.clone(),
+            completed: activity.newest_completed.map(|sequence| sequence.get()),
+            exit: activity.newest_exit,
+        })
+    }
+
     pub(crate) fn open(
         &mut self,
         integrated: bool,

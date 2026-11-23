@@ -25,6 +25,8 @@ on:
       - 'src-tauri/src/local_sessions/**'
       - 'src-tauri/src/local_block_search.rs'
       - 'src-tauri/src/local_workflows.rs'
+      - 'src-tauri/src/companion.rs'
+      - 'src-tauri/src/companion/**'
       - 'src-tauri/src/main.rs'
       - 'web/**'
 
@@ -82,9 +84,10 @@ jobs:
               /usr/bin/python3 -B scripts/test-two-local-webkit.py "$app" \
                 --jsh "$RUNNER_TEMP/aether-shell-fixture/bin/jsh" \
                 --workspace --api-chat --native-task --notebook --vim9
-      - name: Wayland composition, Terminal Chat and Workflows
+      - name: Prepare Wayland compositor clients
+        id: wayland-fixtures
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        timeout-minutes: 4
+        timeout-minutes: 2
         run: |
           host=$(rustc -vV | sed -n 's/^host: //p')
           core=$(cargo metadata --locked --manifest-path src-tauri/Cargo.toml --format-version 1 --filter-platform "$host" |
@@ -100,10 +103,29 @@ jobs:
             wlroots-0.17.1/protocol/wlr-virtual-pointer-unstable-v1.xml
           bash "$core/crates/jterm_gtk_view/tests/build-wayland-fixtures.sh" \
             "$fixture_dir/wlroots-0.17.1/protocol" "$fixture_dir/clients"
+          printf 'AETHER_WAYLAND_FIXTURES=%s\n' "$fixture_dir" >> "$GITHUB_ENV"
+      - name: Wayland composition, Terminal Chat and Workflows
+        if: ${{ !cancelled() && steps.wayland-fixtures.outcome == 'success' }}
+        timeout-minutes: 4
+        run: |
+          fixture_dir="${AETHER_WAYLAND_FIXTURES:?}"
           dbus-run-session -- /usr/bin/python3 -B scripts/test-wayland-ime.py \
             "$CARGO_TARGET_DIR/debug/tauri-terminal-lab" --output "$fixture_dir/evidence" \
             --ime-client "$fixture_dir/clients/native-ime-client" \
             --jsh "$RUNNER_TEMP/aether-shell-fixture/bin/jsh"
+      - name: Native Eva feedback, split ownership and window retirement on Wayland
+        if: ${{ !cancelled() && steps.wayland-fixtures.outcome == 'success' }}
+        timeout-minutes: 7
+        run: |
+          cargo install --locked --debug --git https://github.com/beamiter/jcompanion.git \
+            --rev 2099481195383737633f0201bf4ce298fc4f3232 \
+            --root "$RUNNER_TEMP/aether-eva-fixture" jcompaniond
+          fixture_dir="${AETHER_WAYLAND_FIXTURES:?}"
+          dbus-run-session -- /usr/bin/python3 -B scripts/test-wayland-ime.py \
+            "$CARGO_TARGET_DIR/debug/tauri-terminal-lab" --output "$fixture_dir/eva-evidence" \
+            --ime-client "$fixture_dir/clients/native-ime-client" \
+            --jsh "$RUNNER_TEMP/aether-shell-fixture/bin/jsh" \
+            --companion-daemon "$RUNNER_TEMP/aether-eva-fixture/bin/jcompaniond"
       - name: SSH files and read-only Workspace on X11
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 4

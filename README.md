@@ -92,6 +92,19 @@ description, or tag, choose an entry, and fill in its arguments. **Insert at
 cursor** puts the rendered line into the original jsh editor. Review the line
 there and press Enter to run it.
 
+### Eva Companion
+
+Launch Aether with `EVA_COMPANION_MODE=shared` in the graphical session that
+runs `jcompaniond`. The **Eva** control shows or hides its native slot in this
+window. Eva follows the selected local shell. When jsh reports a finished
+command, the slot shows its success or failure and the daemon receives the
+outcome with an opaque command ID. The feedback clears when the active tab
+changes or enters an alternate-screen program.
+
+Eva needs native presentation timestamps from the display. Aether waits for
+that evidence before requesting a shared body. Closing a window that owns one
+waits for the cleared frame and the daemon's acceptance.
+
 ## SSH files and read-only Workspace
 
 In **SSH Files**, enter a known OpenSSH host and an absolute Linux project

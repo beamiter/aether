@@ -16,6 +16,7 @@ pub struct CommandActivity {
     pub prompt: Option<Counter>,
     pub running: bool,
     pub newest_completed: Option<Counter>,
+    pub newest_exit: Option<i32>,
 }
 
 #[derive(serde::Serialize)]
@@ -130,14 +131,15 @@ impl LiveBridge {
             .as_ref()
             .expect("validated local PTY")
             .terminal();
+        let latest = terminal
+            .completed_command_blocks()
+            .and_then(|blocks| blocks.back());
         Ok(CommandActivity {
             alternate_screen: terminal.alternate_screen_active(),
             prompt: terminal.command_prompt_generation().and_then(Counter::new),
             running: terminal.command_running(),
-            newest_completed: terminal
-                .completed_command_blocks()
-                .and_then(|blocks| blocks.back())
-                .and_then(|block| Counter::new(block.sequence)),
+            newest_completed: latest.and_then(|block| Counter::new(block.sequence)),
+            newest_exit: latest.and_then(|block| block.outcome.reported_exit_code()),
         })
     }
 

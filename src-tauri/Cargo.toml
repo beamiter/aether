@@ -15,6 +15,7 @@ tauri-terminal-frame-bridge = { path = "../bridge" }
 uuid = { version = "~1.26.0", features = ["v4"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+companion-host = { version = "0.1.0", git = "https://github.com/beamiter/jcompanion.git", rev = "2099481195383737633f0201bf4ce298fc4f3232" }
 gdkx11 = "0.18"
 gtk = "0.18"
 

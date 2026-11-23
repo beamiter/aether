@@ -203,6 +203,10 @@ impl LiveBridge {
         Ok(epoch)
     }
 
+    pub fn has_acknowledged_frame(&self) -> bool {
+        self.accepted.is_some()
+    }
+
     pub fn validate_input(&self, owner: &Attachment) -> Result<u32, String> {
         let epoch = self.validate_attachment(owner)?;
         if !self.input_attached {

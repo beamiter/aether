@@ -364,10 +364,31 @@ dependencies = [
 [[package]]
 name = "companion-client"
 version = "0.1.0"
+source = "git+https://github.com/beamiter/jcompanion.git?rev=2099481195383737633f0201bf4ce298fc4f3232#2099481195383737633f0201bf4ce298fc4f3232"
+dependencies = [
+ "companion-protocol 0.1.0 (git+https://github.com/beamiter/jcompanion.git?rev=2099481195383737633f0201bf4ce298fc4f3232)",
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "companion-client"
+version = "0.1.0"
 source = "git+https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b#9aa569540091524d637a7115b64c587b9177a55b"
 dependencies = [
- "companion-protocol",
+ "companion-protocol 0.1.0 (git+https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b)",
  "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "companion-core"
+version = "0.1.0"
+source = "git+https://github.com/beamiter/jcompanion.git?rev=2099481195383737633f0201bf4ce298fc4f3232#2099481195383737633f0201bf4ce298fc4f3232"
+dependencies = [
+ "companion-protocol 0.1.0 (git+https://github.com/beamiter/jcompanion.git?rev=2099481195383737633f0201bf4ce298fc4f3232)",
  "serde",
  "serde_json",
 ]
@@ -377,7 +398,29 @@ name = "companion-core"
 version = "0.1.0"
 source = "git+https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b#9aa569540091524d637a7115b64c587b9177a55b"
 dependencies = [
- "companion-protocol",
+ "companion-protocol 0.1.0 (git+https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b)",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "companion-host"
+version = "0.1.0"
+source = "git+https://github.com/beamiter/jcompanion.git?rev=2099481195383737633f0201bf4ce298fc4f3232#2099481195383737633f0201bf4ce298fc4f3232"
+dependencies = [
+ "companion-client 0.1.0 (git+https://github.com/beamiter/jcompanion.git?rev=2099481195383737633f0201bf4ce298fc4f3232)",
+ "companion-core 0.1.0 (git+https://github.com/beamiter/jcompanion.git?rev=2099481195383737633f0201bf4ce298fc4f3232)",
+ "companion-protocol 0.1.0 (git+https://github.com/beamiter/jcompanion.git?rev=2099481195383737633f0201bf4ce298fc4f3232)",
+ "eva-character-atlas 0.1.0 (git+https://github.com/beamiter/jcompanion.git?rev=2099481195383737633f0201bf4ce298fc4f3232)",
+ "libc",
+ "uuid",
+]
+
+[[package]]
+name = "companion-protocol"
+version = "0.1.0"
+source = "git+https://github.com/beamiter/jcompanion.git?rev=2099481195383737633f0201bf4ce298fc4f3232#2099481195383737633f0201bf4ce298fc4f3232"
+dependencies = [
  "serde",
  "serde_json",
 ]
@@ -796,6 +839,11 @@ dependencies = [
  "libc",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "eva-character-atlas"
+version = "0.1.0"
+source = "git+https://github.com/beamiter/jcompanion.git?rev=2099481195383737633f0201bf4ce298fc4f3232#2099481195383737633f0201bf4ce298fc4f3232"
 
 [[package]]
 name = "eva-character-atlas"
@@ -1804,12 +1852,12 @@ name = "jterm_core"
 version = "0.2.0"
 source = "git+https://github.com/beamiter/jterm_core?rev=82795a073753f25243c41f1000f708ff2061fca8#82795a073753f25243c41f1000f708ff2061fca8"
 dependencies = [
- "companion-client",
- "companion-core",
- "companion-protocol",
+ "companion-client 0.1.0 (git+https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b)",
+ "companion-core 0.1.0 (git+https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b)",
+ "companion-protocol 0.1.0 (git+https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b)",
  "crossbeam-channel",
  "dirs",
- "eva-character-atlas",
+ "eva-character-atlas 0.1.0 (git+https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b)",
  "fuzzy-matcher",
  "jagent",
  "jterm_engine",
@@ -3714,6 +3762,7 @@ dependencies = [
 name = "tauri-terminal-lab"
 version = "0.0.1"
 dependencies = [
+ "companion-host",
  "gdkx11",
  "gtk",
  "jterm_core",

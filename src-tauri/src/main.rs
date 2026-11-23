@@ -10,6 +10,8 @@ use tauri_terminal_frame_bridge::{
 
 use jterm_remote_client as jwm_remote_session;
 mod agent_workspace;
+#[cfg(target_os = "linux")]
+mod companion;
 mod local_block_search;
 mod local_sessions;
 mod local_workflows;
@@ -495,7 +497,13 @@ fn application<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<
                 eprintln!("Cannot detach the previous local terminal view: {error}");
             }
         })
-        .on_window_event(remote_desktop::window_event)
+        .on_window_event(|window, event| {
+            #[cfg(target_os = "linux")]
+            if companion::window_event(window, event) {
+                return;
+            }
+            remote_desktop::window_event(window, event);
+        })
         .invoke_handler(tauri::generate_handler![
             demo_frame,
             acknowledge,
@@ -558,7 +566,17 @@ fn main() {
     if let Some(code) = jterm_core::agent_workspace::run_embedded_if_requested() {
         std::process::exit(code);
     }
-    application(tauri::Builder::default())
+    let builder = application(tauri::Builder::default());
+    #[cfg(target_os = "linux")]
+    let builder = builder.setup(|app| {
+        if companion_host::shared_mode_requested() {
+            if let Some(window) = app.get_webview_window("main") {
+                companion::install(&window)?;
+            }
+        }
+        Ok(())
+    });
+    builder
         .run(tauri::generate_context!())
         .expect("Tauri runtime");
 }

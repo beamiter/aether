@@ -16,6 +16,105 @@ import tempfile
 import time
 
 
+def exercise_companion(driver, fixtures, profile, compositor_ipc, compositor_tools):
+    import gi
+
+    gi.require_version("Atspi", "2.0")
+    from gi.repository import Atspi
+
+    Atspi.init()
+    wait_for = fixtures["wait_for"]
+
+    def named(role, name):
+        pending = [Atspi.get_desktop(0)]
+        while pending:
+            node = pending.pop()
+            if node is None:
+                continue
+            actual = node.get_role()
+            if actual == role and node.get_name() == name and node.get_state_set().contains(Atspi.StateType.SHOWING):
+                return node
+            if actual not in (Atspi.Role.DOCUMENT_WEB, Atspi.Role.DOCUMENT_FRAME):
+                pending.extend(node.get_child_at_index(i) for i in range(node.get_child_count()))
+        return None
+
+    def label(text):
+        return named(Atspi.Role.LABEL, text)
+
+    def residence():
+        return json.loads((profile / "residence.json").read_text())
+
+    def active_body():
+        current = residence()
+        if current["phase"] == "active":
+            return current["possible_body"]
+        return None
+
+    def retired(token):
+        current = residence()
+        return current["possible_body"] is None and token in current["retired_tokens"]
+
+    def state():
+        return driver.execute(fixtures["READ"])
+
+    def current_writable():
+        value = state()
+        return value["current_tab"] if value["writable"] else None
+
+    def received_status(outcome):
+        ledger = json.loads((profile / "dialogue-index.json").read_text())
+        return [record for record in ledger["results"] if record["status"] == outcome]
+
+    toggle = wait_for(lambda: named(Atspi.Role.TOGGLE_BUTTON, "Eva"), "Eva's GTK control did not appear")
+    process = toggle.get_process_id()
+    assert not active_body(), "a window without a local shell acquired Eva"
+    driver.click("#open-integrated")
+    first = wait_for(current_writable, "the integrated shell did not activate")
+    token = wait_for(active_body, "the coordinator did not accept a native Aether body frame")
+    assert token["host_id"].startswith("aether-")
+    wait_for(lambda: label("Eva ready"), "the native Eva slot did not report its presented body")
+
+    marker = "AETHER_EVA_PRIVATE_COMMAND_MARKER"
+    driver.type("#ime-input", f"printf '%s\\n' {marker}\ue007")
+    wait_for(lambda: label("Command succeeded"), "Eva missed the first PTY's successful command")
+    results = wait_for(lambda: received_status("succeeded"), "the shared coordinator missed the successful result")
+    assert len(results) == 1 and results[0]["host_id"] == token["host_id"]
+
+    driver.click("#new-jsh-tab")
+    second = wait_for(lambda: (tab if (tab := current_writable()) and tab != first else None), "the peer shell did not activate")
+    driver.click("#split-local")
+    wait_for(lambda: state()["split"] and label("Eva ready"), "the split peer inherited the first shell's feedback")
+    assert not label("Command succeeded")
+    driver.type("#ime-input", "false\ue007")
+    wait_for(lambda: label("Command failed"), "Eva missed the split peer's failed command")
+    failures = wait_for(lambda: received_status("failed"), "the shared coordinator missed the failed result")
+    assert len(failures) == 1 and failures[0]["task_id"] != results[0]["task_id"]
+    assert failures[0]["host_id"] == token["host_id"]
+
+    fixtures["click_tab"](driver, first)
+    wait_for(lambda: label("Eva ready"), "returning to the first tab replayed previous feedback")
+    driver.type("#close", "\ue007")
+    wait_for(lambda: state()["status"].startswith("Terminal closed"), "the original shell did not close")
+    wait_for(lambda: label("Eva follows the focused local shell."), "the closed tab kept its companion feedback")
+    fixtures["click_tab"](driver, second)
+    wait_for(lambda: label("Eva ready"), "the surviving tab inherited stale feedback")
+    live_token = wait_for(active_body, "the surviving tab did not present its Eva body")
+    assert live_token["host_id"] == token["host_id"]
+    assert not label("Command failed")
+    assert marker not in (profile / "dialogue-index.json").read_text()
+
+    swaymsg = shutil.which("swaymsg")
+    assert swaymsg
+    subprocess.run([swaymsg, "-s", str(compositor_ipc), f"[pid={process}] kill"],
+                   env=compositor_tools, check=True, capture_output=True, timeout=5)
+    wait_for(lambda: retired(live_token), "closing Aether did not retire its exact presented body")
+    wait_for(lambda: not named(Atspi.Role.TOGGLE_BUTTON, "Eva"), "Aether stayed open after withdrawal was accepted")
+    driver.session = None
+    return {"case_id": "PRODUCT.COMPANION.001.NATIVE.001", "backend": "wayland", "result": "passed",
+            "native_body_presented_and_retired": True, "split_feedback_isolated": True,
+            "opaque_success_and_failure_recorded": True, "window_closes_after_withdrawal": True}
+
+
 def run(args):
     fixtures = runpy.run_path(str(Path(__file__).with_name("test-two-local-webkit.py")))
     wait_for = fixtures["wait_for"]
@@ -69,6 +168,22 @@ def run(args):
 
         env["WAYLAND_DISPLAY"] = wait_for(wayland_display, "Sway headless output did not start")
         spawn([args.wtype, "-s", "600000", "-k", "F24"], "seat.log")
+        if args.companion_daemon:
+            profile = root / "eva-profile"
+            profile.mkdir(mode=0o700)
+            eva_socket = runtime / "eva.sock"
+            env.update(EVA_COMPANION_MODE="shared", EVA_COMPANION_SOCKET=str(eva_socket),
+                       XDG_SESSION_ID="aether-native-qa", NO_AT_BRIDGE="0")
+            env["AT_SPI_BUS_ADDRESS"] = os.environ["AT_SPI_BUS_ADDRESS"] = fixtures["private_accessibility_address"]()
+            daemon = args.companion_daemon.resolve(strict=True)
+            process = spawn([daemon, profile], "eva.log")
+
+            def eva_ready():
+                if process.poll() is not None:
+                    raise RuntimeError((root / "eva.log").read_text(errors="replace"))
+                return eva_socket.is_socket()
+
+            wait_for(eva_ready, "the private Eva daemon did not listen")
         control = root / "control"
         control.mkdir()
         ime = spawn([ime_client, control], "ime.log")
@@ -92,6 +207,14 @@ def run(args):
         driver.open(binary)
         cleanup.callback(driver.close)
         wait_for(lambda: fixtures["opened_page"](driver), "embedded Aether page did not load")
+        if args.companion_daemon:
+            compositor_ipc = wait_for(lambda: next(runtime.glob("sway-ipc.*.sock"), None), "no private compositor IPC")
+            result = exercise_companion(driver, fixtures, profile, compositor_ipc, compositor_env)
+            result.update(binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
+                          daemon_sha256=hashlib.sha256(daemon.read_bytes()).hexdigest())
+            (root / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+            print(json.dumps(result), flush=True)
+            return
         driver.click("#open")
         wait_for(lambda: driver.execute(fixtures["READ"])["transport"] == "channel",
                  "the normal local output Channel did not attach")
@@ -282,7 +405,11 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--ime-client", type=Path, required=True)
     parser.add_argument("--jsh", type=Path, help="installed jsh for Terminal Chat and workflows")
+    parser.add_argument("--companion-daemon", type=Path, help="run the private native Eva journey instead of the IME journey")
     parser.add_argument("--sway", default="sway")
     parser.add_argument("--wtype", default="wtype")
     parser.add_argument("--compositor-libraries", type=Path)
-    run(parser.parse_args())
+    args = parser.parse_args()
+    if args.companion_daemon and not args.jsh:
+        parser.error("--companion-daemon requires the real --jsh fixture")
+    run(args)
