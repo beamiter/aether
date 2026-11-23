@@ -218,16 +218,127 @@ def click_tab(driver, number):
                          f"writable={state['writable']}, status={state['status']!r}")
 
 
-def exercise(driver, owned):
-    def state():
-        return driver.execute(READ)
+CLOSE_EVIDENCE_START = """
+window.__aetherCloseEvidence?.();
+delete window.__aetherCloseEvidence;
+const close = document.querySelector('#close');
+const detach = document.querySelector('#detach');
+const status = document.querySelector('#status');
+const events = [], transitions = [], phases = [];
+let clipped = false;
+function phase() {
+  const text = status.textContent;
+  if (text.startsWith('Terminal closed; direct child reaped.')) return 'closed_reaped';
+  if (text.startsWith('Terminal closed; direct-child cleanup')) return 'closed_cleanup_pending';
+  if (text.startsWith('Close error:')) return 'close_error';
+  if (text.startsWith('Local shell ')) return 'local_shell';
+  if (text.startsWith('Reconnected to the existing shell')) return 'reattached';
+  if (text.startsWith('Terminal output') || text.startsWith('Local output stream paused:')) return 'output_status';
+  return text ? 'other' : 'empty';
+}
+function snapshot() {
+  const focus = document.activeElement;
+  return {phase:phase(), close_disabled:close.disabled, detach_disabled:detach.disabled,
+    focus:focus===close?'close':focus===detach?'detach':focus===document.body?'body':'other',
+    selected:!!document.querySelector('#local-tab-list [aria-current]')};
+}
+const initial = snapshot();
+function append(list,value) {
+  if (list.length < 16) list.push(value);
+  else clipped = true;
+}
+function note(event) {
+  const route = event.composedPath();
+  append(events, {type:event.type, trusted:event.isTrusted, on_close:route.includes(close),
+    on_detach:route.includes(detach), close_disabled:close.disabled, detach_disabled:detach.disabled});
+}
+const kinds = ['pointerdown', 'pointerup', 'click'];
+for (const kind of kinds) document.addEventListener(kind, note, true);
+function observe(records) {
+  // oldValue records every transition, even if a refusal re-enables both
+  // controls before the observer callback runs. Keep only bounded evidence.
+  const states = {close:close.disabled, detach:detach.disabled};
+  const start = Math.max(0, records.length - 32), changes = [];
+  if (start) clipped = true;
+  for (let i = records.length - 1; i >= start; i--) {
+    const record = records[i];
+    if (record.type !== 'attributes') continue;
+    const control = record.target === close ? 'close' : 'detach';
+    const before = record.oldValue !== null;
+    if (before !== states[control]) changes.push({control, before_disabled:before, after_disabled:states[control]});
+    states[control] = before;
+  }
+  for (const value of changes.reverse()) append(transitions,value);
+  const current = phase();
+  if (current !== (phases.at(-1) ?? initial.phase)) append(phases,current);
+}
+const observer = new MutationObserver(observe);
+observer.observe(status, {childList:true, characterData:true, subtree:true});
+for (const button of [close,detach])
+  observer.observe(button, {attributes:true, attributeFilter:['disabled'], attributeOldValue:true});
+window.__aetherCloseEvidence = () => {
+  observe(observer.takeRecords());
+  for (const kind of kinds) document.removeEventListener(kind, note, true);
+  observer.disconnect();
+  return {initial, final:snapshot(), events, transitions, phases, clipped};
+};
+"""
 
-    def close_without_stale_presentation():
+
+CLOSE_EVIDENCE_STOP = """
+const finish = window.__aetherCloseEvidence;
+delete window.__aetherCloseEvidence;
+if (finish) finish();
+"""
+CLOSE_EVIDENCE_READ = CLOSE_EVIDENCE_STOP.replace("if (finish) finish();", "return finish?.() ?? null;")
+
+
+def optional_close_evidence(driver, script):
+    # Only the observer is optional. Keep the native click and existing
+    # acceptance waits on their original WebDriver path and time budget.
+    with contextlib.suppress(Exception):
+        if driver.session is not None:
+            return driver.request("POST", f"/session/{driver.session}/execute/sync",
+                                  {"script":script, "args":[]}, timeout=1)
+    return None
+
+
+def known_owned_shell(identity):
+    child, original_birth = identity
+    if original_birth is not None:
+        with contextlib.suppress(Exception):
+            return birth(child) == original_birth
+    return None
+
+
+def close_without_stale_presentation(driver, state, selected, peer, reap_label):
+    pid, expected_birth = selected
+    before = {"selected":known_owned_shell(selected), "peer":known_owned_shell(peer)}
+    optional_close_evidence(driver, CLOSE_EVIDENCE_START)
+    try:
         driver.click("#close")
         wait_for(lambda: state()["status"].startswith("Terminal closed"), "selected shell did not close")
         closed = state()
         assert closed["pixel"] == [0, 0, 0, 0], "a closed shell left pixels in the WebKit canvas"
         assert closed["cursor"] == closed["health"] == closed["dump"] == "", "closed shell status or text remains visible"
+        wait_for(lambda: birth(pid) != expected_birth, reap_label)
+    except Exception:
+        after = {"selected":known_owned_shell(selected), "peer":known_owned_shell(peer)}
+        gesture = optional_close_evidence(driver, CLOSE_EVIDENCE_READ)
+        with contextlib.suppress(Exception):
+            print("Native Close failure:", json.dumps({
+                "known_owned_before":before, "known_owned_after":after, "gesture":gesture,
+            }), flush=True)
+        raise
+    finally:
+        # A timed-out arm or capture may nevertheless have run in the page.
+        # Idempotent cleanup retrieves no diagnostic data on success.
+        optional_close_evidence(driver, CLOSE_EVIDENCE_STOP)
+
+
+def exercise(driver, owned):
+    def state():
+        return driver.execute(READ)
 
     def marker_on_screen(marker, absent, color):
         def sample():
@@ -422,13 +533,11 @@ def exercise(driver, owned):
     assert birth(b_pid) == b_birth
     assert not current["writable"] and not current["resize"] and current["draft"] == draft_b
     assert not forbidden_a.exists() and not forbidden_b.exists(), "a parked draft executed"
-    close_without_stale_presentation()
-    wait_for(lambda: birth(b_pid) != b_birth, "second owned shell not reaped")
+    close_without_stale_presentation(driver, state, (b_pid, b_birth), (a_pid, a_birth), "second owned shell not reaped")
     select(list_shells(1)["options"][0])
     marker_on_screen(a, b, red)
     assert state()["draft"] == draft_a and birth(a_pid) == a_birth
-    close_without_stale_presentation()
-    wait_for(lambda: birth(a_pid) != a_birth, "first owned shell not reaped")
+    close_without_stale_presentation(driver, state, (a_pid, a_birth), (b_pid, b_birth), "first owned shell not reaped")
     list_shells(0)
     assert not forbidden_a.exists() and not forbidden_b.exists(), "a parked draft executed"
 
@@ -490,14 +599,12 @@ def exercise(driver, owned):
     assert state()["draft"] == draft_b
     assert write_from_current_tab(driver, owned / "tab-b-return.pid") == b_identity
     wait_for(lambda: state()["writable"] and state()["draft"] == "", "second tab return input still pending")
-    close_without_stale_presentation()
-    wait_for(lambda: birth(b_identity[0]) != b_identity[1], "closed writable tab was not reaped")
+    close_without_stale_presentation(driver, state, b_identity, a_identity, "closed writable tab was not reaped")
     click_tab(driver, a_tab)
     assert state()["tabs"] == [a_tab]
     assert write_from_current_tab(driver, owned / "tab-a-after-close.pid") == a_identity
     wait_for(lambda: state()["writable"] and state()["draft"] == "", "surviving tab input still pending")
-    close_without_stale_presentation()
-    wait_for(lambda: birth(a_identity[0]) != a_identity[1], "surviving owned tab was not reaped")
+    close_without_stale_presentation(driver, state, a_identity, b_identity, "surviving owned tab was not reaped")
     assert not forbidden_a.exists() and not forbidden_b.exists(), "a writable tab replayed another draft"
     print(json.dumps({"native_webkitgtk": True, "owned_local_ptys": 2,
                       "local_frames_delivered_by_tauri_channel": True,
