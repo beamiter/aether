@@ -110,21 +110,22 @@ jobs:
         run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1440x1100x24 -nolisten tcp" \
             dbus-run-session -- python3 -B scripts/test-remote-project-webkit.py \
-              "$CARGO_TARGET_DIR/debug/tauri-terminal-lab" "$CARGO_TARGET_DIR/debug/aether-terminal-host"
+              "$CARGO_TARGET_DIR/debug/tauri-terminal-lab" "$CARGO_TARGET_DIR/debug/aether-terminal-host" \
+              --runner-ssh-config
       - name: SSH files and read-only Workspace on native Wayland
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 4
         run: |
           dbus-run-session -- python3 -B scripts/test-remote-project-webkit.py \
             "$CARGO_TARGET_DIR/debug/tauri-terminal-lab" "$CARGO_TARGET_DIR/debug/aether-terminal-host" \
-            --backend wayland
+            --backend wayland --runner-ssh-config
       - name: Recover an interactive SSH terminal after relay loss
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 4
         run: |
           /usr/bin/python3 -B scripts/test-remote-project-webkit.py \
             "$CARGO_TARGET_DIR/debug/tauri-terminal-lab" "$CARGO_TARGET_DIR/debug/aether-terminal-host" \
-            --interactive-terminal
+            --interactive-terminal --runner-ssh-config
       - name: Check out the previous Workspace host
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         id: previous

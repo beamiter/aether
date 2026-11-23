@@ -197,6 +197,10 @@ same-name local and remote files, changed file versions, directory navigation,
 binary transfer and no-overwrite upload. It checks the expected host ID, both
 kinds of pagination, stale search selections, and the document's exact revision.
 Successful output includes the case ID, display backend and both binary hashes.
+The hosted workflow uses `--runner-ssh-config` on its disposable account when
+the fixture cannot depend on a user namespace. The option reserves an empty
+`~/.ssh/config` slot for the ephemeral host and removes the link on exit.
+It refuses to replace an existing configuration. Local runs use bubblewrap.
 The desktop workflow runs both displays against the same build. Its X11 local
 journey also exercises Notebook and the Vim9 workbench.
 

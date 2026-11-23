@@ -2,11 +2,11 @@
 """Exercise SSH Files and read-only Workspace over a private loopback OpenSSH server."""
 import argparse
 import contextlib
-import getpass
 import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import runpy
 import shutil
 import socket
@@ -22,6 +22,24 @@ def port():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
+
+
+@contextlib.contextmanager
+def runner_ssh_config(home, fixture):
+    directory = home / ".ssh"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    if directory.is_symlink():
+        raise RuntimeError("The isolated runner needs its own .ssh directory.")
+    config = directory / "config"
+    try:
+        config.symlink_to(fixture)
+    except FileExistsError as error:
+        raise RuntimeError("The isolated runner already has an SSH client configuration.") from error
+    try:
+        yield
+    finally:
+        if config.is_symlink() and config.readlink() == fixture:
+            config.unlink()
 
 
 def exercise_files(driver, owned):
@@ -174,12 +192,14 @@ def exercise_workspace(driver, binary, host_id, store):
           "paged evidence search", "replaced revision refused", "exact document", "disconnect"]}), flush=True)
 
 
-def exercise(app, helper, backend, compositor_libraries, terminal_only=False):
+def exercise(app, helper, backend, compositor_libraries, terminal_only=False, use_runner_config=False):
     uid = os.getuid()
+    account = pwd.getpwuid(uid)
+    home = Path(account.pw_dir)
     runtime = Path(f"/run/user/{uid}")
-    if not runtime.is_dir() or runtime.stat().st_uid != uid:
+    if use_runner_config or not runtime.is_dir() or runtime.stat().st_uid != uid:
         # OpenSSH StrictModes checks the ancestors of AuthorizedKeysFile.
-        runtime = Path.home()
+        runtime = home
     with tempfile.TemporaryDirectory(prefix="aether-remote-", dir=runtime) as temporary, contextlib.ExitStack() as stack:
         owned = Path(temporary)
         def start(argv, log, env=None):
@@ -198,7 +218,7 @@ def exercise(app, helper, backend, compositor_libraries, terminal_only=False):
         (ssh / "config").write_text(f"""Host aether-qa
     HostName 127.0.0.1
     Port {ssh_port}
-    User {getpass.getuser()}
+    User {account.pw_name}
     IdentityFile {key}
     IdentitiesOnly yes
     UserKnownHostsFile {ssh}/known_hosts
@@ -212,7 +232,7 @@ Port {ssh_port}
 HostKey {host_key}
 PidFile {owned}/sshd.pid
 AuthorizedKeysFile {key}.pub
-AllowUsers {getpass.getuser()}
+AllowUsers {account.pw_name}
 AuthenticationMethods publickey
 PasswordAuthentication no
 KbdInteractiveAuthentication no
@@ -224,19 +244,26 @@ SetEnv JTERM_WORKSPACE_STATE_DIR={state}
 """)
         daemon = start(["/usr/sbin/sshd", "-D", "-e", "-f", config], "sshd.log")
         wait(lambda: (owned / "sshd.pid").is_file() or daemon.poll() is not None, "private sshd")
-        probe = subprocess.run(["/usr/bin/ssh", "-F", ssh / "config", "-oBatchMode=yes",
+        if use_runner_config:
+            # The hosted runner's account is disposable and its user namespaces
+            # may be restricted. Both native SSH clients still use OpenSSH config.
+            stack.enter_context(runner_ssh_config(home, ssh / "config"))
+            wrap = []
+        else:
+            # Give only the test processes this SSH host and key configuration.
+            wrap = ["bwrap", "--dev-bind", "/", "/", "--ro-bind", ssh / "config", "/etc/ssh/ssh_config"]
+            personal = home / ".ssh"
+            if personal.is_dir():
+                wrap += ["--ro-bind", ssh, personal]
+            wrap += ["--"]
+        probe = subprocess.run([*wrap, "/usr/bin/ssh", "-oBatchMode=yes",
                                 "-oStrictHostKeyChecking=yes", "aether-qa", "true"],
                                capture_output=True, text=True, timeout=10)
         if probe.returncode:
             raise RuntimeError(f"Loopback SSH failed: {probe.stderr}\n{(owned / 'sshd.log').read_text()}")
-        # Give only the test processes this SSH host and key configuration.
-        wrap = ["bwrap", "--dev-bind", "/", "/", "--ro-bind", ssh / "config", "/etc/ssh/ssh_config"]
-        personal = Path.home() / ".ssh"
-        if personal.is_dir():
-            wrap += ["--ro-bind", ssh, personal]
         if terminal_only:
             script = Path(__file__).with_name("test-ssh-terminal-webview.py").resolve()
-            subprocess.run([*wrap, "--", sys.executable, "-B", script, app, "aether-qa", helper],
+            subprocess.run([*wrap, sys.executable, "-B", script, app, "aether-qa", helper],
                            check=True, timeout=180)
             return
         remote_env = os.environ | {"JTERM_WORKSPACE_STATE_DIR": str(state)}
@@ -275,7 +302,7 @@ SetEnv JTERM_WORKSPACE_STATE_DIR={state}
         webdriver = shutil.which("WebKitWebDriver")
         if not webdriver:
             raise RuntimeError("WebKitWebDriver is required")
-        process = start([*wrap, "--", webdriver, "--host=127.0.0.1", f"--port={driver_port}"], "driver.log", env)
+        process = start([*wrap, webdriver, "--host=127.0.0.1", f"--port={driver_port}"], "driver.log", env)
         def ready():
             if process.poll() is not None:
                 raise RuntimeError((owned / "driver.log").read_text())
@@ -309,8 +336,10 @@ if __name__ == "__main__":
     parser.add_argument("--compositor-libraries", type=Path)
     parser.add_argument("--interactive-terminal", action="store_true",
                         help="exercise the SSH terminal and reconnect over a private X11 display")
+    parser.add_argument("--runner-ssh-config", action="store_true",
+                        help="use an empty SSH configuration slot in the disposable runner account")
     args = parser.parse_args()
     if args.interactive_terminal and args.backend != "x11":
         parser.error("--interactive-terminal uses a private X11 display")
     exercise(args.aether.resolve(strict=True), args.helper.resolve(strict=True), args.backend,
-             args.compositor_libraries, args.interactive_terminal)
+             args.compositor_libraries, args.interactive_terminal, args.runner_ssh_config)
