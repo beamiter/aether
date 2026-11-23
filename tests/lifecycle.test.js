@@ -5,7 +5,7 @@ import {installHistory} from '../web/history.js';
 import {installCommandBlocks} from '../web/command-blocks.js';
 import {installTerminalChat,validateChatStatus} from '../web/terminal-chat.js';
 import {installWorkflows} from '../web/workflows.js';
-import {readLocalShellLayout,saveLocalShellLayout} from '../web/local-layout.js';
+import {plainLocalTab,readLocalShellLayout,saveLocalShellLayout} from '../web/local-layout.js';
 import {acceptFull,acceptUpdate,clearPaint,paint as paintFrame} from '../web/frames.js'; import {installIme} from '../web/ime.js';
 import {acceptChannelFrame,channelCounter,CHANNEL_FRAME_VERSION} from '../web/frames-v4.js';
 const tick=()=>new Promise(r=>setImmediate(r));
@@ -30,7 +30,7 @@ function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsuppo
  const element=()=>({disabled:false,value:'',textContent:'',style:{},dataset:{},handlers:{},focus(){},append(){},scrollTo(){},setAttribute(){},replaceChildren(...options){this.options=options;},addEventListener(name,fn){this.handlers[name]=fn}});
  const el=selector=>{if(!elements.has(selector))elements.set(selector,element());return elements.get(selector)};
  const context={installFilePreviewPanel:()=>({dismiss(){}}),document:{querySelector:el,createElement:element},__TAURI__:{core:{invoke,Channel}},acceptFull,acceptUpdate,clearPaint,acceptChannelFrame,channelCounter,CHANNEL_FRAME_VERSION,installIme,installHistory,installCommandBlocks,installTerminalChat,installWorkflows,validateChatStatus,installPasteReview,resizeQueue,cursorTarget,terminalCellAt,paint,TextEncoder:Encoder,TextDecoder,
- readLocalShellLayout:()=>readLocalShellLayout(storage),saveLocalShellLayout:value=>saveLocalShellLayout(value,storage),
+ plainLocalTab,readLocalShellLayout:()=>readLocalShellLayout(storage),saveLocalShellLayout:value=>saveLocalShellLayout(value,storage),
  setInterval(fn){timers.set(++id,fn);return id},clearInterval(i){timers.delete(i)},setTimeout,...animation};
  vm.runInNewContext(fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8').replace(/^import .*\n/gm,''),context);
  return {el,timers,click:s=>el(s).handlers.click(),submit:()=>el('#command').handlers.submit({preventDefault(){}}),submitSsh:()=>el('#ssh-terminal-form').handlers.submit({preventDefault(){}})};
@@ -939,8 +939,9 @@ function layoutStorage(layout){
  return environment;
 }
 
-test('saved two-tab layout waits for an explicit action then selects the saved fresh tab',async()=>{
- const storage=layoutStorage({count:2,active:0});
+test('restore creates fresh tabs with their saved shell and presentation, then selects the saved position',async()=>{
+ const layout={tabs:[plainLocalTab,{shell:'jsh',presentation:'chat'}],active:0,split:false};
+ const storage=layoutStorage(layout);
  const first={session:'a'.repeat(32),epoch:7,generation:1};
  const second={session:'b'.repeat(32),epoch:8,generation:2};
  const frame=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
@@ -950,7 +951,8 @@ test('saved two-tab layout waits for an explicit action then selects the saved f
   if(name==='list_local_shells')return [];
   if(name==='open_shell')return first;
   if(name==='activate_local_tab'){
-   const owner=args.targetEpoch===null?second:{...first,generation:3};
+   const owner=args.targetEpoch===null?second:args.targetEpoch===first.epoch
+     ?{...first,generation:3}:{...second,generation:4};
    return {Ok:{owner,frame:{...frame,session:owner.session,epoch:owner.epoch},input_allowed:true}};
   }
   if(name==='poll_shell'||name==='ack_shell')return null;
@@ -962,14 +964,20 @@ test('saved two-tab layout waits for an explicit action then selects the saved f
  assert.equal(h.el('#saved-local-layout').hidden,true);
  assert.equal(h.el('#input').disabled,false);
  assert.equal(h.el('#input').value,'');
+ assert.equal(h.el('#command').hidden,false);
  assert.match(h.el('#status').textContent,/two fresh shells/);
  assert.deepEqual(calls.filter(([name])=>name==='activate_local_tab').map(([,args])=>args.targetEpoch),[null,first.epoch]);
+ assert.deepEqual(calls.filter(([name])=>name==='activate_local_tab').map(([,args])=>args.integrated),[true,undefined]);
  assert(!calls.some(([name])=>name==='write_shell'||name==='key_shell'||name==='text_shell'));
- assert.deepEqual(readLocalShellLayout(storage),{count:2,active:0,split:false});
+ assert.deepEqual(readLocalShellLayout(storage),layout);
+ h.el('#local-tab-list').options.find(tab=>tab.dataset.epoch==='8').handlers.click();await tick();
+ assert.equal(h.el('#command').hidden,true);
+ assert.deepEqual(readLocalShellLayout(storage),{...layout,active:1});
 });
 
-test('failure to create the second restored tab leaves the first usable and the preference intact',async()=>{
- const storage=layoutStorage({count:2,active:1});
+test('failure to restore the jsh tab leaves the plain shell usable and the preference intact',async()=>{
+ const layout={tabs:[plainLocalTab,{shell:'jsh',presentation:'chat'}],active:1,split:false};
+ const storage=layoutStorage(layout);
  const calls=[];
  const h=harness(async(name)=>{
   calls.push(name);
@@ -985,11 +993,11 @@ test('failure to create the second restored tab leaves the first usable and the 
  assert.equal(h.el('#close').disabled,false);
  assert.equal(h.el('#local-tab-list').options.length,1);
  assert.equal(calls.filter(name=>name==='activate_local_tab').length,1);
- assert.deepEqual(readLocalShellLayout(storage),{count:2,active:1,split:false});
+ assert.deepEqual(readLocalShellLayout(storage),layout);
 });
 
 test('a lost first restore reply discovers the retained shell without launching again',async()=>{
- const storage=layoutStorage({count:1,active:0});
+ const storage=layoutStorage({tabs:[plainLocalTab],active:0,split:false});
  let openCalls=0;
  const h=harness(async(name)=>{
   if(name==='list_local_shells')return openCalls?[4]:[];
@@ -1002,6 +1010,30 @@ test('a lost first restore reply discovers the retained shell without launching 
  assert.equal(h.el('#saved-local-layout').hidden,true);
  assert.equal(h.el('#local-tab-list').options[0].dataset.epoch,'4');
  assert.equal(openCalls,1);
+});
+
+test('reattaching one retained shell preserves the launch and presentation of an unobserved peer',async()=>{
+ const layout={tabs:[{shell:'jsh',presentation:'chat'},plainLocalTab],active:0,split:true};
+ const storage=layoutStorage(layout);
+ const owner={session:'b'.repeat(32),epoch:2,generation:3};
+ const frame=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+ const h=harness(async(name,args)=>{
+  switch(name){
+   case 'list_local_shells':return [1,2];
+   case 'attach_selected_local_shell':
+    assert.equal(args.epoch,2);
+    return {owner,frame:{...frame,session:owner.session,epoch:owner.epoch}};
+   case 'ack_shell':case 'poll_shell':return null;
+   default:throw Error(name);
+  }
+ },({epoch})=>({...channelHealth(epoch),command_blocks_enabled:false}),undefined,undefined,storage);
+ await h.click('#manage-local');
+ h.el('#local-shell-selection').value='2';
+ h.el('#local-shell-selection').handlers.change();
+ await h.click('#attach-selected-local');
+ assert.equal(h.el('#saved-local-layout').hidden,true);
+ assert.equal(h.el('#input').disabled,true);
+ assert.deepEqual(readLocalShellLayout(storage),layout);
 });
 
 test('unconfirmed retirement aborts the switch and recovers only the old local shell',async()=>{

@@ -45,9 +45,11 @@ history window, and searching the same term in the other shell finds no match.
 The restart journey closes the desktop with two writable tabs and the first
 selected, waits for both original child identities to disappear, and launches
 the same binary in the same private profile. **Restore shell tabs** opens two
-fresh writable PTYs, restores the split, and selects the first tab. Both new child identities are
-distinct, the old draft stays out of the restored view, and explicit close
-reaps both children.
+fresh writable PTYs, restores the split, and selects the first tab. Both new
+child identities are distinct, the old draft stays out of the restored view,
+and explicit close reaps both children. With the jsh fixture, both X11 and
+Wayland verify that the second tab restores as a jsh with Terminal Chat
+selected and Workflows available at its prompt.
 
 Add `--jsh /absolute/path/to/jsh` to the driver invocation to include the
 command-block journey. The isolated application PATH resolves that executable

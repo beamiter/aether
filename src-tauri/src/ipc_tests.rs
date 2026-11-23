@@ -89,6 +89,9 @@ fn local_tab_activation_rotates_the_lease_after_an_ack_and_retries_exactly() {
         invoke(&window, "activate_local_tab", new_tab.clone()),
         switched
     );
+    let mut different_shell = new_tab.clone();
+    different_shell["integrated"] = json!(true);
+    assert!(invoke(&window, "activate_local_tab", different_shell)["Err"].is_string());
     assert_eq!(
         invoke(&window, "list_local_shells", json!({})),
         json!([first["epoch"], second["epoch"]])
@@ -136,6 +139,7 @@ fn local_tab_activation_rotates_the_lease_after_an_ack_and_retries_exactly() {
                 Some(&source),
                 Some(target_epoch),
                 true,
+                false,
                 super::SnapshotFormat::Compatibility,
                 Arc::downgrade(local.inner()),
             )

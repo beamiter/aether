@@ -12,7 +12,7 @@ export function validateChatStatus(chat) {
   if (chat.newest_completed !== null) channelCounter(chat.newest_completed);
 }
 
-export function installTerminalChat(document, {getOwner, blocks, canSend, sendEnter, focusTerminal, revealCursor}) {
+export function installTerminalChat(document, {getOwner, blocks, canSend, sendEnter, focusTerminal, revealCursor, onModeChange}) {
   const toggle = document.querySelector('#terminal-chat-toggle');
   const pane = document.querySelector('#active-pane');
   const send = document.querySelector('#terminal-chat-send');
@@ -82,6 +82,7 @@ export function installTerminalChat(document, {getOwner, blocks, canSend, sendEn
     if (!owner || getOwner() !== owner) return;
     selected = !selected;
     setSelection(owner.session, selected);
+    onModeChange();
     render();
   });
 
@@ -106,6 +107,8 @@ export function installTerminalChat(document, {getOwner, blocks, canSend, sendEn
 
   return {
     updateOwner,
+    modeFor: session => selection(session) ? 'chat' : 'terminal',
+    restoreMode: (session, presentation) => setSelection(session, presentation === 'chat'),
     currentPrompt: () => currentStatus()?.chat?.prompt ?? null,
     showStatus(info, attachment) {
       lastStatus = {owner: attachment, info};

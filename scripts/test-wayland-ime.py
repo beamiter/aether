@@ -270,6 +270,8 @@ def run(args):
             driver.click("#close")
             wait_for(lambda: fixtures["opened_page"](driver), "the integrated Chat shell did not close")
             result.update(fixtures["exercise_terminal_workflows"](driver, root))
+            fixtures["exercise_restart"](driver, root, binary, integrated=True)
+            result["native_restart_restores_jsh_terminal_chat_and_workflows"] = True
         (root / "result.json").write_text(json.dumps(result, indent=2) + "\n")
         print(json.dumps(result), flush=True)
 

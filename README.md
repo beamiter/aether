@@ -23,18 +23,18 @@ for **Reconnect view**, which restores the output in read-only mode. Reloading
 the desktop page also leaves the local shell running. **Reconnect view** restores
 its output, including output produced during the reload.
 
-Use **New shell tab** to open a second local shell. Select the numbered tabs to
-return to each shell's output, draft, and working process. A tab that was parked
+Use **New shell tab** or **New jsh tab** to open a second local shell. Select the
+numbered tabs to return to each shell's output, draft, and working process. A tab that was parked
 with idle, healthy input can write again after its current snapshot is
 acknowledged. Switching does not submit drafts or repeat pending input. Closing
 the active shell leaves any surviving tab available for selection. **Detach
 view** and **Reconnect view** still provide an explicit read-only path.
 
-After restarting Aether, **Restore shell tabs** opens fresh local shells in the
-saved layout. With two shells, **Split panes** shows both outputs side by side.
-Click the other pane to transfer keyboard input and sizing to that shell. Aether
-saves the tab count, selected position, and split choice in the desktop profile.
-Closing the last shell clears the saved layout.
+After restarting Aether, **Restore shell tabs** opens fresh PTYs with each
+saved shell type and Terminal Chat preference. It restores the selected tab
+and the split layout. With two shells, **Split panes** shows both outputs side
+by side. Click the other pane to transfer keyboard input and sizing to that
+shell. Closing the last shell clears the saved layout.
 
 For a remote PTY, run `aether-terminal-host serve` on the Linux host and use
 **Open SSH shell** with an OpenSSH host alias or `user@host`. The same terminal

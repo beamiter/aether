@@ -77,6 +77,7 @@ async fn activate_local_tab<R: tauri::Runtime>(
     owner: Option<Attachment>,
     target_epoch: Option<u32>,
     preserve_input: bool,
+    integrated: Option<bool>,
     frame_version: Option<u8>,
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<Result<local_sessions::AttachedView, String>, String> {
@@ -85,7 +86,14 @@ async fn activate_local_tab<R: tauri::Runtime>(
     let shared = bridge.inner().clone();
     let weak = Arc::downgrade(&shared);
     run_bridge(shared, move |bridge| {
-        Ok(bridge.activate_tab(owner.as_ref(), target_epoch, preserve_input, format, weak))
+        Ok(bridge.activate_tab(
+            owner.as_ref(),
+            target_epoch,
+            preserve_input,
+            integrated.unwrap_or(false),
+            format,
+            weak,
+        ))
     })
     .await
 }

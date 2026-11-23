@@ -855,9 +855,15 @@ finally:
     print(json.dumps({"native_kitty_disambiguation": True, "pty_bytes_verified": len(actual)}), flush=True)
 
 
-def exercise_restart(driver, owned, binary):
+def exercise_restart(driver, owned, binary, integrated=False):
     def state():
         return driver.execute(READ)
+
+    def chat_prompt():
+        return driver.execute("""
+            return document.querySelector('#active-pane').dataset.chatSurface === 'prompt' &&
+                   !document.querySelector('#workflows').disabled;
+        """)
 
     driver.click("#open")
     wait_for(lambda: state()["writable"] and len(state()["tabs"]) == 1, "restart fixture's first shell did not open")
@@ -866,10 +872,13 @@ def exercise_restart(driver, owned, binary):
     wait_for(lambda: state()["writable"] and state()["draft"] == "", "first restart fixture write is pending")
     forbidden = owned / "restart-must-not-run"
     driver.type("#input", f"printf replayed > {shlex.quote(str(forbidden))}")
-    driver.click("#new-local-tab")
+    driver.click("#new-jsh-tab" if integrated else "#new-local-tab")
     wait_for(lambda: state()["writable"] and len(state()["tabs"]) == 2, "restart fixture's second shell did not open")
     second_before = write_from_current_tab(driver, owned / "before-restart-b.pid")
     wait_for(lambda: state()["writable"] and state()["draft"] == "", "second restart fixture write is pending")
+    if integrated:
+        driver.click("#terminal-chat-toggle")
+        wait_for(chat_prompt, "the new jsh tab did not offer Terminal Chat and workflows")
     driver.click("#split-local")
     wait_for(lambda: state()["split"] == "right" and state()["peer_geometry"] == "80x24", "restart fixture split was not visible")
     click_tab(driver, first)
@@ -887,13 +896,21 @@ def exercise_restart(driver, owned, binary):
     restored = state()
     first, second = restored["tabs"]
     assert restored["writable"] and restored["current_tab"] == first, "saved active position was lost"
+    assert driver.execute("return !document.querySelector('#command').hidden;"), "the plain tab inherited Terminal Chat"
     wait_for(lambda: state()["split"] == "left" and state()["peer_geometry"] == "80x24", "saved split layout was lost")
     assert restored["draft"] == "" and not forbidden.exists(), "old command draft survived restart"
     first_after = write_from_current_tab(driver, owned / "after-restart-a.pid")
     wait_for(lambda: state()["writable"] and state()["draft"] == "", "first restored shell write is pending")
     click_tab(driver, second)
     assert state()["draft"] == ""
-    second_after = write_from_current_tab(driver, owned / "after-restart-b.pid")
+    if integrated:
+        wait_for(chat_prompt, "restore lost the jsh prompt or its Terminal Chat preference")
+        receipt = owned / "after-restart-b.pid"
+        driver.type("#ime-input", "printf '%s' \"$$\" > " + shlex.quote(str(receipt)) + "\ue007")
+        wait_for(lambda: receipt.is_file() and receipt.read_text().isdigit(), "the restored live jsh did not receive input")
+        second_after = shell_identity(receipt)
+    else:
+        second_after = write_from_current_tab(driver, owned / "after-restart-b.pid")
     assert len({first_before, second_before, first_after, second_after}) == 4, "restore reused an old shell identity"
     wait_for(lambda: state()["writable"] and state()["draft"] == "", "second restored shell write is pending")
     driver.click("#close")
@@ -902,9 +919,12 @@ def exercise_restart(driver, owned, binary):
     driver.click("#close")
     wait_for(lambda: birth(first_after[0]) != first_after[1], "restored first shell was not reaped")
     assert not forbidden.exists()
-    print(json.dumps({"native_restart_restores_tab_count_and_active_position": True,
-                      "native_restart_restores_split_panes": True,
-                      "restore_starts_fresh_pty_identities_without_replay": True}), flush=True)
+    result = {"native_restart_restores_tab_count_and_active_position": True,
+              "native_restart_restores_split_panes": True,
+              "restore_starts_fresh_pty_identities_without_replay": True}
+    if integrated:
+        result["native_restart_restores_jsh_terminal_chat_and_workflows"] = True
+    print(json.dumps(result), flush=True)
 
 
 def exercise_command_blocks(driver, owned, output_review=False):
@@ -2882,7 +2902,7 @@ def run(binary, jsh, workspace, api, native, notebook=False, output_review=False
                 exercise_keyboard(driver, owned)
                 exercise_height_shrink(driver)
                 exercise_renderer_reload(driver, owned)
-                exercise_restart(driver, owned, binary)
+                exercise_restart(driver, owned, binary, integrated=jsh is not None)
                 if jsh:
                     exercise_command_blocks(driver, owned, output_review)
                     exercise_terminal_chat(driver, owned)

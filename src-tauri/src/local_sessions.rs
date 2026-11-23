@@ -149,6 +149,7 @@ pub(crate) struct AttachedView {
 struct PendingTab {
     source: Option<Attachment>,
     requested_epoch: Option<u32>,
+    integrated: bool,
     target: Attachment,
     input_allowed: bool,
 }
@@ -267,11 +268,17 @@ impl LocalSessions {
         owner: Option<&Attachment>,
         target_epoch: Option<u32>,
         preserve_input: bool,
+        integrated: bool,
         format: SnapshotFormat,
         shared: Weak<Mutex<Self>>,
     ) -> Result<AttachedView, String> {
+        if integrated && target_epoch.is_some() {
+            return Err("Choose the shell type when opening a new tab.".into());
+        }
         if let Some(pending) = self.pending_tab.as_ref().filter(|pending| {
-            pending.source.as_ref() == owner && pending.requested_epoch == target_epoch
+            pending.source.as_ref() == owner
+                && pending.requested_epoch == target_epoch
+                && pending.integrated == integrated
         }) {
             let owned = self.registry.reader(&pending.target.session)?;
             return Ok(AttachedView {
@@ -321,7 +328,7 @@ impl LocalSessions {
             activated
         } else {
             let (mut owned, original) =
-                Self::spawn(self.last_epoch, false, self.worker.as_ref().unwrap())?;
+                Self::spawn(self.last_epoch, integrated, self.worker.as_ref().unwrap())?;
             let Entry::Vacant(entry) = self.registry.sessions.entry(original.session) else {
                 return Err("terminal session ID collision".into());
             };
@@ -345,6 +352,7 @@ impl LocalSessions {
         self.pending_tab = Some(PendingTab {
             source: owner.cloned(),
             requested_epoch: target_epoch,
+            integrated,
             target: target.clone(),
             input_allowed,
         });
