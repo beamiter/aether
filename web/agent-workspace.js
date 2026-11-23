@@ -143,6 +143,18 @@ export function installWorkspace(document,invoke){
     const row=selected();
     if(attach.disabled||!row)return;
     const launch=attempt??{id:row.id,generation:page().receipt.generation,request:++request};
+    // Async attach may complete after the user has started working elsewhere.
+    const attachFocus=element=>element===attach||element===document.body;
+    const pageWindow=document.defaultView;
+    let focusRequested=attachFocus(document.activeElement)&&document.hasFocus()&&!document.hidden;
+    const retireFocus=()=>{focusRequested=false;};
+    const observeFocus=event=>{if(!attachFocus(event.target))retireFocus();};
+    const observeVisibility=()=>{if(document.hidden)retireFocus();};
+    if(focusRequested){
+      document.addEventListener('focusin',observeFocus,true);
+      document.addEventListener('visibilitychange',observeVisibility);
+      pageWindow?.addEventListener('blur',retireFocus);
+    }
     attempt=launch;opening=true;controls();status.textContent='Requesting the Workspace terminal lease…';
     let view=null;
     try{
@@ -167,8 +179,12 @@ export function installWorkspace(document,invoke){
       }
       status.textContent=String(error?.message??error);
     }finally{
+      document.removeEventListener('focusin',observeFocus,true);
+      document.removeEventListener('visibilitychange',observeVisibility);
+      pageWindow?.removeEventListener('blur',retireFocus);
       opening=false;controls();
-      if(active?.writable)input.focus();
+      if(!input.disabled&&focusRequested&&root.open&&document.hasFocus()&&!document.hidden&&
+          attachFocus(document.activeElement))input.focus();
     }
   }
 

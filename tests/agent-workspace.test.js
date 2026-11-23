@@ -24,9 +24,18 @@ test('an attachment is admitted only for the requested source and a complete vie
 });
 
 function catalogHarness(handle){
-  const fields=new Map();
+  const fields=new Map(),listeners=new Map(),windowListeners=new Map();
+  let document;
+  const body={},focusLog=[];
   function element(){
-    return {disabled:false,value:'',textContent:'',children:[],events:new Map(),
+    return {disabled:false,value:'',textContent:'',children:[],events:new Map(),style:{},
+      focus(){
+        if(this.disabled)return;
+        document.activeElement=this;focusLog.push(this);
+        document.dispatch('focusin',{target:this});
+      },
+      getContext(){return {setTransform(){},clearRect(){},fillRect(){},save(){},beginPath(){},
+        rect(){},clip(){},fillText(){},restore(){}};},
       addEventListener(kind,callback){this.events.set(kind,callback);},
       replaceChildren(...children){this.children=children;this.value=children[0]?.value??'';},
       fire(kind){if(kind!=='click'||!this.disabled)return this.events.get(kind)?.();}
@@ -36,15 +45,32 @@ function catalogHarness(handle){
     if(!fields.has(name))fields.set(name,element());
     return fields.get(name);
   };
+  const eventTarget=registered=>({
+    addEventListener(kind,handler,capture=false){
+      if(!registered.has(kind))registered.set(kind,new Map());
+      registered.get(kind).set(handler,capture);
+    },
+    removeEventListener(kind,handler,capture=false){
+      if(registered.get(kind)?.get(handler)===capture)registered.get(kind).delete(handler);
+    },
+    dispatch(kind,event={}){
+      for(const handler of registered.get(kind)?.keys()??[])handler(event);
+    },
+  });
+  document={getElementById:get,createElement:element,body,activeElement:body,foreground:true,hidden:false,
+    defaultView:eventTarget(windowListeners),
+    hasFocus(){return this.foreground;},
+    ...eventTarget(listeners)};
+  get('agent-workspace').open=true;
   const calls=[];
-  installWorkspace({getElementById:get,createElement:element},async(command,args)=>{
+  installWorkspace(document,async(command,args)=>{
     calls.push([command,args]);
     return {request:args.request,value:await handle(command,args)};
   });
   const button=id=>get('workspace-'+id);
   const pick=id=>{button('conversation').value=id;button('conversation').fire('change');};
   const act=async id=>{button(id).fire('click');await new Promise(setImmediate);};
-  return {button,calls,pick,act,selection:()=>button('conversation').value};
+  return {button,calls,pick,act,document,get,focusLog,listeners,windowListeners,selection:()=>button('conversation').value};
 }
 
 test('Workspace Previous restores the exact profile without replaying the host cursor',async()=>{
@@ -142,5 +168,67 @@ test('Workspace traverses empty filtered pages and invalidates a lost or non-adv
     await h.act('refresh');
     assert.equal(h.selection(),second);
     assert.equal(h.button('previous').disabled,true);
+  }
+});
+
+test('Workspace attach cannot steal focus after the user moves away before first poll',async()=>{
+  const owner={session:'a'.repeat(32),epoch:3,generation:3};
+  const identity={conversation:first,owner};
+  const frame={version:3,session:owner.session,epoch:owner.epoch,revision:1,layout:1,cols:1,
+    rows:[[{text:'a',foreground:'#ffffff',background:'#000000',width:1,style:0}]],
+    cursor_row:0,cursor_col:0,cursor_visible:false,cursor_shape:'block',pending_wrap:false};
+  for(const mode of ['stay','moved','moved-then-body','button-blurred','started-elsewhere','collapsed','background','read-only',
+    'blur-return','hidden-return','visible-event']){
+    let finishPoll;
+    const firstPoll=new Promise(resolve=>{finishPoll=resolve;});
+    const h=catalogHarness(async(command,args)=>{
+      if(command==='workspace_catalog')return {generation:1,rows:[row(first)],next_before:null};
+      if(command==='workspace_attach')return {identity,frame};
+      assert.equal(command,'workspace_terminal');
+      assert.deepEqual(args.identity,identity);
+      if(args.operation.operation==='poll'){await firstPoll;return {kind:'polled',
+        update:{frame:null,writable:mode!=='read-only',status:'Fixture ready.'}};}
+      return {kind:'receipt'};
+    });
+    await h.act('refresh');
+    const attach=h.button('attach'),input=h.button('input');
+    if(mode==='started-elsewhere')h.get('notebook-search').focus();
+    else attach.focus();
+    const result=attach.fire('click');
+    await new Promise(setImmediate);
+    try{
+      assert.deepEqual(h.calls.slice(1).map(([command,args])=>[command,args.operation?.operation]),
+        [['workspace_attach',undefined],['workspace_terminal','ack'],['workspace_terminal','poll']]);
+      assert.equal(input.disabled,true,'writability waits for first confirmed update');
+      if(mode==='moved'||mode==='moved-then-body')h.get('notebook-search').focus();
+      if(mode==='moved-then-body'||mode==='button-blurred')h.document.activeElement=h.document.body;
+      if(mode==='collapsed')h.get('agent-workspace').open=false;
+      if(mode==='background')h.document.foreground=false;
+      if(mode==='blur-return'){
+        h.document.foreground=false;
+        h.document.defaultView.dispatch('blur');
+        h.document.foreground=true;
+      }
+      if(mode==='hidden-return'){
+        h.document.hidden=true;
+        h.document.dispatch('visibilitychange');
+        h.document.hidden=false;
+      }
+      if(mode==='visible-event')h.document.dispatch('visibilitychange');
+      const before=h.document.activeElement;
+      finishPoll();
+      await result;
+      assert.equal(input.disabled,mode==='read-only');
+      const followsAttach=mode==='stay'||mode==='button-blurred'||mode==='visible-event';
+      assert.equal(h.document.activeElement,followsAttach?input:before,mode);
+      assert.equal(h.focusLog.filter(element=>element===input).length,followsAttach?1:0,mode);
+      assert.equal(h.listeners.get('focusin')?.size??0,0,'focus listener must retire');
+      assert.equal(h.listeners.get('visibilitychange')?.size??0,0,'visibility listener must retire');
+      assert.equal(h.windowListeners.get('blur')?.size??0,0,'window listener must retire');
+    }finally{
+      finishPoll();
+      await result;
+      await h.act('detach');
+    }
   }
 });
