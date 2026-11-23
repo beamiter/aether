@@ -42,9 +42,9 @@ jobs:
             librsvg2-dev libxdo-dev libssl-dev webkit2gtk-driver \
             xvfb xauth dbus-daemon fonts-dejavu-core xdotool xclip imagemagick metacity ripgrep vim \
             openssh-client openssh-server bubblewrap sway wtype libwayland-dev \
-            python3-gi gir1.2-atspi-2.0 at-spi2-core fakeroot
+            python3-gi gir1.2-atspi-2.0 at-spi2-core fakeroot nodejs
           sudo install -d -m 0755 /run/sshd
-          dpkg-query -W libwebkit2gtk-4.1-0 webkit2gtk-driver xvfb
+          dpkg-query -W libwebkit2gtk-4.1-0 webkit2gtk-driver xvfb nodejs
       - name: Build desktop at the workflow revision
         id: build
         run: |

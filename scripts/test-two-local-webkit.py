@@ -1076,6 +1076,7 @@ def exercise_workspace(driver, owned, binary, env, transcripts):
                                 stdin=subprocess.DEVNULL, stdout=output, stderr=output,
                                 start_new_session=True)
     helper = None
+    helper_output = bytearray()
     master = None
     identity = None
     trace = Path(env["AETHER_WORKSPACE_TRACE"])
@@ -1134,8 +1135,6 @@ def exercise_workspace(driver, owned, binary, env, transcripts):
                                       start_new_session=True)
         finally:
             os.close(slave)
-        helper_output = bytearray()
-
         def helper_saw(text):
             try:
                 helper_output.extend(os.read(master, 65536))
@@ -1145,7 +1144,12 @@ def exercise_workspace(driver, owned, binary, env, transcripts):
                 if error.errno != errno.EIO:
                     raise
             assert len(helper_output) < 1024 * 1024
-            return text in helper_output
+            if text in helper_output:
+                return True
+            code = helper.poll()
+            if code is not None:
+                raise AssertionError(f"embedded Workspace terminal exited before {text!r}: {code}")
+            return False
 
         wait_for(lambda: helper_saw(b"WORKSPACE_READY"), "the existing embedded terminal did not attach")
         starts = trace.read_text().splitlines()
@@ -1196,7 +1200,9 @@ def exercise_workspace(driver, owned, binary, env, transcripts):
             "native_workspace_provider_input_and_exit_once": True,
         }), flush=True)
     except Exception:
-        print("Workspace fixture:", log.read_text()[-4000:], read_state())
+        print("Workspace fixture:", log.read_text()[-4000:], read_state(), flush=True)
+        print("Workspace helper:", helper.poll() if helper is not None else None,
+              bytes(helper_output[-2000:]), flush=True)
         raise
     finally:
         if helper is not None and helper.poll() is None:
@@ -2463,6 +2469,10 @@ def run(binary, jsh, workspace, api, native, notebook=False, output_review=False
     executable = shutil.which("WebKitWebDriver")
     if not executable or not os.environ.get("DISPLAY") or not os.environ.get("XAUTHORITY"):
         raise RuntimeError("run with official WebKitWebDriver and authenticated Xvfb")
+    # Native Codex launcher admission and the ordinary Workspace resume both
+    # use the fixture's restricted PATH, not the shell or Actions tool cache.
+    if native and not shutil.which("node", path="/usr/bin:/bin"):
+        raise RuntimeError("the native Codex fixture requires system Node.js (Ubuntu package: nodejs)")
     with tempfile.TemporaryDirectory(prefix="aether-native-two-") as scratch:
         owned = Path(scratch)
         env = {name: os.environ[name] for name in ("DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS") if name in os.environ}
