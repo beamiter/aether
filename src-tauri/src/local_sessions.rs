@@ -1,6 +1,8 @@
 //! Local desktop ownership, separate from the SSH transport.
+mod chat;
 mod stream;
 mod worker;
+pub(crate) use chat::LocalShellStatus;
 use std::{
     collections::{btree_map::Entry, BTreeMap},
     sync::{Mutex, Weak},

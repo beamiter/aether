@@ -3,6 +3,8 @@ import {resizeQueue,cursorTarget,terminalCellAt} from '../web/viewport.js';
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import vm from 'node:vm';
 import {installHistory} from '../web/history.js';
 import {installCommandBlocks} from '../web/command-blocks.js';
+import {installTerminalChat,validateChatStatus} from '../web/terminal-chat.js';
+import {installWorkflows} from '../web/workflows.js';
 import {readLocalShellLayout,saveLocalShellLayout} from '../web/local-layout.js';
 import {acceptFull,acceptUpdate,clearPaint,paint as paintFrame} from '../web/frames.js'; import {installIme} from '../web/ime.js';
 import {acceptChannelFrame,channelCounter,CHANNEL_FRAME_VERSION} from '../web/frames-v4.js';
@@ -25,9 +27,9 @@ function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsuppo
   return result;
  };
  const elements=new Map(),timers=new Map();let id=0;
- const element=()=>({disabled:false,value:'',textContent:'',style:{},dataset:{},handlers:{},focus(){},setAttribute(){},replaceChildren(...options){this.options=options;},addEventListener(name,fn){this.handlers[name]=fn}});
+ const element=()=>({disabled:false,value:'',textContent:'',style:{},dataset:{},handlers:{},focus(){},append(){},scrollTo(){},setAttribute(){},replaceChildren(...options){this.options=options;},addEventListener(name,fn){this.handlers[name]=fn}});
  const el=selector=>{if(!elements.has(selector))elements.set(selector,element());return elements.get(selector)};
- const context={installFilePreviewPanel:()=>({dismiss(){}}),document:{querySelector:el,createElement:element},__TAURI__:{core:{invoke,Channel}},acceptFull,acceptUpdate,clearPaint,acceptChannelFrame,channelCounter,CHANNEL_FRAME_VERSION,installIme,installHistory,installCommandBlocks,installPasteReview,resizeQueue,cursorTarget,terminalCellAt,paint,TextEncoder:Encoder,TextDecoder,
+ const context={installFilePreviewPanel:()=>({dismiss(){}}),document:{querySelector:el,createElement:element},__TAURI__:{core:{invoke,Channel}},acceptFull,acceptUpdate,clearPaint,acceptChannelFrame,channelCounter,CHANNEL_FRAME_VERSION,installIme,installHistory,installCommandBlocks,installTerminalChat,installWorkflows,validateChatStatus,installPasteReview,resizeQueue,cursorTarget,terminalCellAt,paint,TextEncoder:Encoder,TextDecoder,
  readLocalShellLayout:()=>readLocalShellLayout(storage),saveLocalShellLayout:value=>saveLocalShellLayout(value,storage),
  setInterval(fn){timers.set(++id,fn);return id},clearInterval(i){timers.delete(i)},setTimeout,...animation};
  vm.runInNewContext(fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8').replace(/^import .*\n/gm,''),context);
@@ -35,6 +37,38 @@ function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsuppo
 }
 
 const channelHealth=epoch=>({epoch,exited:false,drained:false,write_error:null,dropped_reply_bytes:'0',unsupported:'0'});
+test('terminal Chat sends each displayed prompt at most once while preserving normal input',async()=>{
+ const submissions=[];
+ const prompt=value=>({surface:'prompt',prompt:value,newest_completed:null});
+ let chat=prompt('1');
+ const h=harness(async(name,args)=>{
+  if(name==='open_shell')return 1;
+  if(name==='poll_shell')return null;
+  if(name==='local_command_blocks')return {owner:args.owner,enabled:true,blocks:[]};
+  if(name==='submit_local_chat'){
+   const pending=deferred();submissions.push({prompt:args.prompt,...pending});return pending.promise;
+  }
+  throw Error('unexpected IPC '+name);
+ },({epoch})=>({...channelHealth(epoch),chat}));
+ await h.click('#open-integrated');
+ h.click('#terminal-chat-toggle');
+ h.click('#terminal-chat-send');
+ h.click('#terminal-chat-send');
+ await tick();
+ assert.deepEqual(submissions.map(entry=>entry.prompt),['1']);
+ submissions[0].resolve(true);await tick();
+ h.click('#terminal-chat-send');await tick();
+ assert.equal(submissions.length,1);
+ assert.equal(h.el('#terminal-chat-send').disabled,true);
+ chat=prompt('2');
+ await h.timers.values().next().value();
+ h.click('#terminal-chat-send');await tick();
+ assert.deepEqual(submissions.map(entry=>entry.prompt),['1','2']);
+ submissions[1].resolve(false);await tick();
+ assert.equal(h.el('#input').disabled,false);
+ assert.match(h.el('#status').textContent,/shell prompt changed/);
+});
+
 function channelSnapshot(frame){
  const {cols,rows,...stamp}=frame;
  return JSON.stringify({kind:'snapshot',cols,rows:rows.map(cells=>({wrapped:false,cells})),

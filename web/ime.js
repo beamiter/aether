@@ -51,6 +51,6 @@ export function installIme(element,{getEpoch,commit,preedit=()=>{},afterEnd=call
    const epoch=getEpoch();if(epoch!==null&&text)commit(text,epoch);
  });
  element.addEventListener('blur',reset);
- return {reset,isComposing:()=>active};
+ return {reset,isComposing:()=>active,isSettled:()=>!active&&pending===null};
 }
 

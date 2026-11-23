@@ -38,6 +38,12 @@ def run(args):
         directory = root / name
         directory.mkdir(mode=0o700)
         env[name] = str(directory)
+    if args.jsh:
+        fixture_bin = root / "bin"
+        fixture_bin.mkdir()
+        (fixture_bin / "jsh").symlink_to(args.jsh.resolve(strict=True))
+        env["PATH"] = str(fixture_bin) + ":" + env["PATH"]
+        fixtures["prepare_workflows"](root, env)
     config = root / "sway.conf"
     config.write_text("xwayland disable\noutput * resolution 1440x1100\nseat seat0 fallback true\nfocus_follows_mouse no\n")
     with contextlib.ExitStack() as cleanup:
@@ -217,6 +223,53 @@ def run(args):
                       preedit_bytes=0, committed_hex=expected.hex(),
                       preedit_geometry=anchor, cursor_rectangle=cursor, pane_switch_cancelled_preedit=True,
                       window_blur_cancelled_preedit=True)
+        if args.jsh:
+            driver.click("#close")
+            wait_for(lambda: driver.execute(fixtures["READ"])["status"].startswith("Terminal closed"),
+                     "second raw capture did not close")
+            fixtures["click_tab"](driver, left)
+            driver.click("#close")
+            wait_for(lambda: fixtures["opened_page"](driver), "first raw capture did not close")
+            driver.click("#open-integrated")
+            wait_for(lambda: not driver.execute("return document.querySelector('#terminal-chat-toggle').disabled;"),
+                     "the native jsh view did not attach")
+            driver.click("#terminal-chat-toggle")
+            wait_for(lambda: driver.execute("""
+                return document.querySelector('#active-pane').dataset.chatSurface === 'prompt' &&
+                       !document.querySelector('#terminal-chat-send').disabled;
+            """), "Chat did not dock the integrated shell prompt")
+            focus_ime()
+            driver.type("#ime-input", "printf '%s' A")
+            chat_control = root / "chat-composition"
+            chat_control.mkdir()
+            chat_ime = spawn([ime_client, chat_control], "chat-ime.log")
+            wait_for((chat_control / "connected").exists, "Chat input method did not connect")
+            (chat_control / "start").touch()
+            wait_for(lambda: driver.execute("""
+                return document.querySelector('#terminal-preedit').textContent === 'ni' &&
+                       document.querySelector('#terminal-chat-send').disabled &&
+                       !document.querySelector('#command-block-list details');
+            """), "Chat's live composer did not display native preedit and suspend Send")
+            (chat_control / "commit").touch()
+            wait_for((chat_control / "committed").exists, "Chat input method did not send commit")
+            wait_for(lambda: driver.execute("""
+                return document.querySelector('#terminal-preedit').hidden &&
+                       !document.querySelector('#terminal-chat-send').disabled;
+            """), "Chat's pending composition did not settle")
+            assert chat_ime.wait(timeout=5) == 0
+            chat_receipt = root / "chat-pty-receipt"
+            driver.type("#ime-input", " >> " + shlex.quote(str(chat_receipt)))
+            driver.click("#terminal-chat-send")
+            wait_for(lambda: chat_receipt.is_file() and chat_receipt.read_bytes() == b"A" + expected,
+                     "Chat did not send the composed shell line exactly once")
+            assert wait_for(lambda: driver.execute("""
+                return Array.from(document.querySelectorAll('#command-block-list details code'), code => code.textContent)
+                    .filter(text => text.startsWith("printf '%s' A"));
+            """), "Chat did not show the completed command") == ["printf '%s' A你 >> " + str(chat_receipt)]
+            result["terminal_chat_ime_commit_preserved_and_sent_once"] = True
+            driver.click("#close")
+            wait_for(lambda: fixtures["opened_page"](driver), "the integrated Chat shell did not close")
+            result.update(fixtures["exercise_terminal_workflows"](driver, root))
         (root / "result.json").write_text(json.dumps(result, indent=2) + "\n")
         print(json.dumps(result), flush=True)
 
@@ -226,6 +279,7 @@ if __name__ == "__main__":
     parser.add_argument("binary", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--ime-client", type=Path, required=True)
+    parser.add_argument("--jsh", type=Path, help="installed jsh for Terminal Chat and workflows")
     parser.add_argument("--sway", default="sway")
     parser.add_argument("--wtype", default="wtype")
     parser.add_argument("--compositor-libraries", type=Path)

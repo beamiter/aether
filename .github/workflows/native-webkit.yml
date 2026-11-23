@@ -17,8 +17,16 @@ on:
       - 'scripts/package-linux-deb.sh'
       - 'packaging/linux-deb.json'
       - 'bridge/Cargo.lock'
+      - 'bridge/src/live.rs'
+      - 'bridge/src/live/command_blocks.rs'
       - 'session/Cargo.lock'
       - 'src-tauri/Cargo.lock'
+      - 'src-tauri/src/local_sessions.rs'
+      - 'src-tauri/src/local_sessions/**'
+      - 'src-tauri/src/local_block_search.rs'
+      - 'src-tauri/src/local_workflows.rs'
+      - 'src-tauri/src/main.rs'
+      - 'web/**'
 
 permissions:
   contents: read
@@ -55,7 +63,13 @@ jobs:
           cargo build --locked --manifest-path src-tauri/Cargo.toml --bin tauri-terminal-lab
           cargo build --locked --manifest-path bridge/Cargo.toml --bin aether-terminal-host
           printf 'CARGO_TARGET_DIR=%s\n' "$CARGO_TARGET_DIR" >> "$GITHUB_ENV"
-      - name: Local PTYs, Workspace, API Chat, native task, notebook and Vim9 on X11
+      - name: Install the real jsh fixture
+        run: |
+          cargo install --locked --debug --git https://github.com/beamiter/jsh.git \
+            --rev 295fc912ef22da4d864b79a549cd01b0b27c3d84 \
+            --root "$RUNNER_TEMP/aether-shell-fixture" jsh
+          sha256sum "$RUNNER_TEMP/aether-shell-fixture/bin/jsh"
+      - name: Local PTYs, Terminal Chat, Workflows, Workspace, API Chat, native task, notebook and Vim9 on X11
         timeout-minutes: 5
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
@@ -66,8 +80,9 @@ jobs:
           xvfb-run --auto-servernum --server-args="-screen 0 1600x1200x24 -nolisten tcp" \
             dbus-run-session -- timeout --kill-after=25s 240s \
               /usr/bin/python3 -B scripts/test-two-local-webkit.py "$app" \
+                --jsh "$RUNNER_TEMP/aether-shell-fixture/bin/jsh" \
                 --workspace --api-chat --native-task --notebook --vim9
-      - name: Verify Wayland composition across terminal and window focus changes
+      - name: Wayland composition, Terminal Chat and Workflows
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 4
         run: |
@@ -87,7 +102,8 @@ jobs:
             "$fixture_dir/wlroots-0.17.1/protocol" "$fixture_dir/clients"
           dbus-run-session -- /usr/bin/python3 -B scripts/test-wayland-ime.py \
             "$CARGO_TARGET_DIR/debug/tauri-terminal-lab" --output "$fixture_dir/evidence" \
-            --ime-client "$fixture_dir/clients/native-ime-client"
+            --ime-client "$fixture_dir/clients/native-ime-client" \
+            --jsh "$RUNNER_TEMP/aether-shell-fixture/bin/jsh"
       - name: SSH files and read-only Workspace on X11
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 4

@@ -21,6 +21,8 @@
     <div id="local-tab-list"></div>
     <button id="new-local-tab" type="button">New shell tab</button>
     <button id="split-local" type="button" aria-pressed="false" disabled>Split panes</button>
+    <button id="terminal-chat-toggle" type="button" aria-pressed="false" disabled>Terminal Chat</button>
+    <button id="workflows" type="button" aria-controls="workflow-picker" aria-expanded="false" disabled>Workflows</button>
     <button id="retry-local-tab" type="button" hidden>Retry tab switch</button>
   </nav>
   <button id="manage-local" type="button" disabled>Show retained local shells</button>
@@ -31,9 +33,31 @@
     <p class="note">Select a different shell to switch views. Detach before opening a second shell. Reconnected views are read-only.</p>
   </div>
 </section>
+<section id="workflow-picker" hidden aria-label="Shell workflows">
+  <div class="workflow-controls">
+    <label>Find workflows <input id="workflow-search" type="search" maxlength="4096" autocomplete="off"></label>
+    <button id="workflow-close" type="button">Close workflows</button>
+  </div>
+  <p id="workflow-status" role="status"></p>
+  <ul id="workflow-results"></ul>
+  <div id="workflow-fields" hidden>
+    <h2 id="workflow-title"></h2>
+    <pre id="workflow-command"></pre>
+    <div id="workflow-args"></div>
+    <div class="workflow-controls">
+      <button id="workflow-insert" type="button">Insert at cursor</button>
+      <button id="workflow-back" type="button">Back to workflows</button>
+    </div>
+  </div>
+</section>
 <p class="note">The scrollable canvas shows the live grid only. Show cursor brings its position into view without changing terminal state. Archived history is a separate snapshot below.</p>
 <div id="terminal-panes">
   <section id="active-pane" aria-label="Active terminal pane">
+    <div id="terminal-chat-transcript"></div>
+    <div id="terminal-chat-dock" hidden>
+      <span id="terminal-chat-surface"></span>
+      <button id="terminal-chat-send" type="button" disabled>Send command</button>
+    </div>
     <div class="viewport"><p id="health" aria-live="polite"></p>
       <canvas tabindex="0" aria-label="Active terminal keyboard and composition input"></canvas>
       <textarea id="ime-input" rows="1" wrap="off" spellcheck="false" autocomplete="off" aria-label="Terminal input"></textarea>
@@ -45,7 +69,7 @@
     <div class="viewport"><canvas id="peer-canvas" aria-label="Inactive terminal output"></canvas></div>
   </section>
 </div>
-<section id="command-blocks" hidden aria-label="Local command blocks">
+<div id="command-block-home"><section id="command-blocks" hidden aria-label="Local command blocks">
   <button id="command-block-toggle" type="button" aria-controls="command-block-panel" aria-expanded="false">Command blocks</button>
   <div id="command-block-panel" hidden>
     <div class="command-block-controls">
@@ -53,6 +77,13 @@
       <button id="command-block-return" type="button">Back to live terminal</button>
     </div>
     <p id="command-block-status" role="status"></p>
+    <form id="command-block-search" hidden>
+      <label>Find in completed commands <input id="command-block-query" type="search" maxlength="128" autocomplete="off" spellcheck="false" required></label>
+      <button type="submit">Find</button>
+      <button id="command-block-query-clear" type="button">Clear search</button>
+    </form>
+    <p id="command-block-search-status" role="status"></p>
+    <ul id="command-block-matches"></ul>
     <form id="command-review-form" hidden>
       <label>Before <select id="command-review-before" disabled></select></label>
       <label>After <select id="command-review-after" disabled></select></label>
@@ -68,7 +99,7 @@
     <p id="command-review-status" role="status"></p>
     <div id="command-block-list"></div>
   </div>
-</section>
+</section></div>
 <section id="paste-review" hidden aria-label="Review multiline paste"><h2>Review multiline paste</h2><p>Newlines may execute commands. Verify every line before sending. This review applies even when bracketed paste is enabled; terminal modes can change.</p><textarea id="paste-preview" readonly rows="6" spellcheck="false" aria-label="Clipboard text with visual line breaks" aria-describedby="paste-line-endings"></textarea><p id="paste-line-endings">The preview displays CR, LF and CRLF as line breaks. The original clipboard text is shown below as a quoted string: \r means carriage return, \n means line feed, \t means tab and \\ means a literal backslash. Unicode format characters, including bidirectional controls and zero-width joiners, appear as \uXXXX escapes (two escapes for a supplementary character); this does not remove them from the paste. Other characters remain literal, so this is not a complete code-point listing. On delivery, each CRLF pair, lone CR or LF becomes one carriage return. Bracketed paste markers depend on the terminal mode at delivery.</p><pre id="paste-escaped" tabindex="0" role="region" aria-label="Original clipboard text with escaped line endings and format characters" aria-describedby="paste-line-endings"></pre><button id="paste-confirm" type="button" disabled>Send reviewed paste</button> <button id="paste-cancel" type="button">Cancel paste</button></section>
 <section aria-label="Terminal history">
   <button id="copy-visible">Snapshot visible text</button> <button id="history-older">Older 20 rows</button> <button id="history-newer">Newer 20 rows</button> <button id="history-refresh">Refresh history / copy snapshot</button>

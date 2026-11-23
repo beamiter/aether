@@ -8,7 +8,7 @@ ANSI parser. **This is not a daily-use terminal.**
 ## Shared core
 
 The three Cargo manifests pin the shared crates to
-`afb42aaba56b7cdb256a287a3c31e9f76a734744`. `jterm_runtime` owns the local PTY, direct child and
+`938bc85d8df75dc756bf8e84ed75743cf4c093dc`. `jterm_runtime` owns the local PTY, direct child and
 output drain. Its `jterm_engine::terminal::Terminal` owns parsing, screen
 state, input encoding, history and immutable frames. The session host supplies
 each frame stream's epoch. Run `python3 scripts/check-core-pin.py` to verify
@@ -68,6 +68,26 @@ Enter to execute it. A foreground program or a retired record cannot receive
 the insertion. **Back to live terminal** returns keyboard
 focus to the same PTY. Command blocks are kept in memory for that shell.
 [Shell integration contract](SHELL-INTEGRATION-CONTRACT.md)
+
+**Find in completed commands** searches the retained commands and their
+captured output by literal text. Choose a result to open the matching record
+and select the text in its original command or output.
+
+**Terminal Chat** in the local tab bar places completed command cards above
+that tab's live shell. At a ready jsh prompt, **Send command** presses Enter in
+the existing shell editor. Foreground programs keep receiving keyboard input
+through the same terminal. Fullscreen programs occupy the pane, and ordinary
+shells retain the live terminal. The selected presentation follows the local
+tab while its PTY remains open.
+
+At a writable jsh prompt, open **Workflows** or press **Ctrl+Shift+M** in the
+terminal. Aether loads TOML and YAML from the shared workflow format. It reads
+the user configuration directory's `aether/workflows` first, then directories
+in `AETHER_WORKFLOW_DIR`, followed by the user and system data directories'
+`aether/workflows`. The first workflow with a given name wins. Search by name,
+description, or tag, choose an entry, and fill in its arguments. **Insert at
+cursor** puts the rendered line into the original jsh editor. Review the line
+there and press Enter to run it.
 
 ## SSH files and read-only Workspace
 

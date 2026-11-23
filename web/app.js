@@ -4,6 +4,8 @@ import {installPasteReview} from './paste.js';
 import {resizeQueue,cursorTarget,terminalCellAt} from './viewport.js';
 import {installHistory} from './history.js';
 import {installCommandBlocks} from './command-blocks.js';
+import {installTerminalChat,validateChatStatus} from './terminal-chat.js';
+import {installWorkflows} from './workflows.js';
 import {readLocalShellLayout,saveLocalShellLayout} from './local-layout.js';
 import {acceptFull,acceptUpdate,clearPaint,paint} from './frames.js'; import {installIme} from './ime.js';
 import {acceptChannelFrame,channelCounter,CHANNEL_FRAME_VERSION} from './frames-v4.js';
@@ -30,17 +32,25 @@ const filePreview=installFilePreviewPanel(document,{getFrame:()=>state,getEpoch:
   openInVim:typeof openVim9Snapshot==='function'?openVim9Snapshot:null});
 const imeInput=document.querySelector('#ime-input');
 const terminalPreedit=document.querySelector('#terminal-preedit');
+const terminalChatSend=document.querySelector('#terminal-chat-send');
 const inputOwner=()=>!input.disabled?owner:null;
+function refreshTerminalControls(){terminalChat.updateOwner();workflows.updateOwner();}
 const ime=installIme(imeInput,{getEpoch:inputOwner,
 canCommit:()=>!document.hidden&&(document.activeElement??imeInput)===imeInput,
-afterEnd:callback=>typeof requestAnimationFrame==='function'?requestAnimationFrame(callback):callback(),preedit:text=>{
+afterEnd:callback=>{
+  const flush=()=>{callback();refreshTerminalControls();};
+  if(typeof requestAnimationFrame==='function')requestAnimationFrame(flush);else flush();
+},preedit:text=>{
   terminalPreedit.textContent=text;terminalPreedit.hidden=text==='';
+  void Promise.resolve().then(refreshTerminalControls);
 },commit:(text,attachment)=>{if(attachment!==owner)return;if(text.length>4096||new TextEncoder().encode(text).length>4096){status.textContent='Committed text exceeds 4096-byte limit; nothing sent.';return;}enqueueLogical('text_shell',{text});}});
 // WebKit can emit compositionend with the uncommitted preedit while the
 // browser moves focus, before the text element receives its blur event.
 document.addEventListener?.('pointerdown',event=>{
+  if(event.target===terminalChatSend){event.preventDefault();return;}
   if(event.target!==imeInput&&event.target!==canvas&&ime.isComposing())ime.reset();
 },true);
+terminalChatSend.addEventListener('mousedown',event=>event.preventDefault());
 document.addEventListener?.('keydown',event=>{
   if(event.key==='Tab'&&!event.isComposing&&event.keyCode!==229&&ime.isComposing())ime.reset();
 },true);
@@ -100,6 +110,7 @@ function renderLocalTabs(focusActive=false) {
   renderSplit();
   history.updateSearchControls();
   blocks.updateOwner();
+  refreshTerminalControls();
   tabs.hidden=!invoke||sshSession!==null||!localTabEpochs.size||(!owner&&showLocal.disabled&&!changingTab);
   if(tabs.hidden)return;
   let activeButton=null;
@@ -247,7 +258,8 @@ function acceptOwner(attachment) {
       !valid(attachment.epoch)||!valid(attachment.generation)) throw new Error('invalid terminal attachment');
   return attachment;
 }
-const pasteReview=installPasteReview({panel:document.querySelector('#paste-review'),preview:document.querySelector('#paste-preview'),escaped:document.querySelector('#paste-escaped'),confirm:document.querySelector('#paste-confirm'),cancel:document.querySelector('#paste-cancel'),getEpoch:inputOwner,send:(text,attachment)=>{if(attachment===owner)enqueueLogical('paste_shell',{text});},onError:message=>{status.textContent=message;}});
+const pasteReviewPanel=document.querySelector('#paste-review');
+const pasteReview=installPasteReview({panel:pasteReviewPanel,preview:document.querySelector('#paste-preview'),escaped:document.querySelector('#paste-escaped'),confirm:document.querySelector('#paste-confirm'),cancel:document.querySelector('#paste-cancel'),getEpoch:inputOwner,send:(text,attachment)=>{if(attachment===owner)enqueueLogical('paste_shell',{text});},onError:message=>{status.textContent=message;}});
 const history=installHistory({older:document.querySelector('#history-older'),newer:document.querySelector('#history-newer'),refresh:document.querySelector('#history-refresh'),output:document.querySelector('#history-output'),label:document.querySelector('#history-label'),
  invoke:(command,{owner:attachment,...args})=>invokeAttached(command,{epoch:attachment.epoch,...args},attachment),
  getOwner:()=>changingTab?null:owner,
@@ -255,9 +267,11 @@ const history=installHistory({older:document.querySelector('#history-older'),new
   find:document.querySelector('#history-find'),older:document.querySelector('#history-find-older'),
   cancel:document.querySelector('#history-find-cancel'),status:document.querySelector('#history-find-status'),
   enabled:attachment=>attachment.session!==sshSession&&!restoringLocalLayout&&!recovery}});
+const localView=()=>owner&&owner.session!==sshSession&&!changingTab&&!recovery&&!restoringLocalLayout?owner:null;
 const blocks=installCommandBlocks(document,{
-  getOwner:()=>owner&&owner.session!==sshSession&&!changingTab&&!recovery&&!restoringLocalLayout?owner:null,
+  getOwner:localView,
   read:attachment=>invokeAttached('local_command_blocks',{epoch:attachment.epoch},attachment),
+  find:(attachment,query)=>invokeAttached('search_local_blocks',{epoch:attachment.epoch,query},attachment),
   compare:(attachment,before,after)=>invokeAttached('compare_local_output',{epoch:attachment.epoch,before,after},attachment),
   exportReview:(reviewId,format)=>invoke('export_local_output',{reviewId,format}),
   recall:(block,attachment,origin,report)=>{
@@ -271,6 +285,30 @@ const blocks=installCommandBlocks(document,{
     });
   },
   returnToTerminal:()=>{(input.disabled?canvas:imeInput).focus();},
+});
+const terminalChat=installTerminalChat(document,{
+  getOwner:localView, blocks,
+  canSend:()=>!!localView()&&!input.disabled&&ime.isSettled(),
+  sendEnter:(prompt,receipt)=>{
+    if(!pasteReviewPanel.hidden)return;
+    return enqueueLogical('submit_local_chat',{prompt},accepted=>{
+      receipt(accepted===true);
+      if(accepted!==true)status.textContent='The shell prompt changed. Continue typing in the live terminal.';
+    });
+  },
+  focusTerminal:()=>imeInput.focus(),
+  revealCursor:revealLiveCursor,
+});
+const workflows=installWorkflows(document,{
+  context:()=>{
+    const attachment=localView(),prompt=terminalChat.currentPrompt();
+    return attachment&&inputOwner()===attachment&&prompt&&ime.isSettled()&&pasteReviewPanel.hidden
+      ?{owner:attachment,prompt}:null;
+  },
+  invoke:request=>invoke('local_workflow_library',{request}),
+  insert:(choice,receipt)=>enqueueLogical('insert_local_workflow',choice,receipt),
+  returnToTerminal:()=>{(input.disabled?canvas:imeInput).focus();},
+  announce:message=>{status.textContent=message;},
 });
 openIntegrated.hidden=!invoke;
 sshForm.hidden=!invoke;localTools.hidden=!invoke;
@@ -294,6 +332,7 @@ button.addEventListener('click',async()=>{
 });
 function validateShellStatus(info,expectedEpoch){
   if(!info||info.epoch!==expectedEpoch||typeof info.exited!=='boolean'||typeof info.drained!=='boolean'||(info.write_error!==null&&typeof info.write_error!=='string')||typeof info.dropped_reply_bytes!=='string'||!/^[0-9]{1,20}$/.test(info.dropped_reply_bytes)||typeof info.unsupported!=='string'||!/^[0-9]{1,20}$/.test(info.unsupported))throw new Error('invalid session status');
+  if(owner?.session!==sshSession)validateChatStatus(info.chat);
 }
 function showShellStatus(info,mode){
   const health=document.querySelector('#health');
@@ -304,6 +343,9 @@ function showShellStatus(info,mode){
   }
   health.textContent=`Unsupported sequences: ${info.unsupported}. Dropped reply bytes: ${info.dropped_reply_bytes}. Shell ${info.exited?'exited; output remains visible':'running'}.${info.write_error?' Input disabled: '+info.write_error:''}`;
   if(info.exited||info.write_error){pasteReview.reset();keyQueue.locked=true;input.disabled=send.disabled=resize.disabled=true;}
+  if(owner&&owner.session!==sshSession)terminalChat.showStatus(info,owner);
+  workflows.updateOwner();
+  if(document.activeElement===imeInput||document.activeElement===canvas)terminalChat.followCursor();
 }
 function stopTransport(){
   clearInterval(timer);
@@ -322,6 +364,7 @@ function suspendLocalOutput(error){
   localInputSuspended=!keyQueue.locked&&!keyQueue.pending&&!input.disabled;
   pasteReview.reset();ime.reset();keyQueue.locked=true;
   input.disabled=send.disabled=resize.disabled=true;
+  refreshTerminalControls();
   status.textContent=`Local output stream paused: ${String(error?.message??error)}. Recover the output snapshot to continue using polling.`;
 }
 async function receiveLocalStream(stream,event){
@@ -419,6 +462,7 @@ async function poll(){
     pasteReview.reset();keyQueue.locked=true;clearInterval(timer);
     status.textContent=isSsh?`SSH terminal paused: ${String(e?.message??e)}. Use Recover output snapshot.`:`Shell stopped: ${String(e?.message??e)}. Close/reopen before continuing.`;
     input.disabled=send.disabled=resize.disabled=true;
+    terminalChat.updateOwner();
   }
   finally{if(polling===ticket)polling=null;}
 }
@@ -673,8 +717,8 @@ close.addEventListener('click',async()=>{
   // before Close can give up that view, even if the close response is lost.
   if(changingTab||!owner||close.disabled)return;
   generation++;transport++;polling=null;setLocalTools(false);filePreview.dismiss();pasteReview.reset();ime.reset();history.reset();stopTransport();const old=epoch,oldOwner=owner;epoch=null;owner=null;renderLocalTabs();resize.disabled=close.disabled=detach.disabled=input.disabled=send.disabled=true;
-  try{const result=await invokeAttached('close_shell',{epoch:old},oldOwner);if(oldOwner.session!==sshSession){input.value='';localDrafts.delete(oldOwner.session);localTabEpochs.delete(oldOwner.epoch);localTabOwners.delete(oldOwner.epoch);integratedShells.delete(oldOwner.session);if(localTabEpochs.size<2)splitEnabled=false;recordLocalLayout();}status.textContent=result?.cleanup_pending===false?'Terminal closed; direct child reaped. Descendant containment is not provided.':'Terminal closed; direct-child cleanup handed to bounded supervisor and may still be pending. Descendant containment is not provided.';state=null;clearTerminalPaint();sshSession=null;sshInputSuspended=false;setOpenDisabled(false);attach.disabled=button.disabled=false;renderLocalTabs();}
-  catch(e){epoch=old;owner=oldOwner;blocks.updateOwner();close.disabled=detach.disabled=false;status.textContent=`Close error: ${String(e?.message??e)}. Retry Close to finish cleanup.`;}
+  try{const result=await invokeAttached('close_shell',{epoch:old},oldOwner);if(oldOwner.session!==sshSession){input.value='';localDrafts.delete(oldOwner.session);localTabEpochs.delete(oldOwner.epoch);localTabOwners.delete(oldOwner.epoch);integratedShells.delete(oldOwner.session);terminalChat.forget(oldOwner.session);if(localTabEpochs.size<2)splitEnabled=false;recordLocalLayout();}status.textContent=result?.cleanup_pending===false?'Terminal closed; direct child reaped. Descendant containment is not provided.':'Terminal closed; direct-child cleanup handed to bounded supervisor and may still be pending. Descendant containment is not provided.';state=null;clearTerminalPaint();sshSession=null;sshInputSuspended=false;setOpenDisabled(false);attach.disabled=button.disabled=false;renderLocalTabs();}
+  catch(e){epoch=old;owner=oldOwner;blocks.updateOwner();terminalChat.updateOwner();close.disabled=detach.disabled=false;status.textContent=`Close error: ${String(e?.message??e)}. Retry Close to finish cleanup.`;}
 });
 document.querySelector('#command').addEventListener('submit',async event=>{
   event.preventDefault();if(epoch===null||input.disabled)return;
@@ -737,7 +781,12 @@ canvas.addEventListener('click',event=>{
     if(owner===attachment)status.textContent=String(error?.message??error);
   });
 },true);
-document.querySelector('#reveal-cursor').addEventListener('click',()=>{if(!state)return;const viewport=document.querySelector('.viewport');viewport.scrollTo(cursorTarget(state,canvas,viewport));});
+function revealLiveCursor(){
+  if(!state)return;
+  const viewport=document.querySelector('#active-pane .viewport');
+  viewport.scrollTo(cursorTarget(state,canvas,viewport));
+}
+document.querySelector('#reveal-cursor').addEventListener('click',revealLiveCursor);
 
 
 // Browser supplies logical events only; Rust chooses all terminal wire sequences.
@@ -758,12 +807,19 @@ function enqueueLogical(command,payload,onReceipt){
     }
     catch(e){if(ownsInput(attachment,queue)){pasteReview.reset();queue.locked=true;input.disabled=send.disabled=true;status.textContent=`Input not accepted: ${String(e?.message??e)}. Close/reopen before retrying.`;}}
   }).finally(()=>{queue.pending--;});
+  return queue.chain;
 }
 function keydown(event){
   // Respect an earlier control or capture handler that already owns this key.
   if(event.defaultPrevented)return;
   if(epoch===null||input.disabled||ime.isComposing()||event.isComposing||event.keyCode===229||event.getModifierState?.('AltGraph')||event.metaKey||event.key==='Dead'||event.key==='Process')return;
   if(pasteReview.dismissFromOrigin(event))return;
+  if(workflows.consumeEnterRepeat(event)){event.preventDefault();return;}
+  if(localView()&&event.ctrlKey&&event.shiftKey&&!event.altKey&&event.key.toLowerCase()==='m'){
+    event.preventDefault();
+    if(!event.repeat)workflows.toggle();
+    return;
+  }
   // Leave browser paste shortcut alone; the paste event carries clipboard text.
   if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==='v')return;
   // Linux browser paste must reach the same review path as Ctrl+V.

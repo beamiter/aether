@@ -1,5 +1,6 @@
 //! A single delivery credit for the active local view. The PTY keeps draining
 //! while the WebView validates, paints and acknowledges the current envelope.
+use super::LocalShellStatus;
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -9,13 +10,10 @@ use std::{
 };
 use tauri::ipc::Channel;
 pub(crate) use tauri_terminal_frame_bridge::protocol::ObserverTarget;
-pub(crate) use tauri_terminal_frame_bridge::protocol_v4::{
-    Counter, PeerUpdate, Receipt, StreamEvent,
-};
-use tauri_terminal_frame_bridge::{
-    live::{LiveBridge, SessionStatus},
-    semantic::Attachment,
-};
+pub(crate) use tauri_terminal_frame_bridge::protocol_v4::{Counter, PeerUpdate, Receipt};
+use tauri_terminal_frame_bridge::{live::LiveBridge, protocol_v4, semantic::Attachment};
+
+pub(crate) type StreamEvent = protocol_v4::StreamEvent<LocalShellStatus>;
 
 const HEARTBEAT: Duration = Duration::from_secs(2);
 
@@ -41,7 +39,7 @@ pub(super) struct LocalStream {
     sequence: u64,
     pending: Option<Receipt>,
     acknowledged: Option<Receipt>,
-    last_status: Option<SessionStatus>,
+    last_status: Option<LocalShellStatus>,
     last_sent: Instant,
     error: Option<String>,
     stopped: bool,
@@ -145,9 +143,9 @@ impl LocalStream {
         preview: Option<(Counter, PeerUpdate)>,
     ) -> Result<(bool, Option<Delivery>), String> {
         let frame = bridge.poll_channel_frame(self.owner.epoch, self.sequence == 0)?;
-        let status = bridge.status(self.owner.epoch)?;
+        let status = LocalShellStatus::read(bridge, self.owner.epoch)?;
         let now = Instant::now();
-        let ready = !status.drained;
+        let ready = !status.drained();
         if frame.is_none()
             && preview.is_none()
             && self.last_status.as_ref() == Some(&status)

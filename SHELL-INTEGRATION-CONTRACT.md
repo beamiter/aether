@@ -22,6 +22,14 @@ generation. Refresh obtains a new snapshot and keeps open cards expanded.
 `/bin/sh` launch and SSH terminal use the live terminal surface.
 [Native smoke](docs/NATIVE-LOCAL-WEBKIT-SMOKE.md)
 
+**Terminal Chat** projects the shared Rust prompt, running and alternate-screen
+state onto the same local PTY renderer. It follows the newest completed record
+for the exact attachment. The live terminal still owns all keystrokes and IME
+composition. A Send request carries the prompt generation and holds the view's
+writable input lease. Rust advances the PTY and checks that the generation and
+kernel foreground group still belong to that prompt. A successful request
+queues one logical Enter and consumes that generation for Send.
+
 ## Plain-shell fallback baseline, 2026-11-13
 
 This is a deliberately fail-closed fallback contract for the fifth terminal, not a command-block feature or authenticated shell integration.

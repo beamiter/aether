@@ -19,12 +19,31 @@ form{display:flex;gap:12px;align-items:center;margin-top:16px}label{flex:1}input
 #command-blocks:not([hidden]){margin:12px 0}
 #command-block-panel{margin:8px 0}
 .command-block-controls{display:flex;flex-wrap:wrap;gap:8px}
+#command-block-search[hidden],#command-block-search-status:empty,#command-block-matches:empty{display:none}
+#command-block-search{flex-wrap:wrap}
+#command-block-matches{list-style:none;margin:8px 0;padding:0}
+#command-block-matches li{margin:4px 0}
+#command-block-matches button{text-align:start;overflow-wrap:anywhere}
 .command-block{margin:6px 0;padding:10px;border:1px solid #52627a;border-radius:6px;background:#111820}
 .command-block summary{cursor:pointer;overflow-wrap:anywhere}
 .command-block-command{white-space:pre-wrap;unicode-bidi:isolate}
 .command-block-outcome{margin-inline:10px;color:#a5c7fa;font-size:13px}
 .command-block-meta{font-size:13px;overflow-wrap:anywhere;unicode-bidi:plaintext}
 .command-block textarea{margin-bottom:8px;unicode-bidi:plaintext}
+#terminal-chat-transcript #command-block-list{max-height:18rem;overflow:auto;overflow-anchor:none}
+#terminal-chat-dock:not([hidden]){display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:2rem;margin:6px 0;color:#acbacb}
+#active-pane[data-chat-surface="prompt"] .viewport{max-height:min(14rem,35vh)}
+#active-pane[data-chat-surface="fullscreen"] .viewport{max-height:none}
+#workflow-picker{margin:12px 0;padding:12px;border:1px solid #52627a;border-radius:8px;background:#111820}
+.workflow-controls,#workflow-results li{display:flex;align-items:center;flex-wrap:wrap;gap:8px}
+.workflow-controls label{min-width:min(100%,16rem)}
+#workflow-status:empty{display:none}
+#workflow-results{padding:0;margin:8px 0;list-style:none}
+#workflow-results li{margin:6px 0}
+#workflow-title{margin:.5em 0;font-size:18px}
+#workflow-command{max-height:8em;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;unicode-bidi:isolate}
+#workflow-args{display:grid;gap:8px;margin:8px 0}
+#workflow-args label{display:grid;gap:4px}
 #agent-workspace{max-width:1000px;margin:0 auto 24px;padding:0 24px}
 #agent-workspace > summary{cursor:pointer;font-weight:650}
 .workspace-controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:12px 0}

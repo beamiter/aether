@@ -1,3 +1,5 @@
+import {installBlockSearch} from './command-block-search.js';
+
 const MAX_BLOCKS=8;
 const MAX_OUTPUT_BYTES=16*1024;
 const encoder=new TextEncoder();
@@ -40,7 +42,7 @@ export function validateFrozenReview(receipt,owner){
   }
 }
 
-export function installCommandBlocks(document,{getOwner,read,compare,exportReview,recall,returnToTerminal}){
+export function installCommandBlocks(document,{getOwner,read,find,compare,exportReview,recall,returnToTerminal}){
   const controls=document.querySelector('#command-blocks');
   const toggle=document.querySelector('#command-block-toggle');
   const panel=document.querySelector('#command-block-panel');
@@ -56,24 +58,38 @@ export function installCommandBlocks(document,{getOwner,read,compare,exportRevie
   const reviewMarkdown=document.querySelector('#command-review-markdown');
   const reviewJson=document.querySelector('#command-review-json');
   const cards=new Map();
+  const search=installBlockSearch(document,{
+    getOwner:()=>controls.hidden||panel.hidden?null:getOwner(),
+    scan:find,
+    cardFor:record=>{
+      const card=cards.get(record.sequence);
+      return card?.dataset.revision===record.revision?card:null;
+    },
+  });
   let owner=null,request=null;
+  let chat=false,chatVisible=false,manuallyOpen=false;
+  let desiredSequence=null,displayedSequence,attemptedSequence;
   let choices=new Map(),frozen=null,reviewOperation=null;
 
   function setOpen(open){
     panel.hidden=!open;
     toggle.setAttribute('aria-expanded',String(open));
-    if(!open){request=null;refresh.disabled=false;}
+    if(!open){request=null;attemptedSequence=undefined;refresh.disabled=false;search.reset();}
   }
 
   function updateOwner(){
     const next=getOwner();
-    controls.hidden=!next;
+    controls.hidden=!next||(chat&&!chatVisible);
     if(next===owner)return;
     owner=next;
+    manuallyOpen=false;
     setOpen(false);
+    desiredSequence=null;
+    displayedSequence=attemptedSequence=undefined;
     status.textContent='';
     cards.clear();
     list.replaceChildren();
+    search.setAvailable(false);
     reviewOperation=null;
     frozen=null;
     reviewPanel.hidden=true;
@@ -82,6 +98,27 @@ export function installCommandBlocks(document,{getOwner,read,compare,exportRevie
     document.querySelector('#command-review-summary').textContent='';
     reviewStatus.textContent='';
     setChoices([]);
+  }
+
+  function setChatPresentation(enabled,visible,newestCompleted){
+    chat=enabled;
+    chatVisible=visible;
+    desiredSequence=newestCompleted;
+    toggle.hidden=chat;
+    const hide=!owner||(chat&&!chatVisible);
+    if(hide&&!controls.hidden)search.reset();
+    controls.hidden=hide;
+    const open=chat||manuallyOpen;
+    if(panel.hidden===open)setOpen(open);
+    refreshChat();
+  }
+
+  function refreshChat(){
+    if(!chat||controls.hidden||request||attemptedSequence===desiredSequence)return;
+    if(displayedSequence!==undefined&&(desiredSequence===null||
+        (displayedSequence!==null&&BigInt(displayedSequence)>=BigInt(desiredSequence))))return;
+    attemptedSequence=desiredSequence;
+    void refreshList();
   }
 
   function element(type,text,css){
@@ -176,6 +213,7 @@ export function installCommandBlocks(document,{getOwner,read,compare,exportRevie
   function makeCard(block,attachment){
     const card=element('details',undefined,'command-block');
     card.dataset.sequence=block.sequence;
+    card.dataset.revision=block.revision;
     const summary=element('summary');
     const command=element('code',block.command,'command-block-command');
     const outcome=block.exit===null?'Exit status unavailable':`Exit ${block.exit}`;
@@ -240,7 +278,14 @@ export function installCommandBlocks(document,{getOwner,read,compare,exportRevie
       if(request!==reading||getOwner()!==attachment)return;
       validateCommandBlockSnapshot(snapshot,attachment);
       setChoices(snapshot.blocks);
+      search.setAvailable(snapshot.blocks.length>0);
       const retained=new Set(snapshot.blocks.map(block=>block.sequence));
+      let anchor,anchorTop;
+      if(chat&&list.scrollTop>0){
+        const top=list.getBoundingClientRect().top;
+        anchor=[...list.children].find(card=>retained.has(card.dataset.sequence)&&card.getBoundingClientRect().bottom>top);
+        anchorTop=anchor?.getBoundingClientRect().top;
+      }
       for(const [sequence,card] of cards){
         if(!retained.has(sequence)){card.remove();cards.delete(sequence);}
       }
@@ -250,6 +295,8 @@ export function installCommandBlocks(document,{getOwner,read,compare,exportRevie
         cards.set(block.sequence,card);
         list.prepend(card);
       }
+      if(anchor)list.scrollTop+=anchor.getBoundingClientRect().top-anchorTop;
+      displayedSequence=snapshot.blocks[0]?.sequence??null;
       status.textContent=!snapshot.enabled
         ?'Command blocks are available for local sessions opened with jsh.'
         :snapshot.blocks.length
@@ -258,13 +305,14 @@ export function installCommandBlocks(document,{getOwner,read,compare,exportRevie
     }catch(error){
       if(request===reading&&getOwner()===attachment)status.textContent=String(error?.message??error);
     }finally{
-      if(request===reading){request=null;refresh.disabled=false;}
+      if(request===reading){request=null;refresh.disabled=false;refreshChat();}
     }
   }
 
   toggle.addEventListener('click',()=>{
-    if(!getOwner())return;
-    setOpen(panel.hidden);
+    if(!getOwner()||chat)return;
+    manuallyOpen=panel.hidden;
+    setOpen(manuallyOpen);
     if(!panel.hidden)void refreshList();
   });
   refresh.addEventListener('click',refreshList);
@@ -274,8 +322,8 @@ export function installCommandBlocks(document,{getOwner,read,compare,exportRevie
   reviewMarkdown.addEventListener('click',()=>void saveReview('markdown','md'));
   reviewJson.addEventListener('click',()=>void saveReview('json','json'));
   document.querySelector('#command-block-return').addEventListener('click',()=>{
-    setOpen(false);
+    if(!chat){manuallyOpen=false;setOpen(false);}
     returnToTerminal();
   });
-  return {updateOwner};
+  return {updateOwner,setChatPresentation};
 }

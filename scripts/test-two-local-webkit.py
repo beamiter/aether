@@ -908,6 +908,9 @@ def exercise_restart(driver, owned, binary):
 
 
 def exercise_command_blocks(driver, owned, output_review=False):
+    # Leave room to reach the expanded card after its review controls appear.
+    driver.command("POST", "/window/rect", {"width": 1380, "height": 1000})
+
     def state():
         return driver.execute(READ)
 
@@ -988,7 +991,8 @@ def exercise_command_blocks(driver, owned, output_review=False):
     assert any(item["command"] == command and item["open"] for item in blocks()), "another block collapsed the previous card"
     # Reinsert the original revision and append a shell operator before pressing
     # Enter. That suffix only parses as part of the recalled, still-editable line.
-    driver.click("#command-block-list details[open] .command-block-recall")
+    recall = "#command-block-list details[open] .command-block-recall"
+    driver.type(recall, "\ue007")
     wait_for(lambda: driver.execute("return document.querySelector('#command-block-status').textContent") ==
              "Command inserted at the shell prompt.", "command was not inserted at the live prompt")
     recalled = owned / "recalled-line"
@@ -1005,7 +1009,7 @@ def exercise_command_blocks(driver, owned, output_review=False):
     send(secret_command)
     visible("AETHER_PRIVATE_READY")
     driver.click("#command-block-toggle")
-    driver.click("#command-block-list details[open] .command-block-recall")
+    driver.type(recall, "\ue007")
     wait_for(lambda: "Wait for the integrated shell prompt" in driver.execute(
         "return document.querySelector('#command-block-status').textContent"), "command recall reached foreground read")
     driver.click("#command-block-return")
@@ -1028,6 +1032,7 @@ def exercise_command_blocks(driver, owned, output_review=False):
     send(editor)
     visible("AETHER_NATIVE_VIM")
     driver.type("#ime-input", "\ue00c:q!\ue007")
+    wait_for(ready_prompt, "Vim did not return to the live jsh prompt")
     driver.click("#command-block-toggle")
     fullscreen = refresh_for(editor)
     assert fullscreen["output"] is None and "screen operations" in fullscreen["body"], fullscreen
@@ -1060,21 +1065,261 @@ def exercise_command_blocks(driver, owned, output_review=False):
                       "native_blocks_isolated_between_split_tabs": True}), flush=True)
 
 
-def exercise_frozen_output_review(driver, owned, send, refresh_for, blocks, before):
-    def option(select, command):
-        return driver.execute(f"""
-            const id=Array.from(document.querySelectorAll('#command-block-list details'))
-                .find(card=>card.querySelector('code').textContent==={json.dumps(command)})?.dataset.sequence;
-            return Array.from(document.querySelectorAll('#command-review-{select} option'))
-                .find(option=>option.textContent.startsWith('#'+id+' · '))?.value ?? null;
+def exercise_terminal_chat(driver, owned):
+    driver.command("POST", "/window/rect", {"width": 1380, "height": 1000})
+    toggle = "#terminal-chat-toggle"
+    terminal = "#ime-input"
+
+    def view():
+        return driver.execute("""
+            const pane = document.querySelector('#active-pane');
+            const send = document.querySelector('#terminal-chat-send');
+            const transcript = document.querySelector('#command-blocks');
+            return {
+              surface: pane.dataset.chatSurface,
+              legacy: !document.querySelector('#command').hidden,
+              send: !send.hidden && !send.disabled,
+              transcript: !transcript.hidden && pane.contains(transcript),
+              chrome: !document.querySelector('#terminal-chat-dock').hidden,
+              cards: Array.from(transcript.querySelectorAll('details'), card => ({
+                command: card.querySelector('code').textContent,
+                body: card.textContent,
+                output: card.querySelector('textarea')?.value ?? null,
+              })),
+            };
         """)
 
-    before_revision = option("before", before)
-    after_revision = option("after", "pwd")
-    assert re.fullmatch(r"[0-9a-f]{64}", before_revision or "")
-    assert re.fullmatch(r"[0-9a-f]{64}", after_revision or "")
-    driver.click(f'#command-review-before option[value="{before_revision}"]')
-    driver.click(f'#command-review-after option[value="{after_revision}"]')
+    def phase(surface):
+        def observed():
+            current = view()
+            return current if current['surface'] == surface else None
+        return wait_for(observed, f"Terminal Chat did not enter {surface}")
+
+    def card_for(command):
+        return wait_for(lambda: next((card for card in view()['cards'] if card['command'] == command), None),
+                        f"Terminal Chat did not automatically show {command!r}")
+
+    driver.click("#open-integrated")
+    wait_for(lambda: not driver.execute(f"return document.querySelector('{toggle}').disabled;"),
+             "the integrated terminal did not acquire a local view")
+    live_input = driver.element_path(terminal)
+    live_canvas = driver.element_path("#active-pane canvas")
+    driver.click(toggle)
+    assert phase("prompt")['transcript']
+    pid = owned / "terminal-chat.pid"
+    receipt = owned / "terminal-chat-send"
+    prefix = f"cd {shlex.quote(str(owned))}; printf '%s' \"$$\" > {shlex.quote(str(pid))}; "
+    suffix = f"printf x >> {shlex.quote(str(receipt))}; printf 'TERMINAL_CHAT_%s\\n' ONCE"
+    driver.type(terminal, prefix)
+    driver.click(toggle)
+    assert phase('')['legacy'] and not receipt.exists()
+    driver.click(toggle)
+    assert not phase('prompt')['legacy']
+    driver.type(terminal, suffix)
+    assert not receipt.exists(), "switching presentation submitted live shell input"
+    wait_for(lambda: view()['send'], "send was unavailable at the native prompt")
+    driver.click("#terminal-chat-send")
+    first = card_for(prefix + suffix)
+    assert receipt.read_text() == "x" and first['output'] == "TERMINAL_CHAT_ONCE\n", first
+    identity = shell_identity(pid)
+    assert driver.element_path(terminal) == live_input
+    assert driver.element_path("#active-pane canvas") == live_canvas
+    driver.type(terminal, "pwd\ue007")
+    assert card_for("pwd")['output'] == str(owned) + "\n"
+
+    hidden_receipt = owned / "terminal-chat-hidden"
+    hidden_command = "/bin/sh -c " + shlex.quote(
+        f"stty -echo; printf 'CHAT_READ_READY\\n'; IFS= read -r reply; stty echo; printf '%s' \"$reply\" > {hidden_receipt}")
+    driver.type(terminal, hidden_command + "\ue007")
+    running = phase("running")
+    assert running['transcript'] and not running['send'] and not running['legacy']
+    driver.click(toggle)
+    assert phase('')['legacy']
+    driver.click(toggle)
+    assert phase("running")['transcript']
+    hidden = "terminal-chat-hidden-value"
+    driver.type(terminal, hidden + "\ue007")
+    wait_for(lambda: hidden_receipt.is_file() and hidden_receipt.read_text() == hidden,
+             "foreground read did not receive the actual terminal input")
+    assert hidden not in card_for(hidden_command)['body']
+    assert phase("prompt")['send']
+
+    editor_file = owned / "terminal-chat-vim.txt"
+    editor_file.write_text("TERMINAL_CHAT_VIM\n")
+    editor = f"vim -Nu NONE -i NONE -n -X {shlex.quote(str(editor_file))}"
+    driver.type(terminal, editor + "\ue007")
+    fullscreen = phase("fullscreen")
+    assert not fullscreen['transcript'] and not fullscreen['chrome'] and not fullscreen['legacy']
+    driver.type(terminal, "\ue00c:q!\ue007")
+    assert phase("prompt")['transcript']
+    assert card_for(editor)['output'] is None
+    assert birth(identity[0]) == identity[1] and receipt.read_text() == "x"
+    driver.click("#close")
+    wait_for(lambda: birth(identity[0]) != identity[1], "Terminal Chat leaked the original PTY child")
+
+    driver.click("#open")
+    wait_for(lambda: not driver.execute(f"return document.querySelector('{toggle}').disabled;"),
+             "the ordinary shell did not acquire a local view")
+    driver.click(toggle)
+    fallback = phase("passthrough")
+    assert not fallback['transcript'] and not fallback['send'] and not fallback['legacy']
+    plain = owned / "terminal-chat-plain"
+    driver.type(terminal, f"printf plain > {shlex.quote(str(plain))}\ue007")
+    wait_for(lambda: plain.is_file() and plain.read_text() == "plain", "Chat fallback lost shell input")
+    driver.click("#close")
+    wait_for(lambda: driver.execute(READ)['status'].startswith("Terminal closed"), "ordinary shell did not close")
+    print(json.dumps({"native_terminal_chat_same_live_renderer_and_pty": True,
+                      "native_terminal_chat_one_enter_and_automatic_cards": True,
+                      "native_terminal_chat_hidden_foreground_input": True,
+                      "native_terminal_chat_vim_fullscreen_and_passthrough": True}), flush=True)
+
+
+def prepare_workflows(owned, env):
+    config = Path(env["XDG_CONFIG_HOME"]) / "aether" / "workflows"
+    override = owned / "workflow-override"
+    config.mkdir(parents=True)
+    override.mkdir()
+    env["AETHER_WORKFLOW_DIR"] = str(override)
+    command = "printf '%s\\n' '{value}-{suffix}' >> " + shlex.quote(str(owned / "workflow-result"))
+    (config / "report.toml").write_text(
+        'name = "Local report"\n'
+        'description = "Write the report fixture"\n'
+        'tags = ["native-report-fixture"]\n'
+        f'command = {json.dumps(command)}\n'
+        '\n[[args]]\nname = "value"\n'
+        '\n[[args]]\nname = "suffix"\ndefault = "default"\n',
+        encoding="utf-8",
+    )
+    (override / "duplicate.yaml").write_text(
+        'name: Local report\ncommand: printf wrong\n', encoding="utf-8")
+    (override / "additional.yaml").write_text(
+        'name: YAML check\ncommand: printf yaml\n', encoding="utf-8")
+
+
+def exercise_terminal_workflows(driver, owned):
+    terminal = "#ime-input"
+    receipt = owned / "workflow-result"
+
+    def view():
+        return driver.execute("""
+            return {
+              available: !document.querySelector('#workflows').disabled,
+              open: !document.querySelector('#workflow-picker').hidden,
+              rows: Array.from(document.querySelectorAll('#workflow-results button'), el => el.textContent),
+              fields: !document.querySelector('#workflow-fields').hidden,
+              command: document.querySelector('#workflow-command').textContent,
+              defaults: Array.from(document.querySelectorAll('#workflow-args input'), el => el.value),
+              message: document.querySelector('#workflow-status').textContent,
+            };
+        """)
+
+    driver.click("#open-integrated")
+    wait_for(lambda: view()["available"], "the integrated prompt did not enable workflows")
+    original = driver.execute(READ)["current_tab"]
+    driver.click("#terminal-chat-toggle")
+    driver.click("#workflows")
+    wait_for(lambda: view()["rows"].count("Local report") == 1 and "YAML check" in view()["rows"],
+             "the workflow library did not use config precedence and the additive override")
+    driver.type("#workflow-search", "native-report-fixture")
+    wait_for(lambda: view()["rows"] == ["Local report"], "workflow tag search did not narrow the results")
+    driver.click("#workflow-results li:first-child button")
+    wait_for(lambda: view()["fields"], "workflow arguments did not open")
+    assert view()["defaults"] == ["", "default"] and "{value}-{suffix}" in view()["command"]
+    driver.click("#workflow-insert")
+    wait_for(lambda: "missing values" in view()["message"], "a required workflow value was accepted blank")
+    assert not receipt.exists()
+
+    driver.type("#workflow-args label:first-child input", "alpha beta")
+    driver.click("#workflow-insert")
+    wait_for(lambda: not view()["open"] and
+             driver.execute(READ)["status"].startswith("Workflow queued at the shell cursor."),
+             "the selected workflow did not reach the live shell")
+    assert not receipt.exists(), "workflow insertion executed before Enter"
+    driver.type(terminal, "; printf 'edited\\n' >> " + shlex.quote(str(receipt)) + "\ue007")
+    expected = "alpha beta-default\nedited\n"
+    wait_for(lambda: receipt.is_file() and receipt.read_text() == expected,
+             "the workflow did not stay editable in the selected jsh prompt")
+    exercise_completed_block_search(driver)
+
+    wait_for(lambda: view()["available"], "workflows did not follow the next shell prompt")
+    driver.click("#workflows")
+    wait_for(lambda: view()["rows"][:1] == ["Local report"], "the next prompt did not open its own catalog")
+    driver.click("#workflow-results li:first-child button")
+    wait_for(lambda: view()["fields"], "the workflow form did not open before switching tabs")
+    driver.click("#new-local-tab")
+    peer = wait_for(lambda: (tab if (tab := driver.execute(READ)["current_tab"]) != original else None),
+                    "the other shell tab did not activate")
+    assert not view()["open"] and not view()["available"], "the old picker survived the tab switch"
+    assert not driver.execute("return document.querySelector('#command-block-matches').children.length;")
+    click_tab(driver, original)
+    wait_for(lambda: view()["available"], "workflows did not return with the integrated shell")
+    assert not view()["open"] and receipt.read_text() == expected
+    driver.click("#close")
+    click_tab(driver, peer)
+    driver.click("#close")
+    wait_for(lambda: driver.execute(READ)["status"].startswith("Terminal closed"),
+             "the workflow fixture shells did not close")
+    return {
+        "native_workflow_shared_discovery_and_precedence": True,
+        "native_workflow_required_and_default_arguments": True,
+        "native_workflow_inserts_editable_text_with_explicit_enter": True,
+        "native_workflow_picker_retires_on_tab_switch": True,
+        "native_completed_block_search_selects_owned_command_and_output_ranges": True,
+    }
+
+
+def exercise_completed_block_search(driver):
+    command = r"printf '\360\237\220\207 %s%s\n' alpha suffix"
+    driver.type("#ime-input", command + "\ue007")
+    wait_for(lambda: driver.execute(r"""
+        return Array.from(document.querySelectorAll('#command-block-list details'),
+                          card => card.querySelector('textarea')?.value).includes('🐇 alphasuffix\n');
+    """), "the search fixture output did not appear in a retained command card")
+    driver.type("#command-block-query", "alphasuffix\ue007")
+    wait_for(lambda: driver.execute("""
+        const results = document.querySelectorAll('#command-block-matches button');
+        return results.length === 1 && results[0].textContent.startsWith('Output');
+    """), "retained command search did not isolate the output hit")
+    driver.click("#command-block-matches button")
+    assert driver.execute(r"""
+        const output = document.activeElement;
+        return output.matches('#command-block-list textarea') &&
+            output.value === '🐇 alphasuffix\n' && output.selectionStart === 3 &&
+            output.value.slice(output.selectionStart, output.selectionEnd) === 'alphasuffix';
+    """), "an output hit did not select the exact UTF-16 range in its retained record"
+    driver.click("#command-block-query-clear")
+    driver.type("#command-block-query", "%s%s\ue007")
+    wait_for(lambda: driver.execute("""
+        const results = document.querySelectorAll('#command-block-matches button');
+        return results.length === 1 && results[0].textContent.startsWith('Command');
+    """), "retained command search did not isolate the command hit")
+    driver.click("#command-block-matches button")
+    assert driver.execute("""
+        const selected = document.getSelection();
+        return selected.toString() === '%s%s' &&
+               selected.anchorNode.parentElement.matches('#command-block-list summary code');
+    """), "a command hit did not select the exact text of the shell command"
+
+
+def exercise_frozen_output_review(driver, owned, send, refresh_for, blocks, before):
+    def select_revision(field, command):
+        selector = f"#command-review-{field}"
+        choice = driver.execute(f"""
+            const id=Array.from(document.querySelectorAll('#command-block-list details'))
+                .find(card=>card.querySelector('code').textContent==={json.dumps(command)})?.dataset.sequence;
+            const select=document.querySelector({json.dumps(selector)});
+            const index=Array.from(select.options).findIndex(option=>option.textContent.startsWith('#'+id+' · '));
+            return index<0 ? null : {{ index, revision:select.options[index].value, selected:index===select.selectedIndex }};
+        """)
+        assert choice and re.fullmatch(r"[0-9a-f]{64}", choice["revision"])
+        if not choice["selected"]:
+            driver.type(selector, "\ue011" + "\ue015" * choice["index"])
+        wait_for(lambda: driver.execute(f"return document.querySelector({json.dumps(selector)}).value;") ==
+                 choice["revision"], f"{field} output revision was not selected")
+        return choice["revision"]
+
+    before_revision = select_revision("before", before)
+    after_revision = select_revision("after", "pwd")
     driver.click("#command-review-compare")
 
     def current():
@@ -2592,6 +2837,7 @@ def run(binary, jsh, workspace, api, native, notebook=False, output_review=False
             env["PATH"] = f"{launch}:/usr/bin:/bin"
         if jsh:
             (launch / "jsh").symlink_to(jsh)
+            (launch / "vim").symlink_to(Path(shutil.which("vim")).resolve())
         transcripts = prepare_workspace(owned, env, launch) if workspace else None
         native_fixture = prepare_native_task(owned, env, launch) if native else None
         if api and not workspace:
@@ -2600,6 +2846,8 @@ def run(binary, jsh, workspace, api, native, notebook=False, output_review=False
             path = owned / name.lower()
             path.mkdir(mode=0o700)
             env["XDG_RUNTIME_DIR" if name == "RUNTIME" else f"XDG_{name}_HOME"] = str(path)
+        if jsh:
+            prepare_workflows(owned, env)
         if vim9:
             address = private_accessibility_address()
             os.environ["AT_SPI_BUS_ADDRESS"] = env["AT_SPI_BUS_ADDRESS"] = address
@@ -2637,6 +2885,8 @@ def run(binary, jsh, workspace, api, native, notebook=False, output_review=False
                 exercise_restart(driver, owned, binary)
                 if jsh:
                     exercise_command_blocks(driver, owned, output_review)
+                    exercise_terminal_chat(driver, owned)
+                    print(json.dumps(exercise_terminal_workflows(driver, owned)), flush=True)
                 if workspace:
                     exercise_workspace(driver, owned, binary, env, transcripts)
                 if api:
@@ -2662,7 +2912,7 @@ def run(binary, jsh, workspace, api, native, notebook=False, output_review=False
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path, help="exact built tauri-terminal-lab executable")
-    parser.add_argument("--jsh", type=Path, help="installed jsh executable for the optional native command-block journey")
+    parser.add_argument("--jsh", type=Path, help="installed jsh for the command-block, Terminal Chat and workflow journeys")
     parser.add_argument("--workspace", action="store_true", help="include the isolated shared Workspace host and CLI PTY journey")
     parser.add_argument("--api-chat", action="store_true", help="include the isolated local streaming API conversation")
     parser.add_argument("--native-task", action="store_true", help="include the isolated scoped native Codex task and approval")

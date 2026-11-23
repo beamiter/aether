@@ -1,8 +1,8 @@
 # Native local-shell WebKitGTK smoke
 
 Run **Desktop WebKitGTK acceptance** manually on Ubuntu 24.04. It also runs
-when a push to `master` changes the native workflow, a driver script or any
-of the three Cargo lockfiles. It builds and hashes the exact
+when a push to `master` changes the native workflow, a driver script, local
+terminal source, WebView source or any of the three Cargo lockfiles. It builds and hashes the exact
 checkout’s Aether desktop binary and verifies that the embedded Aether page,
 not MiniBrowser or a mock runtime, is under automation.
 
@@ -59,6 +59,30 @@ binary as the rest of the smoke.
 It recalls a command into the editable jsh prompt, appends another expression
 before submitting, and checks that a foreground process waiting for hidden
 input receives only the explicitly typed reply.
+
+The same option activates the Terminal Chat journey. It switches the view
+around a partially typed command, checks that Send reaches the existing prompt
+once, and verifies the renderer, shell PID and working directory across the
+switch. The test also covers automatic completed cards, hidden foreground
+input, Vim's alternate screen and writable fallback for an ordinary shell.
+The workflow builds a pinned jsh fixture for X11 and Wayland. The Wayland
+driver's `--jsh` option additionally verifies that Send stays disabled during
+native composition and that the committed Unicode reaches the PTY once on Send.
+
+The jsh fixture also loads its workflow library from private TOML and YAML
+files. It verifies that user configuration takes precedence over the additive
+override, checks tag search and required and default arguments, and edits the
+rendered line in the same PTY before pressing Enter. Switching tabs dismisses
+the form for the previous attachment. The X11 and Wayland journeys also search
+completed command cards and select the exact text after a non-BMP character
+in the captured output.
+
+Build the native desktop from the Aether checkout using its published core pin.
+
+```sh
+python3 scripts/check-core-pin.py
+cargo build --locked --manifest-path src-tauri/Cargo.toml --bin tauri-terminal-lab
+```
 
 Add `--notebook` to select an actual local `.jtnb.md` input through the
 WebKit file control and verify its exact SHA-256. The journey explicitly

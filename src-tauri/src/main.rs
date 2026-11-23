@@ -1,16 +1,18 @@
-use local_sessions::LocalSessions;
+use local_sessions::{LocalSessions, LocalShellStatus};
 use std::sync::{Arc, Mutex};
 use tauri::{ipc::Channel, webview::PageLoadEvent, Manager};
 use tauri_terminal_frame_bridge::{
     history_search::{HistorySearchRequest, HistorySearchResponse},
-    live::{LiveBridge, SessionStatus},
+    live::LiveBridge,
     semantic::{Attachment, Resume, SessionSelector, Update},
     DemoBridge, LocalSnapshot, SnapshotFormat, SnapshotRevision, WireFrame,
 };
 
 use jterm_remote_client as jwm_remote_session;
 mod agent_workspace;
+mod local_block_search;
 mod local_sessions;
+mod local_workflows;
 mod notebook_panel;
 mod output_review;
 mod remote_desktop;
@@ -234,9 +236,9 @@ async fn open_terminal_hyperlink<R: tauri::Runtime>(
 async fn shell_status(
     owner: Attachment,
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
-) -> Result<SessionStatus, String> {
+) -> Result<LocalShellStatus, String> {
     run_attached(bridge.inner().clone(), owner, |bridge, epoch| {
-        bridge.status(epoch)
+        LocalShellStatus::read(bridge, epoch)
     })
     .await
 }
@@ -292,6 +294,19 @@ async fn key_shell(
 ) -> Result<(), String> {
     run_input(bridge.inner().clone(), owner, move |bridge, epoch| {
         bridge.key(epoch, &name, shift, alt, ctrl)
+    })
+    .await
+}
+#[tauri::command]
+async fn submit_local_chat<R: tauri::Runtime>(
+    window: tauri::WebviewWindow<R>,
+    owner: Attachment,
+    prompt: local_sessions::Counter,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
+) -> Result<bool, String> {
+    require_terminal_window(&window)?;
+    run_input(bridge.inner().clone(), owner, move |bridge, epoch| {
+        bridge.submit_prompt_enter(epoch, prompt)
     })
     .await
 }
@@ -431,6 +446,9 @@ fn application<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<
         .manage(Arc::new(Mutex::new(DemoBridge::default())))
         .manage(Arc::new(Mutex::new(LocalSessions::default())))
         .manage(Arc::new(Mutex::new(
+            local_workflows::LocalWorkflows::default(),
+        )))
+        .manage(Arc::new(Mutex::new(
             notebook_panel::NotebookPanel::default(),
         )))
         .manage(Arc::new(
@@ -476,11 +494,15 @@ fn application<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<
             local_command_blocks,
             recall_local_command,
             search_local_history,
+            local_block_search::search_local_blocks,
             ack_shell,
             recover_shell,
             write_shell,
             resize_shell,
             key_shell,
+            submit_local_chat,
+            local_workflows::local_workflow_library,
+            local_workflows::insert_local_workflow,
             text_shell,
             paste_shell,
             close_shell,

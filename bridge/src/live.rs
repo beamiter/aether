@@ -14,7 +14,7 @@ use jterm_headless_session_spike::{Session, WakeSink};
 mod command_blocks;
 mod raw_suffix;
 pub use crate::protocol::{CloseStatus, HistorySnapshot, SessionStatus};
-pub use command_blocks::{BlockSelection, CommandBlockSnapshot, RetainedBlock};
+pub use command_blocks::{BlockSelection, CommandActivity, CommandBlockSnapshot, RetainedBlock};
 use raw_suffix::RawSuffix;
 
 const HISTORY_PAGE_ROWS: usize = 128;
@@ -37,6 +37,7 @@ pub struct LiveBridge {
     hyperlink_policy: Option<jterm_engine::hyperlink::HyperlinkPolicy>,
     stable: Option<CellFrame>,
     history_search: Option<HistorySearch>,
+    submitted_chat_prompt: Option<crate::protocol_v4::Counter>,
     raw: RawSuffix<Attachment>,
 }
 impl LiveBridge {
@@ -140,6 +141,7 @@ impl LiveBridge {
         self.flight = None;
         self.accepted = None;
         self.history_search = None;
+        self.submitted_chat_prompt = None;
         self.raw = RawSuffix::default();
         Ok(epoch)
     }

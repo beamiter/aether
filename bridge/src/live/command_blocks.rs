@@ -1,5 +1,5 @@
 use super::LiveBridge;
-use crate::semantic::Attachment;
+use crate::{protocol_v4::Counter, semantic::Attachment};
 use jterm_engine::command_blocks::{CommandBlock, OutputUnavailable};
 use sha2::{Digest, Sha256};
 
@@ -8,6 +8,13 @@ pub struct CommandBlockSnapshot {
     owner: Attachment,
     enabled: bool,
     blocks: Vec<RetainedBlock>,
+}
+
+pub struct CommandActivity {
+    pub alternate_screen: bool,
+    pub prompt: Option<Counter>,
+    pub running: bool,
+    pub newest_completed: Option<Counter>,
 }
 
 #[derive(serde::Serialize)]
@@ -77,6 +84,10 @@ impl RetainedBlock {
 }
 
 impl CommandBlockSnapshot {
+    pub fn retained_blocks(&self) -> &[RetainedBlock] {
+        &self.blocks
+    }
+
     /// Take two exact complete records from one already-validated attachment.
     pub fn select_pair(
         self,
@@ -107,6 +118,76 @@ impl CommandBlockSnapshot {
 }
 
 impl LiveBridge {
+    pub fn command_activity(&self, epoch: u32) -> Result<CommandActivity, String> {
+        self.check(epoch)?;
+        let terminal = self
+            .session
+            .as_ref()
+            .expect("validated local PTY")
+            .terminal();
+        Ok(CommandActivity {
+            alternate_screen: terminal.alternate_screen_active(),
+            prompt: terminal.command_prompt_generation().and_then(Counter::new),
+            running: terminal.command_running(),
+            newest_completed: terminal
+                .completed_command_blocks()
+                .and_then(|blocks| blocks.back())
+                .and_then(|block| Counter::new(block.sequence)),
+        })
+    }
+
+    /// The caller holds the attachment's writable input lease. Advance PTY
+    /// state before checking the displayed prompt and its foreground group.
+    pub fn submit_prompt_enter(&mut self, epoch: u32, prompt: Counter) -> Result<bool, String> {
+        if !self.prompt_accepts_input(epoch, prompt)? {
+            return Ok(false);
+        }
+        self.key(epoch, "Enter", false, false, false)?;
+        // Keep an accepted action spent even if its receipt is lost or the
+        // shell's keyboard encoding does not contain a literal carriage return.
+        self.submitted_chat_prompt = Some(prompt);
+        Ok(true)
+    }
+
+    /// Insert a rendered workflow at the live cursor using one ordered paste event.
+    pub fn insert_prompt_workflow(
+        &mut self,
+        epoch: u32,
+        prompt: Counter,
+        command: &str,
+    ) -> Result<(), String> {
+        if command.trim().is_empty() || command.chars().any(char::is_control) {
+            return Err("Workflow insertion requires a single line of text.".into());
+        }
+        if !self.prompt_accepts_input(epoch, prompt)? {
+            return Err("The original shell prompt can no longer receive this workflow.".into());
+        }
+        let session = self.session.as_mut().expect("validated local PTY");
+        if !session.terminal().bracketed_paste_active() {
+            return Err(
+                "The shell prompt must support bracketed paste for workflow insertion.".into(),
+            );
+        }
+        session.submit_native_paste(command)?;
+        Ok(())
+    }
+
+    fn prompt_accepts_input(&mut self, epoch: u32, prompt: Counter) -> Result<bool, String> {
+        self.check(epoch)?;
+        if !self.input_attached || self.submitted_chat_prompt == Some(prompt) {
+            return Ok(false);
+        }
+        if self.flight.is_some() {
+            self.pump_attached_io(epoch)?;
+        } else {
+            self.pump_unpublished()?;
+        }
+        let session = self.session.as_ref().expect("validated local PTY");
+        Ok(!session.is_exited()
+            && session.terminal().command_prompt_generation() == Some(prompt.get())
+            && session.at_shell_prompt())
+    }
+
     /// Resolve the displayed revision at delivery, while holding the same session
     /// owner as ordinary paste. A stale card or a foreground program receives no input.
     pub fn recall_command(
