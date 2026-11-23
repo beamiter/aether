@@ -97,9 +97,31 @@ fn engine_repin_does_not_inherit_another_terminals_da_identity() {
             assert!(event.starts_with(prefix), "{event}");
             assert!(event.contains(" final=99 "), "{event}");
         }
-        assert!(t.feed(b"\x1bc").unwrap().is_empty()); // RIS is not CSI c.
-        assert_eq!(t.unsupported_count(), 5);
-        assert_eq!(t.unsupported_events()[4], "ESC intermediate=[] final=99");
-        assert!(t.visible_text().starts_with("persist"));
+    }
+}
+
+#[test]
+fn ris_resets_screen_and_modes_without_advertising_device_identity() {
+    let ris = "\x1bc";
+    for cut in 0..=ris.len() {
+        let mut t = Terminal::new(2, 8).unwrap();
+        let initial = t.frame().unwrap();
+        t.feed(b"archived\r\n\r\npersist\x1b[?2004h").unwrap();
+        assert!(t.visible_text().contains("persist"));
+        assert!(t.history_rows() > 0);
+        assert_ne!(t.frame().unwrap().cursor(), initial.cursor());
+        assert_eq!(t.feed(b"\x1b[?2004$p").unwrap(), b"\x1b[?2004;1$y");
+
+        assert!(feed_at_cut(&mut t, ris, cut).is_empty());
+        assert_eq!(t.unsupported_count(), 0);
+        assert!(t.unsupported_events().is_empty());
+        assert_eq!(t.history_rows(), 0);
+        let reset = t.frame().unwrap();
+        assert_eq!(reset.cursor(), initial.cursor());
+        for (row, initial) in reset.rows().iter().zip(initial.rows()) {
+            assert_eq!(row.cells, initial.cells);
+            assert_eq!(row.wrapped, initial.wrapped);
+        }
+        assert_eq!(t.feed(b"\x1b[?2004$p").unwrap(), b"\x1b[?2004;2$y");
     }
 }
