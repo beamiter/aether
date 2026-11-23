@@ -26,7 +26,7 @@ const localShellKinds=new Map();
 let changingTab=null,restoringLocalLayout=false;
 let state=null,epoch=null,owner=null,timer=null,polling=null,generation=0,transport=0,recovery=null;
 let sshSession=null,sshInputSuspended=false,detachedLocal=null;
-let localStream=null,localTransport='channel',localInputSuspended=false;
+let localStream=null,localTransport='channel',localInputSuspended=false,localFrameRecovery=false;
 let splitEnabled=false,splitLayout=1,settingSplit=false,peerState=null;
 const filePreview=installFilePreviewPanel(document,{getFrame:()=>state,getEpoch:()=>changingTab?null:epoch,getSession:()=>changingTab?null:owner?.session,
   getOwner:()=>!changingTab&&!recovery&&owner?JSON.stringify([owner.session,owner.epoch,owner.generation]):null,isLocalTerminal:()=>!sshSession,
@@ -62,7 +62,7 @@ const invoke=globalThis.__TAURI__?.core?.invoke;
 const Channel=globalThis.__TAURI__?.core?.Channel;
 const channelSnapshots=()=>typeof Channel==='function'?{frameVersion:CHANNEL_FRAME_VERSION}:{};
 const acceptAttachedSnapshot=(frame,attachment,options)=>options.frameVersion===CHANNEL_FRAME_VERSION
-  ?acceptChannelFrame(null,frame,attachment,true):acceptFull(null,frame,attachment);
+  ?acceptChannelFrame(null,frame,{...attachment,frameVersion:options.frameVersion},true):acceptFull(null,frame,attachment);
 let savedLayout=invoke?readLocalShellLayout():null;
 const sshCommands={poll_shell:'poll',ack_shell:'ack',shell_status:'status',history_shell:'history',recover_shell:'recover',detach_shell:'detach',close_shell:'close',write_shell:'write',key_shell:'key',text_shell:'text',paste_shell:'paste',resize_shell:'resize'};
 function setOpenDisabled(disabled) {
@@ -146,7 +146,7 @@ function validatePeerFrame(frame,target){
 function validateChannelPeer(frame,target){
   const session=localTabOwners.get(target.epoch)?.session;
   if(typeof session!=='string'||!/^[a-f0-9]{32}$/.test(session))throw new Error('invalid inactive shell');
-  const next=acceptChannelFrame(null,frame,{session,epoch:target.epoch},true);
+  const next=acceptChannelFrame(null,frame,{session,epoch:target.epoch,frameVersion:CHANNEL_FRAME_VERSION},true);
   return peerState?.epoch===next.epoch&&BigInt(peerState.revision)>=BigInt(next.revision)?null:next;
 }
 function paintPeer(frame){
@@ -379,21 +379,21 @@ function stopTransport(){
   }
   localStream=null;
 }
-function failLocalStream(stream,error){
+function failLocalStream(stream,error,recoverFrame=false){
   if(localStream!==stream||owner!==stream.owner)return;
-  suspendLocalOutput(error);
+  suspendLocalOutput(error,recoverFrame);
 }
-function suspendLocalOutput(error){
-  stopTransport();localTransport='recovery';
+function suspendLocalOutput(error,recoverFrame=false){
+  stopTransport();localTransport='recovery';localFrameRecovery=recoverFrame;
   localInputSuspended=!keyQueue.locked&&!keyQueue.pending&&!input.disabled;
   pasteReview.reset();ime.reset();keyQueue.locked=true;
   input.disabled=send.disabled=resize.disabled=true;
   refreshTerminalControls();
-  status.textContent=`Local output stream paused: ${String(error?.message??error)}. Recover the output snapshot to continue using polling.`;
+  status.textContent=`Local output stream paused: ${String(error?.message??error)}. Recover the output snapshot to continue.`;
 }
 async function receiveLocalStream(stream,event){
   if(localStream!==stream||owner!==stream.owner)return;
-  let sequence=null;
+  let sequence=null,recoverFrame=false;
   try{
     const attachment=acceptOwner(event?.owner);
     if(attachment.session!==owner.session||attachment.epoch!==epoch||attachment.generation!==owner.generation)
@@ -404,13 +404,15 @@ async function receiveLocalStream(stream,event){
     if(sequence!==stream.sequence+1n)throw new Error('invalid local stream sequence');
     validateShellStatus(event.status,attachment.epoch);
     const target=observerTarget();
+    recoverFrame=true;
     const peer=target&&event.preview?.layout===target.layout?validateChannelPeer(event.preview.frame,target):null;
     let revision=null;
     if(event.frame!==null){
-      const next=acceptChannelFrame(stream.frame,event.frame,attachment);
+      const next=acceptChannelFrame(stream.frame,event.frame,{...attachment,frameVersion:CHANNEL_FRAME_VERSION});
       paint(canvas,next);state=next;stream.frame=next;revision=next.revision;describeCursor();
     }
     paintPeer(peer);
+    recoverFrame=false;
     showShellStatus(event.status,'channel');
     stream.sequence=sequence;stream.lastSeen=Date.now();
     await invoke('ack_local_stream',{owner:stream.owner,streamId:stream.channel.id,sequence:event.sequence,
@@ -419,7 +421,7 @@ async function receiveLocalStream(stream,event){
   }catch(error){
     // A later delivery proves that the previous acknowledgement was applied,
     // even when its IPC response arrived late or was lost.
-    if(sequence===null||sequence>=stream.sequence)failLocalStream(stream,error);
+    if(sequence===null||sequence>=stream.sequence)failLocalStream(stream,error,recoverFrame);
   }
 }
 function queueLocalStream(stream,event){
@@ -631,8 +633,9 @@ async function openShell({destination=null,retained=null,fromRestore=false,confi
   if(destination!==null)status.textContent=`Opening SSH terminal on ${destination}…`;
   const integrated=configuration.shell==='jsh';
   try{
+    const options=channelSnapshots();
     const result=destination!==null?await invoke('ssh_terminal',{action:{operation:'open',destination}})
-      :retained?await invoke('open_second_local_shell',{epoch:retained}):await invoke('open_shell',{integrated});
+      :retained?await invoke('open_second_local_shell',{epoch:retained,...options}):await invoke('open_shell',{integrated,...options});
     if(generation!==attempt)return;
     const opened=acceptOwner(result);
     if(retained&&(opened.epoch<=retained||opened.session===detachedLocal?.session||opened.generation!==1))
@@ -887,13 +890,13 @@ async function recoverOutput(previousStatus=null){
   setLocalTools(false);renderLocalTabs();
   try {
     const isLocal=attachment.session!==sshSession;
-    let options=isLocal&&localTransport==='channel'?channelSnapshots():{};
+    let options=isLocal&&(localTransport==='channel'||localTransport==='recovery'&&localFrameRecovery)?channelSnapshots():{};
     let result;
     try{result=await invokeAttached('recover_shell',{epoch:current,...options},attachment);}
     catch(error){
       // Encoding precedes the host's generation change. The v3 path can be
-      // retried with v4 when its smaller counters cannot name the snapshot.
-      if(!isLocal||localTransport!=='recovery'||typeof Channel!=='function'||
+      // retried with the Channel when its smaller counters cannot name the snapshot.
+      if(!isLocal||localTransport!=='recovery'||options.frameVersion||typeof Channel!=='function'||
           !['revision exhausted','layout exhausted'].includes(String(error?.message??error))||
           epoch!==current||transport!==ticket)throw error;
       options=channelSnapshots();
@@ -919,6 +922,7 @@ async function recoverOutput(previousStatus=null){
       status.textContent=result.input_allowed===true?'SSH output snapshot recovered.':'SSH output snapshot recovered. Input remains disabled.';
     }else if(localTransport==='recovery'){
       localTransport=options.frameVersion===CHANNEL_FRAME_VERSION?'channel':'poll';
+      localFrameRecovery=false;
       if(localInputSuspended&&result.input_allowed===true&&!keyQueue.pending){
         keyQueue.locked=false;input.disabled=send.disabled=resize.disabled=restoringLocalLayout;
       }

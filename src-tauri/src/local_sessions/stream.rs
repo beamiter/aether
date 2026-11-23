@@ -11,7 +11,9 @@ use std::{
 use tauri::ipc::Channel;
 pub(crate) use tauri_terminal_frame_bridge::protocol::ObserverTarget;
 pub(crate) use tauri_terminal_frame_bridge::protocol_v4::{Counter, PeerUpdate, Receipt};
-use tauri_terminal_frame_bridge::{live::LiveBridge, protocol_v4, semantic::Attachment};
+use tauri_terminal_frame_bridge::{
+    live::LiveBridge, protocol_v4, semantic::Attachment, SnapshotFormat,
+};
 
 pub(crate) type StreamEvent = protocol_v4::StreamEvent<LocalShellStatus>;
 
@@ -34,6 +36,7 @@ impl Delivery {
 
 pub(super) struct LocalStream {
     pub(super) owner: Attachment,
+    pub(super) format: SnapshotFormat,
     sink: Channel<StreamEvent>,
     failed: Arc<AtomicBool>,
     sequence: u64,
@@ -48,9 +51,14 @@ pub(super) struct LocalStream {
 }
 
 impl LocalStream {
-    pub(super) fn new(owner: Attachment, sink: Channel<StreamEvent>) -> Self {
+    pub(super) fn new(
+        owner: Attachment,
+        sink: Channel<StreamEvent>,
+        format: SnapshotFormat,
+    ) -> Self {
         Self {
             owner,
+            format,
             sink,
             failed: Arc::new(AtomicBool::new(false)),
             sequence: 0,
@@ -142,7 +150,7 @@ impl LocalStream {
         bridge: &mut LiveBridge,
         preview: Option<(Counter, PeerUpdate)>,
     ) -> Result<(bool, Option<Delivery>), String> {
-        let frame = bridge.poll_channel_frame(self.owner.epoch, self.sequence == 0)?;
+        let frame = bridge.poll_channel_frame(self.owner.epoch, self.sequence == 0, self.format)?;
         let status = LocalShellStatus::read(bridge, self.owner.epoch)?;
         let now = Instant::now();
         let ready = !status.drained();
@@ -214,7 +222,7 @@ mod tests {
         let owner = local
             .lock()
             .unwrap()
-            .open(false, Arc::downgrade(&local))
+            .open(false, SnapshotFormat::Channel, Arc::downgrade(&local))
             .unwrap();
         let (send, receive) = mpsc::channel();
         let channel = Channel::new(move |body| {
@@ -228,7 +236,13 @@ mod tests {
         local
             .lock()
             .unwrap()
-            .subscribe(owner.clone(), channel, None, Arc::downgrade(&local))
+            .subscribe(
+                owner.clone(),
+                channel,
+                None,
+                SnapshotFormat::Channel,
+                Arc::downgrade(&local),
+            )
             .unwrap();
         let first = receive.recv_timeout(Duration::from_secs(5)).unwrap();
         let first_frame: Value = serde_json::from_str(first["frame"].as_str().unwrap()).unwrap();

@@ -1,12 +1,14 @@
-//! Convert the current immutable engine paint state to a bounded v4 frame.
+//! Convert immutable engine paint state to bounded Channel frames.
 
 use crate::{cell_width, color, cursor_shape, protocol_v4 as wire, semantic::validate_grid};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use jterm_engine::{
     frame::{CellFrame, Screen},
+    terminal::InlineImage,
     UnderlineStyle,
 };
 use std::{
-    collections::{btree_map::Entry, BTreeMap},
+    collections::{btree_map::Entry, BTreeMap, BTreeSet},
     io::{self, Write},
 };
 
@@ -14,13 +16,21 @@ pub(crate) fn encode(
     previous: Option<&CellFrame>,
     frame: &CellFrame,
     session: &str,
+    version: u8,
 ) -> Result<(wire::Counter, String), String> {
-    let update = update(previous, frame, session)?;
-    let mut data = BoundedJson(Vec::new());
+    let update = update(previous, frame, session, version)?;
+    let images = match &update {
+        wire::Update::Snapshot { images, .. } | wire::Update::Delta { images, .. } => images,
+    };
+    let mut data = BoundedJson {
+        bytes: Vec::new(),
+        limit: wire::MAX_ENCODED_FRAME_BYTES
+            + images.iter().map(|image| image.rgba.len()).sum::<usize>(),
+    };
     serde_json::to_writer(&mut data, &update).map_err(|e| e.to_string())?;
     Ok((
         update.revision(),
-        String::from_utf8(data.0).map_err(|_| "invalid frame encoding")?,
+        String::from_utf8(data.bytes).map_err(|_| "invalid frame encoding")?,
     ))
 }
 
@@ -28,12 +38,13 @@ fn update(
     previous: Option<&CellFrame>,
     frame: &CellFrame,
     session: &str,
+    version: u8,
 ) -> Result<wire::Update, String> {
     validate_grid(frame)?;
     let engine_stamp = frame.stamp();
     let cursor = frame.cursor();
     let stamp = wire::Stamp {
-        version: wire::VERSION,
+        version,
         session: session.into(),
         epoch: counter(engine_stamp.epoch)?,
         revision: counter(engine_stamp.revision)?,
@@ -49,34 +60,49 @@ fn update(
         cursor_shape: cursor_shape(cursor.shape),
         pending_wrap: cursor.pending_wrap,
     };
-    let mut projection = Projection::default();
-    if let Some(delta) = previous
-        .and_then(|previous| previous.delta_to(frame).ok())
-        .filter(|delta| delta.rows.len() < frame.rows().len())
+    let mut projection = Projection {
+        images_enabled: version == wire::IMAGE_VERSION,
+        ..Projection::default()
+    };
+    if let Some((base, delta)) = previous
+        .and_then(|base| base.delta_to(frame).ok().map(|delta| (base, delta)))
+        .filter(|(_, delta)| delta.rows.len() < frame.rows().len())
     {
+        if projection.images_enabled {
+            projection.base_images = (0..base.rows().len())
+                .flat_map(|index| row_images(base, index))
+                .map(|(_, image, _)| image.id().get())
+                .collect();
+        }
+        let rows = delta
+            .rows
+            .iter()
+            .map(|(index, _)| {
+                Ok(wire::ChangedRow {
+                    index: *index as u16,
+                    row: wire_row(frame, *index, &mut projection)?,
+                })
+            })
+            .collect::<Result<_, String>>()?;
+        let (hyperlinks, images) = projection.into_resources();
         return Ok(wire::Update::Delta {
             stamp,
             base_revision: counter(delta.base.revision)?,
-            rows: delta
-                .rows
-                .iter()
-                .map(|(index, _)| {
-                    Ok(wire::ChangedRow {
-                        index: *index as u16,
-                        row: wire_row(frame, *index, &mut projection)?,
-                    })
-                })
-                .collect::<Result<_, String>>()?,
-            hyperlinks: projection.into_hyperlinks(),
+            rows,
+            hyperlinks,
+            images,
         });
     }
+    let rows = (0..frame.rows().len())
+        .map(|index| wire_row(frame, index, &mut projection))
+        .collect::<Result<_, _>>()?;
+    let (hyperlinks, images) = projection.into_resources();
     Ok(wire::Update::Snapshot {
         stamp,
         cols: frame.cols() as u16,
-        rows: (0..frame.rows().len())
-            .map(|index| wire_row(frame, index, &mut projection))
-            .collect::<Result<_, _>>()?,
-        hyperlinks: projection.into_hyperlinks(),
+        rows,
+        hyperlinks,
+        images,
     })
 }
 
@@ -85,18 +111,73 @@ struct Projection<'a> {
     text_bytes: usize,
     hyperlink_bytes: usize,
     hyperlinks: BTreeMap<u16, &'a str>,
+    images_enabled: bool,
+    image_bytes: usize,
+    base_images: BTreeSet<u64>,
+    images: BTreeMap<u64, wire::ImageResource>,
 }
 
 impl Projection<'_> {
-    fn into_hyperlinks(self) -> Vec<wire::Hyperlink> {
-        self.hyperlinks
+    fn into_resources(self) -> (Vec<wire::Hyperlink>, Vec<wire::ImageResource>) {
+        let hyperlinks = self
+            .hyperlinks
             .into_iter()
             .map(|(id, target)| wire::Hyperlink {
                 id,
                 target: target.into(),
             })
+            .collect();
+        (hyperlinks, self.images.into_values().collect())
+    }
+
+    fn image_slices(
+        &mut self,
+        frame: &CellFrame,
+        index: usize,
+    ) -> Result<Vec<wire::ImageSlice>, String> {
+        if !self.images_enabled {
+            return Ok(Vec::new());
+        }
+        row_images(frame, index)
+            .map(|(column, image, slice)| {
+                let key = image.id().get();
+                let id = counter(key)?;
+                if !self.base_images.contains(&key) && !self.images.contains_key(&key) {
+                    let raster = image.raster().ok_or("missing inline raster")?;
+                    self.image_bytes += raster.rgba().len();
+                    if self.images.len() >= wire::MAX_IMAGES
+                        || self.image_bytes > wire::MAX_IMAGE_BYTES
+                        || raster.width() > wire::MAX_IMAGE_DIMENSION
+                        || raster.height() > wire::MAX_IMAGE_DIMENSION
+                    {
+                        return Err("terminal frame exceeds image resource limit".into());
+                    }
+                    self.images.insert(
+                        key,
+                        wire::ImageResource {
+                            id,
+                            width: raster.width(),
+                            height: raster.height(),
+                            columns: image.columns(),
+                            rows: image.rows(),
+                            rgba: STANDARD.encode(raster.rgba()),
+                        },
+                    );
+                }
+                Ok(wire::ImageSlice {
+                    column: column as u16,
+                    id,
+                    slice,
+                })
+            })
             .collect()
     }
+}
+
+fn row_images(frame: &CellFrame, index: usize) -> impl Iterator<Item = (usize, &InlineImage, u16)> {
+    frame.inline_images(index).filter(|(column, image, _)| {
+        image.raster().is_some() && column + usize::from(image.columns()) <= frame.cols()
+    })
 }
 
 fn wire_row<'a>(
@@ -180,6 +261,7 @@ fn wire_row<'a>(
     Ok(wire::Row {
         wrapped: row.wrapped,
         cells,
+        image_slices: projection.image_slices(frame, index)?,
     })
 }
 
@@ -187,14 +269,17 @@ fn counter(value: u64) -> Result<wire::Counter, String> {
     wire::Counter::new(value).ok_or_else(|| "invalid terminal frame counter".into())
 }
 
-struct BoundedJson(Vec<u8>);
+struct BoundedJson {
+    bytes: Vec<u8>,
+    limit: usize,
+}
 
 impl Write for BoundedJson {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() > wire::MAX_ENCODED_FRAME_BYTES - self.0.len() {
+        if bytes.len() > self.limit - self.bytes.len() {
             return Err(io::Error::other("terminal frame exceeds JSON byte limit"));
         }
-        self.0.extend_from_slice(bytes);
+        self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
     }
 
@@ -257,12 +342,51 @@ mod tests {
     }
 
     #[test]
+    fn v5_deltas_reuse_the_visible_resource_and_v4_omits_rasters() {
+        let mut terminal = jterm_engine::terminal::Terminal::new(5, 8).unwrap();
+        terminal.enable_inline_graphics((12, 24), |_, _, _| None);
+        let before = terminal.frame().unwrap();
+        let command = b"\x1b[3;2H\x1b_Ga=T,i=3,s=1,v=1,c=2,r=1,f=24,C=1;/wAA\x1b\\";
+        assert_eq!(terminal.feed(command).unwrap(), b"\x1b_Gi=3;OK\x1b\\");
+        let displayed = terminal.frame().unwrap();
+        let (_, data) = encode(Some(&before), &displayed, "test", wire::IMAGE_VERSION).unwrap();
+        let wire::Update::Delta {
+            stamp,
+            rows,
+            images,
+            ..
+        } = serde_json::from_str(&data).unwrap()
+        else {
+            panic!("new image must arrive in its changed row");
+        };
+        assert_eq!(stamp.version, wire::IMAGE_VERSION);
+        assert_eq!(images.len(), 1);
+        assert_eq!(rows[0].row.image_slices[0].id, images[0].id);
+        assert_eq!(images[0].rgba, "/wAA/w==");
+        terminal.feed(b"\x1b[1S").unwrap();
+        let moved = terminal.frame().unwrap();
+        let wire::Update::Delta { rows, images, .. } =
+            update(Some(&displayed), &moved, "test", wire::IMAGE_VERSION).unwrap()
+        else {
+            panic!("scroll must move the image in the delta");
+        };
+        assert!(images.is_empty());
+        assert!(rows
+            .iter()
+            .any(|row| row.index == 1 && row.row.image_slices.len() == 1));
+        let (_, data) = encode(None, &moved, "test", wire::VERSION).unwrap();
+        let text_frame: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert!(text_frame.get("images").is_none());
+        assert!(text_frame["rows"][1].get("image_slices").is_none());
+    }
+
+    #[test]
     fn snapshot_and_exact_delta_preserve_the_same_paint_data_at_u64_width() {
         let revision = 9_007_199_254_740_992;
         let base = sample(revision, Screen::Primary, false);
         let next = sample(revision + 1, Screen::Primary, true);
-        let (_, snapshot) = encode(None, &next, "test").unwrap();
-        let (_, delta) = encode(Some(&base), &next, "test").unwrap();
+        let (_, snapshot) = encode(None, &next, "test", wire::VERSION).unwrap();
+        let (_, delta) = encode(Some(&base), &next, "test", wire::VERSION).unwrap();
         let wire::Update::Snapshot { stamp, rows, .. } = serde_json::from_str(&snapshot).unwrap()
         else {
             panic!("expected snapshot");
@@ -281,6 +405,7 @@ mod tests {
             base_revision,
             rows: edits,
             hyperlinks,
+            images,
         } = serde_json::from_str(&delta).unwrap()
         else {
             panic!("expected partial delta");
@@ -291,9 +416,10 @@ mod tests {
         assert_eq!(edits[0].index, 0);
         assert_eq!(edits[0].row, rows[0]);
         assert!(hyperlinks.is_empty());
+        assert!(images.is_empty());
         let alternate = sample(revision + 2, Screen::Alternate, false);
         assert!(matches!(
-            update(Some(&next), &alternate, "test").unwrap(),
+            update(Some(&next), &alternate, "test", wire::VERSION).unwrap(),
             wire::Update::Snapshot { stamp, .. } if stamp.screen == wire::Screen::Alternate
         ));
     }
@@ -304,7 +430,9 @@ mod tests {
         terminal.enable_underline_colors();
         terminal.feed(b"\x1b[4:2;58:2::1:2:3mX").unwrap();
         let base = terminal.frame().unwrap();
-        let wire::Update::Snapshot { rows, .. } = update(None, &base, "test").unwrap() else {
+        let wire::Update::Snapshot { rows, .. } =
+            update(None, &base, "test", wire::VERSION).unwrap()
+        else {
             panic!("expected color snapshot");
         };
         assert_eq!(rows[0].cells[0].underline_color.as_deref(), Some("#010203"));
@@ -315,7 +443,9 @@ mod tests {
             next.rows(),
             "only the color sidecar should differ"
         );
-        let wire::Update::Delta { rows, .. } = update(Some(&base), &next, "test").unwrap() else {
+        let wire::Update::Delta { rows, .. } =
+            update(Some(&base), &next, "test", wire::VERSION).unwrap()
+        else {
             panic!("expected color-only delta");
         };
         assert_eq!(rows.len(), 1);
@@ -325,7 +455,9 @@ mod tests {
         );
         terminal.feed(b"\r\x1b[59mX").unwrap();
         let reset = terminal.frame().unwrap();
-        let wire::Update::Delta { rows, .. } = update(Some(&next), &reset, "test").unwrap() else {
+        let wire::Update::Delta { rows, .. } =
+            update(Some(&next), &reset, "test", wire::VERSION).unwrap()
+        else {
             panic!("expected color reset delta");
         };
         assert_eq!(rows[0].row.cells[0].underline_color, None);
@@ -346,7 +478,7 @@ mod tests {
             rows,
             hyperlinks,
             ..
-        } = update(None, &base, "test").unwrap()
+        } = update(None, &base, "test", wire::VERSION).unwrap()
         else {
             panic!("expected link snapshot");
         };
@@ -361,7 +493,7 @@ mod tests {
         let next = terminal.frame().unwrap();
         let wire::Update::Delta {
             rows, hyperlinks, ..
-        } = update(Some(&base), &next, "test").unwrap()
+        } = update(Some(&base), &next, "test", wire::VERSION).unwrap()
         else {
             panic!("expected link delta");
         };
@@ -379,7 +511,8 @@ mod tests {
         terminal.feed("\u{0301}".as_bytes()).unwrap();
         let composed = terminal.frame().unwrap();
         assert_eq!(base.rows(), composed.rows());
-        let wire::Update::Delta { rows, .. } = update(Some(&base), &composed, "test").unwrap()
+        let wire::Update::Delta { rows, .. } =
+            update(Some(&base), &composed, "test", wire::VERSION).unwrap()
         else {
             panic!("expected cluster-only delta");
         };
@@ -388,7 +521,9 @@ mod tests {
             terminal.feed(chunk.as_bytes()).unwrap();
         }
         let frame = terminal.frame().unwrap();
-        let wire::Update::Snapshot { rows, .. } = update(None, &frame, "test").unwrap() else {
+        let wire::Update::Snapshot { rows, .. } =
+            update(None, &frame, "test", wire::VERSION).unwrap()
+        else {
             panic!("expected full cluster frame");
         };
         assert_eq!(rows[0].cells[1].text, "👩‍💻");

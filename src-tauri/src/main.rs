@@ -41,13 +41,15 @@ async fn acknowledge(
 async fn open_shell<R: tauri::Runtime>(
     window: tauri::WebviewWindow<R>,
     integrated: Option<bool>,
+    frame_version: Option<u8>,
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<Attachment, String> {
     require_terminal_window(&window)?;
+    let format = SnapshotFormat::negotiate(frame_version)?;
     let shared = bridge.inner().clone();
     let weak = Arc::downgrade(&shared);
     run_bridge(shared, move |bridge| {
-        bridge.open(integrated.unwrap_or(false), weak)
+        bridge.open(integrated.unwrap_or(false), format, weak)
     })
     .await
 }
@@ -56,12 +58,17 @@ async fn open_shell<R: tauri::Runtime>(
 async fn open_second_local_shell<R: tauri::Runtime>(
     window: tauri::WebviewWindow<R>,
     epoch: u32,
+    frame_version: Option<u8>,
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<Attachment, String> {
     require_terminal_window(&window)?;
+    let format = SnapshotFormat::negotiate(frame_version)?;
     let shared = bridge.inner().clone();
     let weak = Arc::downgrade(&shared);
-    run_bridge(shared, move |bridge| bridge.open_second(epoch, weak)).await
+    run_bridge(shared, move |bridge| {
+        bridge.open_second(epoch, format, weak)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -158,13 +165,14 @@ async fn subscribe_local_shell<R: tauri::Runtime>(
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<(), String> {
     require_terminal_window(&window)?;
-    if frame_version != tauri_terminal_frame_bridge::protocol_v4::VERSION {
+    let format = SnapshotFormat::negotiate(Some(frame_version))?;
+    if format.channel_version().is_none() {
         return Err("unsupported terminal Channel version".into());
     }
     let shared = bridge.inner().clone();
     let weak = Arc::downgrade(&shared);
     run_bridge(shared, move |bridge| {
-        bridge.subscribe(owner, stream, observer, weak)
+        bridge.subscribe(owner, stream, observer, format, weak)
     })
     .await
 }

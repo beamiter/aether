@@ -34,7 +34,7 @@ fn local_v4_snapshot_recovery_and_attach_keep_exact_lease_and_receipt() {
     let owner = invoke(&window, "open_shell", json!({}));
     assert!(tauri::test::get_ipc_response(
         &window,
-        request("recover_shell", json!({"owner":owner,"frameVersion":5}))
+        request("recover_shell", json!({"owner":owner,"frameVersion":6}))
     )
     .is_err());
     let arguments = json!({"owner":owner,"frameVersion":4});

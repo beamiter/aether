@@ -508,7 +508,11 @@ impl Editor {
         });
         let terminal = self
             .terminal
-            .observe_channel_frame(epoch, terminal_revision)?
+            .observe_channel_frame(
+                epoch,
+                terminal_revision,
+                tauri_terminal_frame_bridge::SnapshotFormat::Channel,
+            )?
             .map(|(_, frame)| frame);
         let activity = tools_revision
             .map(|seen| self.project.activity(self.vim.root(), &mut editor, seen))

@@ -77,3 +77,52 @@ test('Canvas draws the supplied underline colour and both lines across the full 
     ['#aabbcc',0,21,24,1], ['#aabbcc',0,23,24,1],
   ]);
 });
+
+const imageOwner = {...owner, frameVersion:5};
+const imageId = '9007199254740993';
+const image = {id:imageId,width:1,height:2,columns:1,rows:2,rgba:'/wAA/wD/AP8='};
+const imageRow = (row, slice, column=1, id=imageId) => ({...row,image_slices:[{column,id,slice}]});
+const imageSnapshot = {...snapshot,stamp:{...stamp,version:5},rows:[imageRow(first,0),imageRow(second,1)],images:[image]};
+const imageDelta = {...delta,stamp:{...delta.stamp,version:5},rows:[{index:0,row:changed}]};
+const acceptImage = (previous,value) => acceptChannelFrame(previous,JSON.stringify(value),imageOwner);
+
+test('image slices reuse the exact base resource and release it with the last visible slice', () => {
+  const full = acceptImage(null,imageSnapshot);
+  const trimmed = acceptImage(full,imageDelta);
+  assert.equal(trimmed.rows[0].imageSlices,undefined);
+  assert.equal(trimmed.rows[1],full.rows[1]);
+  assert.equal(trimmed.images[imageId],full.images[imageId]);
+  assert.equal(trimmed.images[imageId].rgba,image.rgba);
+  const moved = acceptImage(trimmed,{...imageDelta,base_revision:trimmed.revision,
+    stamp:{...imageDelta.stamp,revision:'9007199254740994'},
+    rows:[{index:0,row:imageRow(changed,1)},{index:1,row:second}],hyperlinks});
+  assert.equal(moved.images[imageId],full.images[imageId]);
+  const erased = acceptImage(moved,{...imageDelta,base_revision:moved.revision,
+    stamp:{...imageDelta.stamp,revision:'9007199254740995'}});
+  assert.deepEqual(Object.keys(erased.images),[]);
+  assert.ok(full.images[imageId]);
+  assert.throws(() => acceptImage(null,{...imageSnapshot,images:[]}),/unresolved/);
+  assert.throws(() => acceptImage(full,{...imageDelta,images:[image]}),/identity/);
+  assert.throws(() => acceptImage(full,{...imageSnapshot,stamp:imageDelta.stamp,
+    images:[{...image,rgba:'AAAAAAAAAAA='}]}),/changed Channel image/);
+});
+
+test('resource generation, bounds, canonical RGBA and both resource byte budgets are enforced', () => {
+  const check = (changes, error) => assert.throws(() => acceptImage(null,{...imageSnapshot,...changes}),error);
+  check({stamp:{...imageSnapshot.stamp,resource_generation:'8'}},/foreign/);
+  check({stamp:{...imageSnapshot.stamp,version:4}},/foreign/);
+  check({stamp:{...imageSnapshot.stamp,screen:'alternate'}},/count or version/);
+  check({images:[{...image,columns:2}]},/out-of-bounds/);
+  check({images:[{...image,rgba:'/wAA/wD/AP9='}]},/base64/);
+  check({images:[{...image,width:4096,height:4096}]},/image byte limit/);
+  check({images:[{...image,id:'4'}]},/unresolved/);
+  check({images:[image,{...image,id:'4'}]},/unreferenced/);
+  check({rows:[imageRow(first,2),imageRow(second,1)]},/out-of-bounds/);
+  assert.throws(() => accept(null,{...snapshot,images:[image]}),/version/);
+  const large = {...image,width:512,height:1024,rows:1,rgba:'A'.repeat(2796203)+'='};
+  const full = acceptImage(null,{...imageSnapshot,images:[large],rows:[first,imageRow(second,0)]});
+  const small = {...image,id:'4'};
+  assert.throws(() => acceptImage(full,{...imageDelta,images:[small],
+    rows:[{index:0,row:imageRow(changed,0,1,small.id)}]}),/retained image limit/);
+  assert.deepEqual(Object.keys(full.images),[imageId]);
+});

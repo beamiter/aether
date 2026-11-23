@@ -1,4 +1,10 @@
-export const CHANNEL_FRAME_VERSION = 4;
+export const CHANNEL_FRAME_VERSION = 5;
+const textChannelVersion = 4;
+const maxImages = 32;
+const maxImageBytes = 2 * 1024 * 1024;
+const maxImageDimension = 4096;
+const maxEncodedImageBytes = 4 * Math.ceil((maxImageBytes + 2 * maxImages) / 3);
+const base64Alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 const maxCounter = 18446744073709551615n;
 const maxEncodedBytes = 8 * 1024 * 1024;
 const maxTextBytes = 512 * 1024;
@@ -49,7 +55,75 @@ function validatedHyperlinks(entries, previous) {
   return links;
 }
 
-function validateRow(row, cols, links, referenced) {
+function validatedImages(entries, supportsImages, base, previous) {
+  const images = new Map();
+  if (entries === undefined) return {images, encodedBytes: 0};
+  if (!supportsImages || !Array.isArray(entries) || entries.length > maxImages)
+    throw new Error('Channel image count or version');
+  let bytes = 0, encodedBytes = 0;
+  for (const entry of entries) {
+    if (!entry || typeof entry !== 'object') throw new Error('invalid Channel image');
+    const {id, width, height, columns, rows, rgba} = entry;
+    channelCounter(id);
+    if (images.has(id) || base?.images[id] ||
+        !Number.isInteger(width) || width < 1 || width > maxImageDimension ||
+        !Number.isInteger(height) || height < 1 || height > maxImageDimension ||
+        !Number.isInteger(columns) || columns < 1 || columns > 256 ||
+        !Number.isInteger(rows) || rows < 1 || rows > 128) throw new Error('invalid Channel image geometry or identity');
+    const size = width * height * 4;
+    bytes += size;
+    if (bytes > maxImageBytes || typeof rgba !== 'string' || rgba.length !== 4 * Math.ceil(size / 3))
+      throw new Error('Channel image byte limit');
+    const padding = (3 - size % 3) % 3;
+    const end = rgba.length - padding;
+    const last = base64Alphabet.indexOf(rgba[end - 1]);
+    if (/[^a-zA-Z0-9+/]/.test(rgba.slice(0,end)) || rgba.slice(end) !== '='.repeat(padding) ||
+        (padding && (last & (padding === 1 ? 3 : 15)))) throw new Error('invalid Channel RGBA base64');
+    encodedBytes += rgba.length;
+    const prior = previous?.images[id];
+    if (prior && (prior.width !== width || prior.height !== height || prior.columns !== columns ||
+        prior.rows !== rows || prior.rgba !== rgba)) throw new Error('changed Channel image identity');
+    images.set(id,prior ?? Object.freeze({id,width,height,columns,rows,rgba,bytes:size}));
+  }
+  return {images, encodedBytes};
+}
+
+function validateSlices(slices, cols, supportsImages) {
+  if (slices === undefined) return undefined;
+  if (!supportsImages || !Array.isArray(slices) || slices.length > cols)
+    throw new Error('invalid Channel image slices');
+  let last = -1;
+  return Object.freeze(slices.map(entry => {
+    const {column, id, slice} = entry ?? {};
+    if (!Number.isInteger(column) || column <= last || column >= cols ||
+        !Number.isInteger(slice) || slice < 0 || slice >= 128) throw new Error('invalid Channel image slice');
+    channelCounter(id);
+    last = column;
+    return Object.freeze({column,id,slice});
+  }));
+}
+
+function resolveImages(rows, cols, newImages, base) {
+  const images = Object.create(null);
+  const referenced = new Set();
+  let bytes = 0, count = 0;
+  for (const row of rows) {
+    for (const {id,column,slice} of row.imageSlices ?? []) {
+      const resource = newImages.get(id) ?? base?.images[id];
+      if (!resource || slice >= resource.rows || column + resource.columns > cols)
+        throw new Error('unresolved or out-of-bounds Channel image slice');
+      if (newImages.has(id)) referenced.add(id);
+      if (images[id]) continue;
+      if (++count > maxImages || (bytes += resource.bytes) > maxImageBytes)
+        throw new Error('Channel retained image limit');
+      images[id] = resource;
+    }
+  }
+  if (referenced.size !== newImages.size) throw new Error('unreferenced Channel images');
+  return Object.freeze(images);
+}
+
+function validateRow(row, cols, links, referenced, supportsImages) {
   if (!row || typeof row.wrapped !== 'boolean' || !Array.isArray(row.cells) || row.cells.length !== cols)
     throw new Error('invalid Channel row');
   let textBytes = 0;
@@ -78,15 +152,20 @@ function validateRow(row, cols, links, referenced) {
     }
     return Object.freeze({text, foreground, background, width, style, underline, underline_color, hyperlink_id});
   });
-  return Object.freeze(Object.assign(cells, {wrapped: row.wrapped, textBytes, links:Object.freeze([...rowLinks])}));
+  const imageSlices = validateSlices(row.image_slices, cols, supportsImages);
+  return Object.freeze(Object.assign(cells, {wrapped: row.wrapped, textBytes, links:Object.freeze([...rowLinks]), imageSlices}));
 }
 
 export function acceptChannelFrame(previous, encoded, expected, snapshotOnly = false) {
-  if (typeof encoded !== 'string' || encoded.length > maxEncodedBytes || utf8Bytes(encoded) > maxEncodedBytes)
-    throw new Error('Channel frame byte limit');
+  const expectedVersion = expected.frameVersion ?? previous?.version;
+  const limit = maxEncodedBytes + (expectedVersion === CHANNEL_FRAME_VERSION ? maxEncodedImageBytes : 0);
+  if (typeof encoded !== 'string' || encoded.length > limit) throw new Error('Channel frame byte limit');
+  const wireBytes = utf8Bytes(encoded);
+  if (wireBytes > limit) throw new Error('Channel frame byte limit');
   const update = JSON.parse(encoded);
   const stamp = update?.stamp;
-  if (!stamp || stamp.version !== CHANNEL_FRAME_VERSION || stamp.session !== expected.session ||
+  if (!stamp || ![textChannelVersion,CHANNEL_FRAME_VERSION].includes(stamp.version) ||
+      (expectedVersion !== undefined && stamp.version !== expectedVersion) || stamp.session !== expected.session ||
       stamp.epoch !== String(expected.epoch) || stamp.resource_generation !== stamp.epoch ||
       !['primary','alternate'].includes(stamp.screen))
     throw new Error('foreign Channel frame');
@@ -96,8 +175,13 @@ export function acceptChannelFrame(previous, encoded, expected, snapshotOnly = f
       revision <= channelCounter(previous.revision) || layout < channelCounter(previous.layout)))
     throw new Error('stale Channel frame');
   if (!Array.isArray(update.rows) || update.rows.length > 128) throw new Error('Channel row bounds');
+  const supportsImages = stamp.version === CHANNEL_FRAME_VERSION;
+  const imageBase = update.kind === 'delta' ? previous : null;
+  const {images: newImages, encodedBytes} = validatedImages(update.images, supportsImages && stamp.screen === 'primary', imageBase, previous);
+  if (wireBytes > maxEncodedBytes + encodedBytes) throw new Error('Channel frame byte limit');
   const links = validatedHyperlinks(update.hyperlinks, previous), referenced = new Set();
 
+  const allowSlices = supportsImages && stamp.screen === 'primary';
   let cols, rows;
   if (update.kind === 'snapshot') {
     cols = update.cols;
@@ -105,7 +189,7 @@ export function acceptChannelFrame(previous, encoded, expected, snapshotOnly = f
       throw new Error('Channel dimension limit');
     if (previous && previous.layout === stamp.layout && (cols !== previous.cols || update.rows.length !== previous.rows.length))
       throw new Error('Channel geometry requires new layout');
-    rows = update.rows.map(row => validateRow(row, cols, links, referenced));
+    rows = update.rows.map(row => validateRow(row, cols, links, referenced, allowSlices));
   } else {
     if (snapshotOnly || update.kind !== 'delta' || !previous ||
         update.base_revision !== previous.revision || stamp.layout !== previous.layout || stamp.screen !== previous.screen ||
@@ -117,7 +201,7 @@ export function acceptChannelFrame(previous, encoded, expected, snapshotOnly = f
       const index = edit?.index;
       if (!Number.isInteger(index) || index < 0 || index >= rows.length || seen.has(index))
         throw new Error('invalid Channel row index');
-      rows[index] = validateRow(edit.row, cols, links, referenced);
+      rows[index] = validateRow(edit.row, cols, links, referenced, allowSlices);
       seen.add(index);
     }
   }
@@ -139,7 +223,8 @@ export function acceptChannelFrame(previous, encoded, expected, snapshotOnly = f
       !Number.isInteger(cursor_col) || cursor_col < 0 || cursor_col >= cols ||
       !['block','underline','beam'].includes(cursor_shape) || typeof cursor_visible !== 'boolean' || typeof pending_wrap !== 'boolean')
     throw new Error('invalid Channel cursor');
-  return Object.freeze({version: CHANNEL_FRAME_VERSION, session: stamp.session, epoch: expected.epoch,
+  const images = resolveImages(rows, cols, newImages, imageBase);
+  return Object.freeze({version: stamp.version, session: stamp.session, epoch: expected.epoch,
     revision: stamp.revision, layout: stamp.layout, screen: stamp.screen, cols, rows: Object.freeze(rows),
-    hyperlinks:Object.freeze(hyperlinks), cursor_row, cursor_col, cursor_shape, cursor_visible, pending_wrap});
+    hyperlinks:Object.freeze(hyperlinks), images, cursor_row, cursor_col, cursor_shape, cursor_visible, pending_wrap});
 }

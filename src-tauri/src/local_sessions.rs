@@ -186,25 +186,27 @@ impl LocalSessions {
     pub(crate) fn open(
         &mut self,
         integrated: bool,
+        format: SnapshotFormat,
         shared: Weak<Mutex<Self>>,
     ) -> Result<Attachment, String> {
         // Keep the ordinary opener fail-closed if *any* PTY remains.
         if !self.registry.sessions.is_empty() {
             return Err("close the existing session first".into());
         }
-        self.open_fresh(integrated, shared)
+        self.open_fresh(integrated, format, shared)
     }
 
     pub(crate) fn open_second(
         &mut self,
         retained_epoch: u32,
+        format: SnapshotFormat,
         shared: Weak<Mutex<Self>>,
     ) -> Result<Attachment, String> {
         if self.registry.sessions.len() != 1 || self.registry.reader.is_some() {
             return Err("detach the single existing local shell before opening a second".into());
         }
         self.target_for_epoch(retained_epoch)?;
-        self.open_fresh(false, shared)
+        self.open_fresh(false, format, shared)
     }
 
     pub(crate) fn list_epochs(&self) -> Vec<u32> {
@@ -241,13 +243,14 @@ impl LocalSessions {
     fn open_fresh(
         &mut self,
         integrated: bool,
+        format: SnapshotFormat,
         shared: Weak<Mutex<Self>>,
     ) -> Result<Attachment, String> {
         self.ensure_worker(shared)?;
         let worker = self.worker.as_ref().unwrap();
         let prev_epoch = self.last_epoch;
         let owner = self.registry.open(|| {
-            let (owned, owner) = Self::spawn(prev_epoch, integrated, worker)?;
+            let (owned, owner) = Self::spawn(prev_epoch, integrated, format, worker)?;
             Ok((owner.session.clone(), owned, owner))
         })?;
         self.last_epoch = owner.epoch;
@@ -258,9 +261,11 @@ impl LocalSessions {
     fn spawn(
         prev_epoch: u32,
         integrated: bool,
+        format: SnapshotFormat,
         worker: &LocalWorker,
     ) -> Result<(OwnedLocalPty, Attachment), String> {
         let mut bridge = LiveBridge::local_desktop_after(prev_epoch);
+        bridge.enable_inline_graphics(format);
         bridge.set_hyperlink_policy(jterm_core::link::is_openable_osc8);
         let epoch = if integrated {
             bridge.open_integrated(24, 80)?
@@ -341,12 +346,17 @@ impl LocalSessions {
                 grant_input,
                 snapshot_encoder(format),
             )?;
+            owned.bridge.enable_inline_graphics(format);
             owned.pump_candidate = false;
             owned.parked_input = false;
             activated
         } else {
-            let (mut owned, original) =
-                Self::spawn(self.last_epoch, integrated, self.worker.as_ref().unwrap())?;
+            let (mut owned, original) = Self::spawn(
+                self.last_epoch,
+                integrated,
+                format,
+                self.worker.as_ref().unwrap(),
+            )?;
             let Entry::Vacant(entry) = self.registry.sessions.entry(original.session) else {
                 return Err("terminal session ID collision".into());
             };
@@ -393,6 +403,7 @@ impl LocalSessions {
                         .bridge
                         .attach_read_only_with(target, snapshot_encoder(format))?
                         .ok_or("terminal session closed")?;
+                    owned.bridge.enable_inline_graphics(format);
                     owned.pump_candidate = false;
                     owned.parked_input = false;
                     Ok(view)
@@ -495,6 +506,7 @@ impl LocalSessions {
         owner: Attachment,
         sink: Channel<StreamEvent>,
         observer: Option<ObserverTarget>,
+        format: SnapshotFormat,
         shared: Weak<Mutex<Self>>,
     ) -> Result<(), String> {
         let bridge = &self.registry.reader(&owner.session)?.bridge;
@@ -504,7 +516,11 @@ impl LocalSessions {
         }
         self.validate_observer(&owner, observer)?;
         self.ensure_worker(shared)?;
-        let mut stream = LocalStream::new(owner, sink);
+        self.registry
+            .reader(&owner.session)?
+            .bridge
+            .enable_inline_graphics(format);
+        let mut stream = LocalStream::new(owner, sink, format);
         stream.set_observer(observer);
         self.stream = Some(stream);
         self.worker.as_ref().unwrap().wake();
@@ -516,10 +532,14 @@ impl LocalSessions {
         let preview = self
             .stream
             .as_ref()
-            .and_then(LocalStream::observe_next)
-            .and_then(|(target, revision)| {
+            .and_then(|stream| {
+                stream
+                    .observe_next()
+                    .map(|observation| (observation, stream.format))
+            })
+            .and_then(|((target, revision), format)| {
                 self.retained_bridge(target.epoch)
-                    .and_then(|bridge| bridge.observe_channel_frame(target.epoch, revision))
+                    .and_then(|bridge| bridge.observe_channel_frame(target.epoch, revision, format))
                     .ok()
                     .flatten()
                     .map(|(revision, frame)| {
@@ -671,6 +691,7 @@ impl LocalSessions {
             .bridge
             .resume_with(Some(owner), snapshot_encoder(format))?
             .ok_or("terminal session closed")?;
+        owned.bridge.enable_inline_graphics(format);
         let input_allowed = owned.bridge.can_resume_local_input();
         self.retire_stale_stream(&view.owner);
         Ok(AttachedView {

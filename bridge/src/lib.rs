@@ -1,5 +1,6 @@
 //! Rust frame bridge and limited Linux PTY spike, not a full terminal.
 pub mod history_search;
+mod inline_png;
 pub mod live;
 #[cfg(target_os = "linux")]
 pub mod remote_files;
@@ -26,8 +27,11 @@ pub fn snapshot_encoder(
         SnapshotFormat::Compatibility => {
             from_engine(frame, session, epoch).map(LocalSnapshot::Compatibility)
         }
-        SnapshotFormat::Channel => semantic_v4::encode(None, frame, session)
-            .map(|(_, frame)| LocalSnapshot::Channel(frame)),
+        SnapshotFormat::Channel | SnapshotFormat::ChannelImages => {
+            let version = format.channel_version().expect("Channel format");
+            semantic_v4::encode(None, frame, session, version)
+                .map(|(_, data)| LocalSnapshot::Channel(data))
+        }
     }
 }
 

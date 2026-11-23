@@ -30,25 +30,35 @@ WebView validates the identity, base, revisions, row indices, cell values and
 cursor before replacing its current state. It acknowledges a frame after applying
 and painting it.
 
-The local desktop requests frame version 4 through `subscribe_local_shell`.
+The local desktop requests frame version 5 through `subscribe_local_shell`.
 The registry's worker advances the PTY and sends frame and shell status updates
-through a Tauri Channel. Each new stream starts with a full snapshot. A v4
-snapshot and delta carry the screen, wide-cell spans, full underline type and
+through a Tauri Channel. Each new stream starts with a full snapshot. Versions 4 and 5 carry the screen, wide-cell spans, full underline type and
 color, and physical row wrap flags. The visible copy action uses the flags to
-keep a soft-wrapped line together. Aether's local v4 stream preserves bounded
+keep a soft-wrapped line together. The local Channel preserves bounded
 Unicode clusters across PTY reads, including combining marks and wide joined
 emoji. Cell spans currently follow the first graphic scalar in the cluster.
 
 Local OSC 8 links use the same validated absolute HTTP(S) target policy as
-Ember. Each v4 update carries the targets named by its rows. The WebView keeps
+Ember. Each Channel update carries the targets named by its rows. The WebView keeps
 targets only while decoded rows reference them and rejects a changed target for
 an existing ID within the same session incarnation. Ctrl-click resolves the
 cell in the exact acknowledged frame under the current owner before asking
 the desktop's default URI handler to open it. Hyperlink targets and terminal
 cell text have independent byte budgets.
 
-The WebView checks the encoded frame against an 8 MiB budget before decoding,
-then checks the cluster, total text and grid budgets. Frame revision, layout,
+Version 5 also carries immutable image resources and per-row image slices. A
+full snapshot includes every visible resource. A delta can reference a resource
+in the exact acknowledged base. The WebView rejects missing resources and drops
+a resource when its last visible slice leaves the current grid. Image IDs use
+canonical decimal strings and share the session incarnation with hyperlinks.
+The engine admits up to 32 raster resources and 2 MiB of RGBA per local PTY,
+including resources referenced by retained history or immutable frames. The
+local canvas displays static direct Kitty RGB, RGBA, and PNG transfers on the
+primary screen. The history text projection continues to expose text.
+
+The WebView checks the 8 MiB encoded frame budget with a separate allowance for
+canonical base64 image data. It validates the cluster, total text, grid and
+raster budgets before applying the update. Frame revision, layout,
 publication sequence and ACK use canonical positive u64 decimal strings. The
 WebView compares them at full precision and validates the attachment, sequence,
 frame and status. It applies and paints the frame at the next animation callback
@@ -57,10 +67,11 @@ revision, when present. An idle healthy session sends a status heartbeat. A slow
 view holds one envelope in flight.
 The worker keeps parsing and draining the PTY, then publishes the latest grid
 against the acknowledged base. Local tab activation, attach and recovery can
-negotiate v4 full snapshots and acknowledge their decimal revision before
-opening the stream. An unconfirmed Channel can recover a compatibility snapshot
-under a new generation and continue by polling. If v3 cannot represent its
-counters, recovery uses v4. SSH retains its existing polling and wire contracts.
+negotiate Channel full snapshots and acknowledge their decimal revision before
+opening the stream. A rejected paint frame recovers a full Channel snapshot
+under a new attachment generation. A stalled transport can recover a v3
+snapshot and continue polling if its counters fit. SSH retains its polling and
+wire contracts.
 
 The publisher keeps one acknowledged base and one in-flight frame. The coherent
 recovery snapshot shares the in-flight frame where applicable. A grid permits up

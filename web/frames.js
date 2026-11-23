@@ -68,6 +68,37 @@ export function acceptUpdate(previous, update, expected = {session:'frame-demo',
   return finishFrame(frame, previous.cols, rows);
 }
 const painted = new WeakMap();
+const rasterCanvases = new WeakMap();
+
+function rasterCanvas(document, resource) {
+  const cached = rasterCanvases.get(resource);
+  if (cached) return cached;
+  const canvas = document.createElement('canvas');
+  canvas.width = resource.width;
+  canvas.height = resource.height;
+  const context = canvas.getContext('2d');
+  const pixels = context.createImageData(resource.width,resource.height);
+  const rgba = globalThis.atob(resource.rgba);
+  for (let i = 0; i < rgba.length; i++) pixels.data[i] = rgba.charCodeAt(i);
+  context.putImageData(pixels,0,0);
+  rasterCanvases.set(resource,canvas);
+  return canvas;
+}
+
+function paintImages(canvas, g, frame, dirty, cw, ch) {
+  for (const y of dirty) for (const {id,column,slice} of frame.rows[y].imageSlices ?? []) {
+    const image = frame.images[id];
+    const source = rasterCanvas(canvas.ownerDocument,image);
+    const x = column * cw, width = image.columns * cw;
+    g.save();
+    try {
+      g.beginPath();g.rect(x,y*ch,width,ch);g.clip();
+      g.drawImage(source,x,(y-slice)*ch,width,image.rows*ch);
+    } finally {
+      g.restore();
+    }
+  }
+}
 
 export function clearPaint(canvas) {
   painted.delete(canvas);
@@ -178,6 +209,7 @@ export function paint(canvas, frame, scale = globalThis.devicePixelRatio || 1) {
       g.restore();
     }
   });
+  paintImages(canvas,g,frame,dirty,cw,ch);
   if(frame.cursor_visible && dirty.includes(frame.cursor_row)){
     const x=frame.cursor_col*cw,y=frame.cursor_row*ch,width=cw*(frame.rows[frame.cursor_row][frame.cursor_col].width===2?2:1);g.fillStyle=g.strokeStyle='#9ac6ff';
     if(frame.cursor_shape==='beam')g.fillRect(x,y,2,ch);

@@ -4,7 +4,7 @@ use crate::{
     history_search::{HistorySearch, HistorySearchRequest, HistorySearchResponse},
     protocol::MAX_HISTORY_SNAPSHOT_BYTES,
     semantic::{self, Attachment, Resume, SessionSelector, Update},
-    WireFrame,
+    SnapshotFormat, WireFrame,
 };
 use jterm_engine::{
     frame::CellFrame,
@@ -21,6 +21,9 @@ use raw_suffix::RawSuffix;
 const HISTORY_PAGE_ROWS: usize = 128;
 const MIN_HISTORY_PAGE_ROWS: usize = 32;
 const MAX_HISTORY_OFFSET: usize = 1024;
+// Match the web canvas's intrinsic cell geometry. Device scaling is applied
+// only by its compositor and does not change the terminal's cell dimensions.
+const CELL_PIXELS: (u16, u16) = (12, 24);
 
 #[derive(Default)]
 pub struct LiveBridge {
@@ -34,6 +37,7 @@ pub struct LiveBridge {
     flight: Option<CellFrame>,
     accepted: Option<CellFrame>,
     local_desktop: bool,
+    inline_graphics: bool,
     unpublished_background: bool,
     hyperlink_policy: Option<jterm_engine::hyperlink::HyperlinkPolicy>,
     stable: Option<CellFrame>,
@@ -63,6 +67,16 @@ impl LiveBridge {
 
     pub fn set_hyperlink_policy(&mut self, policy: jterm_engine::hyperlink::HyperlinkPolicy) {
         self.hyperlink_policy = Some(policy);
+    }
+
+    pub fn enable_inline_graphics(&mut self, format: SnapshotFormat) {
+        if !self.local_desktop || format != SnapshotFormat::ChannelImages || self.inline_graphics {
+            return;
+        }
+        self.inline_graphics = true;
+        if let Some(session) = &mut self.session {
+            session.enable_inline_graphics(CELL_PIXELS, crate::inline_png::decode);
+        }
     }
 
     /// Wake the desktop worker after the reader queues output or an exit.
@@ -127,6 +141,9 @@ impl LiveBridge {
             session.enable_grapheme_clusters();
             session.enable_keyboard_disambiguation();
             session.enable_history_preserving_resize();
+        }
+        if self.inline_graphics {
+            session.enable_inline_graphics(CELL_PIXELS, crate::inline_png::decode);
         }
         if let Some(policy) = self.hyperlink_policy {
             session.enable_hyperlinks(policy);
@@ -531,7 +548,11 @@ impl LiveBridge {
         &mut self,
         epoch: u32,
         snapshot: bool,
+        format: SnapshotFormat,
     ) -> Result<Option<(crate::protocol_v4::Counter, String)>, String> {
+        let version = format
+            .channel_version()
+            .ok_or("terminal Channel version required")?;
         let Some(frame) = self.poll_frame(epoch, snapshot)? else {
             return Ok(None);
         };
@@ -540,7 +561,7 @@ impl LiveBridge {
         } else {
             self.accepted.as_ref()
         };
-        let update = crate::semantic_v4::encode(previous, &frame, &self.id)?;
+        let update = crate::semantic_v4::encode(previous, &frame, &self.id, version)?;
         self.publish(frame);
         Ok(Some(update))
     }
@@ -581,13 +602,17 @@ impl LiveBridge {
         &self,
         epoch: u32,
         revision: Option<crate::protocol_v4::Counter>,
+        format: SnapshotFormat,
     ) -> Result<Option<(crate::protocol_v4::Counter, String)>, String> {
+        let version = format
+            .channel_version()
+            .ok_or("terminal Channel version required")?;
         self.check(epoch)?;
         let frame = self.current_snapshot()?;
         if revision.is_some_and(|revision| revision.get() >= frame.stamp().revision) {
             return Ok(None);
         }
-        crate::semantic_v4::encode(None, &frame, &self.id).map(Some)
+        crate::semantic_v4::encode(None, &frame, &self.id, version).map(Some)
     }
 
     fn current_snapshot(&self) -> Result<CellFrame, String> {
@@ -829,7 +854,10 @@ mod tests {
             assert!(std::time::Instant::now() < until);
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        let (_, frame) = bridge.observe_channel_frame(epoch, None).unwrap().unwrap();
+        let (_, frame) = bridge
+            .observe_channel_frame(epoch, None, SnapshotFormat::Channel)
+            .unwrap()
+            .unwrap();
         let json: serde_json::Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(json["stamp"]["epoch"], "1");
         assert_eq!(json["stamp"]["session"], owner.session);

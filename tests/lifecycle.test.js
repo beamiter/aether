@@ -72,7 +72,7 @@ test('terminal Chat sends each displayed prompt at most once while preserving no
 function channelSnapshot(frame){
  const {cols,rows,...stamp}=frame;
  return JSON.stringify({kind:'snapshot',cols,rows:rows.map(cells=>({wrapped:false,cells})),
-   stamp:{...stamp,version:4,epoch:String(stamp.epoch),resource_generation:String(stamp.epoch),revision:String(stamp.revision),layout:String(stamp.layout),screen:'primary'}});
+   stamp:{...stamp,version:CHANNEL_FRAME_VERSION,epoch:String(stamp.epoch),resource_generation:String(stamp.epoch),revision:String(stamp.revision),layout:String(stamp.layout),screen:'primary'}});
 }
 function testChannel(){
  let number=40;
@@ -115,10 +115,10 @@ test('local Channel paints and acknowledges exact revisions, fencing a retired a
  const h=harness(async(name,args)=>{
   switch(name){
    case 'open_shell':return first;
-   case 'subscribe_local_shell':assert.equal(args.frameVersion,4);receivers.push(args.stream.onmessage);return null;
+   case 'subscribe_local_shell':assert.equal(args.frameVersion,CHANNEL_FRAME_VERSION);receivers.push(args.stream.onmessage);return null;
    case 'ack_local_stream':sent.push(args);return null;
    case 'detach_shell':case 'ack_shell':return null;
-   case 'attach_shell':assert.equal(args.frameVersion,4);return {owner:next,frame:channelSnapshot(frame)};
+   case 'attach_shell':assert.equal(args.frameVersion,CHANNEL_FRAME_VERSION);return {owner:next,frame:channelSnapshot(frame)};
    default:throw Error('unexpected local IPC '+name);
   }
  },undefined,undefined,(_canvas,frame)=>painted.push(frame.revision),{},testChannel(),{
@@ -167,6 +167,31 @@ test('a rejected stream snapshot requires recovery before compatibility polling 
  assert.deepEqual(painted,[frame.revision]);
 });
 
+test('a missing image resource requests a fresh graphics snapshot on the same PTY',async()=>{
+ const first={session:'a'.repeat(32),epoch:1,generation:1},next={...first,generation:2};
+ const raw=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+ const frame={...raw,session:first.session};
+ const incomplete=JSON.parse(channelSnapshot(frame));
+ incomplete.rows[0].image_slices=[{column:0,id:'1',slice:0}];
+ const painted=[],received=[],acks=[];
+ const h=harness(async(name,args)=>{
+  switch(name){
+   case 'open_shell':return first;
+   case 'subscribe_local_shell':received.push(args.stream.onmessage);return null;
+   case 'recover_shell':assert.equal(args.epoch,1);assert.equal(args.frameVersion,CHANNEL_FRAME_VERSION);
+    return {owner:next,frame:channelSnapshot(frame),input_allowed:true};
+   case 'ack_shell':acks.push(args.epoch);return null;
+   default:throw Error('unexpected local IPC '+name);
+  }
+ },undefined,undefined,(_canvas,frame)=>painted.push(frame.revision),{},testChannel());
+ await h.click('#open');
+ await received[0]({owner:first,kind:'update',sequence:'1',frame:JSON.stringify(incomplete),status:channelHealth(1)});
+ assert.equal(painted.length,0);assert.equal(h.el('#input').disabled,true);assert.deepEqual(acks,[]);
+ await h.click('#recover');
+ assert.deepEqual(acks,[1]);assert.deepEqual(painted,[String(frame.revision)]);
+ assert.equal(received.length,2);assert.equal(h.el('#input').disabled,false);
+});
+
 test('split observations paint the inactive shell and cannot claim live input',async()=>{
  const a={session:'a'.repeat(32),epoch:1,generation:1},b={session:'b'.repeat(32),epoch:2,generation:2};
  const returned={...a,generation:3};
@@ -182,7 +207,7 @@ test('split observations paint the inactive shell and cannot claim live input',a
    case 'activate_local_tab':{
     const owner=args.targetEpoch===null?b:returned;
     adopted.push(owner.epoch);
-    assert.equal(args.frameVersion,4);
+    assert.equal(args.frameVersion,CHANNEL_FRAME_VERSION);
     return {Ok:{owner,frame:channelSnapshot(frame(owner)),input_allowed:true}};
    }
    case 'write_shell':writes.push(args.epoch);return args.bytes.length;

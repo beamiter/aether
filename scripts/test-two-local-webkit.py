@@ -729,6 +729,130 @@ def click_visible_terminal(driver):
     driver.command("DELETE", "/actions")
 
 
+def exercise_inline_graphics(driver, owned):
+    fixture = owned / "inline-graphics-fixture.py"
+    fixture.write_text(r'''
+import base64
+import os
+from pathlib import Path
+import select
+import struct
+import sys
+import termios
+import time
+import tty
+import zlib
+
+root = Path(sys.argv[1])
+fd = 0
+saved = termios.tcgetattr(fd)
+
+def send(data):
+    os.write(1, data)
+
+def wait_for_file(name):
+    until = time.monotonic() + 45
+    while not (root / name).exists():
+        if time.monotonic() >= until:
+            raise RuntimeError(name)
+        time.sleep(0.03)
+
+def expect(reply):
+    received = b''
+    until = time.monotonic() + 5
+    while len(received) < len(reply):
+        ready, _, _ = select.select([fd], [], [], max(0, until - time.monotonic()))
+        if not ready:
+            break
+        received += os.read(fd, 128)
+    if received != reply:
+        raise RuntimeError(repr((received, reply)))
+
+def png_chunk(kind, data):
+    return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
+
+try:
+    tty.setraw(fd)
+    send(b'\x1b[3J\x1b[2J\x1b[H\x1b[?25l\x1b_Ga=q,i=31,f=24,s=1,v=1;AAAA\x1b\\')
+    expect(b'\x1b_Gi=31;OK\x1b\\')
+    rgba = base64.b64encode(bytes([240, 28, 80, 255, 34, 193, 91, 255]))
+    send(b'\x1b[5;2H\x1b_Ga=T,i=41,c=2,r=2,f=32,s=1,v=2,C=1,m=1;' + rgba[:4] + b'\x1b\\')
+    send(b'\x1b_Gm=0;' + rgba[4:] + b'\x1b\\\x1b[6n')
+    expect(b'\x1b_Gi=41;OK\x1b\\\x1b[5;2R')
+    png = (b'\x89PNG\r\n\x1a\n' + png_chunk(b'IHDR', struct.pack('>2I5B', 1, 1, 8, 6, 0, 0, 0))
+           + png_chunk(b'IDAT', zlib.compress(bytes([0, 31, 111, 243, 255]))) + png_chunk(b'IEND', b''))
+    send(b'\x1b[5;5H\x1b_Ga=T,i=42,c=2,r=1,f=100,C=1;' + base64.b64encode(png) + b'\x1b\\')
+    expect(b'\x1b_Gi=42;OK\x1b\\')
+    (root / 'inline-ready').write_text(str(os.getpid()))
+    wait_for_file('inline-scroll')
+    send(b'\x1b[1S')
+    wait_for_file('inline-erase')
+    send(b'\x1b[2J\x1b[3J')
+    (root / 'inline-erased').touch()
+    wait_for_file('inline-finish')
+except Exception as error:
+    (root / 'inline-error').write_text(str(error))
+    raise
+finally:
+    termios.tcsetattr(fd, termios.TCSANOW, saved)
+    send(b'\x1b[?25h')
+''')
+    error = owned / "inline-error"
+    red, green, blue = [240, 28, 80, 255], [34, 193, 91, 255], [31, 111, 243, 255]
+    driver.click("#open")
+    original = wait_for(lambda: (state := driver.execute(READ))["writable"] and state["transport"] == "channel" and state,
+                        "graphics fixture did not attach to the real local Channel")
+    driver.type("#input", f"python3 {shlex.quote(str(fixture))} {shlex.quote(str(owned))}")
+    driver.click("#send")
+
+    def pixels(row):
+        if error.exists():
+            raise AssertionError("PTY graphics fixture: " + error.read_text())
+        return driver.execute(f"""
+            const canvas = document.querySelector('main canvas');
+            const g = canvas.getContext('2d');
+            const scale = canvas.width / parseFloat(canvas.style.width);
+            const sample = (x,y) => Array.from(g.getImageData(Math.floor(x*scale),Math.floor(y*scale),1,1).data);
+            return [sample(22,{row}*24+12), sample(22,{row + 1}*24+12), sample(56,{row}*24+12)];
+        """)
+
+    ready = owned / "inline-ready"
+    wait_for(lambda: pixels(4) == [red, green, blue] and ready.is_file() and ready.stat().st_size,
+             "real Kitty RGBA and PNG were not painted in WebKit")
+    child = int(ready.read_text())
+    child_birth = birth(child)
+    assert child_birth is not None
+    (owned / "inline-scroll").touch()
+    wait_for(lambda: pixels(3) == [red, green, blue] and pixels(4)[1] != green,
+             "canvas row patches did not move both image resources with PTY scroll")
+
+    driver.clear("#cols")
+    driver.type("#cols", "76")
+    driver.click("#resize")
+    wait_for(lambda: "76 ×" in driver.execute(READ)["cursor"] and pixels(3) == [red, green, blue],
+             "full snapshot after terminal resize lost the image resources")
+
+    driver.click("#detach")
+    wait_for(lambda: driver.execute("return !document.querySelector('#attach').disabled"),
+             "graphics fixture did not detach")
+    driver.click("#attach")
+    wait_for(lambda: (view := driver.execute(READ))["current_tab"] == original["current_tab"] and
+             view["transport"] == "channel" and not view["writable"] and pixels(3) == [red, green, blue],
+             "read-only reconnect did not restore the graphics resources for the retained PTY")
+    assert birth(child) == child_birth
+    (owned / "inline-erase").touch()
+    wait_for(lambda: (owned / "inline-erased").exists() and
+             all(pixel not in (red, green, blue) for pixel in pixels(3)), "erase did not clear the painted slices")
+    (owned / "inline-finish").touch()
+    driver.click("#close")
+    wait_for(lambda: driver.execute(READ)["status"].startswith("Terminal closed"), "graphics fixture did not close")
+    print(json.dumps({"native_inline_graphics_raw_and_png_pixels": True,
+                      "native_inline_graphics_pty_reply_order": True,
+                      "native_inline_graphics_scroll_resize_erase": True,
+                      "native_inline_graphics_readonly_reconnect_same_pty": True,
+                      "device_pixel_ratio": driver.execute("return devicePixelRatio")}), flush=True)
+
+
 def exercise_height_shrink(driver):
     def state():
         return driver.execute(READ)
@@ -2897,7 +3021,7 @@ def private_accessibility_address():
     return address.unpack()[0]
 
 
-def run(binary, jsh, workspace, api, native, notebook=False, output_review=False, vim9=False):
+def run(binary, jsh, workspace, api, native, notebook=False, output_review=False, vim9=False, inline_graphics_only=False):
     executable = shutil.which("WebKitWebDriver")
     if not executable or not os.environ.get("DISPLAY") or not os.environ.get("XAUTHORITY"):
         raise RuntimeError("run with official WebKitWebDriver and authenticated Xvfb")
@@ -2907,7 +3031,8 @@ def run(binary, jsh, workspace, api, native, notebook=False, output_review=False
         raise RuntimeError("the native Codex fixture requires system Node.js (Ubuntu package: nodejs)")
     with tempfile.TemporaryDirectory(prefix="aether-native-two-") as scratch:
         owned = Path(scratch)
-        env = {name: os.environ[name] for name in ("DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS") if name in os.environ}
+        env = {name: os.environ[name] for name in ("DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS", "GDK_SCALE")
+               if name in os.environ}
         env.update({"HOME": scratch, "PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8",
                     "GDK_BACKEND": "x11", "LIBGL_ALWAYS_SOFTWARE": "1",
                     "TAURI_WEBVIEW_AUTOMATION": "true"})
@@ -2960,6 +3085,9 @@ def run(binary, jsh, workspace, api, native, notebook=False, output_review=False
                 wait_for(ready, "loopback WebKitWebDriver not ready")
                 driver.open(binary)
                 wait_for(lambda: opened_page(driver), "embedded Aether tauri: page did not load")
+                if inline_graphics_only:
+                    exercise_inline_graphics(driver, owned)
+                    return
                 exercise(driver, owned)
                 exercise_hyperlinks(driver, owned)
                 exercise_keyboard(driver, owned)
@@ -3002,6 +3130,7 @@ if __name__ == "__main__":
     parser.add_argument("--notebook", action="store_true", help="include native file selection and a supervised notebook run/stop")
     parser.add_argument("--output-review", action="store_true", help="compare and export actual local jsh outputs after eviction")
     parser.add_argument("--vim9", action="store_true", help="open an actual local workbench and edit/save through Vim and its fallback PTY")
+    parser.add_argument("--inline-graphics-only", action="store_true", help="exercise real PTY image rendering and reconnect")
     args = parser.parse_args()
     if not args.binary.is_absolute() or args.binary.is_symlink() or not args.binary.is_file() or not os.access(args.binary, os.X_OK):
         parser.error("an absolute regular executable is required")
@@ -3013,4 +3142,4 @@ if __name__ == "__main__":
     if args.vim9 and any(not shutil.which(tool) for tool in ("vim", "rg", "xdotool")):
         parser.error("--vim9 requires Vim 9, ripgrep and xdotool")
     signal.signal(signal.SIGTERM, interrupted)
-    run(args.binary, args.jsh, args.workspace, args.api_chat, args.native_task, args.notebook, args.output_review, args.vim9)
+    run(args.binary, args.jsh, args.workspace, args.api_chat, args.native_task, args.notebook, args.output_review, args.vim9, args.inline_graphics_only)
