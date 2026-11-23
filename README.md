@@ -8,7 +8,7 @@ ANSI parser. **This is not a daily-use terminal.**
 ## Shared core
 
 The three Cargo manifests pin the shared crates to
-`e4a5411bf8e25851406580801ed0eb80de20cb70`. `jterm_runtime` owns the local PTY, direct child and
+`92b8d7ac7be16fef4874e1178a17e4f2d0f96934`. `jterm_runtime` owns the local PTY, direct child and
 output drain. Its `jterm_engine::terminal::Terminal` owns parsing, screen
 state, input encoding, history and immutable frames. The session host supplies
 each frame stream's epoch. Run `python3 scripts/check-core-pin.py` to verify
