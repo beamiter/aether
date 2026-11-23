@@ -19,6 +19,8 @@ form{display:flex;gap:12px;align-items:center;margin-top:16px}label{flex:1}input
 #command-blocks:not([hidden]){margin:12px 0}
 #command-block-panel{margin:8px 0}
 .command-block-controls{display:flex;flex-wrap:wrap;gap:8px}
+#command-block-bookmarked[aria-pressed="true"],.command-block-bookmark[aria-pressed="true"]{background:#d0e6ff;box-shadow:inset 0 0 0 2px #52627a}
+.command-block[data-bookmarked="true"]{border-color:#a5c7fa}
 #command-block-search[hidden],#command-block-search-status:empty,#command-block-matches:empty{display:none}
 #command-block-search{flex-wrap:wrap}
 #command-block-matches{list-style:none;margin:8px 0;padding:0}
@@ -30,6 +32,7 @@ form{display:flex;gap:12px;align-items:center;margin-top:16px}label{flex:1}input
 .command-block-outcome{margin-inline:10px;color:#a5c7fa;font-size:13px}
 .command-block-meta{font-size:13px;overflow-wrap:anywhere;unicode-bidi:plaintext}
 .command-block textarea{margin-bottom:8px;unicode-bidi:plaintext}
+.command-block-actions{display:flex;flex-wrap:wrap;gap:6px}
 #terminal-chat-transcript #command-block-list{max-height:18rem;overflow:auto;overflow-anchor:none}
 #terminal-chat-dock:not([hidden]){display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:2rem;margin:6px 0;color:#acbacb}
 #active-pane[data-chat-surface="prompt"] .viewport{max-height:min(14rem,35vh)}

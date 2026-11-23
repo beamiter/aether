@@ -13,6 +13,7 @@ export function validateCommandBlockSnapshot(snapshot,owner){
   const identity=snapshot?.owner;
   if(!sameOwner(identity,owner)||typeof snapshot.enabled!=='boolean'||
       !Array.isArray(snapshot.blocks)||snapshot.blocks.length>MAX_BLOCKS||
+      !Array.isArray(snapshot.bookmarked)||snapshot.bookmarked.length>snapshot.blocks.length||
       (!snapshot.enabled&&snapshot.blocks.length)){
     throw new Error('Invalid command block snapshot.');
   }
@@ -33,6 +34,10 @@ export function validateCommandBlockSnapshot(snapshot,owner){
     }
     previous=BigInt(block.sequence);
   }
+  if(new Set(snapshot.bookmarked).size!==snapshot.bookmarked.length||
+      snapshot.bookmarked.some(sequence=>!snapshot.blocks.some(block=>block.sequence===sequence))){
+    throw new Error('Invalid command block bookmarks.');
+  }
 }
 
 export function validateFrozenReview(receipt,owner){
@@ -42,13 +47,15 @@ export function validateFrozenReview(receipt,owner){
   }
 }
 
-export function installCommandBlocks(document,{getOwner,read,find,compare,exportReview,recall,returnToTerminal}){
+export function installCommandBlocks(document,{getOwner,read,bookmark,find,compare,exportReview,recall,returnToTerminal}){
   const controls=document.querySelector('#command-blocks');
   const toggle=document.querySelector('#command-block-toggle');
   const panel=document.querySelector('#command-block-panel');
   const refresh=document.querySelector('#command-block-refresh');
   const status=document.querySelector('#command-block-status');
   const list=document.querySelector('#command-block-list');
+  const bookmarkFilter=document.querySelector('#command-block-bookmarked');
+  const noBookmarks=document.querySelector('#command-block-no-bookmarks');
   const reviewForm=document.querySelector('#command-review-form');
   const beforeSelect=document.querySelector('#command-review-before');
   const afterSelect=document.querySelector('#command-review-after');
@@ -63,10 +70,13 @@ export function installCommandBlocks(document,{getOwner,read,find,compare,export
     scan:find,
     cardFor:record=>{
       const card=cards.get(record.sequence);
-      return card?.dataset.revision===record.revision?card:null;
+      if(card?.dataset.revision!==record.revision)return null;
+      if(card.hidden){bookmarkedOnly=false;applyBookmarkFilter();}
+      return card;
     },
   });
   let owner=null,request=null;
+  let bookmarkedOnly=false,bookmarkOperation=null;
   let chat=false,chatVisible=false,manuallyOpen=false;
   let desiredSequence=null,displayedSequence,attemptedSequence;
   let choices=new Map(),frozen=null,reviewOperation=null;
@@ -74,7 +84,7 @@ export function installCommandBlocks(document,{getOwner,read,find,compare,export
   function setOpen(open){
     panel.hidden=!open;
     toggle.setAttribute('aria-expanded',String(open));
-    if(!open){request=null;attemptedSequence=undefined;refresh.disabled=false;search.reset();}
+    if(!open){request=null;attemptedSequence=undefined;refresh.disabled=!!bookmarkOperation;search.reset();}
   }
 
   function updateOwner(){
@@ -83,12 +93,16 @@ export function installCommandBlocks(document,{getOwner,read,find,compare,export
     if(next===owner)return;
     owner=next;
     manuallyOpen=false;
+    bookmarkOperation=null;
+    bookmarkedOnly=false;
+    bookmarkFilter.hidden=true;
     setOpen(false);
     desiredSequence=null;
     displayedSequence=attemptedSequence=undefined;
     status.textContent='';
     cards.clear();
     list.replaceChildren();
+    applyBookmarkFilter();
     search.setAvailable(false);
     reviewOperation=null;
     frozen=null;
@@ -114,7 +128,7 @@ export function installCommandBlocks(document,{getOwner,read,find,compare,export
   }
 
   function refreshChat(){
-    if(!chat||controls.hidden||request||attemptedSequence===desiredSequence)return;
+    if(!chat||controls.hidden||request||bookmarkOperation||attemptedSequence===desiredSequence)return;
     if(displayedSequence!==undefined&&(desiredSequence===null||
         (displayedSequence!==null&&BigInt(displayedSequence)>=BigInt(desiredSequence))))return;
     attemptedSequence=desiredSequence;
@@ -210,10 +224,49 @@ export function installCommandBlocks(document,{getOwner,read,find,compare,export
     }
   }
 
+  function applyBookmarkFilter(){
+    bookmarkFilter.setAttribute('aria-pressed',String(bookmarkedOnly));
+    let anyVisible=false;
+    for(const card of cards.values()){
+      card.hidden=bookmarkedOnly&&card.dataset.bookmarked!=='true';
+      anyVisible ||= !card.hidden;
+    }
+    noBookmarks.hidden=!bookmarkedOnly||anyVisible;
+  }
+
+  function showBookmark(card,bookmarked){
+    card.dataset.bookmarked=String(bookmarked);
+    card.querySelector('.command-block-bookmark').setAttribute('aria-pressed',String(bookmarked));
+  }
+
+  async function changeBookmark(card,button,attachment){
+    if(getOwner()!==attachment||panel.hidden||controls.hidden||request||bookmarkOperation)return;
+    const {sequence,revision}=card.dataset;
+    const operation={};
+    const bookmarked=card.dataset.bookmarked!=='true';
+    bookmarkOperation=operation;
+    refresh.disabled=true;
+    try{
+      await bookmark(attachment,{sequence,revision},bookmarked);
+      if(bookmarkOperation!==operation||getOwner()!==attachment)return;
+      showBookmark(card,bookmarked);
+      if(bookmarkedOnly&&!bookmarked&&document.activeElement===button)bookmarkFilter.focus();
+      applyBookmarkFilter();
+      if(!panel.hidden)status.textContent=bookmarked?'Command bookmarked.':'Bookmark removed.';
+    }catch(error){
+      if(bookmarkOperation===operation&&getOwner()===attachment&&!panel.hidden){
+        status.textContent=String(error?.message??error);
+      }
+    }finally{
+      if(bookmarkOperation===operation){bookmarkOperation=null;refresh.disabled=false;refreshChat();}
+    }
+  }
+
   function makeCard(block,attachment){
     const card=element('details',undefined,'command-block');
     card.dataset.sequence=block.sequence;
     card.dataset.revision=block.revision;
+    const actions=element('div',undefined,'command-block-actions');
     const summary=element('summary');
     const command=element('code',block.command,'command-block-command');
     const outcome=block.exit===null?'Exit status unavailable':`Exit ${block.exit}`;
@@ -253,7 +306,8 @@ export function installCommandBlocks(document,{getOwner,read,find,compare,export
             :'Output selected. Use your system copy shortcut.';
         }
       });
-      card.append(text,copy);
+      card.append(text);
+      actions.append(copy);
     }
     if(recall){
       const insert=element('button','Insert command at shell prompt');
@@ -262,14 +316,19 @@ export function installCommandBlocks(document,{getOwner,read,find,compare,export
         if(getOwner()!==attachment||panel.hidden)return;
         recall(block,attachment,insert,message=>{if(getOwner()===attachment)status.textContent=message;});
       });
-      card.append(insert);
+      actions.append(insert);
     }
+    const pin=element('button','Bookmark','command-block-bookmark');
+    pin.type='button';
+    pin.addEventListener('click',()=>void changeBookmark(card,pin,attachment));
+    actions.append(pin);
+    card.append(actions);
     return card;
   }
 
   async function refreshList(){
     const attachment=getOwner();
-    if(!attachment||panel.hidden||request)return;
+    if(!attachment||panel.hidden||request||bookmarkOperation)return;
     const reading={};
     request=reading;
     refresh.disabled=true;
@@ -279,23 +338,26 @@ export function installCommandBlocks(document,{getOwner,read,find,compare,export
       validateCommandBlockSnapshot(snapshot,attachment);
       setChoices(snapshot.blocks);
       search.setAvailable(snapshot.blocks.length>0);
-      const retained=new Set(snapshot.blocks.map(block=>block.sequence));
+      const retained=new Map(snapshot.blocks.map(block=>[block.sequence,block.revision]));
+      const bookmarked=new Set(snapshot.bookmarked);
       let anchor,anchorTop;
       if(chat&&list.scrollTop>0){
         const top=list.getBoundingClientRect().top;
-        anchor=[...list.children].find(card=>retained.has(card.dataset.sequence)&&card.getBoundingClientRect().bottom>top);
+        anchor=[...list.children].find(card=>!card.hidden&&retained.get(card.dataset.sequence)===card.dataset.revision&&
+          card.getBoundingClientRect().bottom>top);
         anchorTop=anchor?.getBoundingClientRect().top;
       }
       for(const [sequence,card] of cards){
-        if(!retained.has(sequence)){card.remove();cards.delete(sequence);}
+        if(retained.get(sequence)!==card.dataset.revision){card.remove();cards.delete(sequence);}
       }
       for(const block of [...snapshot.blocks].reverse()){
-        if(cards.has(block.sequence))continue;
-        const card=makeCard(block,attachment);
-        cards.set(block.sequence,card);
-        list.prepend(card);
+        let card=cards.get(block.sequence);
+        if(!card){card=makeCard(block,attachment);cards.set(block.sequence,card);list.prepend(card);}
+        showBookmark(card,bookmarked.has(block.sequence));
       }
-      if(anchor)list.scrollTop+=anchor.getBoundingClientRect().top-anchorTop;
+      bookmarkFilter.hidden=!snapshot.enabled;
+      applyBookmarkFilter();
+      if(anchor&&!anchor.hidden)list.scrollTop+=anchor.getBoundingClientRect().top-anchorTop;
       displayedSequence=snapshot.blocks[0]?.sequence??null;
       status.textContent=!snapshot.enabled
         ?'Command blocks are available for local sessions opened with jsh.'
@@ -316,6 +378,7 @@ export function installCommandBlocks(document,{getOwner,read,find,compare,export
     if(!panel.hidden)void refreshList();
   });
   refresh.addEventListener('click',refreshList);
+  bookmarkFilter.addEventListener('click',()=>{bookmarkedOnly=!bookmarkedOnly;applyBookmarkFilter();});
   reviewForm.addEventListener('submit',freezeSelection);
   beforeSelect.addEventListener('change',reviewControls);
   afterSelect.addEventListener('change',reviewControls);

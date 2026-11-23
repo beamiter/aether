@@ -285,6 +285,9 @@ const localView=()=>owner&&owner.session!==sshSession&&!changingTab&&!recovery&&
 const blocks=installCommandBlocks(document,{
   getOwner:localView,
   read:attachment=>invokeAttached('local_command_blocks',{epoch:attachment.epoch},attachment),
+  bookmark:(attachment,selection,bookmarked)=>invokeAttached('set_local_command_bookmark',{
+    epoch:attachment.epoch,selection,bookmarked,
+  },attachment),
   find:(attachment,query)=>invokeAttached('search_local_blocks',{epoch:attachment.epoch,query},attachment),
   compare:(attachment,before,after)=>invokeAttached('compare_local_output',{epoch:attachment.epoch,before,after},attachment),
   exportReview:(reviewId,format)=>invoke('export_local_output',{reviewId,format}),

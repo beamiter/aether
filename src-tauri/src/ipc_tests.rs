@@ -538,8 +538,16 @@ fn tauri_ipc_real_pty_lifecycle_and_wire_contract() {
     .is_err());
     assert_eq!(
         invoke(&window, "local_command_blocks", json!({"owner": current})),
-        json!({"owner": current, "enabled": false, "blocks": []})
+        json!({"owner": current, "enabled": false, "blocks": [], "bookmarked": []})
     );
+    for attachment in [&owner, current] {
+        let invalid = json!({"owner":attachment,"selection":{"sequence":"1","revision":"0".repeat(64)},"bookmarked":true});
+        assert!(tauri::test::get_ipc_response(
+            &window,
+            request("set_local_command_bookmark", invalid)
+        )
+        .is_err());
+    }
 
     invoke(&window, "detach_shell", json!({"owner": current}));
     for (command, arguments) in [

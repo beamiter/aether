@@ -1260,6 +1260,7 @@ def exercise_terminal_workflows(driver, owned):
     wait_for(lambda: receipt.is_file() and receipt.read_text() == expected,
              "the workflow did not stay editable in the selected jsh prompt")
     exercise_completed_block_search(driver)
+    bookmarked = bookmark_selected_command(driver)
 
     wait_for(lambda: view()["available"], "workflows did not follow the next shell prompt")
     driver.click("#workflows")
@@ -1274,6 +1275,7 @@ def exercise_terminal_workflows(driver, owned):
     click_tab(driver, original)
     wait_for(lambda: view()["available"], "workflows did not return with the integrated shell")
     assert not view()["open"] and receipt.read_text() == expected
+    exercise_bookmark_retention(driver, bookmarked)
     driver.click("#close")
     click_tab(driver, peer)
     driver.click("#close")
@@ -1285,6 +1287,7 @@ def exercise_terminal_workflows(driver, owned):
         "native_workflow_inserts_editable_text_with_explicit_enter": True,
         "native_workflow_picker_retires_on_tab_switch": True,
         "native_completed_block_search_selects_owned_command_and_output_ranges": True,
+        "native_bookmark_follows_exact_owned_command_until_eviction": True,
     }
 
 
@@ -1319,6 +1322,48 @@ def exercise_completed_block_search(driver):
         return selected.toString() === '%s%s' &&
                selected.anchorNode.parentElement.matches('#command-block-list summary code');
     """), "a command hit did not select the exact text of the shell command"
+
+
+def bookmark_selected_command(driver):
+    record = driver.execute("""
+        const card = document.getSelection().anchorNode.parentElement.closest('details');
+        return {sequence: card.dataset.sequence, revision: card.dataset.revision};
+    """)
+    assert re.fullmatch(r"[0-9]+", record["sequence"])
+    assert re.fullmatch(r"[0-9a-f]{64}", record["revision"])
+    card = f"#command-block-list details[data-sequence='{record['sequence']}'][data-revision='{record['revision']}']"
+    driver.click(card + " .command-block-bookmark")
+    wait_for(lambda: driver.execute(f"return !!document.querySelector({json.dumps(card)} + '[data-bookmarked=true]');"),
+             "the exact command card was not bookmarked")
+    driver.click("#command-block-bookmarked")
+    assert driver.execute("""
+        return Array.from(document.querySelectorAll('#command-block-list details:not([hidden])'), card => card.dataset.sequence);
+    """) == [record["sequence"]]
+    return card
+
+
+def exercise_bookmark_retention(driver, card):
+    def bookmarked():
+        return driver.execute(f"return !!document.querySelector({json.dumps(card)} + '[data-bookmarked=true]');")
+
+    def empty():
+        return driver.execute("return !document.querySelector('#command-block-no-bookmarks').hidden;")
+
+    wait_for(bookmarked, "switching tabs lost the original command bookmark")
+    filter_button = "#command-block-bookmarked"
+    pin = card + " .command-block-bookmark"
+    driver.click(filter_button)
+    driver.click(card + " summary")
+    driver.click(pin)
+    wait_for(empty, "removing the bookmark left the record in the filtered list")
+    driver.click(filter_button)
+    driver.click(pin)
+    wait_for(bookmarked, "the original record could not be bookmarked again")
+    driver.click(filter_button)
+    for index in range(8):
+        driver.type("#ime-input", f"printf 'BOOKMARK_EVICT_{index}\\n'\ue007")
+    wait_for(empty, "evicting the command did not clear the filtered list")
+    assert not driver.execute(f"return !!document.querySelector({json.dumps(card)});")
 
 
 def exercise_frozen_output_review(driver, owned, send, refresh_for, blocks, before):

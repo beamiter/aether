@@ -11,6 +11,7 @@ use jterm_engine::{
     terminal::{HistoryPage, Terminal},
 };
 use jterm_headless_session_spike::{Session, WakeSink};
+use std::collections::BTreeMap;
 mod command_blocks;
 mod raw_suffix;
 pub use crate::protocol::{CloseStatus, HistorySnapshot, SessionStatus};
@@ -38,6 +39,7 @@ pub struct LiveBridge {
     stable: Option<CellFrame>,
     history_search: Option<HistorySearch>,
     submitted_chat_prompt: Option<crate::protocol_v4::Counter>,
+    command_bookmarks: BTreeMap<String, String>,
     raw: RawSuffix<Attachment>,
 }
 impl LiveBridge {
@@ -739,6 +741,7 @@ impl LiveBridge {
         self.accepted = None;
         self.resumed_from = None;
         self.history_search = None;
+        self.command_bookmarks.clear();
         self.raw = RawSuffix::default();
         Ok(CloseStatus { cleanup_pending })
     }

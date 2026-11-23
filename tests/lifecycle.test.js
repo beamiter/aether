@@ -44,7 +44,7 @@ test('terminal Chat sends each displayed prompt at most once while preserving no
  const h=harness(async(name,args)=>{
   if(name==='open_shell')return 1;
   if(name==='poll_shell')return null;
-  if(name==='local_command_blocks')return {owner:args.owner,enabled:true,blocks:[]};
+  if(name==='local_command_blocks')return {owner:args.owner,enabled:true,blocks:[],bookmarked:[]};
   if(name==='submit_local_chat'){
    const pending=deferred();submissions.push({prompt:args.prompt,...pending});return pending.promise;
   }
@@ -100,9 +100,9 @@ test('a block snapshot from an old attachment cannot populate the reconnected pa
  await h.click('#attach');
  h.click('#command-block-toggle');
  assert.deepEqual(reads.map(read=>read.owner.generation),[1,3]);
- reads[0].resolve({owner:first,enabled:false,blocks:[]});await tick();
+ reads[0].resolve({owner:first,enabled:false,blocks:[],bookmarked:[]});await tick();
  assert.equal(h.el('#command-block-status').textContent,'');
- reads[1].resolve({owner:next,enabled:true,blocks:[]});await tick();
+ reads[1].resolve({owner:next,enabled:true,blocks:[],bookmarked:[]});await tick();
  assert.match(h.el('#command-block-status').textContent,/Waiting for a completed command/);
  assert.equal(h.el('#input').disabled,true);
 });

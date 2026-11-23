@@ -8,7 +8,7 @@ const block={
   command:'printf 文',cwd:'/tmp',exit:null,provenance:'shell_reported',
   output:{kind:'text',text:'文\n'},
 };
-const snapshot={owner,enabled:true,blocks:[block]};
+const snapshot={owner,enabled:true,blocks:[block],bookmarked:[]};
 
 test('command block records require exact attachment identity and bounded ordered observations',()=>{
   assert.doesNotThrow(()=>validateCommandBlockSnapshot(snapshot,owner));
@@ -24,6 +24,14 @@ test('command block records require exact attachment identity and bounded ordere
     {blocks:[{...block,exit:2147483648}]},
     {blocks:[{...block,output:{kind:'text',text:'文'.repeat(5462)}}]},
   ])assert.throws(()=>validateCommandBlockSnapshot({...snapshot,...change},owner));
+});
+
+test('command bookmarks reference only retained records and contain no duplicates',()=>{
+  const blocks=[{...block,sequence:'5'},block];
+  assert.doesNotThrow(()=>validateCommandBlockSnapshot({...snapshot,blocks,bookmarked:['4']},owner));
+  for(const bookmarked of [['3'],[4],['4','4'],['4','5','3']]){
+    assert.throws(()=>validateCommandBlockSnapshot({...snapshot,blocks,bookmarked},owner));
+  }
 });
 
 test('frozen output receipts bind to the exact local attachment',()=>{

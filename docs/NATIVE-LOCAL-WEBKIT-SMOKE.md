@@ -77,7 +77,9 @@ override, checks tag search and required and default arguments, and edits the
 rendered line in the same PTY before pressing Enter. Switching tabs dismisses
 the form for the previous attachment. The X11 and Wayland journeys also search
 completed command cards and select the exact text after a non-BMP character
-in the captured output.
+in the captured output. They bookmark that card, switch away from its tab and
+back, remove and re-add the bookmark, and verify that retention eviction clears
+it from the bookmarked-only view.
 
 Build the native desktop from the Aether checkout using its published core pin.
 

@@ -71,7 +71,10 @@ focus to the same PTY. Command blocks are kept in memory for that shell.
 
 **Find in completed commands** searches the retained commands and their
 captured output by literal text. Choose a result to open the matching record
-and select the text in its original command or output.
+and select the text in its original command or output. Expand a card to
+**Bookmark** it. **Bookmarked only** shows saved cards from that shell in
+both the command panel and Terminal Chat. A bookmark follows its live PTY
+until its command leaves the bounded history or the shell closes.
 
 **Terminal Chat** in the local tab bar places completed command cards above
 that tab's live shell. At a ready jsh prompt, **Send command** presses Enter in

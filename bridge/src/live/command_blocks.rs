@@ -8,6 +8,7 @@ pub struct CommandBlockSnapshot {
     owner: Attachment,
     enabled: bool,
     blocks: Vec<RetainedBlock>,
+    bookmarked: Vec<String>,
 }
 
 pub struct CommandActivity {
@@ -37,6 +38,12 @@ pub struct RetainedBlock {
 pub struct BlockSelection {
     pub sequence: String,
     pub revision: String,
+}
+
+impl BlockSelection {
+    fn matches(&self, block: &RetainedBlock) -> bool {
+        self.sequence == block.sequence && self.revision == block.revision
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -101,9 +108,7 @@ impl CommandBlockSnapshot {
         let mut select = |choice: &BlockSelection| {
             let index = blocks
                 .iter()
-                .position(|record| {
-                    record.sequence == choice.sequence && record.revision == choice.revision
-                })
+                .position(|record| choice.matches(record))
                 .ok_or(
                     "A selected command revision is no longer retained. Refresh the command list.",
                 )?;
@@ -206,7 +211,7 @@ impl LiveBridge {
             .command_blocks(epoch)?
             .blocks
             .into_iter()
-            .find(|block| block.sequence == choice.sequence && block.revision == choice.revision)
+            .find(|block| choice.matches(block))
             .map(|block| block.command)
         else {
             return Ok(Some(
@@ -215,6 +220,34 @@ impl LiveBridge {
         };
         self.paste(epoch, &command)?;
         Ok(None)
+    }
+
+    /// Modify presentation metadata for an exact retained command in this PTY.
+    pub fn set_command_bookmark(
+        &mut self,
+        epoch: u32,
+        choice: BlockSelection,
+        bookmarked: bool,
+    ) -> Result<(), String> {
+        let snapshot = self.command_blocks(epoch)?;
+        if !snapshot.blocks.iter().any(|block| choice.matches(block)) {
+            return Err(
+                "The selected command revision has expired. Refresh the command list.".into(),
+            );
+        }
+        self.command_bookmarks.retain(|sequence, revision| {
+            snapshot
+                .blocks
+                .iter()
+                .any(|block| &block.sequence == sequence && &block.revision == revision)
+        });
+        if bookmarked {
+            self.command_bookmarks
+                .insert(choice.sequence, choice.revision);
+        } else {
+            self.command_bookmarks.remove(&choice.sequence);
+        }
+        Ok(())
     }
 
     /// Independent read-only projection of the current session's bounded records.
@@ -226,13 +259,20 @@ impl LiveBridge {
             .expect("validated local PTY")
             .terminal()
             .completed_command_blocks();
+        let blocks: Vec<_> = records
+            .into_iter()
+            .flat_map(|blocks| blocks.iter().rev().map(RetainedBlock::from))
+            .collect();
+        let bookmarked = blocks
+            .iter()
+            .filter(|block| self.command_bookmarks.get(&block.sequence) == Some(&block.revision))
+            .map(|block| block.sequence.clone())
+            .collect();
         Ok(CommandBlockSnapshot {
             owner,
             enabled: records.is_some(),
-            blocks: records
-                .into_iter()
-                .flat_map(|blocks| blocks.iter().rev().map(RetainedBlock::from))
-                .collect(),
+            blocks,
+            bookmarked,
         })
     }
 }
@@ -270,6 +310,7 @@ mod tests {
                 record(2, Ok("")),
                 record(1, Ok("before\n")),
             ],
+            bookmarked: Vec::new(),
         };
         let selection = |record: RetainedBlock| BlockSelection {
             sequence: record.sequence,

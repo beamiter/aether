@@ -366,6 +366,21 @@ async fn local_command_blocks<R: tauri::Runtime>(
 }
 
 #[tauri::command]
+async fn set_local_command_bookmark<R: tauri::Runtime>(
+    window: tauri::WebviewWindow<R>,
+    owner: Attachment,
+    selection: tauri_terminal_frame_bridge::live::BlockSelection,
+    bookmarked: bool,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
+) -> Result<(), String> {
+    require_terminal_window(&window)?;
+    run_attached(bridge.inner().clone(), owner, move |bridge, epoch| {
+        bridge.set_command_bookmark(epoch, selection, bookmarked)
+    })
+    .await
+}
+
+#[tauri::command]
 async fn search_local_history<R: tauri::Runtime>(
     window: tauri::WebviewWindow<R>,
     owner: Attachment,
@@ -500,6 +515,7 @@ fn application<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<
             shell_status,
             history_shell,
             local_command_blocks,
+            set_local_command_bookmark,
             recall_local_command,
             search_local_history,
             local_block_search::search_local_blocks,
