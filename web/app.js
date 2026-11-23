@@ -350,6 +350,8 @@ button.addEventListener('click',async()=>{
 });
 function validateShellStatus(info,expectedEpoch){
   if(!info||info.epoch!==expectedEpoch||typeof info.exited!=='boolean'||typeof info.drained!=='boolean'||(info.write_error!==null&&typeof info.write_error!=='string')||typeof info.dropped_reply_bytes!=='string'||!/^[0-9]{1,20}$/.test(info.dropped_reply_bytes)||typeof info.unsupported!=='string'||!/^[0-9]{1,20}$/.test(info.unsupported))throw new Error('invalid session status');
+  const exitNotice=info.exit_output_notice;
+  if(exitNotice!=null&&(typeof exitNotice!=='string'||exitNotice.length>256))throw new Error('invalid exit output notice');
   if(owner?.session!==sshSession)validateChatStatus(info.chat);
 }
 function showShellStatus(info,mode){
@@ -363,6 +365,7 @@ function showShellStatus(info,mode){
     }
   }
   health.textContent=`Unsupported sequences: ${info.unsupported}. Dropped reply bytes: ${info.dropped_reply_bytes}. Shell ${info.exited?'exited; output remains visible':'running'}.${info.write_error?' Input disabled: '+info.write_error:''}`;
+  if(info.exit_output_notice)health.textContent+=' '+info.exit_output_notice;
   if(info.exited||info.write_error){pasteReview.reset();keyQueue.locked=true;input.disabled=send.disabled=resize.disabled=true;}
   if(owner&&owner.session!==sshSession)terminalChat.showStatus(info,owner);
   workflows.updateOwner();

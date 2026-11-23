@@ -647,6 +647,10 @@ impl LiveBridge {
             exited: session.is_exited(),
             drained: session.is_drained(),
             write_error: session.write_error().map(str::to_owned),
+            exit_output_notice: session
+                .exit_status()
+                .and_then(|status| status.tail.notice())
+                .map(str::to_owned),
             dropped_reply_bytes: session.dropped_reply_bytes().to_string(),
             unsupported: session.terminal().unsupported_count().to_string(),
             command_blocks_enabled: session.terminal().completed_command_blocks().is_some(),

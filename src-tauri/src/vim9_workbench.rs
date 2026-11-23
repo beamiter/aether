@@ -538,7 +538,8 @@ impl Editor {
                 .transport_error
                 .clone()
                 .or(session.write_error)
-                .or(editor.error),
+                .or(editor.error)
+                .or(session.exit_output_notice),
             terminal,
             render,
         })
