@@ -4,6 +4,7 @@ import {installIme} from './ime.js';
 const uint=value=>Number.isInteger(value)&&value>0&&value<=0xffffffff;
 const conversationId=value=>typeof value==='string'&&value.startsWith('jterm:cli:v1:')&&value.length<=32768;
 const boundedText=(value,limit)=>typeof value==='string'&&value.length<=limit;
+const CATALOG_PAGE_MEMORY=4;
 const keys=/^(Arrow(Up|Down|Left|Right)|Home|End|Insert|Delete|PageUp|PageDown|F([1-9]|1[0-2])|Enter|Escape|Backspace|Tab)$/;
 
 export function validateWorkspacePage(page){
@@ -36,11 +37,14 @@ export function installWorkspace(document,invoke){
   if(!invoke)return;
   const byId=id=>document.getElementById(id);
   const root=byId('agent-workspace'),refresh=byId('workspace-refresh'),more=byId('workspace-more');
+  const previous=byId('workspace-previous');
   const select=byId('workspace-conversation'),attach=byId('workspace-attach'),detach=byId('workspace-detach');
   const selection=byId('workspace-selection'),status=byId('workspace-status'),panel=byId('workspace-view');
   const canvas=byId('workspace-canvas'),input=byId('workspace-input'),output=byId('workspace-output');
   const encoder=new TextEncoder();
-  let request=0,catalog=null,loading=false,attempt=null,opening=false,active=null,detaching=false;
+  let request=0,loading=false,attempt=null,opening=false,active=null,detaching=false;
+  let pages=[],pageIndex=-1,evictedOlderPages=false;
+  const page=()=>pages[pageIndex];
 
   const ime=installIme(input,{getEpoch:()=>!input.disabled?active:null,commit:(text,view)=>{
     if(text.length<=4096&&encoder.encode(text).length<=4096){
@@ -55,12 +59,13 @@ export function installWorkspace(document,invoke){
     return receipt.value;
   }
 
-  const selected=()=>catalog?.rows.find(row=>row.id===select.value);
+  const selected=()=>page()?.receipt.rows.find(row=>row.id===select.value);
   function controls(){
     const changing=loading||opening||detaching;
     refresh.disabled=changing||!!active;
-    more.disabled=changing||!!active||!catalog?.next_before;
-    select.disabled=changing||!!active||!catalog?.rows.length;
+    previous.disabled=changing||!!active||pageIndex<1;
+    more.disabled=changing||!!active||!(pageIndex+1<pages.length||page()?.receipt.next_before);
+    select.disabled=changing||!!active||!page()?.receipt.rows.length;
     attach.disabled=changing||!!active||!selected()?.reopenable;
     detach.disabled=changing||!active;
     input.disabled=changing||!active?.writable;
@@ -73,27 +78,59 @@ export function installWorkspace(document,invoke){
     controls();
   }
 
+  function displayPage(){
+    const current=page();
+    const options=current.receipt.rows.map(row=>{
+      const option=document.createElement('option');
+      option.value=row.id;option.textContent=row.title||'Untitled conversation';
+      return option;
+    });
+    select.replaceChildren(...options);
+    if(options.some(option=>option.value===current.selection))select.value=current.selection;
+    status.textContent=options.length?'':current.receipt.next_before
+      ?'No local CLI sessions on this page. Use Next page.'
+      :'No CLI conversations in this part of the shared catalog.';
+    if(pageIndex===0&&evictedOlderPages){
+      status.textContent=[status.textContent,'Earlier pages were released. Refresh to start over.'].filter(Boolean).join(' ');
+    }
+    showSelection();
+  }
+
   async function load(cursor=null){
-    if(loading||active||opening)return;
-    const oldSelection=select.value;
+    if(loading||active||opening||detaching)return;
+    const oldSelection=cursor?'':select.value;
     loading=true;controls();status.textContent='Reading the shared Workspace catalog…';
     try{
       const next=validateWorkspacePage(await call('workspace_catalog',{cursor}));
-      if(cursor&&next.generation!==cursor.generation)throw new Error('Workspace page changed.');
-      catalog=next;
-      const options=catalog.rows.map(row=>{
-        const option=document.createElement('option');
-        option.value=row.id;option.textContent=row.title||'Untitled conversation';
-        return option;
-      });
-      select.replaceChildren(...options);
-      if(options.some(option=>option.value===oldSelection))select.value=oldSelection;
-      status.textContent=options.length?'':catalog.next_before
-        ?'No local CLI sessions on this page. Use Next page.'
-        :'No CLI conversations in this part of the shared catalog.';
-      showSelection();
-    }catch(error){status.textContent=String(error?.message??error);}
-    finally{loading=false;controls();}
+      if(cursor&&(next.generation!==cursor.generation||
+          next.next_before!==null&&BigInt(next.next_before)>=BigInt(cursor.before))){
+        throw new Error('Workspace page changed.');
+      }
+      if(!cursor){pages=[];evictedOlderPages=false;}
+      pages.push({receipt:next,selection:oldSelection});
+      if(pages.length>CATALOG_PAGE_MEMORY){pages.shift();evictedOlderPages=true;}
+      pageIndex=pages.length-1;
+      displayPage();
+    }catch(error){
+      // A failed or lost request can already have advanced the shared
+      // catalog generation or server cursor. Retire the local navigation
+      // receipts instead of replaying the same cursor or allowing attachment.
+      pages=[];pageIndex=-1;evictedOlderPages=false;
+      select.replaceChildren();showSelection();
+      status.textContent=`${String(error?.message??error)} Refresh the catalog to continue.`;
+    }finally{loading=false;controls();}
+  }
+
+  function turnPage(change){
+    if(loading||active||opening||detaching||!page())return;
+    page().selection=select.value;
+    const target=pageIndex+change;
+    if(target>=0&&target<pages.length){
+      pageIndex=target;displayPage();
+    }else if(change===1&&page().receipt.next_before){
+      const {generation,next_before:before}=page().receipt;
+      void load({generation,before});
+    }
   }
 
   function operate(view,operation){return call('workspace_terminal',{identity:view.identity,operation});}
@@ -105,7 +142,7 @@ export function installWorkspace(document,invoke){
   async function start(){
     const row=selected();
     if(attach.disabled||!row)return;
-    const launch=attempt??{id:row.id,generation:catalog.generation,request:++request};
+    const launch=attempt??{id:row.id,generation:page().receipt.generation,request:++request};
     attempt=launch;opening=true;controls();status.textContent='Requesting the Workspace terminal lease…';
     let view=null;
     try{
@@ -204,9 +241,10 @@ export function installWorkspace(document,invoke){
   }
 
   root.hidden=false;
-  root.addEventListener('toggle',()=>{if(root.open&&!catalog&&!loading)void load();});
+  root.addEventListener('toggle',()=>{if(root.open&&!page()&&!loading)void load();});
   refresh.addEventListener('click',()=>void load());
-  more.addEventListener('click',()=>void load({generation:catalog.generation,before:catalog.next_before}));
+  previous.addEventListener('click',()=>turnPage(-1));
+  more.addEventListener('click',()=>turnPage(1));
   select.addEventListener('change',()=>{status.textContent='';showSelection();});
   attach.addEventListener('click',start);
   detach.addEventListener('click',release);
