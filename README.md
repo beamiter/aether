@@ -8,7 +8,7 @@ ANSI parser. **This is not a daily-use terminal.**
 ## Shared core
 
 The three Cargo manifests pin the shared crates to
-`c03010115766bce6f5f70bcdffc3a97545f033ae`. `jterm_runtime` owns the local PTY, direct child and
+`63d804a7cba9ff9ec6e4e469f77dcd7a1c3ba699`. `jterm_runtime` owns the local PTY, direct child and
 output drain. Its `jterm_engine::terminal::Terminal` owns parsing, screen
 state, input encoding, history and immutable frames. The session host supplies
 each frame stream's epoch. Run `python3 scripts/check-core-pin.py` to verify
@@ -56,10 +56,12 @@ rows and reconnect with the retained shell. **Recover output snapshot** can
 replace an invalid Channel frame or resume compatibility polling after a
 transport stall. SSH terminal sessions use polling over the existing relay.
 
-Use **Find in local history** to search the selected shell's retained output.
-The search is literal and case-sensitive. **Older match** selects the next
-earlier result, and **Cancel** stops between history windows. Aether places
-the result in the selectable history snapshot below the terminal.
+Use **Refresh history / copy snapshot** to read the local archive. The history
+viewport displays retained styles and images at the current terminal width.
+Select cells in the viewport or use the text field to copy its snapshot.
+**Find in local history** searches the selected shell with a literal,
+case-sensitive query and selects the match. **Older match** continues the
+same search, and **Cancel** stops between history windows.
 
 With jsh installed on the application's PATH, **Open jsh with Blocks** starts
 an integrated local shell. **Command blocks** shows completed commands with

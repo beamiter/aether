@@ -277,6 +277,8 @@ const pasteReview=installPasteReview({panel:pasteReviewPanel,preview:document.qu
 const history=installHistory({older:document.querySelector('#history-older'),newer:document.querySelector('#history-newer'),refresh:document.querySelector('#history-refresh'),output:document.querySelector('#history-output'),label:document.querySelector('#history-label'),
  invoke:(command,{owner:attachment,...args})=>invokeAttached(command,{epoch:attachment.epoch,...args},attachment),
  getOwner:()=>changingTab?null:owner,
+ visual:{viewport:document.querySelector('#history-viewport'),spacer:document.querySelector('#history-grid-size'),canvas:document.querySelector('#history-canvas')},
+ enableProjection:attachment=>typeof Channel==='function'&&attachment.session!==sshSession,
  searchControls:{form:document.querySelector('#history-find-form'),query:document.querySelector('#history-find-query'),
   find:document.querySelector('#history-find'),older:document.querySelector('#history-find-older'),
   cancel:document.querySelector('#history-find-cancel'),status:document.querySelector('#history-find-status'),
@@ -352,7 +354,10 @@ function validateShellStatus(info,expectedEpoch){
   if(!info||info.epoch!==expectedEpoch||typeof info.exited!=='boolean'||typeof info.drained!=='boolean'||(info.write_error!==null&&typeof info.write_error!=='string')||typeof info.dropped_reply_bytes!=='string'||!/^[0-9]{1,20}$/.test(info.dropped_reply_bytes)||typeof info.unsupported!=='string'||!/^[0-9]{1,20}$/.test(info.unsupported))throw new Error('invalid session status');
   const exitNotice=info.exit_output_notice;
   if(exitNotice!=null&&(typeof exitNotice!=='string'||exitNotice.length>256))throw new Error('invalid exit output notice');
-  if(owner?.session!==sshSession)validateChatStatus(info.chat);
+  if(owner?.session!==sshSession){
+    validateChatStatus(info.chat);
+    if(info.history_oldest_row!==undefined)channelCounter(info.history_oldest_row);
+  }
 }
 function showShellStatus(info,mode){
   const health=document.querySelector('#health');
@@ -367,7 +372,10 @@ function showShellStatus(info,mode){
   health.textContent=`Unsupported sequences: ${info.unsupported}. Dropped reply bytes: ${info.dropped_reply_bytes}. Shell ${info.exited?'exited; output remains visible':'running'}.${info.write_error?' Input disabled: '+info.write_error:''}`;
   if(info.exit_output_notice)health.textContent+=' '+info.exit_output_notice;
   if(info.exited||info.write_error){pasteReview.reset();keyQueue.locked=true;input.disabled=send.disabled=resize.disabled=true;}
-  if(owner&&owner.session!==sshSession)terminalChat.showStatus(info,owner);
+  if(owner&&owner.session!==sshSession){
+    terminalChat.showStatus(info,owner);
+    if(info.history_oldest_row!==undefined)history.updateRetained(owner,info.history_oldest_row);
+  }
   workflows.updateOwner();
   if(document.activeElement===imeInput||document.activeElement===canvas)terminalChat.followCursor();
 }
@@ -776,7 +784,7 @@ document.querySelector('#command').addEventListener('submit',async event=>{
 
 const colsInput=document.querySelector('#cols'),rowsInput=document.querySelector('#rows');
 colsInput.value ||= '100';rowsInput.value ||= '24';
-const sizes=resizeQueue({getEpoch:()=>changingTab||recovery?null:owner,invoke:(command,{epoch:attachment,...args})=>invokeAttached(command,{epoch:attachment.epoch,...args},attachment),onDone:async()=>{await poll();},onError:e=>{status.textContent=String(e?.message??e);}});
+const sizes=resizeQueue({getEpoch:()=>changingTab||recovery?null:owner,invoke:(command,{epoch:attachment,...args})=>invokeAttached(command,{epoch:attachment.epoch,...args},attachment),onDone:async()=>{await poll();await history.refreshProjection();},onError:e=>{status.textContent=String(e?.message??e);}});
 resize.addEventListener('click',async()=>{if(epoch===null||input.disabled)return;try{await sizes.request(Number(rowsInput.value),Number(colsInput.value));}catch(e){status.textContent=String(e?.message??e);}});
 function describeCursor(){
   canvas.title='';canvas.style.cursor='';

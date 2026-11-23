@@ -332,3 +332,32 @@ test('cancel and an attachment change leave no stale search continuation or sele
  h.requests[2].resolve({kind:'match',id:3,epoch:1,snapshot:page(1,'fresh'),start:0,end:5});await fresh;
  assert.equal(h.output.value,'fresh');
 });
+
+test('a removed projected source discards both its displayed selection and superseded replies', async()=>{
+ const element=()=>({value:'',textContent:'',handlers:{},style:{},dataset:{},
+  setSelectionRange(start,end){this.selectionStart=start;this.selectionEnd=end;},
+  addEventListener(name,handle){this.handlers[name]=handle;}});
+ const owner={session:'owner',epoch:1,generation:2},requests=[];
+ const output=element(),label=element(),refresh=element(),viewport={...element(),scrollTop:0,clientHeight:100};
+ const context={setTransform(){},clearRect(){},save(){},beginPath(){},rect(){},clip(){},fillText(){},restore(){},fillRect(){}};
+ const canvas={...element(),getContext:()=>context};
+ const ui=installHistory({older:element(),newer:element(),refresh,output,label,getOwner:()=>owner,
+  visual:{viewport,spacer:element(),canvas},enableProjection:()=>true,
+  invoke:(_,args)=>new Promise(resolve=>requests.push({args,resolve}))});
+ const projection=(row,text)=>JSON.stringify({owner,version:5,revision:'19',cols:1,offset:0,total_rows:1,text,
+  rows:[{source:{row,column:0},text_offsets:[0,1],paint:{wrapped:false,cells:[
+   {text,foreground:'#ffffff',background:'#000000',width:1,style:0}]}}]});
+ const first=refresh.handlers.click();
+ assert.equal(requests[0].args.frameVersion,5);
+ requests[0].resolve(projection('10','Z'));await first;
+ assert.equal(output.value,'Z');assert.equal(viewport.hidden,false);
+ output.setSelectionRange(0,1);
+ const pending=refresh.handlers.click();
+ assert.deepEqual(requests[1].args.anchor,{row:'10',column:0});
+ ui.updateRetained(owner,'11');
+ assert.equal(output.value,'');assert.equal(viewport.hidden,true);
+ requests[1].resolve(projection('10','Z'));await pending;
+ assert.equal(output.value,'');assert.match(label.textContent,/History source expired/);
+ const current=refresh.handlers.click();requests[2].resolve(projection('11','Q'));await current;
+ assert.equal(output.value,'Q');assert.equal(viewport.hidden,false);
+});

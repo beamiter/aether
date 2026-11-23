@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {acceptChannelFrame, channelCounter} from '../web/frames-v4.js';
+import {acceptChannelFrame, acceptHistoryProjection, channelCounter} from '../web/frames-v4.js';
 import {paint} from '../web/frames.js';
 
 const owner = {session:'isolated', epoch:7};
@@ -125,4 +125,39 @@ test('resource generation, bounds, canonical RGBA and both resource byte budgets
   assert.throws(() => acceptImage(full,{...imageDelta,images:[small],
     rows:[{index:0,row:imageRow(changed,0,1,small.id)}]}),/retained image limit/);
   assert.deepEqual(Object.keys(full.images),[imageId]);
+});
+
+const archiveOwner = {...owner,generation:3};
+const archive = {
+  version:5,owner:archiveOwner,revision:'9007199254741000',cols:2,offset:0,total_rows:2,
+  text:'🐍\ne\u0301',
+  rows:[
+    {source:{row:'9007199254740993',column:0},paint:{wrapped:false,
+      cells:[{...cell,text:'🐍',width:2},{...cell,width:0}],image_slices:[{column:0,id:imageId,slice:0}]},
+      text_offsets:[0,2,2]},
+    {source:{row:'9007199254740994',column:0},paint:{wrapped:false,cells:[{...cell,text:'e\u0301'}]},
+      text_offsets:[3,5]},
+  ],
+  images:[{...image,columns:3}],
+};
+
+test('an archived page preserves wide glyphs, source identities and clipped rasters', () => {
+  const projected = acceptHistoryProjection(JSON.stringify(archive),archiveOwner);
+  assert.deepEqual(projected.offsets,[[0,2,2],[3,5]]);
+  assert.equal(projected.text.slice(projected.offsets[1][0],projected.offsets[1][1]),'e\u0301');
+  assert.equal(projected.rows[1].length,archive.cols);
+  assert.equal(projected.images[imageId].columns,3);
+  assert.equal(channelCounter(projected.sources[0].row),9007199254740993n);
+  const withPrefix = {...archive,text:archive.text+'\nmore'};
+  assert.throws(()=>acceptHistoryProjection(JSON.stringify(withPrefix),archiveOwner),/resources/);
+  assert.equal(acceptHistoryProjection(JSON.stringify(withPrefix),archiveOwner,true).text,withPrefix.text);
+});
+
+test('an archived page rejects stale ownership, false cell offsets and conflicting source rows', () => {
+  const admit = value => acceptHistoryProjection(JSON.stringify(value),archiveOwner);
+  assert.throws(()=>admit({...archive,owner:{...archiveOwner,generation:2}}),/foreign/);
+  assert.throws(()=>admit({...archive,text:'🐍\nxx'}),/copy range/);
+  assert.throws(()=>admit({...archive,rows:[archive.rows[0],{...archive.rows[1],text_offsets:[2,5]}]}),/boundary/);
+  assert.throws(()=>admit({...archive,rows:[archive.rows[0],{...archive.rows[1],source:archive.rows[0].source}]}),/row source/);
+  assert.throws(()=>admit({...archive,images:[]}),/unresolved/);
 });

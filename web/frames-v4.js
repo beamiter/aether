@@ -103,14 +103,14 @@ function validateSlices(slices, cols, supportsImages) {
   }));
 }
 
-function resolveImages(rows, cols, newImages, base) {
+function resolveImages(rows, cols, newImages, base, clipImages = false) {
   const images = Object.create(null);
   const referenced = new Set();
   let bytes = 0, count = 0;
   for (const row of rows) {
     for (const {id,column,slice} of row.imageSlices ?? []) {
       const resource = newImages.get(id) ?? base?.images[id];
-      if (!resource || slice >= resource.rows || column + resource.columns > cols)
+      if (!resource || slice >= resource.rows || (!clipImages && column + resource.columns > cols))
         throw new Error('unresolved or out-of-bounds Channel image slice');
       if (newImages.has(id)) referenced.add(id);
       if (images[id]) continue;
@@ -227,4 +227,67 @@ export function acceptChannelFrame(previous, encoded, expected, snapshotOnly = f
   return Object.freeze({version: stamp.version, session: stamp.session, epoch: expected.epoch,
     revision: stamp.revision, layout: stamp.layout, screen: stamp.screen, cols, rows: Object.freeze(rows),
     hyperlinks:Object.freeze(hyperlinks), images, cursor_row, cursor_col, cursor_shape, cursor_visible, pending_wrap});
+}
+
+export const MAX_PROJECTED_HISTORY_ROWS = 65536;
+const maxHistoryTextBytes = 131200;
+const historyBlank = Object.freeze({text:' ',foreground:'#d9e5ef',background:'#111820',width:1,style:0});
+
+// The browser selects from the same immutable text that supplied these paint
+// rows. A search window can also carry a short prefix of the following window.
+export function acceptHistoryProjection(encoded, owner, search = false) {
+  const limit = maxEncodedBytes + maxEncodedImageBytes;
+  if (typeof encoded !== 'string' || encoded.length > limit) throw new Error('history projection byte limit');
+  const wireBytes = utf8Bytes(encoded);
+  if (wireBytes > limit) throw new Error('history projection byte limit');
+  const view = JSON.parse(encoded);
+  if (!view || view.version !== CHANNEL_FRAME_VERSION || view.owner?.session !== owner.session ||
+      view.owner.epoch !== owner.epoch || view.owner.generation !== owner.generation)
+    throw new Error('foreign history projection');
+  const {cols,text,offset,total_rows,revision} = view;
+  channelCounter(revision);
+  if (!Number.isInteger(cols) || cols < 1 || cols > 256 ||
+      !Number.isInteger(offset) || offset < 0 || !Number.isInteger(total_rows) ||
+      total_rows < offset || total_rows > MAX_PROJECTED_HISTORY_ROWS ||
+      !Array.isArray(view.rows) || view.rows.length > 128 || view.rows.length + offset > total_rows ||
+      (total_rows > 0 && view.rows.length === 0) ||
+      typeof text !== 'string' || text.length > maxHistoryTextBytes || utf8Bytes(text) > maxHistoryTextBytes ||
+      /[\x00-\x08\x0b-\x1f\x7f-\x9f\ud800-\udfff]/u.test(text))
+    throw new Error('invalid history projection bounds');
+  const {images: newImages, encodedBytes} = validatedImages(view.images,true,null,null);
+  if (wireBytes > maxEncodedBytes + encodedBytes) throw new Error('history projection byte limit');
+  const links = validatedHyperlinks(view.hyperlinks,null), referenced = new Set();
+  const sources = [], offsets = [];
+  let previousRow = 0n, previousColumn = -1, end = 0, wraps = true, paintBytes = 0;
+  const rows = view.rows.map(entry => {
+    const source = entry?.source;
+    const rowId = channelCounter(source?.row);
+    if (!Number.isInteger(source?.column) || source.column < 0 || source.column >= 256 ||
+        rowId < previousRow || (rowId === previousRow && source.column <= previousColumn))
+      throw new Error('invalid history row source');
+    previousRow = rowId;previousColumn = source.column;
+    sources.push(Object.freeze({row:source.row,column:source.column}));
+    const width = entry.paint?.cells?.length;
+    if (!Number.isInteger(width) || width > cols) throw new Error('invalid history row width');
+    const row = validateRow(entry.paint,width,links,referenced,true);
+    paintBytes += row.textBytes;
+    const bounds = entry.text_offsets;
+    if (!Array.isArray(bounds) || bounds.length !== width + 1 || bounds[0] !== end + Number(!wraps) ||
+        (!wraps && text[end] !== '\n')) throw new Error('invalid history copy boundary');
+    for (let i = 0; i < width; i++) {
+      const first = bounds[i], last = bounds[i + 1], {text: glyph, width: span} = row[i];
+      if (!Number.isInteger(last) || last < first || last > text.length ||
+          (last === first ? span !== 0 && glyph !== ' ' : span === 0 || text.slice(first,last) !== glyph))
+        throw new Error('invalid history copy range');
+    }
+    end = bounds[width];wraps = row.wrapped;
+    offsets.push(Object.freeze(bounds));
+    return Object.freeze(Object.assign([...row,...Array(cols-width).fill(historyBlank)], {imageSlices:row.imageSlices}));
+  });
+  if (end > text.length || text.length - end > (search ? 128 : 0) ||
+      paintBytes > maxTextBytes || links.size !== referenced.size)
+    throw new Error('invalid history projection resources');
+  return Object.freeze({session:owner.session,epoch:owner.epoch,revision,offset,total_rows,text,cols,
+    rows:Object.freeze(rows), sources:Object.freeze(sources), offsets:Object.freeze(offsets),
+    images:resolveImages(rows,cols,newImages,null,true),cursor_visible:false});
 }

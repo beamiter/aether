@@ -3,11 +3,13 @@ use crate::{
     from_engine,
     history_search::{HistorySearch, HistorySearchRequest, HistorySearchResponse},
     protocol::MAX_HISTORY_SNAPSHOT_BYTES,
+    protocol_v4::{HistorySource, MAX_PROJECTED_HISTORY_ROWS},
     semantic::{self, Attachment, Resume, SessionSelector, Update},
     SnapshotFormat, WireFrame,
 };
 use jterm_engine::{
     frame::CellFrame,
+    history_reflow::HistoryAnchor,
     terminal::{HistoryPage, Terminal},
 };
 use jterm_headless_session_spike::{Session, WakeSink};
@@ -640,13 +642,59 @@ impl LiveBridge {
         })
     }
 
+    /// Paint and copy one bounded page from the shared primary-history layout.
+    pub fn history_projection(
+        &self,
+        epoch: u32,
+        offset: usize,
+        anchor: Option<HistorySource>,
+        shift: i32,
+    ) -> Result<String, String> {
+        let owner = self.attachment(epoch)?;
+        let terminal = self.session.as_ref().unwrap().terminal();
+        let (layout, first, page) = projected_history_page(terminal, offset, anchor, shift)?;
+        crate::semantic_v4::encode_history(
+            owner,
+            &page,
+            crate::semantic_v4::history_columns(&page, layout.columns()),
+            page.revision,
+            &page.text,
+            |row| layout.anchor_at(first + row),
+        )
+    }
+
+    /// Oldest accessible archive identity after eviction or explicit clear.
+    pub fn history_oldest_row(
+        &self,
+        epoch: u32,
+    ) -> Result<Option<crate::protocol_v4::Counter>, String> {
+        self.check(epoch)?;
+        let session = self.session.as_ref().unwrap();
+        let terminal = session.terminal();
+        if !self.local_desktop
+            || terminal.alternate_screen_active()
+            || (!session.is_drained() && terminal.publication_held())
+        {
+            return Ok(None);
+        }
+        Ok(terminal
+            .history_extent()
+            .start
+            .checked_add(1)
+            .and_then(crate::protocol_v4::Counter::new))
+    }
+
     pub fn search_history(
         &mut self,
         epoch: u32,
         request: HistorySearchRequest,
+        format: SnapshotFormat,
     ) -> Result<HistorySearchResponse, String> {
         self.check(epoch)?;
         request.validate()?;
+        let owner = (format == SnapshotFormat::ChannelImages)
+            .then(|| self.attachment(epoch))
+            .transpose()?;
         if request.restart {
             if self
                 .history_search
@@ -662,7 +710,7 @@ impl LiveBridge {
             .as_mut()
             .filter(|search| search.id == request.id && search.query() == request.query)
             .ok_or("start a new history search")?;
-        search.step(self.session.as_ref().unwrap().terminal(), epoch)
+        search.step(self.session.as_ref().unwrap().terminal(), epoch, owner)
     }
     pub fn status(&self, epoch: u32) -> Result<SessionStatus, String> {
         self.check(epoch)?;
@@ -780,6 +828,53 @@ impl LiveBridge {
     }
 }
 
+fn projected_history_page(
+    terminal: &Terminal,
+    offset: usize,
+    anchor: Option<HistorySource>,
+    shift: i32,
+) -> Result<
+    (
+        std::sync::Arc<jterm_engine::history_reflow::HistoryLayout>,
+        usize,
+        HistoryPage,
+    ),
+    String,
+> {
+    if offset > MAX_PROJECTED_HISTORY_ROWS
+        || shift.unsigned_abs() as usize > MAX_PROJECTED_HISTORY_ROWS
+        || (anchor.is_none() && shift != 0)
+    {
+        return Err("history page out of bounds".into());
+    }
+    let layout = terminal.history_layout()?;
+    let start = anchor
+        .map(|source| {
+            let anchor = HistoryAnchor {
+                row: source.row.get() - 1,
+                column: source.column,
+            };
+            if !terminal.retains_history_anchor(anchor) {
+                return Err("History source expired. Refresh to view retained rows.");
+            }
+            Ok(layout.row_at(anchor).saturating_add_signed(shift as isize))
+        })
+        .transpose()?;
+    let mut limit = HISTORY_PAGE_ROWS;
+    loop {
+        let latest = layout.len().saturating_sub(limit);
+        let first = start.map_or_else(|| latest.saturating_sub(offset), |start| start.min(latest));
+        let page = terminal.projected_history_page(&layout, first, limit)?;
+        if page.text.len() <= MAX_HISTORY_SNAPSHOT_BYTES {
+            return Ok((layout, first, page));
+        }
+        if limit <= MIN_HISTORY_PAGE_ROWS {
+            return Err("history snapshot exceeds its byte limit".into());
+        }
+        limit /= 2;
+    }
+}
+
 fn bounded_history_page(terminal: &Terminal, offset: usize) -> Result<HistoryPage, String> {
     if offset > MAX_HISTORY_OFFSET {
         return Err("history page out of bounds".into());
@@ -802,6 +897,38 @@ fn bounded_history_page(terminal: &Terminal, offset: usize) -> Result<HistoryPag
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn projected_history_moves_raster_coordinates_and_rejects_evicted_anchors() {
+        let mut terminal = Terminal::new(4, 10).unwrap();
+        terminal.enable_inline_graphics((12, 24), |_, _, _| None);
+        terminal
+            .feed(b"abcdefghijxy\x1b_Ga=T,i=51,f=24,s=1,v=1,c=2,r=1,C=1;/wAA\x1b\\\x1b[4S")
+            .unwrap();
+        let (layout, first, before) = projected_history_page(&terminal, 0, None, 0).unwrap();
+        let origin = layout.anchor_at(first).unwrap();
+        let anchor = HistorySource {
+            row: crate::protocol_v4::Counter::new(origin.row + 1).unwrap(),
+            column: origin.column,
+        };
+        let (start_col, image, _) = before.inline_images(1).next().unwrap();
+        assert_eq!(start_col, 2);
+        let id = image.id();
+        terminal.resize(4, 8).unwrap();
+        let (_, _, after) = projected_history_page(&terminal, 0, Some(anchor), 0).unwrap();
+        let (reflowed_col, image, _) = after.inline_images(1).next().unwrap();
+        assert_eq!(reflowed_col, 4);
+        assert_eq!(image.id(), id);
+        assert_eq!(image.raster().unwrap().rgba(), &[255, 0, 0, 255]);
+        assert_eq!(before.text, after.text);
+        terminal.feed(b"\x1b[3J").unwrap();
+        assert_eq!(
+            projected_history_page(&terminal, 0, Some(anchor), 0)
+                .err()
+                .as_deref(),
+            Some("History source expired. Refresh to view retained rows.")
+        );
+    }
 
     #[test]
     fn dense_unicode_history_respects_the_wire_budget_and_reaches_the_oldest_row() {

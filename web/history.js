@@ -1,3 +1,7 @@
+import {acceptHistoryProjection,CHANNEL_FRAME_VERSION,MAX_PROJECTED_HISTORY_ROWS,channelCounter} from './frames-v4.js';
+import {CELL_WIDTH,CELL_HEIGHT,clearPaint,paint} from './frames.js';
+import {terminalCellAt} from './viewport.js';
+
 // Bounded immutable text snapshots. No ANSI parsing or clipboard privilege.
 // UTF-16 length is a lower bound on UTF-8 bytes. Reject oversized strings
 // before encoding so validation never allocates an unbounded second copy.
@@ -14,8 +18,104 @@ export function acceptHistory(value, epoch) {
 // Maximum ordinary page size in LiveBridge::history.
 const HISTORY_PAGE_ROWS=128;
 const oldestOffset=(total,rows=HISTORY_PAGE_ROWS)=>Math.max(0,total-rows);
-export function installHistory({older,newer,refresh,output,label,invoke,getOwner,searchControls}) {
-  let group=null,activeSearch=null,searchId=0;
+function historyGrid({viewport,spacer,canvas},output) {
+  const overscan = 3;
+  let page = null, tile = null, pointer = null;
+
+  function render() {
+    if (!page?.rows.length) return;
+    const top = Math.floor(viewport.scrollTop/CELL_HEIGHT);
+    const visible = Math.ceil(viewport.clientHeight/CELL_HEIGHT)+1;
+    const first = Math.max(0,top-overscan), end = Math.min(page.rows.length,top+visible+overscan);
+    const start = output.selectionStart, stop = output.selectionEnd;
+    const scale = globalThis.devicePixelRatio || 1;
+    if (tile?.page === page && tile.first === first && tile.end === end && tile.start === start &&
+        tile.stop === stop && tile.scale === scale) return;
+    const rows = page.rows.slice(first,end);
+    const selection = [];
+    if (stop > start) for (let index = first; index < end; index++) {
+      const bounds = page.offsets[index];
+      let selected = -1, last = 0;
+      for(let col=0;col+1<bounds.length;col++){
+        if(bounds[col+1]<=bounds[col]||bounds[col+1]<=start||bounds[col]>=stop)continue;
+        if(selected===-1)selected=col;
+        last=col+page.rows[index][col].width;
+      }
+      if(selected!==-1)selection.push({row:index-first,first:selected,last});
+    }
+    canvas.style.top = `${first*CELL_HEIGHT}px`;
+    const frame = {...page, rows, layout:page.revision, selection};
+    paint(canvas,frame,scale);
+    canvas.dataset.firstRow = String(first);
+    tile = {page,frame,first,end,start,stop,scale};
+  }
+
+  function hit(event) {
+    if (!tile) return null;
+    const point = terminalCellAt(tile.frame,canvas,event.clientX,event.clientY);
+    if (!point) return null;
+    const row = point.row + tile.first;
+    const cells = page.rows[row], offsets = page.offsets[row];
+    if (point.col >= offsets.length-1) return null;
+    const column = point.col - Number(cells[point.col].width===0);
+    return {start:offsets[column],end:offsets[column+cells[column].width]};
+  }
+
+  function select(a,b) {
+    output.setSelectionRange(Math.min(a.start,b.start),Math.max(a.end,b.end));
+    render();
+  }
+
+  viewport.addEventListener('scroll',render);
+  output.addEventListener('select',render);
+  globalThis.addEventListener?.('resize',render);
+  canvas.addEventListener('pointerdown',event=>{
+    if (event.button!==0 || event.ctrlKey || event.metaKey) return;
+    const point=hit(event);if(!point)return;
+    event.preventDefault();
+    pointer={id:event.pointerId,point};
+    canvas.setPointerCapture?.(event.pointerId);
+    output.focus({preventScroll:true});
+    select(point,point);
+  });
+  canvas.addEventListener('pointermove',event=>{
+    if(pointer?.id!==event.pointerId)return;
+    const point=hit(event);if(point)select(pointer.point,point);
+  });
+  canvas.addEventListener('lostpointercapture',()=>{pointer=null;});
+  return {
+    show(next, match=null){
+      page=next;tile=null;pointer=null;
+      viewport.hidden=!page?.rows.length;
+      if(viewport.hidden){clearPaint(canvas);return;}
+      spacer.style.width=`${page.cols*CELL_WIDTH}px`;
+      spacer.style.height=`${page.rows.length*CELL_HEIGHT}px`;
+      if (match!==null) {
+        const row=page.offsets.findIndex(bounds=>bounds.at(-1)>match);
+        viewport.scrollTop=Math.max(0,row*CELL_HEIGHT-viewport.clientHeight/2);
+      } else viewport.scrollTop=0;
+      render();
+    },
+  };
+}
+
+export function installHistory({older,newer,refresh,output,label,invoke,getOwner,searchControls,visual,enableProjection}) {
+  let group=null,activeSearch=null,searchId=0,retained=null;
+  const grid=visual?historyGrid(visual,output):null;
+  const format=owner=>grid&&enableProjection?.(owner)?{frameVersion:CHANNEL_FRAME_VERSION}:{};
+  const sameSource=(a,b)=>a?.row===b?.row&&a?.column===b?.column;
+  const sameShell=(a,b)=>a?.session===b?.session&&a?.epoch===b?.epoch;
+  const expired='History source expired. Refresh to view retained rows.';
+  const isExpired=(page,owner)=>page?.sources.length&&retained?.owner===owner&&
+    channelCounter(page.sources[0].row)<retained.first;
+
+  function dropPage(message){
+    group=null;
+    stopSearch();
+    output.value='';
+    grid?.show(null);
+    label.textContent=message;
+  }
 
   function updateSearchControls(){
     if(!searchControls)return;
@@ -50,14 +150,17 @@ export function installHistory({older,newer,refresh,output,label,invoke,getOwner
     const current=activeSearch;
     if(!current||current.owner!==owner||(!restart&&!current.hasHit))return;
     const isCurrent=()=>activeSearch===current&&getOwner()===owner;
-    current.busy=true;group=null;updateSearchControls();
+    current.busy=true;
+    if(group)group={...group,desired:group.offset,pending:null,promise:null};
+    updateSearchControls();
     searchControls.status.textContent='Searching retained history…';
     try{
       // A search visits at most 1,024 rows. Byte-limited windows still
       // contain at least 16 rows until the oldest window. Allow one extra
       // request for the remainder of the currently visible window.
       for(let steps=0;steps<65;steps++){
-        const result=await invoke('search_local_history',{owner,search:{id:current.id,query:current.query,restart}});
+        const options=format(owner);
+        const result=await invoke('search_local_history',{owner,...options,search:{id:current.id,query:current.query,restart}});
         if(!isCurrent())return;
         restart=false;
         if(!result||result.id!==current.id||result.epoch!==owner.epoch)throw new Error('invalid history search response');
@@ -68,8 +171,13 @@ export function installHistory({older,newer,refresh,output,label,invoke,getOwner
           return;
         }
         if(result.kind!=='match')throw new Error('invalid history search response');
-        const page=acceptHistory(result.snapshot,owner.epoch);
-        const {start,end}=result;
+        const snapshot=acceptHistory(result.snapshot,owner.epoch);
+        const projection=options.frameVersion?acceptHistoryProjection(result.projection,owner,true):null;
+        if(projection&&(projection.text!==snapshot.text||projection.revision!==snapshot.revision||
+            projection.offset!==snapshot.offset||projection.total_rows!==snapshot.total_rows||projection.rows.length!==snapshot.row_count))
+          throw new Error('history search projection changed its source');
+        if(isExpired(projection,owner)){dropPage(expired);return;}
+        const {start,end}=result, page=projection??snapshot;
         if(!Number.isInteger(start)||!Number.isInteger(end)||start<0||end>page.text.length||
             end<=start||page.text.slice(start,end)!==current.query)throw new Error('invalid history search range');
         if(output.value!==page.text)output.value=page.text;
@@ -79,9 +187,10 @@ export function installHistory({older,newer,refresh,output,label,invoke,getOwner
           const line=page.text.slice(0,start).split('\n').length-1;
           output.scrollTop=Math.max(0,line*lineHeight-output.clientHeight/2);
         }
+        grid?.show(projection,start);
         label.textContent=`History snapshot ${page.revision}. Select or copy the matching text.`;
         searchControls.status.textContent='Match selected in retained history.';
-        group={owner,offset:page.offset,total:page.total_rows,rows:page.row_count??HISTORY_PAGE_ROWS,desired:page.offset,pending:null,promise:null};
+        group={owner,offset:page.offset,total:page.total_rows,rows:snapshot.row_count??HISTORY_PAGE_ROWS,desired:page.offset,pending:null,promise:null,projection,search:true};
         current.hasHit=true;
         return;
       }
@@ -97,16 +206,17 @@ export function installHistory({older,newer,refresh,output,label,invoke,getOwner
     const owner=getOwner();if(owner===null)return Promise.resolve();
     stopSearch();
     if(group?.owner!==owner){
-      const sameShell=group?.owner.session===owner.session&&group.owner.epoch===owner.epoch;
+      const retainedShell=sameShell(group?.owner,owner);
       // Recovery can rotate the attachment without replacing the PTY. Keep
       // only the page already shown, never its old pending navigation lease.
-      const offset=sameShell?group.offset:0,total=sameShell?group.total:null;
-      const rows=sameShell?group.rows:HISTORY_PAGE_ROWS;
-      group={owner,offset,total,rows,desired:offset,pending:null,promise:null};
+      const offset=retainedShell?group.offset:0,total=retainedShell?group.total:null;
+      const rows=retainedShell?group.rows:HISTORY_PAGE_ROWS;
+      group={owner,offset,total,rows,desired:offset,pending:null,promise:null,projection:retainedShell?group.projection:null};
     }
     const current=group;
     const isCurrent=()=>group===current&&getOwner()===owner;
-    const maxOffset=current.total===null?1024:oldestOffset(current.total,current.rows);
+    const options=format(owner);
+    const maxOffset=current.total===null?(options.frameVersion?MAX_PROJECTED_HISTORY_ROWS:1024):oldestOffset(current.total,current.rows);
     const step=Math.sign(delta)*Math.min(Math.abs(delta),Math.max(1,current.rows));
     const desired=Math.max(0,Math.min(maxOffset,current.desired+step));
     // An already visible edge needs no IPC and must not disturb selection.
@@ -119,13 +229,19 @@ export function installHistory({older,newer,refresh,output,label,invoke,getOwner
       while(current.pending!==null&&isCurrent()){
         const {offset:requested,corrected}=current.pending;current.pending=null;
         try {
-          const value=await invoke('history_shell',{owner,offset:requested});
+          const source=current.projection?.sources[0];
+          const select=output.selectionEnd>output.selectionStart;
+          const anchored=options.frameVersion&&source&&(requested>0||current.offset===0&&select);
+          const position=anchored?{anchor:source,shift:current.offset-requested}:{};
+          const value=await invoke('history_shell',{owner,offset:requested,...options,...position});
           if(!isCurrent())return;
           // A newer request already owns the output. Do not validate or encode
           // the abandoned reply, and do not disturb selected text.
           if(current.pending!==null)continue;
-          const snapshot=acceptHistory(value,owner.epoch);
-          const rows=snapshot.row_count??HISTORY_PAGE_ROWS;
+          const projection=options.frameVersion?acceptHistoryProjection(value,owner):null;
+          if(isExpired(projection,owner)){dropPage(expired);return;}
+          const snapshot=projection??acceptHistory(value,owner.epoch);
+          const rows=projection?.rows.length??snapshot.row_count??HISTORY_PAGE_ROWS;
           const max=oldestOffset(snapshot.total_rows,rows);
           if(snapshot.offset>max){
             // The archive length was unknown or shrank after the last page.
@@ -136,11 +252,15 @@ export function installHistory({older,newer,refresh,output,label,invoke,getOwner
             current.pending={offset:max,corrected:true};
             continue;
           }
-          const unchanged=current.total===snapshot.total_rows&&current.offset===snapshot.offset&&output.value===snapshot.text;
+          const samePage=projection?sameSource(current.projection?.sources[0],projection.sources[0]):
+            current.total===snapshot.total_rows&&current.offset===snapshot.offset;
+          const unchanged=samePage&&output.value===snapshot.text;
           current.offset=current.desired=snapshot.offset;current.total=snapshot.total_rows;current.rows=rows;
+          current.projection=projection;current.search=false;
           // Refresh can advance the revision without changing this page.
           // Assigning even identical text would collapse the browser selection.
           if(!unchanged){output.value=snapshot.text;output.setSelectionRange(0,0);}
+          grid?.show(projection,unchanged&&select?output.selectionStart:null);
           const end=snapshot.total_rows-snapshot.offset,start=Math.max(1,end-rows+1);
           label.textContent=`Snapshot ${snapshot.revision}: ${end>0?`archived rows ${start}–${end}`:'no archived rows'} of ${snapshot.total_rows}; ${snapshot.offset} newer rows skipped. Select text and copy normally. Refresh for new output.`;
         }catch(e){
@@ -148,7 +268,9 @@ export function installHistory({older,newer,refresh,output,label,invoke,getOwner
             // A failed superseded request must not erase newer user intent.
             // Consume only that queued target, never retry this failure itself.
             if(current.pending!==null)continue;
-            current.desired=current.offset;label.textContent=String(e?.message??e);
+            const message=String(e?.message??e);
+            if(message===expired){dropPage(message);return;}
+            current.desired=current.offset;label.textContent=message;
           }
           return;
         }
@@ -166,6 +288,11 @@ export function installHistory({older,newer,refresh,output,label,invoke,getOwner
   }
   return {
     updateSearchControls,
-    reset(){group=null;stopSearch();output.value='';label.textContent='Snapshot cleared. Refresh to view current session.';},
+    updateRetained(owner,first){
+      retained={owner,first:channelCounter(first)};
+      if(sameShell(group?.owner,owner)&&isExpired(group.projection,owner))dropPage(expired);
+    },
+    refreshProjection(){if(group?.projection&&!group.search&&!activeSearch?.busy)return load(0);},
+    reset(){dropPage('Snapshot cleared. Refresh to view current session.');},
   };
 }

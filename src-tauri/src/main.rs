@@ -351,13 +351,33 @@ async fn text_shell(
     .await
 }
 #[tauri::command]
-async fn history_shell(
+async fn history_shell<R: tauri::Runtime>(
+    window: tauri::WebviewWindow<R>,
     owner: Attachment,
     offset: usize,
+    frame_version: Option<u8>,
+    anchor: Option<tauri_terminal_frame_bridge::protocol_v4::HistorySource>,
+    shift: Option<i32>,
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
-) -> Result<tauri_terminal_frame_bridge::live::HistorySnapshot, String> {
+) -> Result<tauri_terminal_frame_bridge::protocol_v4::LocalHistorySnapshot, String> {
+    use tauri_terminal_frame_bridge::protocol_v4::LocalHistorySnapshot;
+    let format = SnapshotFormat::negotiate(frame_version)?;
+    if format == SnapshotFormat::ChannelImages {
+        require_terminal_window(&window)?;
+        return run_attached(bridge.inner().clone(), owner, move |bridge, epoch| {
+            bridge
+                .history_projection(epoch, offset, anchor, shift.unwrap_or_default())
+                .map(LocalHistorySnapshot::Projection)
+        })
+        .await;
+    }
+    if anchor.is_some() || shift.is_some() {
+        return Err("history anchors require the history projection".into());
+    }
     run_attached(bridge.inner().clone(), owner, move |bridge, epoch| {
-        bridge.history(epoch, offset)
+        bridge
+            .history(epoch, offset)
+            .map(LocalHistorySnapshot::Compatibility)
     })
     .await
 }
@@ -395,11 +415,13 @@ async fn search_local_history<R: tauri::Runtime>(
     window: tauri::WebviewWindow<R>,
     owner: Attachment,
     search: HistorySearchRequest,
+    frame_version: Option<u8>,
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<HistorySearchResponse, String> {
     require_terminal_window(&window)?;
+    let format = SnapshotFormat::negotiate(frame_version)?;
     run_attached(bridge.inner().clone(), owner, move |bridge, epoch| {
-        bridge.search_history(epoch, search)
+        bridge.search_history(epoch, search, format)
     })
     .await
 }

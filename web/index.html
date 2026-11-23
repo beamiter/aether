@@ -114,6 +114,9 @@
   </form>
   <p id="history-find-status" role="status"></p>
   <p id="history-label">Bounded snapshot, select and copy manually.</p>
+  <div id="history-viewport" class="viewport" hidden tabindex="0" role="region" aria-label="Archived terminal viewport">
+    <div id="history-grid-size"><canvas id="history-canvas" aria-label="Archived terminal grid"></canvas></div>
+  </div>
   <textarea id="history-output" readonly rows="12" wrap="off" spellcheck="false" aria-label="Terminal history text snapshot for selection and copy"></textarea>
 </section>
 <form id="command"><label>Shell command <input id="input" autocomplete="off" placeholder="printf hello" disabled></label> <button id="send" disabled>Send line</button></form><p class="note">Experimental: fixed /bin/sh; focus terminal for logical keyboard input. Multiline clipboard paste requires review before sending; newlines may execute commands when bracketed paste is off. Still required: production process containment, Unicode shaping, native keyboard/IME acceptance and broad Vim compatibility, IME and accessibility.</p></main>

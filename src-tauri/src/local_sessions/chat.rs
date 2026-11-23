@@ -10,6 +10,8 @@ pub(crate) struct LocalShellStatus {
     #[serde(flatten)]
     shell: SessionStatus,
     chat: TerminalChatStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    history_oldest_row: Option<Counter>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
@@ -44,6 +46,7 @@ impl LocalShellStatus {
         };
         Ok(Self {
             shell,
+            history_oldest_row: bridge.history_oldest_row(epoch)?,
             chat: TerminalChatStatus {
                 surface,
                 prompt,

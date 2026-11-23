@@ -54,7 +54,17 @@ canonical decimal strings and share the session incarnation with hyperlinks.
 The engine admits up to 32 raster resources and 2 MiB of RGBA per local PTY,
 including resources referenced by retained history or immutable frames. The
 local canvas displays static direct Kitty RGB, RGBA, and PNG transfers on the
-primary screen. The history text projection continues to expose text.
+primary screen.
+
+The local history request uses the same Channel cell and raster types in a
+read-only page. Each paint row carries its original archive anchor and the
+UTF-16 copy boundaries of its cells. The history canvas paints the visible
+rows plus a small margin. The canvas and copy field select the same text.
+Ordinary history pages reflow at the current terminal width. A search result
+keeps the original geometry of its immutable search window and selects the
+exact match, including a bounded prefix across the next window. The stream
+reports the oldest retained source row so clearing history or evicting a page
+invalidates its Canvas and selection. SSH retains the text history response.
 
 The WebView checks the 8 MiB encoded frame budget with a separate allowance for
 canonical base64 image data. It validates the cluster, total text, grid and

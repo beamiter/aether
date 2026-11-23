@@ -1,3 +1,5 @@
+export const CELL_WIDTH = 12, CELL_HEIGHT = 24;
+
 // One Unicode scalar occupies at most two UTF-16 units.
 const singleScalar = text => typeof text === 'string' &&
   (text.length === 1 || (text.length === 2 && text.codePointAt(0) > 0xffff));
@@ -129,7 +131,7 @@ function paintUnderline(g, cell, x, y, width) {
 
 export function paint(canvas, frame, scale = globalThis.devicePixelRatio || 1) {
   if (!Number.isFinite(scale) || scale <= 0 || scale > 4) scale = 1;
-  const cw = 12, ch = 24;
+  const cw = CELL_WIDTH, ch = CELL_HEIGHT;
   // Cap backing allocation independently of viewport dimensions and device DPR.
   const limit = Math.sqrt(16777216 / (frame.cols * cw * frame.rows.length * ch));
   // Merge only on an unclamped integer DPR: all opaque cell edges then
@@ -148,7 +150,7 @@ export function paint(canvas, frame, scale = globalThis.devicePixelRatio || 1) {
     canvas.width !== width || canvas.height !== height ||
     previous.session !== frame.session || previous.epoch !== frame.epoch ||
     previous.layout !== frame.layout || previous.screen !== frame.screen || previous.cols !== frame.cols ||
-    previous.rows.length !== frame.rows.length;
+    previous.rows.length !== frame.rows.length || previous.selection !== frame.selection;
   const cursorMoved = !full && (previous.cursor_row !== frame.cursor_row ||
     previous.cursor_col !== frame.cursor_col || previous.cursor_shape !== frame.cursor_shape ||
     previous.cursor_visible !== frame.cursor_visible);
@@ -210,6 +212,10 @@ export function paint(canvas, frame, scale = globalThis.devicePixelRatio || 1) {
     }
   });
   paintImages(canvas,g,frame,dirty,cw,ch);
+  if (frame.selection) {
+    g.fillStyle = '#78a8f46b';
+    for (const {row,first,last} of frame.selection) g.fillRect(first*cw,row*ch,(last-first)*cw,ch);
+  }
   if(frame.cursor_visible && dirty.includes(frame.cursor_row)){
     const x=frame.cursor_col*cw,y=frame.cursor_row*ch,width=cw*(frame.rows[frame.cursor_row][frame.cursor_col].width===2?2:1);g.fillStyle=g.strokeStyle='#9ac6ff';
     if(frame.cursor_shape==='beam')g.fillRect(x,y,2,ch);

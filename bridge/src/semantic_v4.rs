@@ -3,9 +3,10 @@
 use crate::{cell_width, color, cursor_shape, protocol_v4 as wire, semantic::validate_grid};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use jterm_engine::{
-    frame::{CellFrame, Screen},
-    terminal::InlineImage,
-    UnderlineStyle,
+    frame::{CellFrame, Row, Screen},
+    history_reflow::HistoryAnchor,
+    terminal::{HistoryPage, InlineImage},
+    Color, HyperlinkId, UnderlineStyle,
 };
 use std::{
     collections::{btree_map::Entry, BTreeMap, BTreeSet},
@@ -22,16 +23,102 @@ pub(crate) fn encode(
     let images = match &update {
         wire::Update::Snapshot { images, .. } | wire::Update::Delta { images, .. } => images,
     };
+    Ok((update.revision(), encode_json(&update, images)?))
+}
+
+fn encode_json(
+    value: &impl serde::Serialize,
+    images: &[wire::ImageResource],
+) -> Result<String, String> {
     let mut data = BoundedJson {
         bytes: Vec::new(),
         limit: wire::MAX_ENCODED_FRAME_BYTES
             + images.iter().map(|image| image.rgba.len()).sum::<usize>(),
     };
-    serde_json::to_writer(&mut data, &update).map_err(|e| e.to_string())?;
-    Ok((
-        update.revision(),
-        String::from_utf8(data.bytes).map_err(|_| "invalid frame encoding")?,
-    ))
+    serde_json::to_writer(&mut data, value).map_err(|error| error.to_string())?;
+    String::from_utf8(data.bytes).map_err(|_| "invalid frame encoding".into())
+}
+
+pub(crate) fn history_columns(page: &HistoryPage, minimum: usize) -> usize {
+    (0..page.row_count)
+        .filter_map(|index| page.row(index))
+        .map(|row| row.cells.len())
+        .fold(minimum, usize::max)
+}
+
+pub(crate) fn encode_history(
+    owner: crate::semantic::Attachment,
+    page: &HistoryPage,
+    cols: usize,
+    revision: u64,
+    text: &str,
+    source_at: impl Fn(usize) -> Option<HistoryAnchor>,
+) -> Result<String, String> {
+    if !(1..=wire::MAX_COLUMNS).contains(&cols)
+        || page.row_count > wire::MAX_ROWS
+        || page.total_rows > wire::MAX_PROJECTED_HISTORY_ROWS
+        || page.offset + page.row_count > page.total_rows
+        || text.len() > crate::protocol::MAX_HISTORY_SNAPSHOT_BYTES
+        || !text.starts_with(&page.text)
+    {
+        return Err("invalid history projection bounds".into());
+    }
+    let mut projection = Projection {
+        images_enabled: true,
+        ..Projection::default()
+    };
+    let rows = page
+        .copy_offsets_utf16()?
+        .into_iter()
+        .enumerate()
+        .map(|(index, text_offsets)| {
+            let row = page.row(index).ok_or("missing history row")?;
+            if row.cells.len() > cols {
+                return Err("history row exceeds its viewport".into());
+            }
+            let cells = projection.cells(
+                row,
+                |column| page.cluster_text(index, column),
+                |id| page.hyperlink_target(id),
+                |column| page.underline_color(index, column),
+            )?;
+            let image_slices = projection.image_slices(
+                page.inline_images(index)
+                    .filter(|(_, image, _)| image.raster().is_some()),
+            )?;
+            let source = source_at(index).ok_or("missing history source row")?;
+            let row_id = source
+                .row
+                .checked_add(1)
+                .ok_or("history source exhausted")?;
+            Ok(wire::HistoryRow {
+                source: wire::HistorySource {
+                    row: counter(row_id)?,
+                    column: source.column,
+                },
+                paint: wire::Row {
+                    wrapped: row.wrapped,
+                    cells,
+                    image_slices,
+                },
+                text_offsets,
+            })
+        })
+        .collect::<Result<_, String>>()?;
+    let (hyperlinks, images) = projection.into_resources();
+    let view = wire::HistoryView {
+        owner,
+        revision: counter(revision)?,
+        version: wire::IMAGE_VERSION,
+        cols: cols as u16,
+        offset: page.offset as u32,
+        total_rows: page.total_rows as u32,
+        rows,
+        text: text.into(),
+        hyperlinks,
+        images,
+    };
+    encode_json(&view, &view.images)
 }
 
 fn update(
@@ -117,7 +204,7 @@ struct Projection<'a> {
     images: BTreeMap<u64, wire::ImageResource>,
 }
 
-impl Projection<'_> {
+impl<'a> Projection<'a> {
     fn into_resources(self) -> (Vec<wire::Hyperlink>, Vec<wire::ImageResource>) {
         let hyperlinks = self
             .hyperlinks
@@ -132,13 +219,12 @@ impl Projection<'_> {
 
     fn image_slices(
         &mut self,
-        frame: &CellFrame,
-        index: usize,
+        images: impl Iterator<Item = (usize, &'a InlineImage, u16)>,
     ) -> Result<Vec<wire::ImageSlice>, String> {
         if !self.images_enabled {
             return Ok(Vec::new());
         }
-        row_images(frame, index)
+        images
             .map(|(column, image, slice)| {
                 let key = image.id().get();
                 let id = counter(key)?;
@@ -172,6 +258,79 @@ impl Projection<'_> {
             })
             .collect()
     }
+    fn cells(
+        &mut self,
+        row: &Row,
+        cluster: impl Fn(usize) -> Option<&'a str>,
+        hyperlink: impl Fn(HyperlinkId) -> Option<&'a str>,
+        underline: impl Fn(usize) -> Option<Color>,
+    ) -> Result<Vec<wire::Cell>, String> {
+        row.cells
+            .iter()
+            .enumerate()
+            .map(|(column, cell)| {
+                let flags = cell.flags;
+                let width = cell_width(flags, column, row.cells.len());
+                let mut scalar = [0; 4];
+                let text = if width == 0 {
+                    " "
+                } else {
+                    cluster(column).unwrap_or_else(|| cell.character.encode_utf8(&mut scalar))
+                };
+                self.text_bytes += text.len();
+                if text.len() > wire::MAX_CLUSTER_BYTES || self.text_bytes > wire::MAX_TEXT_BYTES {
+                    return Err("terminal frame exceeds text limit".into());
+                }
+                let hyperlink_id = if cell.hyperlink_id.is_none() {
+                    None
+                } else {
+                    let id = cell.hyperlink_id.as_raw();
+                    if usize::from(id) > wire::MAX_HYPERLINKS {
+                        return Err("terminal hyperlink ID exceeds limit".into());
+                    }
+                    if let Entry::Vacant(entry) = self.hyperlinks.entry(id) {
+                        let target = hyperlink(cell.hyperlink_id)
+                            .ok_or("terminal frame has an unresolved hyperlink")?;
+                        self.hyperlink_bytes += target.len();
+                        if target.len() > wire::MAX_HYPERLINK_TARGET_BYTES
+                            || self.hyperlink_bytes > wire::MAX_HYPERLINK_BYTES
+                        {
+                            return Err("terminal frame exceeds hyperlink byte limit".into());
+                        }
+                        entry.insert(target);
+                    }
+                    Some(id)
+                };
+                let mut foreground = color(cell.foreground, true);
+                let mut background = color(cell.background, false);
+                if flags.inverse() {
+                    std::mem::swap(&mut foreground, &mut background);
+                }
+                Ok(wire::Cell {
+                    text: text.to_string(),
+                    foreground,
+                    background,
+                    width,
+                    style: u8::from(flags.bold())
+                        | (u8::from(flags.italic()) << 1)
+                        | (u8::from(flags.strikethrough()) << 3)
+                        | (u8::from(flags.dim()) << 4)
+                        | (u8::from(flags.blink()) << 5)
+                        | (u8::from(flags.protected()) << 6),
+                    underline: match flags.underline() {
+                        UnderlineStyle::None => None,
+                        UnderlineStyle::Single => Some(wire::Underline::Single),
+                        UnderlineStyle::Double => Some(wire::Underline::Double),
+                        UnderlineStyle::Curly => Some(wire::Underline::Curly),
+                        UnderlineStyle::Dotted => Some(wire::Underline::Dotted),
+                        UnderlineStyle::Dashed => Some(wire::Underline::Dashed),
+                    },
+                    underline_color: underline(column).map(|color_value| color(color_value, true)),
+                    hyperlink_id,
+                })
+            })
+            .collect()
+    }
 }
 
 fn row_images(frame: &CellFrame, index: usize) -> impl Iterator<Item = (usize, &InlineImage, u16)> {
@@ -186,82 +345,15 @@ fn wire_row<'a>(
     projection: &mut Projection<'a>,
 ) -> Result<wire::Row, String> {
     let row = &frame.rows()[index];
-    let cells = row
-        .cells
-        .iter()
-        .enumerate()
-        .map(|(column, cell)| {
-            let flags = cell.flags;
-            let width = cell_width(flags, column, row.cells.len());
-            let mut scalar = [0; 4];
-            let text = if width == 0 {
-                " "
-            } else {
-                frame
-                    .cluster_text(index, column)
-                    .unwrap_or_else(|| cell.character.encode_utf8(&mut scalar))
-            };
-            projection.text_bytes += text.len();
-            if text.len() > wire::MAX_CLUSTER_BYTES || projection.text_bytes > wire::MAX_TEXT_BYTES
-            {
-                return Err("terminal frame exceeds text limit".into());
-            }
-            let hyperlink_id = if cell.hyperlink_id.is_none() {
-                None
-            } else {
-                let id = cell.hyperlink_id.as_raw();
-                if usize::from(id) > wire::MAX_HYPERLINKS {
-                    return Err("terminal hyperlink ID exceeds limit".into());
-                }
-                if let Entry::Vacant(entry) = projection.hyperlinks.entry(id) {
-                    let target = frame
-                        .hyperlink_target(cell.hyperlink_id)
-                        .ok_or("terminal frame has an unresolved hyperlink")?;
-                    projection.hyperlink_bytes += target.len();
-                    if target.len() > wire::MAX_HYPERLINK_TARGET_BYTES
-                        || projection.hyperlink_bytes > wire::MAX_HYPERLINK_BYTES
-                    {
-                        return Err("terminal frame exceeds hyperlink byte limit".into());
-                    }
-                    entry.insert(target);
-                }
-                Some(id)
-            };
-            let mut foreground = color(cell.foreground, true);
-            let mut background = color(cell.background, false);
-            if flags.inverse() {
-                std::mem::swap(&mut foreground, &mut background);
-            }
-            Ok(wire::Cell {
-                text: text.to_string(),
-                foreground,
-                background,
-                width,
-                style: u8::from(flags.bold())
-                    | (u8::from(flags.italic()) << 1)
-                    | (u8::from(flags.strikethrough()) << 3)
-                    | (u8::from(flags.dim()) << 4)
-                    | (u8::from(flags.blink()) << 5)
-                    | (u8::from(flags.protected()) << 6),
-                underline: match flags.underline() {
-                    UnderlineStyle::None => None,
-                    UnderlineStyle::Single => Some(wire::Underline::Single),
-                    UnderlineStyle::Double => Some(wire::Underline::Double),
-                    UnderlineStyle::Curly => Some(wire::Underline::Curly),
-                    UnderlineStyle::Dotted => Some(wire::Underline::Dotted),
-                    UnderlineStyle::Dashed => Some(wire::Underline::Dashed),
-                },
-                underline_color: frame
-                    .underline_color(index, column)
-                    .map(|color_value| color(color_value, true)),
-                hyperlink_id,
-            })
-        })
-        .collect::<Result<_, String>>()?;
     Ok(wire::Row {
         wrapped: row.wrapped,
-        cells,
-        image_slices: projection.image_slices(frame, index)?,
+        cells: projection.cells(
+            row,
+            |column| frame.cluster_text(index, column),
+            |id| frame.hyperlink_target(id),
+            |column| frame.underline_color(index, column),
+        )?,
+        image_slices: projection.image_slices(row_images(frame, index))?,
     })
 }
 

@@ -775,8 +775,10 @@ try:
     tty.setraw(fd)
     send(b'\x1b[3J\x1b[2J\x1b[H\x1b[?25l\x1b_Ga=q,i=31,f=24,s=1,v=1;AAAA\x1b\\')
     expect(b'\x1b_Gi=31;OK\x1b\\')
-    rgba = base64.b64encode(bytes([240, 28, 80, 255, 34, 193, 91, 255]))
-    send(b'\x1b[5;2H\x1b_Ga=T,i=41,c=2,r=2,f=32,s=1,v=2,C=1,m=1;' + rgba[:4] + b'\x1b\\')
+    # Multiple solid source pixels on each side keep sampled centers exact
+    # when WebKit interpolates at different fractional device pixel positions.
+    rgba = base64.b64encode(bytes([240, 28, 80, 255] * 4 + [34, 193, 91, 255] * 4))
+    send(b'\x1b[5;2H\x1b_Ga=T,i=41,c=2,r=2,f=32,s=1,v=8,C=1,m=1;' + rgba[:4] + b'\x1b\\')
     send(b'\x1b_Gm=0;' + rgba[4:] + b'\x1b\\\x1b[6n')
     expect(b'\x1b_Gi=41;OK\x1b\\\x1b[5;2R')
     png = (b'\x89PNG\r\n\x1a\n' + png_chunk(b'IHDR', struct.pack('>2I5B', 1, 1, 8, 6, 0, 0, 0))
@@ -817,8 +819,13 @@ finally:
         """)
 
     ready = owned / "inline-ready"
-    wait_for(lambda: pixels(4) == [red, green, blue] and ready.is_file() and ready.stat().st_size,
-             "real Kitty RGBA and PNG were not painted in WebKit")
+    try:
+        wait_for(lambda: pixels(4) == [red, green, blue] and ready.is_file() and ready.stat().st_size,
+                 "real Kitty RGBA and PNG were not painted in WebKit")
+    except AssertionError as failure:
+        state = driver.execute(READ)
+        raise AssertionError(f"{failure} (PTY ready={ready.exists()}, pixels={pixels(4)}, "
+                             f"status={state['status']}, geometry={state['cursor']})") from failure
     child = int(ready.read_text())
     child_birth = birth(child)
     assert child_birth is not None
@@ -851,6 +858,129 @@ finally:
                       "native_inline_graphics_scroll_resize_erase": True,
                       "native_inline_graphics_readonly_reconnect_same_pty": True,
                       "device_pixel_ratio": driver.execute("return devicePixelRatio")}), flush=True)
+
+
+def exercise_history_graphics(driver, owned):
+    fixture = owned / "history-graphics-fixture.py"
+    fixture.write_text(r'''
+import base64
+import os
+from pathlib import Path
+import select
+import sys
+import termios
+import time
+import tty
+
+root = Path(sys.argv[1])
+original = termios.tcgetattr(0)
+try:
+    tty.setraw(0)
+    image = base64.b64encode(bytes([240, 28, 80, 255] * 4 + [34, 193, 91, 255] * 4))
+    os.write(1, b'\x1b[?25l\x1b[3J\x1b[2J\x1b[H' + b'x' * 80 + b'XY' +
+        b'\x1b_Ga=T,i=51,f=32,s=1,v=8,c=2,r=2,C=1;' + image + b'\x1b\\')
+    expected = b'\x1b_Gi=51;OK\x1b\\'
+    received = b''
+    stop = time.monotonic() + 5
+    while len(received) < len(expected):
+        ready, _, _ = select.select([0], [], [], max(0, stop - time.monotonic()))
+        if not ready:
+            break
+        received += os.read(0, 128)
+    if received != expected:
+        raise RuntimeError(repr(received))
+    os.write(1, b'\x1b[2;9H' + '🐍hist-image'.encode() + b'\x1b[24S')
+    (root / 'history-raster-ready').write_text(str(os.getpid()))
+    until = time.monotonic() + 45
+    while not (root / 'history-raster-clear').exists():
+        if time.monotonic() >= until:
+            raise RuntimeError('waiting for history clear')
+        time.sleep(.03)
+    os.write(1, b'\x1b[3J\x1b[?25h')
+    (root / 'history-raster-cleared').touch()
+except Exception as error:
+    (root / 'history-raster-error').write_text(str(error))
+    raise
+finally:
+    termios.tcsetattr(0,termios.TCSANOW,original)
+''')
+    red, green = [240, 28, 80, 255], [34, 193, 91, 255]
+    ready = owned / "history-raster-ready"
+    error = owned / "history-raster-error"
+    driver.click("#open")
+    wait_for(lambda: (state := driver.execute(READ))["writable"] and state["transport"] == "channel",
+             "retained graphics did not obtain a local Channel")
+    driver.type("#input", f"python3 {shlex.quote(str(fixture))} {shlex.quote(str(owned))}")
+    driver.click("#send")
+
+    def archived_ready():
+        if error.exists():
+            raise AssertionError("graphics PTY: " + error.read_text())
+        return ready.is_file() and ready.stat().st_size
+
+    wait_for(archived_ready, "graphics did not reach the retained archive")
+
+    def read(first_column):
+        return driver.execute(f"""
+            const canvas = document.querySelector('#history-canvas'), view = document.querySelector('#history-viewport');
+            const output = document.querySelector('#history-output');
+            if (view.hidden || canvas.width === 0 || !canvas.style.width) return null;
+            const scale = canvas.width / parseFloat(canvas.style.width);
+            const row = Number(canvas.dataset.firstRow);
+            if (row > 1) return null;
+            const sample = (x,y) => Array.from(canvas.getContext('2d').getImageData(
+                Math.floor((12*x+6)*scale),Math.floor((24*(y-row)+12)*scale),1,1).data);
+            return {{red:sample({first_column},1),green:sample(2,2),text:output.value,
+                selected:output.value.slice(output.selectionStart,output.selectionEnd),
+                width:parseFloat(canvas.style.width),tile:parseFloat(canvas.style.height),
+                page:parseFloat(canvas.parentElement.style.height)}};
+        """)
+
+    driver.click("#history-refresh")
+    first = wait_for(lambda: (page := read(2)) and page["red"] == red and page["green"] == green and page,
+                     "the ordinary history projection did not paint both archived image slices")
+    assert first["text"].startswith("x" * 80 + "XY") and "🐍hist-image" in first["text"]
+    assert first["width"] == 80 * 12 and first["tile"] < first["page"]
+    point = driver.execute("""
+        const canvas = document.querySelector('#history-canvas'), geo = canvas.getBoundingClientRect();
+        const x = Math.floor(geo.left + 9.5*12), y = Math.floor(geo.top + (1-Number(canvas.dataset.firstRow))*24 + 12);
+        return document.elementFromPoint(x,y) === canvas ? {x,y} : null;
+    """)
+    assert point, "history viewport clipped the wide-character selection fixture"
+    driver.command("POST", "/actions", {"actions": [{"id": "history-pointer", "type": "pointer",
+        "parameters": {"pointerType": "mouse"}, "actions": [
+            {"type": "pointerMove", "origin": "viewport", "duration": 0, **point},
+            {"type": "pointerDown", "button": 0}, {"type": "pointerUp", "button": 0}]}]})
+    driver.command("DELETE", "/actions")
+    wait_for(lambda: read(2)["selected"] == "🐍", "the wide continuation did not select its complete grapheme")
+
+    driver.clear("#cols")
+    driver.type("#cols", "52")
+    driver.click("#resize")
+    shifted = wait_for(lambda: (page := read(30)) and page["width"] == 52 * 12 and
+                       page["red"] == red and page["green"] == green and page,
+                       "the history image anchor did not follow logical reflow at the new width")
+    assert shifted["text"] == first["text"] and shifted["selected"] == "🐍"
+
+    driver.type("#history-find-query", "hist-image")
+    driver.click("#history-find")
+    hit = wait_for(lambda: (page := read(2)) and page["selected"] == "hist-image" and
+                   page["red"] == red and page["green"] == green and page,
+                   "the search match did not paint its original archived rows and select its exact text")
+    assert hit["width"] == 80 * 12
+    (owned / "history-raster-clear").touch()
+    wait_for(lambda: (owned / "history-raster-cleared").exists() and driver.execute("""
+        return document.querySelector('#history-viewport').hidden && document.querySelector('#history-output').value === '' &&
+            document.querySelector('#history-label').textContent.startsWith('History source expired');
+    """), "clearing the source did not invalidate the rendered page and selection")
+    driver.click("#close")
+    wait_for(lambda: driver.execute(READ)["status"].startswith("Terminal closed"), "retained graphics fixture did not close")
+    print(json.dumps({"native_history_retained_image_pixels": True,
+                      "native_history_virtualized_canvas": True,
+                      "native_history_projected_reflow_and_selection": True,
+                      "native_history_search_uses_original_image_rows": True,
+                      "native_history_clear_invalidates_selection": True,
+                      "device_pixel_ratio":driver.execute("return devicePixelRatio")}), flush=True)
 
 
 def exercise_height_shrink(driver):
@@ -3021,7 +3151,7 @@ def private_accessibility_address():
     return address.unpack()[0]
 
 
-def run(binary, jsh, workspace, api, native, notebook=False, output_review=False, vim9=False, inline_graphics_only=False):
+def run(binary, jsh, workspace, api, native, notebook=False, output_review=False, vim9=False, inline_graphics_only=False, history_graphics_only=False):
     executable = shutil.which("WebKitWebDriver")
     if not executable or not os.environ.get("DISPLAY") or not os.environ.get("XAUTHORITY"):
         raise RuntimeError("run with official WebKitWebDriver and authenticated Xvfb")
@@ -3088,6 +3218,9 @@ def run(binary, jsh, workspace, api, native, notebook=False, output_review=False
                 if inline_graphics_only:
                     exercise_inline_graphics(driver, owned)
                     return
+                if history_graphics_only:
+                    exercise_history_graphics(driver, owned)
+                    return
                 exercise(driver, owned)
                 exercise_hyperlinks(driver, owned)
                 exercise_keyboard(driver, owned)
@@ -3131,6 +3264,7 @@ if __name__ == "__main__":
     parser.add_argument("--output-review", action="store_true", help="compare and export actual local jsh outputs after eviction")
     parser.add_argument("--vim9", action="store_true", help="open an actual local workbench and edit/save through Vim and its fallback PTY")
     parser.add_argument("--inline-graphics-only", action="store_true", help="exercise real PTY image rendering and reconnect")
+    parser.add_argument("--history-graphics-only", action="store_true", help="exercise projected history rendering and selection")
     args = parser.parse_args()
     if not args.binary.is_absolute() or args.binary.is_symlink() or not args.binary.is_file() or not os.access(args.binary, os.X_OK):
         parser.error("an absolute regular executable is required")
@@ -3142,4 +3276,4 @@ if __name__ == "__main__":
     if args.vim9 and any(not shutil.which(tool) for tool in ("vim", "rg", "xdotool")):
         parser.error("--vim9 requires Vim 9, ripgrep and xdotool")
     signal.signal(signal.SIGTERM, interrupted)
-    run(args.binary, args.jsh, args.workspace, args.api_chat, args.native_task, args.notebook, args.output_review, args.vim9, args.inline_graphics_only)
+    run(args.binary, args.jsh, args.workspace, args.api_chat, args.native_task, args.notebook, args.output_review, args.vim9, args.inline_graphics_only, args.history_graphics_only)
