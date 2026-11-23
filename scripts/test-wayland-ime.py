@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Verify native Wayland composition reaches the Aether-owned PTY exactly once."""
 import argparse
+from collections import Counter
 import contextlib
 import hashlib
 import json
@@ -14,6 +15,22 @@ import socket
 import subprocess
 import tempfile
 import time
+
+
+def native_surface_presentations(trace):
+    request = re.compile(r"wp_presentation[@#]\d+\.feedback\(wl_surface[@#](\d+),\s*"
+                         r"new id wp_presentation_feedback[@#](\d+)\)")
+    reply = re.compile(r"wp_presentation_feedback[@#](\d+)\.(presented|discarded)\(")
+    pending = {}
+    presented = Counter()
+    for line in trace.read_text(errors="replace").splitlines():
+        if match := request.search(line):
+            pending[match[2]] = match[1]
+        elif match := reply.search(line):
+            surface = pending.pop(match[1], None)
+            if surface is not None and match[2] == "presented":
+                presented[surface] += 1
+    return max(presented.values(), default=0)
 
 
 def exercise_companion(driver, fixtures, profile, compositor_ipc, compositor_tools):
@@ -111,6 +128,7 @@ def exercise_companion(driver, fixtures, profile, compositor_ipc, compositor_too
     wait_for(lambda: not named(Atspi.Role.TOGGLE_BUTTON, "Eva"), "Aether stayed open after withdrawal was accepted")
     driver.session = None
     return {"case_id": "PRODUCT.COMPANION.001.NATIVE.001", "backend": "wayland", "result": "passed",
+            "compositor_output": "x11", "presentation_protocol": "wp_presentation",
             "native_body_presented_and_retired": True, "split_feedback_isolated": True,
             "opaque_success_and_failure_recorded": True, "window_closes_after_withdrawal": True}
 
@@ -149,6 +167,13 @@ def run(args):
         runtime = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix="aether-ime-", dir="/tmp")))
         env["XDG_RUNTIME_DIR"] = str(runtime)
         compositor_env = dict(env, WLR_BACKENDS="headless", WLR_RENDERER="pixman", WLR_LIBINPUT_NO_DEVICES="1")
+        if args.companion_daemon:
+            if not os.environ.get("DISPLAY") or not os.environ.get("XAUTHORITY"):
+                raise RuntimeError("run the Eva journey with xvfb-run for the private Sway output")
+            # The wlroots headless backend can omit wp_presentation receipts.
+            # Only Sway uses X11 output. Aether stays on native Wayland.
+            compositor_env.update(WLR_BACKENDS="x11", DISPLAY=os.environ["DISPLAY"],
+                                  XAUTHORITY=os.environ["XAUTHORITY"], WAYLAND_DEBUG="server")
         if args.compositor_libraries:
             compositor_env["LD_LIBRARY_PATH"] = str(args.compositor_libraries.resolve(strict=True))
 
@@ -210,8 +235,11 @@ def run(args):
         if args.companion_daemon:
             compositor_ipc = wait_for(lambda: next(runtime.glob("sway-ipc.*.sock"), None), "no private compositor IPC")
             result = exercise_companion(driver, fixtures, profile, compositor_ipc, compositor_env)
+            presentations = native_surface_presentations(root / "sway.log")
+            assert presentations >= 3, "Sway did not present the probe, body, and clearance on the same surface"
             result.update(binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
-                          daemon_sha256=hashlib.sha256(daemon.read_bytes()).hexdigest())
+                          daemon_sha256=hashlib.sha256(daemon.read_bytes()).hexdigest(),
+                          presented_surface_commits=presentations)
             (root / "result.json").write_text(json.dumps(result, indent=2) + "\n")
             print(json.dumps(result), flush=True)
             return

@@ -101,9 +101,10 @@ command, the slot shows its success or failure and the daemon receives the
 outcome with an opaque command ID. The feedback clears when the active tab
 changes or enters an alternate-screen program.
 
-Eva needs native presentation timestamps from the display. Aether waits for
-that evidence before requesting a shared body. Closing a window that owns one
-waits for the cleared frame and the daemon's acceptance.
+Eva is available in Wayland sessions whose compositor provides
+`wp_presentation`. Aether waits for the compositor's presentation feedback
+before requesting a shared body. Closing a window that owns one waits for
+the cleared frame's feedback and the daemon's acceptance.
 
 ## SSH files and read-only Workspace
 

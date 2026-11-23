@@ -114,6 +114,7 @@ jobs:
             --ime-client "$fixture_dir/clients/native-ime-client" \
             --jsh "$RUNNER_TEMP/aether-shell-fixture/bin/jsh"
       - name: Native Eva feedback, split ownership and window retirement on Wayland
+        id: wayland-eva
         if: ${{ !cancelled() && steps.wayland-fixtures.outcome == 'success' }}
         timeout-minutes: 7
         run: |
@@ -121,11 +122,19 @@ jobs:
             --rev 2099481195383737633f0201bf4ce298fc4f3232 \
             --root "$RUNNER_TEMP/aether-eva-fixture" jcompaniond
           fixture_dir="${AETHER_WAYLAND_FIXTURES:?}"
-          dbus-run-session -- /usr/bin/python3 -B scripts/test-wayland-ime.py \
-            "$CARGO_TARGET_DIR/debug/tauri-terminal-lab" --output "$fixture_dir/eva-evidence" \
-            --ime-client "$fixture_dir/clients/native-ime-client" \
-            --jsh "$RUNNER_TEMP/aether-shell-fixture/bin/jsh" \
-            --companion-daemon "$RUNNER_TEMP/aether-eva-fixture/bin/jcompaniond"
+          xvfb-run --auto-servernum --server-args="-screen 0 1600x1200x24 -nolisten tcp" \
+            dbus-run-session -- /usr/bin/python3 -B scripts/test-wayland-ime.py \
+              "$CARGO_TARGET_DIR/debug/tauri-terminal-lab" --output "$fixture_dir/eva-evidence" \
+              --ime-client "$fixture_dir/clients/native-ime-client" \
+              --jsh "$RUNNER_TEMP/aether-shell-fixture/bin/jsh" \
+              --companion-daemon "$RUNNER_TEMP/aether-eva-fixture/bin/jcompaniond"
+      - name: Upload the Eva journey result
+        if: ${{ !cancelled() && steps.wayland-eva.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: aether-wayland-eva-result
+          path: ${{ env.AETHER_WAYLAND_FIXTURES }}/eva-evidence/result.json
+          if-no-files-found: error
       - name: SSH files and read-only Workspace on X11
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 4

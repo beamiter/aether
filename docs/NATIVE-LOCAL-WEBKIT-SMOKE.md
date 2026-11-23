@@ -82,13 +82,17 @@ back, remove and re-add the bookmark, and verify that retention eviction clears
 it from the bookmarked-only view.
 
 Add `--companion-daemon /absolute/path/to/jcompaniond` to the Wayland driver
-with `--jsh` to run the Eva journey in a private daemon profile. It observes
+with `--jsh` to run the Eva journey in a private daemon profile. Run the
+driver under `xvfb-run` so Sway can use its X11 output backend and provide
+presentation feedback. Sway disables XWayland and Aether itself uses native
+Wayland. The driver observes
 the native GTK slot through AT-SPI and checks the coordinator's presentation
-and retirement records. The journey sends successful and failed commands
+and retirement records. Aether uses `wp_presentation` feedback for the
+exact Wayland surface commit. The journey sends successful and failed commands
 through two real jsh PTYs, switches the split, closes the first tab, and
 verifies that the surviving tab starts with fresh feedback. Closing the native
-window waits for the same body token to be retired. Evidence includes the
-desktop and daemon executable hashes.
+window waits for the same body token to be retired. The desktop workflow
+uploads the desktop and daemon hashes with the journey result.
 
 Build the native desktop from the Aether checkout using its published core pin.
 

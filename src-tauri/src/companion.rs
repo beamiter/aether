@@ -146,7 +146,8 @@ impl Companion {
         if let Some(client) = &mut self.client {
             client.poll();
         }
-        self.presentation.presented(self.client.as_mut());
+        self.presentation
+            .presented(self.client.as_mut(), surface.as_ref());
         self.feedback
             .observe(view.filter(|_| eligible), Instant::now());
 
@@ -158,6 +159,9 @@ impl Companion {
             ));
         }
         let Some(client) = self.client.as_mut() else {
+            if eligible && !self.presentation.proven() && self.presentation.needs_draw() {
+                area.queue_draw();
+            }
             return;
         };
         if !self.closing && client.gate.has_connection() {
@@ -245,6 +249,12 @@ impl Companion {
             self.scene = next_scene;
             self.clearance_requested = clearance;
             area.queue_draw();
+        } else if self.presentation.matches(surface.as_ref())
+            && self.presentation.needs_draw()
+            && (self.clearance_requested.is_some()
+                || (self.scene.is_some() && client.gate.body_presentation_pending()))
+        {
+            area.queue_draw();
         }
         if self.closing && client.gate.withdrawal_accepted() && !self.presentation.holds_body() {
             self.close_ready = true;
@@ -256,6 +266,8 @@ impl Companion {
             "Waiting for Eva to leave this window before closing."
         } else if !enabled {
             ""
+        } else if !self.presentation.supported_backend() {
+            "Eva requires Wayland presentation feedback."
         } else if !self.presentation.proven() {
             "Waiting for native presentation feedback."
         } else if self.feedback.session.is_none() {
@@ -299,12 +311,11 @@ impl Companion {
             .scene
             .as_ref()
             .filter(|scene| !self.closing && allowed == Some(&scene.token))
-            .map(|scene| {
+            .and_then(|scene| {
                 // Record possible pixels before drawing, even if Cairo fails or
                 // this damage is smaller than the dedicated native slot.
                 self.presentation.mark_body_drawn(&scene.token);
-                draw_atlas(area, cr, scene, width, height);
-                scene.token.clone()
+                draw_atlas(area, cr, scene, width, height).then(|| scene.token.clone())
             });
         if whole_surface && cr.status().is_ok() {
             self.presentation.painted(self.client.as_mut(), body);
@@ -332,11 +343,11 @@ fn draw_atlas(
     scene: &Scene,
     width: f64,
     height: f64,
-) {
+) -> bool {
     let mut request = atlas::Request::new(scene.skin, scene.pose);
     request.motion = atlas::Motion::Static;
     let Some(frame) = atlas::sample(request) else {
-        return;
+        return false;
     };
     let layout = area.create_pango_layout(None);
     layout.set_font_description(Some(&pango::FontDescription::from_string("Monospace 9")));
@@ -363,19 +374,22 @@ fn draw_atlas(
         .min((height - 8.0) / f64::from(layout_height.max(1)))
         .min(1.0);
     if scale <= 0.0 || cr.save().is_err() {
-        return;
+        return false;
     }
     cr.translate((width - f64::from(layout_width) * scale) / 2.0, 4.0);
     cr.scale(scale, scale);
     gtk::render_layout(&area.style_context(), cr, 0.0, 0.0, &layout);
-    let _ = cr.restore();
+    cr.restore().is_ok()
 }
 
 pub(crate) fn install(window: &WebviewWindow) -> tauri::Result<()> {
     let native = window.gtk_window()?;
     let container = window.default_vbox()?;
     let sessions = window.state::<Arc<Mutex<LocalSessions>>>().inner().clone();
-    let state = Rc::new(RefCell::new(Companion::default()));
+    let state = Rc::new(RefCell::new(Companion {
+        presentation: Presentation::new(native.display()),
+        ..Companion::default()
+    }));
     MAIN_SLOT.with_borrow_mut(|slot| *slot = Rc::downgrade(&state));
 
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
