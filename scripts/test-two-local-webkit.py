@@ -2116,6 +2116,12 @@ def exercise_api_chat(driver, owned, binary, env, fixture):
 
 
 def prepare_native_task(owned, env, launch):
+    node = shutil.which("node", path=os.defpath) or shutil.which("node")
+    if node is None:
+        raise RuntimeError("the native Codex fixture requires Node.js")
+    # Give the fixture one interpreter in its private PATH. The native host
+    # still admits the canonical interpreter and the installed system Git.
+    (launch / "node").symlink_to(Path(node).resolve(strict=True))
     profile = Path(env.setdefault("CODEX_HOME", str(owned / "native-profile")))
     profile.mkdir(mode=0o700, exist_ok=True)
     profile.chmod(0o700)
@@ -3174,10 +3180,6 @@ def run(binary, jsh, workspace, api, native, notebook=False, output_review=False
     executable = shutil.which("WebKitWebDriver")
     if not executable or not os.environ.get("DISPLAY") or not os.environ.get("XAUTHORITY"):
         raise RuntimeError("run with official WebKitWebDriver and authenticated Xvfb")
-    # Native Codex launcher admission and the ordinary Workspace resume both
-    # use the fixture's restricted PATH, not the shell or Actions tool cache.
-    if native and not shutil.which("node", path="/usr/bin:/bin"):
-        raise RuntimeError("the native Codex fixture requires system Node.js (Ubuntu package: nodejs)")
     with tempfile.TemporaryDirectory(prefix="aether-native-two-") as scratch:
         owned = Path(scratch)
         env = {name: os.environ[name] for name in ("DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS", "GDK_SCALE")

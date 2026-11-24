@@ -4,8 +4,12 @@ import json
 import os
 from pathlib import Path
 import sys
-import tomllib
 import uuid
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
 
 
 arguments = sys.argv[1:]
