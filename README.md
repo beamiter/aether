@@ -8,7 +8,7 @@ ANSI parser. **This is not a daily-use terminal.**
 ## Shared core
 
 The three Cargo manifests pin the shared crates to
-`47e9edecc259b0dea7e6e400227331046716c8bc`. `jterm_runtime` owns the local PTY, direct child and
+`fd31651565e9808db4fbe57f9e9335d866bea60c`. `jterm_runtime` owns the local PTY, direct child and
 output drain. Its `jterm_engine::terminal::Terminal` owns parsing, screen
 state, input encoding, history and immutable frames. The session host supplies
 each frame stream's epoch. Run `python3 scripts/check-core-pin.py` to verify
@@ -138,6 +138,8 @@ profile and session ID. Select a conversation and choose **Attach terminal**
 to resume it or take over its running terminal after the other view detaches.
 **Detach terminal** releases the input lease while the host keeps the provider
 running. Reopening Aether can attach to that same provider later.
+The Session Host publishes the viewport and encodes input against the live
+terminal modes. It also answers supported terminal queries between attachments.
 Use **Ctrl+Shift+V** or **Shift+Insert** to paste into the terminal input.
 Multiline clipboard text opens a review before it can be sent.
 [Native Workspace validation](docs/NATIVE-LOCAL-WEBKIT-SMOKE.md)

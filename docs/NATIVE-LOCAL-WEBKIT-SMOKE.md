@@ -154,9 +154,11 @@ synthetic provider-history files with the same native UUID, and a controlled
 local provider script in a real PTY. An existing embedded terminal holds the
 lease first. Aether sees the conflict, attaches after release, and displays the
 same provider output. The journey verifies explicit detach, closing the app
-while attached, and reopening that same provider. The fixture reads the exact
-cursor-position reply and the reviewed bracketed paste from its PTY. It also
-writes a final marker that must appear with the exit receipt.
+while attached, and reopening that same provider. The fixture splits a wide
+cursor-position query across the legacy detach and checks that the Host
+answers once before Aether attaches. It also checks the live query and reviewed
+bracketed paste byte for byte. The final marker must appear with the exit
+receipt.
 
 Add `--api-chat` to run an API conversation against a private loopback
 streaming provider. The real Workspace host acknowledges a multiline draft,

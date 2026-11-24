@@ -1746,33 +1746,57 @@ set -eu
 test "$1" = resume
 printf '%s|%s|%s|%s\\n' "$$" "$CODEX_HOME" "$PWD" "$2" >> "$AETHER_WORKSPACE_TRACE"
 printf 'WORKSPACE_READY\\n'
+query_once() {
+    expected=$(printf '\\033[12;%sR' "$1")
+    saved=$(stty -g)
+    stty raw -echo min 0 time 50
+    printf '\\0337\\033[12;%sH\\033[' "$1"
+    if [ "$#" -eq 2 ]; then
+        while [ ! -e "$2" ]; do sleep 0.02; done
+    fi
+    printf '6n'
+    reply=$(dd bs=1 count="${#expected}" status=none)
+    stty min 0 time 2
+    extra=$(dd bs=1 count=1 status=none)
+    stty "$saved"
+    test "$reply" = "$expected"
+    test -z "$extra"
+    printf '\\0338'
+}
 while IFS= read -r line; do
     printf '%s\\n' "$line" >> "$AETHER_WORKSPACE_INPUT"
     if [ "$line" = exit-fixture ]; then
-        printf 'WORKSPACE_LAST_OUTPUT\\n'
+        printf '\\033[2K\\rWORKSPACE_LAST_OUTPUT\\n'
         exit 7
     fi
     if [ "$line" = query-fixture ]; then
-        saved=$(stty -g)
-        stty raw -echo min 0 time 50
-        printf '\\033[12;7H\\033[6n'
-        reply=$(dd bs=1 count=7 status=none)
-        stty "$saved"
-        test "$reply" = "$(printf '\\033[12;7R')"
-        printf '\\nWORKSPACE_QUERY_REPLY_OK\\n'
+        query_once 7
+        printf '\\033[2K\\rWORKSPACE_QUERY_REPLY_OK\\n'
+        continue
+    fi
+    if [ "$line" = legacy-query-fixture ]; then
+        query_once 17
+        printf '\\033[2K\\rWORKSPACE_LEGACY_REPLY_OK\\n'
+        continue
+    fi
+    if [ "$line" = detached-query-fixture ]; then
+        printf '\\033[2K\\rWORKSPACE_DETACHED_QUERY_ARMED\\n'
+        query_once 300 "$AETHER_WORKSPACE_QUERY_GATE"
+        printf '\\033[2K\\rWORKSPACE_DETACHED_REPLY_OK\\n'
+        : > "$AETHER_WORKSPACE_QUERY_RESULT"
         continue
     fi
     if [ "$line" = paste-fixture ]; then
         saved=$(stty -g)
         stty raw -echo min 0 time 60
-        printf '\\033[?2004hWORKSPACE_PASTE_ARMED\\r\\n'
+        printf '\\033[?2004h\\033[2K\\rWORKSPACE_PASTE_ARMED\\r\\n'
         paste=$(dd bs=1 count=22 status=none)
         stty "$saved"
         test "$paste" = "$(printf '\\033[200~left\\rright\\033[201~')"
-        printf '\\033[?2004lWORKSPACE_PASTE_OK\\n'
+        printf '\\033[?2004l\\033[2K\\rWORKSPACE_PASTE_OK\\n'
         continue
     fi
-    printf 'WORKSPACE_REPLY:%s\\n' "$line"
+    printf '\\033[2K\\rWORKSPACE_REPLY:%s\\n' "$line"
 done
 """)
     executable.chmod(0o700)
@@ -1781,6 +1805,8 @@ done
         "JTERM_WORKSPACE_STATE_DIR": str(owned / "workspace"),
         "AETHER_WORKSPACE_TRACE": str(owned / "provider-starts"),
         "AETHER_WORKSPACE_INPUT": str(owned / "provider-input"),
+        "AETHER_WORKSPACE_QUERY_GATE": str(owned / "provider-query-gate"),
+        "AETHER_WORKSPACE_QUERY_RESULT": str(owned / "provider-query-result"),
     })
     return transcripts
 
@@ -1846,7 +1872,7 @@ def exercise_workspace(driver, owned, binary, env, transcripts):
         }
         master, slave = pty.openpty()
         try:
-            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 384, 0, 0))
             os.set_blocking(master, False)
             helper = subprocess.Popen([binary, "--jterm-session-attach", json.dumps(descriptor)],
                                       cwd=owned, env=env, stdin=slave, stdout=slave, stderr=slave,
@@ -1877,17 +1903,34 @@ def exercise_workspace(driver, owned, binary, env, transcripts):
         assert identity[1] and (home, cwd, native_id) == (profile, row["cwd"], WORKSPACE_ID)
         os.write(master, b"from-existing-terminal\n")
         wait_for(lambda: helper_saw(b"WORKSPACE_REPLY:from-existing-terminal"), "existing lease did not deliver input")
+        os.write(master, b"legacy-query-fixture\n")
+        wait_for(lambda: helper_saw(b"\x1b[12;17H\x1b[6n"), "legacy attachment did not receive the query")
+        os.write(master, b"\x1b[12;17R")
+        wait_for(lambda: helper_saw(b"WORKSPACE_LEGACY_REPLY_OK"), "legacy query was lost or answered twice")
 
         driver.click("#workspace-attach")
         wait_for(lambda: "attached to another terminal" in read_state()["status"], "Workspace host failed to reject a competing lease")
         assert not read_state()["writable"] and not read_state()["visible"]
+        os.write(master, b"detached-query-fixture\n")
+        wait_for(lambda: helper_saw(b"WORKSPACE_DETACHED_QUERY_ARMED"), "detached query fixture was not armed")
+        wait_for(lambda: helper_saw(b"\x1b[12;300H\x1b["),
+                 "the query prefix did not reach the legacy viewport before detach")
         os.write(master, b"\x1d")
         assert helper.wait(timeout=5) == 0
         assert birth(identity[0]) == identity[1]
+        def detached():
+            reply = workspace_command(socket_file, "Runtime", {"id": conversation})
+            return reply.get("Ok", {}).get("Runtime", {}).get("snapshot", {}).get("state") == "Running"
+
+        wait_for(detached, "the Session Host did not release the legacy attachment")
+        Path(env["AETHER_WORKSPACE_QUERY_GATE"]).touch()
+        wait_for(Path(env["AETHER_WORKSPACE_QUERY_RESULT"]).exists,
+                 "the detached provider did not receive exactly one wide-viewport reply")
 
         driver.click("#workspace-attach")
         wait_for(lambda: read_state()["writable"], "native Workspace view did not adopt the host lease")
         shows("WORKSPACE_REPLY:from-existing-terminal")
+        shows("WORKSPACE_DETACHED_REPLY_OK")
         driver.type("#workspace-input", "from-aether" + "\ue007")
         shows("WORKSPACE_REPLY:from-aether")
         driver.type("#workspace-input", "query-fixture" + "\ue007")
@@ -1924,7 +1967,8 @@ def exercise_workspace(driver, owned, binary, env, transcripts):
         assert not read_state()["writable"]
         shows("WORKSPACE_LAST_OUTPUT")
         assert received.read_text().splitlines() == [
-            "from-existing-terminal", "from-aether", "query-fixture", "paste-fixture", "exit-fixture",
+            "from-existing-terminal", "legacy-query-fixture", "detached-query-fixture",
+            "from-aether", "query-fixture", "paste-fixture", "exit-fixture",
         ]
         assert trace.read_text().splitlines() == starts
         print(json.dumps({
@@ -1936,6 +1980,9 @@ def exercise_workspace(driver, owned, binary, env, transcripts):
             "native_workspace_protocol_reply_bytes": True,
             "native_workspace_reviewed_paste_matches_exact_pty_bytes": True,
             "native_workspace_final_output_before_exit": True,
+            "native_workspace_detached_host_answers_wide_viewport": True,
+            "native_workspace_query_split_across_detach": True,
+            "native_workspace_legacy_view_answers_without_duplicates": True,
         }), flush=True)
     except Exception:
         print("Workspace fixture:", log.read_text()[-4000:], read_state(), flush=True)

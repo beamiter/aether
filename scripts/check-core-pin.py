@@ -28,6 +28,7 @@ dependencies = [read(f"{crate}/Cargo.toml")["dependencies"]["jterm_engine"]
                 for crate in ("session", "bridge")]
 runtime = read("session/Cargo.toml")["target"]['cfg(target_os = "linux")']["dependencies"]["jterm_runtime"]
 protocol = read("bridge/Cargo.toml")["dependencies"]["jterm_protocol"]
+projection = {"features": ["engine-projection"]}
 desktop = read("src-tauri/Cargo.toml")["dependencies"]
 remote_client = desktop["jterm_remote_client"]
 workspace_core = desktop.get("jterm_core")
@@ -40,7 +41,7 @@ if args.local_candidate:
     require(runtime == {"path": runtime_path, "features": ["linux-pty"]}, "unexpected local PTY runtime")
     require((ROOT / "session" / runtime_path / "src/pty_session.rs").is_file(), "missing sibling PTY runtime")
     protocol_path = "../../jterm_core/crates/jterm_protocol"
-    require(protocol == {"path": protocol_path}, "unexpected local terminal protocol")
+    require(protocol == {"path": protocol_path, **projection}, "unexpected local terminal protocol")
     require((ROOT / "bridge" / protocol_path / "src/terminal.rs").is_file(), "missing sibling terminal protocol")
     remote_path = "../../jterm_core/crates/jterm_remote_client"
     require(remote_client == {"path": remote_path}, "unexpected local JWM client")
@@ -57,7 +58,7 @@ else:
     require(re.fullmatch(r"[0-9a-f]{40}", revision), "release requires a published core commit SHA")
     require(dependencies == [{"git": URL, "rev": revision}] * 2, "session and bridge core pins disagree")
     require(runtime == {"git": URL, "rev": revision, "features": ["linux-pty"]}, "PTY runtime pin disagrees")
-    require(protocol == {"git": URL, "rev": revision}, "terminal protocol pin disagrees")
+    require(protocol == {"git": URL, "rev": revision, **projection}, "terminal protocol pin disagrees")
     require(remote_client == {"git": URL, "rev": revision}, "JWM client pin disagrees")
     if workspace_core is not None:
         require(workspace_core == {"git": URL, "rev": revision}, "Workspace core pin disagrees")

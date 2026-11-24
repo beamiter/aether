@@ -14,6 +14,8 @@ use jterm_engine::{
 };
 use std::sync::Arc;
 
+pub use jterm_protocol::engine_projection::from_engine;
+use jterm_protocol::engine_projection::{cell_width, color, cursor_shape};
 pub use jterm_protocol::file_reference;
 pub use jterm_protocol::terminal as protocol;
 pub use jterm_protocol::terminal_v4 as protocol_v4;
@@ -35,116 +37,6 @@ pub fn snapshot_encoder(
     }
 }
 
-/// Resolve a host-owned immutable frame into paint-only values. No ANSI reaches JS.
-pub fn from_engine(frame: &CellFrame, session: &str, epoch: u32) -> Result<WireFrame, String> {
-    semantic::validate_grid(frame)?;
-    let revision = u32::try_from(frame.stamp().revision).map_err(|_| "revision exhausted")?;
-    let layout = u32::try_from(frame.stamp().layout).map_err(|_| "layout exhausted")?;
-    Ok(WireFrame {
-        version: protocol::VERSION,
-        session: session.into(),
-        epoch,
-        revision,
-        layout,
-        cols: frame.cols(),
-        rows: frame
-            .rows()
-            .iter()
-            .map(|row| wire_row(row, frame.cols()))
-            .collect(),
-        cursor_row: frame.cursor().row,
-        cursor_col: frame.cursor().col,
-        cursor_visible: frame.cursor().visible,
-        cursor_shape: cursor_shape(frame.cursor().shape),
-        pending_wrap: frame.cursor().pending_wrap,
-    })
-}
-fn cursor_shape(shape: CursorShape) -> WireCursorShape {
-    match shape {
-        CursorShape::Block => WireCursorShape::Block,
-        CursorShape::Underline => WireCursorShape::Underline,
-        CursorShape::Beam => WireCursorShape::Beam,
-    }
-}
-
-fn wire_row(row: &Row, cols: usize) -> Vec<WireCell> {
-    row.cells
-        .iter()
-        .enumerate()
-        .map(|(column, c)| {
-            let mut fg = color(c.foreground, true);
-            let mut bg = color(c.background, false);
-            if c.flags.inverse() {
-                std::mem::swap(&mut fg, &mut bg);
-            }
-            WireCell {
-                text: c.character.to_string(),
-                foreground: fg,
-                background: bg,
-                width: cell_width(c.flags, column, cols),
-                style: u8::from(c.flags.bold())
-                    | (u8::from(c.flags.italic()) << 1)
-                    | (u8::from(c.flags.underline() != jterm_engine::UnderlineStyle::None) << 2)
-                    | (u8::from(c.flags.strikethrough()) << 3)
-                    | (u8::from(c.flags.dim()) << 4),
-            }
-        })
-        .collect()
-}
-
-fn cell_width(flags: jterm_engine::StyleFlags, column: usize, cols: usize) -> u8 {
-    if flags.wide_continuation() {
-        0
-    } else if flags.wide() && column + 1 < cols {
-        2
-    } else {
-        1
-    }
-}
-
-fn color(c: jterm_engine::Color, foreground: bool) -> String {
-    use jterm_engine::Color::*;
-    let index = match c {
-        Black => 0,
-        Red => 1,
-        Green => 2,
-        Yellow => 3,
-        Blue => 4,
-        Magenta => 5,
-        Cyan => 6,
-        White => 7,
-        BrightBlack => 8,
-        BrightRed => 9,
-        BrightGreen => 10,
-        BrightYellow => 11,
-        BrightBlue => 12,
-        BrightMagenta => 13,
-        BrightCyan => 14,
-        BrightWhite => 15,
-        Indexed(n) => n,
-        Rgb(r, g, b) => return format!("#{r:02x}{g:02x}{b:02x}"),
-        Default => return if foreground { "#d9e5ef" } else { "#111820" }.into(),
-    };
-    let palette = [
-        "#000000", "#cd3131", "#0dbc79", "#e5e510", "#2472c8", "#bc3fbc", "#11a8cd", "#e5e5e5",
-        "#666666", "#f14c4c", "#23d18b", "#f5f543", "#3b8eea", "#d670d6", "#29b8db", "#ffffff",
-    ];
-    if index < 16 {
-        return palette[index as usize].into();
-    }
-    if index >= 232 {
-        let n = 8 + (index - 232) * 10;
-        return format!("#{n:02x}{n:02x}{n:02x}");
-    }
-    let n = index - 16;
-    let levels = [0u8, 95, 135, 175, 215, 255];
-    format!(
-        "#{:02x}{:02x}{:02x}",
-        levels[(n / 36) as usize],
-        levels[((n / 6) % 6) as usize],
-        levels[(n % 6) as usize]
-    )
-}
 /// A single fixed demo session. Real session identity must come from host authority.
 pub struct DemoBridge {
     frame: Option<CellFrame>,

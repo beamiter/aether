@@ -248,6 +248,8 @@ export function installWorkspace(document,invoke){
       if(!update.writable){
         paste.reset();
         if(wasWritable)ime.reset();
+      }
+      if(update.finished===true){
         clearInterval(view.timer);
       }
     }catch(error){
