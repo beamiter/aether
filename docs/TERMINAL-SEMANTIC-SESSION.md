@@ -194,6 +194,18 @@ owner continues bounded PTY reads and ordered protocol replies, retaining the
 latest complete paint boundary for recovery. Status and paint ACKs do not
 gate this background progress.
 
+**Saved SSH shells** lists remembered PTYs after the entire application
+restarts. **Reconnect view-only** authenticates with OpenSSH, checks the
+remote owner instance, and displays a fresh snapshot before acknowledging its
+new attachment generation. A saved view has no input or resize lease.
+Aether keeps host aliases, owner instance IDs, session selectors and creation
+times in a private catalog under its application data directory. A lost
+connection leaves the catalog entry available for retry. If the matching
+owner confirms the PTY has expired or closed, Aether removes the stale entry.
+If the owner identity changes, Aether keeps the entry so the user can check
+the SSH alias or choose **Forget saved shell**. A restarted remote owner starts
+with a fresh session table.
+
 An application launcher can set `AETHER_SSH_TERMINAL_HELPER` and
 `AETHER_SSH_TERMINAL_SOCKET` to absolute paths on the SSH host for a private
 deployment. Aether quotes these settings as separate remote arguments.
@@ -218,6 +230,13 @@ and opens a read-only view. Terminal input and creation requests go to the
 owner once per request. The caller treats an interrupted input or open as
 uncertain and can recover an already identified session.
 
+`identify` returns the owner instance's random identifier. A modern client
+checks that identifier before sending a retained session selector and includes
+it as `host` on later requests. The owner validates `host` before handling
+the command so that a socket replacement cannot inherit a request tied to a
+previous owner. Aether can still open a shell through older helpers for the
+current desktop process.
+
 The owner limits an account's service to four live PTYs and expires a session
 after ten minutes without a successful request or PTY output. Each request is
 bounded to 128 KiB and each reply to 16 MiB. The existing grid and input limits apply.
@@ -232,9 +251,11 @@ rejection, read-only attachment and PTY cleanup.
 python3 scripts/test-ssh-terminal-session.py host /absolute/path/aether-terminal-host
 ```
 
-The native Xvfb/WebKitGTK check drives the actual Terminal tab, kills its
-owned OpenSSH relay, recovers the displayed grid, submits fresh input and
-checks read-only reattachment and remote cleanup.
+The native Xvfb/WebKitGTK check drives the actual Terminal tab. It recovers
+after a relay disconnect, exits and restarts the Aether process, verifies
+output produced by the same remote PTY while Aether was closed, and checks
+that a replaced remote owner cannot accept the saved session. It also checks
+read-only attachment, clipboard output and remote cleanup.
 
 ```sh
 python3 scripts/test-ssh-terminal-webview.py /absolute/path/tauri-terminal-lab host /absolute/path/aether-terminal-host

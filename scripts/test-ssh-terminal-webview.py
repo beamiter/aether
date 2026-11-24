@@ -2,6 +2,7 @@
 """Drive Aether’s native WebKitGTK terminal over an isolated Xvfb display and SSH."""
 import argparse
 import contextlib
+import errno
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -11,9 +12,11 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 DETACHED_WRITES = 8192
 DETACHED_WRITE = b"\x1b[12;1H" + b" " * 64
@@ -64,9 +67,10 @@ def exercise(app, destination, helper):
     root = Path(tempfile.mkdtemp(prefix="jwm-aether-ssh-webview."))
     print(root, flush=True)
 
-    def start(args, name, *, group=False):
+    def start(args, name, *, group=False, child_env=None):
         with (root / name).open("wb") as log:
-            child = subprocess.Popen(args, env=env, cwd=root, stdout=log, stderr=log,
+            child = subprocess.Popen(args, env=env if child_env is None else child_env,
+                                     cwd=root, stdout=log, stderr=log,
                                      start_new_session=group)
         cleanup.callback(native["stop_driver"] if group else stop, child)
         return child
@@ -80,18 +84,28 @@ def exercise(app, destination, helper):
         assert remote_socket.is_absolute() and remote_socket.name == "terminal.sock"
         assert owned.name.startswith("aether-ssh-")
 
-        env = os.environ | {
-            "GDK_BACKEND": "x11", "LIBGL_ALWAYS_SOFTWARE": "1",
+        env = {name: os.environ[name] for name in (
+            "DBUS_SESSION_BUS_ADDRESS", "DISPLAY", "XAUTHORITY", "GDK_SCALE", "PATH",
+            "SSH_AUTH_SOCK", "XDG_DATA_DIRS",
+        ) if name in os.environ}
+        env.update({
+            "HOME": str(root), "LC_ALL": "C.UTF-8", "GDK_BACKEND": "x11",
+            "LIBGL_ALWAYS_SOFTWARE": "1",
             "TAURI_WEBVIEW_AUTOMATION": "true",
             "AETHER_SSH_TERMINAL_HELPER": helper, "AETHER_SSH_TERMINAL_SOCKET": endpoint,
             "JTERM_WORKSPACE_STATE_DIR": str(root / "workspace"),
-        }
+        })
         for name in ("CONFIG", "CACHE", "RUNTIME", "DATA", "STATE"):
             directory = root / name.lower()
             directory.mkdir(mode=0o700)
             env["XDG_RUNTIME_DIR" if name == "RUNTIME" else f"XDG_{name}_HOME"] = str(directory)
 
-        start(["metacity", "--sm-disable"], "wm.log")
+        manager = shutil.which("metacity") or shutil.which("openbox")
+        assert manager, "native SSH smoke needs an X11 window manager"
+        manager_env = env.copy()
+        if "LD_LIBRARY_PATH" in os.environ:
+            manager_env["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
+        start([manager, "--sm-disable"], "wm.log", child_env=manager_env)
         with socket.socket() as slot:
             slot.bind(("127.0.0.1", 0))
             port = slot.getsockname()[1]
@@ -126,6 +140,30 @@ def exercise(app, destination, helper):
 
         def snap(name):
             run("import", "-window", window, root / (name + ".png"))
+
+        def stop_desktop():
+            desktop_fd = os.pidfd_open(desktop)
+            try:
+                driver.close()
+                assert select.select([desktop_fd], [], [], 7)[0], "owned Aether process did not exit"
+            finally:
+                os.close(desktop_fd)
+
+        def restart_desktop():
+            old = desktop
+            driver.open(app)
+            wait(lambda: native["opened_page"](driver), "restarted Aether page did not load")
+            pid = wait(lambda: owned_desktop(app, webkit.pid), "restarted Aether process")
+            assert pid != old
+            return pid
+
+        def catalog():
+            path = root / "data" / "local.jterm.frame-lab" / "ssh-terminals" / "sessions.json"
+            observed = path.stat()
+            assert stat.S_IMODE(observed.st_mode) == 0o600 and observed.st_uid == os.geteuid()
+            saved = json.loads(path.read_text())
+            assert saved["version"] == 1
+            return saved["shells"]
 
         def relays():
             found = subprocess.run(["ps", "--ppid", str(desktop), "-o", "pid=,comm="],
@@ -252,6 +290,22 @@ def exercise(app, destination, helper):
         submit("printf '\\033[9;1H\\033[2K%s\\r\\n' \"$SENTINEL\"")
         wait(lambda: visible("WEBVIEW_PTY_SURVIVED"), "recovered shell lost its variable or input")
 
+        restart_gate = str(owned / "allow-restart-output")
+        witness = str(owned / "restart-written")
+        submit(
+            f"(n=0; while [ ! -f {quote(restart_gate)} ] && [ \"$n\" -lt 600 ]; "
+            "do n=$((n+1)); sleep 0.05; done; "
+            f"if [ -f {quote(restart_gate)} ]; then "
+            "printf '\\033[6;1H\\033[2K%s\\r\\n' \"$SENTINEL\"_RESTART; "
+            f"printf done > {quote(witness)}; fi) & "
+            "printf '\\033[5;1H\\033[2K%s\\r\\n' WEBVIEW_RESTART_ARMED"
+        )
+        wait(lambda: visible("WEBVIEW_RESTART_ARMED"), "remote shell starts the restart witness")
+        saved, = catalog()
+        assert set(saved) == {"id", "destination", "instance", "target", "created_ms"}
+        assert saved["destination"] == destination
+        assert set(saved["target"]) == {"session", "epoch"}
+
         driver.click("#detach")
         wait(lambda: not relays() and state()["status"].startswith("View detached."),
              "explicit detach did not retire relay")
@@ -273,12 +327,45 @@ def exercise(app, destination, helper):
             "import pathlib, sys; assert not pathlib.Path(sys.argv[1]).exists(), 'read-only view sent input'",
             forbidden,
         )
+        stop_desktop()
+        actual_identity = json.loads(probe["remote_python"](
+            destination,
+            "import json,pathlib,sys,time; gate,witness,owner=map(pathlib.Path,sys.argv[1:]); "
+            "gate.touch(); deadline=time.monotonic()+5; "
+            "exec('while not witness.exists():\\n assert time.monotonic()<deadline\\n time.sleep(.02)'); "
+            "pid=int(owner.read_text()); "
+            "born=pathlib.Path(f'/proc/{pid}/stat').read_text().rsplit(')',1)[1].split()[19]; "
+            "print(json.dumps([pid,born]))",
+            restart_gate, witness, str(owned / "pty-pid"),
+        ))
+        assert actual_identity == [remote_pid, born], "restart witness ran in a different PTY"
+
+        desktop = restart_desktop()
+        window = wait(find_window, "restarted native WebView window")
+        run("xdotool", "windowactivate", "--sync", window)
+        assert not relays(), "desktop startup implicitly reconnected an SSH shell"
+        driver.click("#show-saved-ssh")
+        wait(lambda: driver.execute("return !document.querySelector('#resume-saved-ssh').disabled"),
+             "the native saved shell directory did not appear after restart")
+        assert not relays(), "listing saved shells implicitly connected to an SSH host"
+        driver.click("#resume-saved-ssh")
+        resumed, = wait(relays, "saved view creates a new SSH relay")
+        assert resumed not in (first, second, third)
+        restarted_grid = wait(lambda: visible("WEBVIEW_PTY_SURVIVED_RESTART"),
+                              "saved view lost output produced while Aether was closed")
+        assert restarted_grid.count("WEBVIEW_PTY_SURVIVED_RESTART") == 1
+        assert "view-only" in state()["status"] and not state()["writable"]
+        assert state()["pixel"] == [22, 63, 91, 255]
+        snap("application-restart")
+
         driver.click("#close")
         wait(lambda: not relays() and state()["status"].startswith("Terminal closed"),
              "explicit close did not retire relay")
         probe["remote_python"](destination, probe["CONFIRM_REAPED"], str(remote_pid), born)
+        assert catalog() == [], "closing the remote PTY left a saved entry"
         snap("closed")
 
+        driver.type("#ssh-terminal-host", destination)
         driver.click("#open-ssh")
         fourth, = wait(relays, "second Aether SSH terminal did not start")
         wait(lambda: state()["writable"], "second remote terminal was read-only before exit")
@@ -305,18 +392,41 @@ def exercise(app, destination, helper):
         driver.click("#close")
         wait(lambda: not relays(), "closing the recovered exit output left an SSH relay")
 
-        desktop_fd = os.pidfd_open(desktop)
-        try:
-            driver.close()
-            assert select.select([desktop_fd], [], [], 7)[0], "owned Aether WebView did not exit"
-        finally:
-            os.close(desktop_fd)
+        driver.click("#open-ssh")
+        wait(lambda: len(relays()) == 1 and state()["writable"], "third SSH shell did not open")
+        old_entry, = catalog()
+        stop_desktop()
+        supervisor.child.stdin.write(b"restart\n")
+        supervisor.child.stdin.flush()
+        assert supervisor.line().decode() == endpoint
+
+        desktop = restart_desktop()
+        window = wait(find_window, "native window after SSH owner replacement")
+        run("xdotool", "windowactivate", "--sync", window)
+        driver.click("#show-saved-ssh")
+        wait(lambda: driver.execute("return !document.querySelector('#resume-saved-ssh').disabled"),
+             "saved entry is missing before owner replacement check")
+        driver.click("#resume-saved-ssh")
+        wait(lambda: "SSH terminal owner changed" in state()["status"], "replacement owner was not surfaced")
+        assert not relays() and not state()["writable"]
+        assert catalog() == [old_entry], "replacement owner discarded a saved identity"
+        driver.click("#show-saved-ssh")
+        wait(lambda: driver.execute("return !document.querySelector('#forget-saved-ssh').disabled"),
+             "saved entry is unavailable for removal")
+        driver.click("#forget-saved-ssh")
+        wait(lambda: state()["status"] == "No saved SSH shells.", "saved entry was not forgotten")
+        assert catalog() == []
+        stop_desktop()
+
         return dict(
-            native_webview=True, ssh_children=5, detached_content_recovered=True,
+            native_webview=True, detached_content_recovered=True,
             same_pty_input_resumed=True, read_only_grid=True, read_only_write_blocked=True,
             remote_pty_reaped=True, clean_native_exit=True, native_clipboard=True,
             native_remote_rgb_paint=True, detached_pty_bytes=DETACHED_WRITES * len(DETACHED_WRITE),
             recovered_exit_output_stays_read_only=True,
+            native_application_restart_kept_the_same_remote_pty=True,
+            detached_output_recovered_across_application_restart=True,
+            owner_restart_refused_to_attach_and_preserved_record=True,
             artifacts=str(root),
         )
 
@@ -330,10 +440,29 @@ if __name__ == "__main__":
     app = args.app.resolve()
     if not app.is_file() or not os.access(app, os.X_OK):
         parser.error("the Aether Tauri executable must exist and be executable")
-    # Use a private display and session bus even when invoked from a live desktop.
+    # Isolate the display and the service activation environment from the live desktop.
     launch = ("import json, runpy, sys; smoke = runpy.run_path(sys.argv[1]); "
               "print(json.dumps(smoke['exercise'](*sys.argv[2:])), flush=True)")
-    os.execvp("dbus-run-session", [
-        "dbus-run-session", "--", "xvfb-run", "-a", "-s", "-screen 0 1600x1200x24 -nolisten tcp",
-        sys.executable, "-c", launch, str(Path(__file__).resolve()), str(app), args.destination, args.helper,
-    ])
+    scratch = tempfile.mkdtemp(prefix="jwm-aether-ssh-bus.")
+    try:
+        bus_env = os.environ | {"XDG_RUNTIME_DIR": scratch}
+        for name in ("CACHE", "CONFIG", "DATA", "STATE"):
+            directory = Path(scratch) / name.lower()
+            directory.mkdir(mode=0o700)
+            bus_env[f"XDG_{name}_HOME"] = str(directory)
+        status = subprocess.call([
+            "dbus-run-session", "--", "xvfb-run", "-a", "-s", "-screen 0 1600x1200x24 -nolisten tcp",
+            sys.executable, "-c", launch, str(Path(__file__).resolve()), str(app), args.destination, args.helper,
+        ], env=bus_env)
+    finally:
+        # The portal's private FUSE mount can disconnect just before unmounting.
+        deadline = time.monotonic() + 3
+        while True:
+            try:
+                shutil.rmtree(scratch)
+                break
+            except OSError as error:
+                if error.errno != errno.ENOTCONN or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
+    sys.exit(status)

@@ -10,7 +10,13 @@
 <form id="ssh-terminal-form" hidden>
   <label>SSH host <input id="ssh-terminal-host" placeholder="Host alias or user@host" maxlength="255" spellcheck="false" autocomplete="off" required></label>
   <button id="open-ssh" type="submit" disabled>Open SSH shell</button>
+  <button id="show-saved-ssh" type="button" disabled>Saved SSH shells</button>
 </form>
+<section id="saved-ssh" hidden aria-label="Saved SSH shells">
+  <label>Saved shell <select id="saved-ssh-shell"></select></label>
+  <button id="resume-saved-ssh" type="button" disabled>Reconnect view-only</button>
+  <button id="forget-saved-ssh" type="button" disabled>Forget saved shell</button>
+</section>
 <button id="recover">Recover output snapshot</button> <button id="demo">Load frame</button> <button id="open" disabled>Open experimental shell</button> <button id="open-integrated" type="button" disabled>Open jsh with Blocks</button> <button id="detach" disabled>Detach view</button> <button id="attach" disabled>Reconnect view</button> <button id="close" disabled>Close shell</button> <label>Columns <input id="cols" type="number" min="1" max="256" step="1" value="100"></label> <label>Rows <input id="rows" type="number" min="1" max="128" step="1" value="24"></label> <button id="resize" disabled>Apply size</button> <button id="reveal-cursor">Show cursor</button><p id="cursor-status"></p><p id="status" role="status">Ready. ANSI parsing never runs in this WebView.</p>
 <section id="local-shells" hidden aria-label="Retained local shells">
   <div id="saved-local-layout" hidden>

@@ -265,6 +265,47 @@ test('SSH terminal recovers the same grid on a new generation and reattaches rea
  assert.equal(h.el('#open-ssh').disabled,false);
 });
 
+test('a fresh WebView selects a saved SSH shell explicitly and acknowledges it read-only',async()=>{
+ const saved={id:'a'.repeat(32),destination:'remembered-host',created_ms:1};
+ const owner={session:'b'.repeat(32),epoch:1,generation:4};
+ const frame={...JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8')),session:owner.session,epoch:1};
+ const calls=[];
+ const h=harness(async(name,{action})=>{
+  assert.equal(name,'ssh_terminal');calls.push(action);
+  if(action.operation==='list_saved')return [saved];
+  if(action.operation==='restore_saved'){assert.equal(action.id,saved.id);return {owner,frame};}
+  switch(action.command.kind){
+   case 'ack':assert.equal(action.command.owner.generation,4);assert.equal(action.command.revision,frame.revision);return null;
+   case 'poll':return null;
+   case 'status':return {epoch:1,exited:false,drained:false,write_error:null,unsupported:'0',dropped_reply_bytes:'0'};
+   default:throw Error(action.command.kind);
+  }
+ });
+ assert.equal(calls.length,0);
+ await h.click('#show-saved-ssh');
+ assert.deepEqual(calls.map(call=>call.operation),['list_saved']);
+ await h.click('#resume-saved-ssh');
+ assert.deepEqual(calls.map(call=>call.command?.kind??call.operation),['list_saved','restore_saved','ack','poll','status']);
+ assert.equal(h.el('#resize').disabled,true);
+ assert.equal(h.el('#input').disabled,true);
+ h.el('#input').value='echo must stay local';await h.submit();
+ assert.equal(calls.filter(call=>call.command?.kind==='write').length,0);
+ assert.match(h.el('#status').textContent,/remembered-host in view-only mode/);
+});
+
+test('a saved SSH shell that expired releases the open controls',async()=>{
+ const saved={id:'a'.repeat(32),destination:'expired-host',created_ms:1};
+ const h=harness(async(name,{action})=>{
+  assert.equal(name,'ssh_terminal');
+  if(action.operation==='list_saved')return [saved];
+  assert.equal(action.operation,'restore_saved');
+  return {ended:true,message:'The saved SSH shell has expired or was closed.'};
+ });
+ await h.click('#show-saved-ssh');await h.click('#resume-saved-ssh');
+ assert.match(h.el('#status').textContent,/expired or was closed/);
+ assert.equal(h.el('#open-ssh').disabled,false);
+});
+
 test('SSH recovery preserves the lock after an uncertain write and never replays it',async()=>{
  const owner={session:'b'.repeat(32),epoch:1,generation:1};
  const frame={...JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8')),session:owner.session,epoch:1};

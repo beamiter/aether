@@ -1,6 +1,7 @@
 //! One authenticated OpenSSH relay, with an absolute deadline per RPC.
 use super::{
-    invalid, read_record, write_record, Command, Reply, Request, MAX_REPLY, MAX_REQUEST, VERSION,
+    invalid, read_record, valid_identity, write_record, Command, Reply, Request, HOST_CHANGED,
+    MAX_REPLY, MAX_REQUEST, VERSION,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
@@ -33,6 +34,10 @@ impl Endpoint {
 
     pub fn files(destination: &str, helper: Option<&Path>) -> Result<Self, String> {
         Self::helper(destination, helper, "files", None)
+    }
+
+    pub fn destination(&self) -> &str {
+        &self.destination
     }
 
     fn helper(
@@ -113,6 +118,7 @@ impl Endpoint {
                 deadline: Instant::now(),
             }),
             next_request: 1,
+            host: None,
         })
     }
 }
@@ -165,9 +171,28 @@ pub struct Relay {
     child: Child,
     channel: BufReader<DeadlineStream>,
     next_request: u32,
+    host: Option<String>,
 }
 
 impl Relay {
+    /// Discover the owner before sending any saved session identity. Bind
+    /// subsequent requests as stdio can reach a replacement Unix socket even
+    /// on the same authenticated SSH connection.
+    pub fn bind_host(&mut self, expected: Option<&str>) -> Result<String, String> {
+        let reply = self
+            .call(Command::Identify)
+            .map_err(|_| "SSH terminal owner identity is unavailable.")??;
+        let identity = reply
+            .as_str()
+            .filter(|identity| valid_identity(identity))
+            .ok_or("Invalid SSH terminal owner identity.")?;
+        if expected.is_some_and(|expected| expected != identity) {
+            return Err(HOST_CHANGED.into());
+        }
+        self.host = Some(identity.to_owned());
+        Ok(identity.to_owned())
+    }
+
     /// An I/O error ends the relay. The caller can recover the known session
     /// on a new relay without retransmitting the interrupted operation.
     pub fn call(&mut self, command: Command) -> io::Result<Result<Value, String>> {
@@ -190,6 +215,7 @@ impl Relay {
             &Request {
                 protocol: VERSION,
                 request,
+                host: self.host.clone(),
                 command,
             },
             request_limit,

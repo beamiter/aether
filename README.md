@@ -111,7 +111,14 @@ from a compositing window manager such as JWM on X11. Aether waits for
 presentation feedback before requesting a shared body. Closing a window that
 owns one waits for the cleared frame's feedback and the daemon's acceptance.
 
-## SSH files and read-only Workspace
+## SSH terminals, files and read-only Workspace
+
+In **Terminal**, enter an OpenSSH alias and choose **Open SSH shell**. After
+restarting Aether, choose **Saved SSH shells** and **Reconnect view-only** to
+see the existing shell when its remote owner still has the PTY. **Forget
+saved shell** removes the local listing. **Close shell** in the connected
+view closes the remote PTY. The restart workflow requires a current
+`aether-terminal-host` on the SSH host.
 
 In **SSH Files**, enter a known OpenSSH host and an absolute Linux project
 directory. Install `aether-terminal-host` on that host's PATH. Aether starts

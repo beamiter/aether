@@ -18,20 +18,29 @@ SSH = [
 MAX_RECORD = 16 * 1024 * 1024
 
 SUPERVISE = '''
-import pathlib, subprocess, sys, tempfile, time
+import pathlib, socket, subprocess, sys, tempfile, time
 with tempfile.TemporaryDirectory(prefix='aether-ssh-') as directory:
-    socket = pathlib.Path(directory) / 'terminal.sock'
-    owner = subprocess.Popen([sys.argv[1], 'serve', str(socket)], stdin=subprocess.DEVNULL,
-                             stdout=subprocess.DEVNULL)
-    try:
+    endpoint = pathlib.Path(directory) / 'terminal.sock'
+
+    def launch_owner():
+        owner = subprocess.Popen([sys.argv[1], 'serve', str(endpoint)], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL)
         deadline = time.monotonic() + 6
-        while not socket.is_socket():
-            assert owner.poll() is None, 'terminal owner exited before binding'
-            assert time.monotonic() < deadline, 'terminal owner socket timed out'
-            time.sleep(0.02)
-        print(socket, flush=True)
-        sys.stdin.buffer.readline()
-    finally:
+        try:
+            while True:
+                assert owner.poll() is None, 'terminal owner exited before binding'
+                assert time.monotonic() < deadline, 'terminal owner socket timed out'
+                try:
+                    with socket.socket(socket.AF_UNIX) as probe:
+                        probe.connect(str(endpoint))
+                    return owner
+                except (FileNotFoundError, ConnectionRefusedError):
+                    time.sleep(0.02)
+        except BaseException:
+            reap_owner(owner)
+            raise
+
+    def reap_owner(owner):
         if owner.poll() is None:
             owner.terminate()
         try:
@@ -39,6 +48,17 @@ with tempfile.TemporaryDirectory(prefix='aether-ssh-') as directory:
         except subprocess.TimeoutExpired:
             owner.kill()
             owner.wait(5)
+
+    owner = launch_owner()
+    try:
+        print(endpoint, flush=True)
+        for command in sys.stdin.buffer:
+            assert command.strip() == b'restart'
+            reap_owner(owner)
+            owner = launch_owner()
+            print(endpoint, flush=True)
+    finally:
+        reap_owner(owner)
 '''
 
 RELEASE_DETACHED_OUTPUT = '''

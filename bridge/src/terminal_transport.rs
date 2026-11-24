@@ -19,6 +19,7 @@ use std::{
 };
 
 pub const VERSION: u8 = 1;
+pub const HOST_CHANGED: &str = "terminal host instance changed";
 const MAX_REQUEST: usize = 128 * 1024;
 const MAX_REPLY: usize = 16 * 1024 * 1024;
 const MAX_INPUT: usize = 16 * 1024;
@@ -33,12 +34,15 @@ const IDLE_OWNER_TICK: Duration = Duration::from_millis(1000);
 pub struct Request<C = Command> {
     pub protocol: u8,
     pub request: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     pub command: C,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum Command {
+    Identify,
     Open {
         rows: usize,
         cols: usize,
@@ -104,9 +108,16 @@ pub struct Reply<T = Value> {
     pub result: Result<T, String>,
 }
 
-#[derive(Default)]
 struct Host {
+    identity: String,
     sessions: SessionTable<LiveBridge, MAX_SESSIONS>,
+}
+
+pub fn valid_identity(identity: &str) -> bool {
+    identity.len() == 32
+        && identity
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn reply_value(value: impl Serialize) -> Result<Value, String> {
@@ -130,6 +141,13 @@ fn check_input(length: usize) -> Result<(), String> {
 }
 
 impl Host {
+    fn new() -> Result<Self, String> {
+        Ok(Self {
+            identity: crate::semantic::session_id()?,
+            sessions: SessionTable::default(),
+        })
+    }
+
     fn expire(&mut self, now: Instant) {
         self.sessions.expire(now, INACTIVITY);
     }
@@ -148,10 +166,16 @@ impl Host {
     }
 
     fn reply(&mut self, request: Request) -> Reply {
-        let result = if request.protocol == VERSION && request.request != 0 {
-            self.execute(request.command)
-        } else {
+        let result = if request.protocol != VERSION || request.request == 0 {
             Err("unsupported terminal transport version or request ID".into())
+        } else if request
+            .host
+            .as_ref()
+            .is_some_and(|host| host != &self.identity)
+        {
+            Err(HOST_CHANGED.into())
+        } else {
+            self.execute(request.command)
         };
         Reply {
             protocol: VERSION,
@@ -162,6 +186,7 @@ impl Host {
 
     fn execute(&mut self, command: Command) -> Result<Value, String> {
         let (id, result) = match command {
+            Command::Identify => return reply_value(&self.identity),
             Command::Open { rows, cols } => {
                 check_grid(rows, cols)?;
                 return self.sessions.admit(|| {
@@ -431,7 +456,7 @@ fn limit_socket(socket: &UnixStream) -> io::Result<()> {
 /// Run the per-account owner independently of SSH transport lifetimes.
 pub fn serve(socket: &Path) -> io::Result<()> {
     let (listener, _socket_file) = bind(socket)?;
-    let mut host = Host::default();
+    let mut host = Host::new().map_err(io::Error::other)?;
     let mut readiness = libc::pollfd {
         fd: listener.as_raw_fd(),
         events: libc::POLLIN,
@@ -545,10 +570,11 @@ mod tests {
             .is_some());
         let wrong_schema = b"{\"protocol\":1,\"request\":1,\"command\":{\"kind\":\"open\",\"rows\":16,\"cols\":80,\"extra\":0}}\n";
         assert!(read_record::<Request>(&mut &wrong_schema[..], 128).is_err());
-        let mut host = Host::default();
+        let mut host = Host::new().unwrap();
         let reply = host.reply(Request {
             protocol: VERSION + 1,
             request: 1,
+            host: None,
             command: Command::Open { rows: 16, cols: 80 },
         });
         assert!(reply.result.is_err());
@@ -556,8 +582,54 @@ mod tests {
     }
 
     #[test]
+    fn expected_host_is_checked_before_allocating_or_looking_up_a_pty() {
+        let mut first = Host::new().unwrap();
+        let mut replacement = Host::new().unwrap();
+        let request = |host, command| Request {
+            protocol: VERSION,
+            request: 1,
+            host,
+            command,
+        };
+        let identity = first
+            .reply(request(None, Command::Identify))
+            .result
+            .unwrap();
+        assert!(valid_identity(identity.as_str().unwrap()));
+        assert_ne!(
+            replacement
+                .reply(request(None, Command::Identify))
+                .result
+                .unwrap(),
+            identity,
+        );
+        let identity = identity.as_str().unwrap().to_owned();
+        for command in [
+            Command::Open { rows: 16, cols: 80 },
+            Command::AttachReadOnly {
+                session: "f".repeat(32),
+                epoch: 1,
+            },
+        ] {
+            assert_eq!(
+                replacement
+                    .reply(request(Some(identity.clone()), command))
+                    .result,
+                Err(HOST_CHANGED.into()),
+            );
+        }
+        assert!(replacement.sessions.is_empty());
+        assert_eq!(
+            first
+                .reply(request(Some(identity.clone()), Command::Identify))
+                .result,
+            Ok(Value::String(identity)),
+        );
+    }
+
+    #[test]
     fn host_limits_live_ptys_and_expires_abandoned_sessions() {
-        let mut host = Host::default();
+        let mut host = Host::new().unwrap();
         assert!(host.execute(Command::Open { rows: 0, cols: 80 }).is_err());
         for _ in 0..MAX_SESSIONS {
             host.execute(Command::Open { rows: 16, cols: 80 }).unwrap();
@@ -578,7 +650,7 @@ mod tests {
             Ok(serde_json::from_value(result).unwrap())
         }
 
-        let mut host = Host::default();
+        let mut host = Host::new().unwrap();
         let a = open(&mut host).unwrap();
         let b = open(&mut host).unwrap();
         assert_ne!(a.session, b.session);
@@ -639,7 +711,7 @@ mod tests {
 
     #[test]
     fn unattended_exit_output_renews_retention_and_recovers_read_only() {
-        let mut host = Host::default();
+        let mut host = Host::new().unwrap();
         let opened = host.execute(Command::Open { rows: 8, cols: 80 }).unwrap();
         let owner: Attachment = serde_json::from_value(opened).unwrap();
         let bytes = b"printf '%s%s\\n' EXIT_ WITNESS; exit\n";
