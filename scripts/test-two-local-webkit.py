@@ -2286,8 +2286,9 @@ def exercise_native_mission(driver, owned, command, reopen_task, task, snapshot,
     assert external["Ok"]["Mission"]["mission"]["revision"] == 2
     driver.type("#mission-edit-goal", " Keep this attempted edit.")
     driver.click("#mission-save")
-    wait_for(lambda: any(detail in view()["status"] for detail in ("changed in another", "Saved revision reloaded")),
-             "another view's Mission save was overwritten")
+    wait_for(lambda: (current := view())["open"] and any(
+        detail in current["status"] for detail in ("changed in another", "Saved revision reloaded")
+    ), "the conflicting Mission save did not finish with reopening available")
     assert view()["goal"].endswith("Keep this attempted edit.") and read()["mission"]["goal"] == replacement
     driver.click("#mission-open")
     wait_for(lambda: view()["goal"] == replacement and "revision 2" in view()["status"],
