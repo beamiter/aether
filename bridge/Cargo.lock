@@ -197,7 +197,7 @@ dependencies = [
 [[package]]
 name = "jterm_engine"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core?rev=85b379f3afdf35d9b06506819428fbfe50d9f88d#85b379f3afdf35d9b06506819428fbfe50d9f88d"
+source = "git+https://github.com/beamiter/jterm_core?rev=f9e6cd7ca95e00b685645393af268b7f4804baa3#f9e6cd7ca95e00b685645393af268b7f4804baa3"
 dependencies = [
  "smallvec",
  "unicode-segmentation",
@@ -207,7 +207,7 @@ dependencies = [
 [[package]]
 name = "jterm_protocol"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core?rev=85b379f3afdf35d9b06506819428fbfe50d9f88d#85b379f3afdf35d9b06506819428fbfe50d9f88d"
+source = "git+https://github.com/beamiter/jterm_core?rev=f9e6cd7ca95e00b685645393af268b7f4804baa3#f9e6cd7ca95e00b685645393af268b7f4804baa3"
 dependencies = [
  "serde",
 ]
@@ -215,7 +215,7 @@ dependencies = [
 [[package]]
 name = "jterm_runtime"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core?rev=85b379f3afdf35d9b06506819428fbfe50d9f88d#85b379f3afdf35d9b06506819428fbfe50d9f88d"
+source = "git+https://github.com/beamiter/jterm_core?rev=f9e6cd7ca95e00b685645393af268b7f4804baa3#f9e6cd7ca95e00b685645393af268b7f4804baa3"
 dependencies = [
  "crossbeam-channel",
  "jterm_engine",
