@@ -24,6 +24,7 @@ DETACHED_WRITE = b"\x1b[12;1H" + b" " * 64
 READ = """
 return {
     status: document.querySelector('#status').textContent,
+    health: document.querySelector('#health').textContent,
     writable: !document.querySelector('#input').disabled &&
               !document.querySelector('#send').disabled,
     draft: document.querySelector('#input').value,
@@ -126,9 +127,9 @@ def exercise(app, destination, helper):
         wait(lambda: native["opened_page"](driver), "embedded Aether tauri: page did not load")
         desktop = wait(lambda: owned_desktop(app, webkit.pid), "owned native Aether process")
 
-        def run(*args):
+        def run(*args, timeout=4):
             return subprocess.run(list(map(str, args)), env=env, text=True, check=True,
-                                  capture_output=True, timeout=4).stdout
+                                  capture_output=True, timeout=timeout).stdout
 
         def find_window():
             found = subprocess.run(["xdotool", "search", "--onlyvisible", "--pid", str(desktop)],
@@ -139,7 +140,7 @@ def exercise(app, destination, helper):
         run("xdotool", "windowactivate", "--sync", window)
 
         def snap(name):
-            run("import", "-window", window, root / (name + ".png"))
+            run("import", "-limit", "thread", 1, "-window", window, root / (name + ".png"), timeout=12)
 
         def stop_desktop():
             desktop_fd = os.pidfd_open(desktop)
@@ -186,6 +187,24 @@ def exercise(app, destination, helper):
 
         def state():
             return driver.execute(READ)
+
+        def wait_for_input():
+            try:
+                wait(lambda: state()["writable"], "remote shell does not accept input")
+            except AssertionError as error:
+                snap("input-unavailable")
+                current = state()
+                raise AssertionError(f"{error}. Aether reported {current['status']!r} "
+                                     f"and {current['health']!r}") from error
+
+        def close_shell():
+            driver.click("#close")
+            try:
+                wait(lambda: not relays() and state()["status"].startswith("Terminal closed"),
+                     "explicit close did not retire the SSH relay", timeout=18)
+            except AssertionError as error:
+                snap("close-unconfirmed")
+                raise AssertionError(f"{error}. Aether reported {state()['status']!r}") from error
 
         def clipboard():
             try:
@@ -246,7 +265,7 @@ def exercise(app, destination, helper):
         driver.type("#ssh-terminal-host", destination)
         driver.click("#open-ssh")
         first, = wait(relays, "Aether starts OpenSSH")
-        wait(lambda: state()["writable"], "remote shell does not accept input")
+        wait_for_input()
         snap("connected")
 
         submit("stty -echo; printf '\\033[1;1H\\033[48;2;22;63;91m%20s\\033[0m' ''; "
@@ -358,9 +377,7 @@ def exercise(app, destination, helper):
         assert state()["pixel"] == [22, 63, 91, 255]
         snap("application-restart")
 
-        driver.click("#close")
-        wait(lambda: not relays() and state()["status"].startswith("Terminal closed"),
-             "explicit close did not retire relay")
+        close_shell()
         probe["remote_python"](destination, probe["CONFIRM_REAPED"], str(remote_pid), born)
         assert catalog() == [], "closing the remote PTY left a saved entry"
         snap("closed")
@@ -368,7 +385,7 @@ def exercise(app, destination, helper):
         driver.type("#ssh-terminal-host", destination)
         driver.click("#open-ssh")
         fourth, = wait(relays, "second Aether SSH terminal did not start")
-        wait(lambda: state()["writable"], "second remote terminal was read-only before exit")
+        wait_for_input()
         identity_path = str(owned / "exit-identity")
         gate = str(owned / "allow-exit")
         submit(f"printf '%s %s\\n' \"$$\" \"$(awk '{{print $22}}' /proc/$$/stat)\" > {quote(identity_path)}; "
@@ -389,8 +406,9 @@ def exercise(app, destination, helper):
         wait(lambda: visible("EXIT_OUTPUT") and "Input remains disabled" in state()["status"],
              "recovered exit output did not carry the host's read-only input grant")
         assert not state()["writable"]
-        driver.click("#close")
-        wait(lambda: not relays(), "closing the recovered exit output left an SSH relay")
+        wait(lambda: driver.execute("return !document.querySelector('#detach').disabled"),
+             "recovery should finish before closing the exit output")
+        close_shell()
 
         driver.click("#open-ssh")
         wait(lambda: len(relays()) == 1 and state()["writable"], "third SSH shell did not open")
@@ -414,7 +432,12 @@ def exercise(app, destination, helper):
         wait(lambda: driver.execute("return !document.querySelector('#forget-saved-ssh').disabled"),
              "saved entry is unavailable for removal")
         driver.click("#forget-saved-ssh")
-        wait(lambda: state()["status"] == "No saved SSH shells.", "saved entry was not forgotten")
+        try:
+            wait(lambda: state()["status"] == "No saved SSH shells.", "saved entry was not forgotten")
+        except AssertionError as error:
+            snap("forget-unconfirmed")
+            raise AssertionError(f"{error}. Aether reported {state()['status']!r} "
+                                 f"with {len(catalog())} saved shells on disk") from error
         assert catalog() == []
         stop_desktop()
 
@@ -462,7 +485,7 @@ if __name__ == "__main__":
                 shutil.rmtree(scratch)
                 break
             except OSError as error:
-                if error.errno != errno.ENOTCONN or time.monotonic() >= deadline:
+                if error.errno not in {errno.EBUSY, errno.ENOTCONN, errno.EPERM} or time.monotonic() >= deadline:
                     raise
                 time.sleep(0.05)
     sys.exit(status)
