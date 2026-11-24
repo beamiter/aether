@@ -58,7 +58,7 @@ def owned_desktop(app, group):
     return None
 
 
-def exercise(app, destination, helper):
+def exercise(app, destination, helper, legacy_helper=False):
     probe = runpy.run_path(str(Path(__file__).with_name("test-ssh-terminal-session.py")))
     native = runpy.run_path(str(Path(__file__).with_name("test-two-local-webkit.py")))
     wait = native["wait_for"]
@@ -264,9 +264,20 @@ def exercise(app, destination, helper):
         snap("start")
         driver.type("#ssh-terminal-host", destination)
         driver.click("#open-ssh")
-        first, = wait(relays, "Aether starts OpenSSH")
         wait_for_input()
+        first, = wait(relays, "Aether starts OpenSSH")
         snap("connected")
+
+        if legacy_helper:
+            assert "Restart recovery requires a current SSH terminal helper" in state()["status"]
+            submit("printf '%s%s\\r\\n' LEGACY_ WORKS")
+            wait(lambda: visible("LEGACY_WORKS"), "the older helper did not carry shell input and output")
+            close_shell()
+            driver.click("#show-saved-ssh")
+            wait(lambda: state()["status"] == "No saved SSH shells.", "the older helper created a saved entry")
+            stop_desktop()
+            return dict(legacy_helper=True, shell_input_and_output=True,
+                        saved_catalog_remains_empty=True, artifacts=str(root))
 
         submit("stty -echo; printf '\\033[1;1H\\033[48;2;22;63;91m%20s\\033[0m' ''; "
                "printf '\\033[2;1H\\033[2K%s\\r\\n' ECHO_DISABLED")
@@ -459,13 +470,14 @@ if __name__ == "__main__":
     parser.add_argument("app", type=Path, help="path to the built Aether Tauri executable")
     parser.add_argument("destination", help="SSH destination with a verified host key")
     parser.add_argument("helper", help="absolute path to aether-terminal-host on the SSH host")
+    parser.add_argument("--legacy-helper", action="store_true", help="verify shell access with a helper released before the catalog")
     args = parser.parse_args()
     app = args.app.resolve()
     if not app.is_file() or not os.access(app, os.X_OK):
         parser.error("the Aether Tauri executable must exist and be executable")
     # Isolate the display and the service activation environment from the live desktop.
     launch = ("import json, runpy, sys; smoke = runpy.run_path(sys.argv[1]); "
-              "print(json.dumps(smoke['exercise'](*sys.argv[2:])), flush=True)")
+              "print(json.dumps(smoke['exercise'](*sys.argv[2:5], sys.argv[5] == '1')), flush=True)")
     scratch = tempfile.mkdtemp(prefix="jwm-aether-ssh-bus.")
     try:
         bus_env = os.environ | {"XDG_RUNTIME_DIR": scratch}
@@ -476,6 +488,7 @@ if __name__ == "__main__":
         status = subprocess.call([
             "dbus-run-session", "--", "xvfb-run", "-a", "-s", "-screen 0 1600x1200x24 -nolisten tcp",
             sys.executable, "-c", launch, str(Path(__file__).resolve()), str(app), args.destination, args.helper,
+            str(int(args.legacy_helper)),
         ], env=bus_env)
     finally:
         # The portal's private FUSE mount can disconnect just before unmounting.
