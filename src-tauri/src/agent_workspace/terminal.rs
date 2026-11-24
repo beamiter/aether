@@ -52,6 +52,9 @@ pub(crate) enum Operation {
     Text {
         text: String,
     },
+    Paste {
+        text: String,
+    },
     Detach,
 }
 
@@ -161,8 +164,14 @@ impl Views {
             Operation::Poll => return view.poll().map(|update| Reply::Polled { update }),
             Operation::Ack { revision } => view.ack(revision)?,
             Operation::Text { text } => {
+                view.drain()?;
                 let bytes = view.terminal.encode_text(&text)?;
-                view.write(request, &bytes)?;
+                view.input_for(request)?.input(&bytes)?;
+            }
+            Operation::Paste { text } => {
+                view.drain()?;
+                let bytes = view.terminal.encode_paste(&text)?;
+                view.input_for(request)?.input_paste(bytes)?;
             }
             Operation::Key {
                 name,
@@ -170,8 +179,9 @@ impl Views {
                 alt,
                 ctrl,
             } => {
+                view.drain()?;
                 let bytes = view.terminal.encode_key(&name, shift, alt, ctrl)?;
-                view.write(request, &bytes)?;
+                view.input_for(request)?.input(&bytes)?;
             }
         }
         Ok(Reply::Receipt)
@@ -191,16 +201,14 @@ impl View {
         Ok(())
     }
 
-    fn write(&mut self, request: u32, bytes: &[u8]) -> Result<(), String> {
+    fn input_for(&mut self, request: u32) -> Result<&mut WorkspaceTerminalAttachment, String> {
         if self.accepted.is_none() || request <= self.last_input_request {
             return Err("Stale Workspace input or initial frame unacknowledged".into());
         }
         self.last_input_request = request;
-        let connection = self
-            .connection
+        self.connection
             .as_mut()
-            .ok_or("Workspace input lease is unavailable")?;
-        connection.input(bytes)
+            .ok_or_else(|| "Workspace input lease is unavailable".into())
     }
 
     fn drain(&mut self) -> Result<(), String> {
@@ -212,7 +220,7 @@ impl View {
                 Some(WorkspaceTerminalEvent::Output(bytes)) => {
                     let reply = self.terminal.feed(&bytes)?;
                     if !reply.is_empty() {
-                        connection.input(&reply)?;
+                        connection.input_reply(reply)?;
                     }
                 }
                 Some(WorkspaceTerminalEvent::Exited { code }) => {

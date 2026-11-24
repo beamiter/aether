@@ -1748,7 +1748,30 @@ printf '%s|%s|%s|%s\\n' "$$" "$CODEX_HOME" "$PWD" "$2" >> "$AETHER_WORKSPACE_TRA
 printf 'WORKSPACE_READY\\n'
 while IFS= read -r line; do
     printf '%s\\n' "$line" >> "$AETHER_WORKSPACE_INPUT"
-    if [ "$line" = exit-fixture ]; then exit 7; fi
+    if [ "$line" = exit-fixture ]; then
+        printf 'WORKSPACE_LAST_OUTPUT\\n'
+        exit 7
+    fi
+    if [ "$line" = query-fixture ]; then
+        saved=$(stty -g)
+        stty raw -echo min 0 time 50
+        printf '\\033[12;7H\\033[6n'
+        reply=$(dd bs=1 count=7 status=none)
+        stty "$saved"
+        test "$reply" = "$(printf '\\033[12;7R')"
+        printf '\\nWORKSPACE_QUERY_REPLY_OK\\n'
+        continue
+    fi
+    if [ "$line" = paste-fixture ]; then
+        saved=$(stty -g)
+        stty raw -echo min 0 time 60
+        printf '\\033[?2004hWORKSPACE_PASTE_ARMED\\r\\n'
+        paste=$(dd bs=1 count=22 status=none)
+        stty "$saved"
+        test "$paste" = "$(printf '\\033[200~left\\rright\\033[201~')"
+        printf '\\033[?2004lWORKSPACE_PASTE_OK\\n'
+        continue
+    fi
     printf 'WORKSPACE_REPLY:%s\\n' "$line"
 done
 """)
@@ -1867,6 +1890,20 @@ def exercise_workspace(driver, owned, binary, env, transcripts):
         shows("WORKSPACE_REPLY:from-existing-terminal")
         driver.type("#workspace-input", "from-aether" + "\ue007")
         shows("WORKSPACE_REPLY:from-aether")
+        driver.type("#workspace-input", "query-fixture" + "\ue007")
+        shows("WORKSPACE_QUERY_REPLY_OK")
+        driver.type("#workspace-input", "paste-fixture" + "\ue007")
+        shows("WORKSPACE_PASTE_ARMED")
+        driver.execute("""
+            const input = document.querySelector('#workspace-input');
+            const event = new Event('paste', {bubbles: true, cancelable: true});
+            Object.defineProperty(event, 'clipboardData', {value: {getData: () => 'left\\r\\nright'}});
+            input.dispatchEvent(event);
+        """)
+        assert driver.execute("return !document.querySelector('#workspace-paste-review').hidden;")
+        assert driver.execute("return document.querySelector('#workspace-paste-preview').value;") == "left\nright"
+        driver.click("#workspace-paste-confirm")
+        shows("WORKSPACE_PASTE_OK")
         driver.click("#workspace-detach")
         wait_for(lambda: "Terminal detached" in read_state()["status"], "native Workspace view did not release its lease")
         assert birth(identity[0]) == identity[1]
@@ -1885,7 +1922,10 @@ def exercise_workspace(driver, owned, binary, env, transcripts):
         driver.type("#workspace-input", "exit-fixture" + "\ue007")
         wait_for(lambda: "exited with status 7" in read_state()["status"], "native Workspace exit receipt missing")
         assert not read_state()["writable"]
-        assert received.read_text().splitlines() == ["from-existing-terminal", "from-aether", "exit-fixture"]
+        shows("WORKSPACE_LAST_OUTPUT")
+        assert received.read_text().splitlines() == [
+            "from-existing-terminal", "from-aether", "query-fixture", "paste-fixture", "exit-fixture",
+        ]
         assert trace.read_text().splitlines() == starts
         print(json.dumps({
             "native_workspace_shared_schema_6_catalog": True,
@@ -1893,6 +1933,9 @@ def exercise_workspace(driver, owned, binary, env, transcripts):
             "native_workspace_conflicting_cli_lease_refused": True,
             "native_workspace_reopens_existing_provider_pty": True,
             "native_workspace_provider_input_and_exit_once": True,
+            "native_workspace_protocol_reply_bytes": True,
+            "native_workspace_reviewed_paste_matches_exact_pty_bytes": True,
+            "native_workspace_final_output_before_exit": True,
         }), flush=True)
     except Exception:
         print("Workspace fixture:", log.read_text()[-4000:], read_state(), flush=True)

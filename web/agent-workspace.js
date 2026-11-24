@@ -1,5 +1,6 @@
 import {acceptFull,acceptUpdate,clearPaint,paint} from './frames.js';
 import {installIme} from './ime.js';
+import {installPasteReview} from './paste.js';
 
 const uint=value=>Number.isInteger(value)&&value>0&&value<=0xffffffff;
 const CLI_ID_PREFIX='jterm:cli:v1:';
@@ -65,6 +66,14 @@ export function installWorkspace(document,invoke){
       enqueue(view,{operation:'text',text});
     }
   }});
+  const paste=installPasteReview({
+    panel:byId('workspace-paste-review'),preview:byId('workspace-paste-preview'),
+    escaped:byId('workspace-paste-escaped'),confirm:byId('workspace-paste-confirm'),
+    cancel:byId('workspace-paste-cancel'),
+    getEpoch:()=>root.open&&!input.disabled?active:null,
+    send:(text,view)=>enqueue(view,{operation:'paste',text}),
+    onError:message=>{status.textContent=message;},
+  });
 
   async function call(command,args,id=++request){
     if(!uint(id))throw new Error('Workspace request counter exhausted.');
@@ -237,12 +246,13 @@ export function installWorkspace(document,invoke){
       view.writable=update.writable&&!view.locked;
       if(!view.locked)status.textContent=update.status;
       if(!update.writable){
+        paste.reset();
         if(wasWritable)ime.reset();
         clearInterval(view.timer);
       }
     }catch(error){
       if(active===view&&!detaching){
-        view.writable=false;view.locked=true;ime.reset();clearInterval(view.timer);
+        view.writable=false;view.locked=true;ime.reset();paste.reset();clearInterval(view.timer);
         status.textContent=`Workspace output interrupted. Detach and attach to recover. ${String(error?.message??error)}`;
       }
     }finally{view.polling=false;controls();}
@@ -251,7 +261,7 @@ export function installWorkspace(document,invoke){
   function enqueue(view,operation){
     if(!view||active!==view||input.disabled)return;
     if(view.pending>=128){
-      view.writable=false;view.locked=true;controls();
+      view.writable=false;view.locked=true;paste.reset();controls();
       status.textContent='Workspace keyboard queue is full. Detach and attach to recover.';
       return;
     }
@@ -263,7 +273,7 @@ export function installWorkspace(document,invoke){
         if(result?.kind!=='receipt')throw new Error('Invalid Workspace input receipt.');
       }catch(error){
         if(active!==view||detaching)return;
-        view.writable=false;view.locked=true;ime.reset();controls();
+        view.writable=false;view.locked=true;ime.reset();paste.reset();controls();
         status.textContent=`Workspace input interrupted. Detach and attach to recover. ${String(error?.message??error)}`;
       }
     }).finally(()=>{view.pending--;});
@@ -272,7 +282,7 @@ export function installWorkspace(document,invoke){
   async function release(){
     const view=active;
     if(!view||detach.disabled)return;
-    detaching=true;controls();ime.reset();
+    detaching=true;controls();ime.reset();paste.reset();
     clearInterval(view.timer);
     try{
       const response=await operate(view,{operation:'detach'});
@@ -286,7 +296,10 @@ export function installWorkspace(document,invoke){
   }
 
   root.hidden=false;
-  root.addEventListener('toggle',()=>{if(root.open&&!page()&&!loading)void load();});
+  root.addEventListener('toggle',()=>{
+    if(!root.open)paste.reset();
+    else if(!page()&&!loading)void load();
+  });
   refresh.addEventListener('click',()=>void load());
   previous.addEventListener('click',()=>turnPage(-1));
   more.addEventListener('click',()=>turnPage(1));
@@ -294,11 +307,17 @@ export function installWorkspace(document,invoke){
   attach.addEventListener('click',start);
   detach.addEventListener('click',release);
   canvas.addEventListener('click',()=>input.focus());
-  input.addEventListener('paste',event=>event.preventDefault());
+  input.addEventListener('paste',event=>{
+    event.preventDefault();
+    if(!input.disabled)paste.offer(event.clipboardData?.getData('text/plain')||'',input);
+  });
   input.addEventListener('keydown',event=>{
     if(event.defaultPrevented||input.disabled||ime.isComposing()||event.isComposing||
         event.keyCode===229||event.metaKey||event.getModifierState?.('AltGraph')||
-        event.key==='Dead'||event.key==='Process')return;
+        event.key==='Dead'||event.key==='Process'||paste.dismissFromOrigin(event))return;
+    const desktopPaste=event.shiftKey&&!event.altKey&&(
+      (event.ctrlKey&&event.key.toLowerCase()==='v')||(!event.ctrlKey&&event.key==='Insert'));
+    if(desktopPaste)return;
     if(!keys.test(event.key)&&(!(event.ctrlKey||event.altKey)||[...event.key].length!==1))return;
     event.preventDefault();
     enqueue(active,{operation:'key',name:event.key,shift:event.shiftKey,alt:event.altKey,ctrl:event.ctrlKey});

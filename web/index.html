@@ -135,6 +135,13 @@
   <section id="workspace-view" aria-label="Workspace CLI terminal" hidden>
     <div class="viewport"><canvas id="workspace-canvas" aria-label="Workspace CLI terminal output"></canvas></div>
     <label>Workspace terminal input <textarea id="workspace-input" rows="2" spellcheck="false" autocomplete="off" disabled></textarea></label>
+    <section id="workspace-paste-review" hidden aria-label="Review multiline Workspace paste">
+      <p>Review every line before sending. Newlines may execute commands.</p>
+      <label>Paste text <textarea id="workspace-paste-preview" rows="4" readonly></textarea></label>
+      <pre id="workspace-paste-escaped" tabindex="0" aria-label="Original clipboard text with escaped line endings and format characters"></pre>
+      <button id="workspace-paste-confirm" type="button" disabled>Send reviewed paste</button>
+      <button id="workspace-paste-cancel" type="button">Cancel paste</button>
+    </section>
     <button id="workspace-copy-visible" type="button">Snapshot visible text</button>
     <textarea id="workspace-output" rows="6" readonly aria-label="Workspace terminal visible text snapshot" hidden></textarea>
   </section>

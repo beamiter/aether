@@ -38,7 +38,7 @@ function catalogHarness(handle){
         rect(){},clip(){},fillText(){},restore(){}};},
       addEventListener(kind,callback){this.events.set(kind,callback);},
       replaceChildren(...children){this.children=children;this.value=children[0]?.value??'';},
-      fire(kind){if(kind!=='click'||!this.disabled)return this.events.get(kind)?.();}
+      fire(kind,event){if(kind!=='click'||!this.disabled)return this.events.get(kind)?.(event);}
     };
   }
   const get=name=>{
@@ -230,6 +230,46 @@ test('Workspace attach cannot steal focus after the user moves away before first
       await result;
       await h.act('detach');
     }
+  }
+});
+
+test('Workspace multiline paste needs confirmation and expires on detach',async()=>{
+  const owner={session:'b'.repeat(32),epoch:4,generation:4};
+  const identity={conversation:first,owner};
+  const frame={version:3,session:owner.session,epoch:owner.epoch,revision:1,layout:1,cols:1,
+    rows:[[{text:'a',foreground:'#ffffff',background:'#000000',width:1,style:0}]],
+    cursor_row:0,cursor_col:0,cursor_visible:false,cursor_shape:'block',pending_wrap:false};
+  const h=catalogHarness((command,args)=>{
+    if(command==='workspace_catalog')return {generation:1,rows:[row(first)],next_before:null};
+    if(command==='workspace_attach')return {identity,frame};
+    if(args.operation.operation==='poll')return {kind:'polled',
+      update:{frame:null,writable:true,status:'Fixture ready.'}};
+    return {kind:'receipt'};
+  });
+  const sent=()=>h.calls.filter(([,args])=>args.operation?.operation==='paste');
+  const offer=text=>{
+    let prevented=false;
+    h.button('input').fire('paste',{
+      preventDefault(){prevented=true;},clipboardData:{getData:()=>text}
+    });
+    assert.equal(prevented,true);
+  };
+  await h.act('refresh');
+  await h.act('attach');
+  try{
+    assert.equal(h.button('input').disabled,false);
+    offer('first\r\nsecond');
+    assert.equal(h.button('paste-review').hidden,false);
+    assert.equal(sent().length,0);
+    await h.act('paste-confirm');
+    assert.deepEqual(sent().map(([,args])=>args.operation.text),['first\r\nsecond']);
+    offer('queued\nreview');
+    await h.act('detach');
+    assert.equal(h.button('paste-review').hidden,true);
+    await h.act('paste-confirm');
+    assert.equal(sent().length,1);
+  }finally{
+    await h.act('detach');
   }
 });
 
