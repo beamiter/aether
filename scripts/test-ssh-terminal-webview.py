@@ -78,7 +78,9 @@ def exercise(app, destination, helper, legacy_helper=False):
 
     with contextlib.ExitStack() as cleanup:
         supervisor = probe["Channel"](destination, ["python3", "-c", probe["SUPERVISE"], helper])
-        cleanup.callback(supervisor.close)
+        # The remote supervisor can spend ten seconds stopping and reaping
+        # the owner before the SSH channel can close.
+        cleanup.callback(supervisor.close, timeout=15)
         endpoint = supervisor.line().decode()
         remote_socket = PurePosixPath(endpoint)
         owned = remote_socket.parent
@@ -498,7 +500,7 @@ if __name__ == "__main__":
                 shutil.rmtree(scratch)
                 break
             except OSError as error:
-                if error.errno not in {errno.EBUSY, errno.ENOTCONN, errno.EPERM} or time.monotonic() >= deadline:
+                if error.errno not in {errno.EBUSY, errno.ECONNABORTED, errno.ENOTCONN, errno.EPERM} or time.monotonic() >= deadline:
                     raise
                 time.sleep(0.05)
     sys.exit(status)

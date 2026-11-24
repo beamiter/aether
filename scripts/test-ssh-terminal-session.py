@@ -141,10 +141,10 @@ class Channel:
         assert self.child.wait(5) < 0
         self.was_cut = True
 
-    def close(self):
+    def close(self, timeout=7):
         self.child.stdin.close()
         try:
-            status = self.child.wait(7)
+            status = self.child.wait(timeout)
         except subprocess.TimeoutExpired:
             self.child.kill()
             self.child.wait(5)
