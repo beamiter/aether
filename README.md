@@ -12,7 +12,7 @@ The three Cargo manifests pin the shared crates to
 output drain. Its `jterm_engine::terminal::Terminal` owns parsing, screen
 state, input encoding, history and immutable frames. The session host supplies
 each frame stream's epoch. Run `python3 scripts/check-core-pin.py` to verify
-that every shared package in the manifests and lockfiles uses that published commit.
+that every shared package in the manifests and lockfiles uses that Git commit.
 [Core upgrade verification](docs/CORE-UPGRADE.md)
 
 ## Terminal session synchronization

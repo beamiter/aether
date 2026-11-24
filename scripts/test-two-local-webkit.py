@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import errno
 import fcntl
+import hashlib
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -2011,7 +2012,12 @@ def exercise_workspace(driver, owned, binary, env, transcripts):
             "native_workspace_legacy_view_answers_without_duplicates": True,
             "native_workspace_removes_only_the_confirmed_profile": True,
         }), flush=True)
-        print(json.dumps({"case": "PRODUCT.CLI.001.NATIVE.001", "backend": "x11", "result": "passed"}), flush=True)
+        print(json.dumps({
+            "case": "PRODUCT.CLI.001.NATIVE.001",
+            "backend": env["GDK_BACKEND"],
+            "result": "passed",
+            "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+        }), flush=True)
     except Exception:
         print("Workspace fixture:", log.read_text()[-4000:], read_state(), flush=True)
         print("Workspace helper:", helper.poll() if helper is not None else None,
@@ -3302,18 +3308,32 @@ def private_accessibility_address():
     return address.unpack()[0]
 
 
-def run(binary, jsh, workspace, api, native, notebook=False, output_review=False, vim9=False, inline_graphics_only=False, history_graphics_only=False):
+def run(binary, jsh, workspace, api, native, notebook=False, output_review=False, vim9=False,
+        inline_graphics_only=False, history_graphics_only=False, workspace_only=False, backend="x11"):
     executable = shutil.which("WebKitWebDriver")
-    if not executable or not os.environ.get("DISPLAY") or not os.environ.get("XAUTHORITY"):
-        raise RuntimeError("run with official WebKitWebDriver and authenticated Xvfb")
+    if not executable:
+        raise RuntimeError("run with official WebKitWebDriver")
+    if backend == "wayland":
+        display = os.environ.get("WAYLAND_DISPLAY")
+        if not display:
+            raise RuntimeError("run with a private Wayland compositor")
+        socket_path = Path(os.environ.get("XDG_RUNTIME_DIR", "")) / display
+        if not socket_path.is_absolute() or not socket_path.is_socket():
+            raise RuntimeError("WAYLAND_DISPLAY must identify the private compositor socket")
+        connection = {"WAYLAND_DISPLAY": str(socket_path)}
+    else:
+        if not os.environ.get("DISPLAY") or not os.environ.get("XAUTHORITY"):
+            raise RuntimeError("run with authenticated Xvfb")
+        connection = {name: os.environ[name] for name in ("DISPLAY", "XAUTHORITY")}
     with tempfile.TemporaryDirectory(prefix="aether-native-two-") as scratch:
         owned = Path(scratch)
-        env = {name: os.environ[name] for name in ("DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS", "GDK_SCALE")
+        env = {name: os.environ[name] for name in ("DBUS_SESSION_BUS_ADDRESS", "GDK_SCALE")
                if name in os.environ}
+        env.update(connection)
         env.update({"HOME": scratch, "PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8",
-                    "GDK_BACKEND": "x11", "LIBGL_ALWAYS_SOFTWARE": "1",
+                    "GDK_BACKEND": backend, "LIBGL_ALWAYS_SOFTWARE": "1",
                     "TAURI_WEBVIEW_AUTOMATION": "true"})
-        if jsh or workspace or native or vim9:
+        if jsh or workspace or workspace_only or native or vim9:
             launch = owned / "bin"
             launch.mkdir()
             env["PATH"] = f"{launch}:/usr/bin:/bin"
@@ -3323,7 +3343,7 @@ def run(binary, jsh, workspace, api, native, notebook=False, output_review=False
             (launch / "vim").symlink_to(Path(shutil.which("vim")).resolve())
         if vim9:
             (launch / "rg").symlink_to(Path(shutil.which("rg")).resolve())
-        transcripts = prepare_workspace(owned, env, launch) if workspace else None
+        transcripts = prepare_workspace(owned, env, launch) if workspace or workspace_only else None
         native_fixture = prepare_native_task(owned, env, launch) if native else None
         if api and not workspace:
             env["JTERM_WORKSPACE_STATE_DIR"] = str(owned / "workspace")
@@ -3362,6 +3382,9 @@ def run(binary, jsh, workspace, api, native, notebook=False, output_review=False
                 wait_for(ready, "loopback WebKitWebDriver not ready")
                 driver.open(binary)
                 wait_for(lambda: opened_page(driver), "embedded Aether tauri: page did not load")
+                if workspace_only:
+                    exercise_workspace(driver, owned, binary, env, transcripts)
+                    return
                 if inline_graphics_only:
                     exercise_inline_graphics(driver, owned)
                     return
@@ -3405,6 +3428,8 @@ if __name__ == "__main__":
     parser.add_argument("binary", type=Path, help="exact built tauri-terminal-lab executable")
     parser.add_argument("--jsh", type=Path, help="installed jsh for the command-block, Terminal Chat and workflow journeys")
     parser.add_argument("--workspace", action="store_true", help="include the isolated shared Workspace host and CLI PTY journey")
+    parser.add_argument("--workspace-only", action="store_true", help="run the isolated Workspace CLI journey by itself")
+    parser.add_argument("--backend", choices=("x11", "wayland"), default="x11", help="display backend for the Workspace-only journey")
     parser.add_argument("--api-chat", action="store_true", help="include the isolated local streaming API conversation")
     parser.add_argument("--native-task", action="store_true", help="include the isolated scoped native Codex task and approval")
     parser.add_argument("--notebook", action="store_true", help="include native file selection and a supervised notebook run/stop")
@@ -3422,5 +3447,9 @@ if __name__ == "__main__":
         parser.error("--output-review requires --jsh")
     if args.vim9 and any(not shutil.which(tool) for tool in ("vim", "rg", "xdotool")):
         parser.error("--vim9 requires Vim 9, ripgrep and xdotool")
+    if args.backend == "wayland" and not args.workspace_only:
+        parser.error("--backend wayland requires --workspace-only")
     signal.signal(signal.SIGTERM, interrupted)
-    run(args.binary, args.jsh, args.workspace, args.api_chat, args.native_task, args.notebook, args.output_review, args.vim9, args.inline_graphics_only, args.history_graphics_only)
+    run(args.binary, args.jsh, args.workspace, args.api_chat, args.native_task, args.notebook,
+        args.output_review, args.vim9, args.inline_graphics_only, args.history_graphics_only,
+        workspace_only=args.workspace_only, backend=args.backend)

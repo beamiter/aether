@@ -164,7 +164,10 @@ The source-qualified CLI removal check uses two entries with the same title
 and provider UUID. It cancels once, confirms removal of the idle source, and
 refreshes the catalog before reattaching the still-running provider. It
 compares both fixture transcripts byte for byte and emits
-`PRODUCT.CLI.001.NATIVE.001` for X11.
+`PRODUCT.CLI.001.NATIVE.001` with the display backend and desktop SHA-256.
+`--workspace-only` runs this journey independently. For native Wayland,
+use `--workspace-only --backend wayland` with a private compositor, an
+active keyboard seat, and its socket in `WAYLAND_DISPLAY`.
 
 Add `--api-chat` to run an API conversation against a private loopback
 streaming provider. The real Workspace host acknowledges a multiline draft,
