@@ -69,7 +69,7 @@ jobs:
       - name: Install the real jsh fixture
         run: |
           cargo install --locked --debug --git https://github.com/beamiter/jsh.git \
-            --rev 295fc912ef22da4d864b79a549cd01b0b27c3d84 \
+            --rev d9e18fe636d2041fc23dabd7e3d6aa1159cad2e9 \
             --root "$RUNNER_TEMP/aether-shell-fixture" jsh
           sha256sum "$RUNNER_TEMP/aether-shell-fixture/bin/jsh"
       - name: Local PTYs, Terminal Chat, Workflows, Workspace, API Chat, native task, notebook and Vim9 on X11
