@@ -3,7 +3,7 @@ name = "jterm-headless-session-spike"
 version = "0.0.1"
 edition = "2021"
 [dependencies]
-jterm_engine = { git = "https://github.com/beamiter/jterm_core", rev = "fd31651565e9808db4fbe57f9e9335d866bea60c" }
+jterm_engine = { git = "https://github.com/beamiter/jterm_core", rev = "dffca6dd2269488b3a9647135406add5172d32b1" }
 [target.'cfg(target_os = "linux")'.dependencies]
-jterm_runtime = { git = "https://github.com/beamiter/jterm_core", rev = "fd31651565e9808db4fbe57f9e9335d866bea60c", features = ["linux-pty"] }
+jterm_runtime = { git = "https://github.com/beamiter/jterm_core", rev = "dffca6dd2269488b3a9647135406add5172d32b1", features = ["linux-pty"] }
 [workspace]
