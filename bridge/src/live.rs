@@ -401,13 +401,13 @@ impl LiveBridge {
         }))
     }
 
-    fn poll_io(&mut self, capture: bool) -> Result<(), String> {
+    fn poll_io(&mut self, capture: bool) -> Result<usize, String> {
         let session = self.session.as_mut().unwrap();
         let result = session.drive_with_sync_capture(capture);
         if session.write_error().is_some() {
             self.input_attached = false;
         }
-        result.map(|_| ())
+        result
     }
 
     /// A local desktop owner may drain a detached PTY after witnessing that
@@ -434,14 +434,20 @@ impl LiveBridge {
     /// Advance the owner while no receiver is issuing publications. Retain
     /// the last paint boundary across synchronized-output holds.
     pub fn pump_unpublished(&mut self) -> Result<bool, String> {
+        self.pump_unpublished_with_activity()
+            .map(|(active, _)| active)
+    }
+
+    /// Report whether the PTY can still produce output and how many bytes were read.
+    pub(crate) fn pump_unpublished_with_activity(&mut self) -> Result<(bool, usize), String> {
         let Some(session) = self.session.as_ref() else {
-            return Ok(false);
+            return Ok((false, 0));
         };
         if session.is_drained() {
-            return Ok(false);
+            return Ok((false, 0));
         }
         self.unpublished_background = true;
-        self.poll_io(true)?;
+        let output_bytes = self.poll_io(true)?;
         let session = self.session.as_mut().unwrap();
         let completed = session.take_completed_sync_frame();
         let active = !session.is_drained();
@@ -450,7 +456,7 @@ impl LiveBridge {
         } else if let Some(frame) = completed {
             self.stable = Some(frame);
         }
-        Ok(active)
+        Ok((active, output_bytes))
     }
 
     pub fn has_unacknowledged_frame(&self) -> bool {
