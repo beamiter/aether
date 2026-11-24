@@ -151,6 +151,13 @@ def exercise_vim9(driver, fixtures, root, control, ime, keyboard, compositor):
     original = "AETHER_VIM9_WAYLAND\n"
     source.write_text(original, encoding="utf-8")
 
+    def saved_text_is(expected):
+        try:
+            return source.read_text(encoding="utf-8") == expected
+        except FileNotFoundError:
+            # Vim may briefly rename the original while writing the replacement.
+            return False
+
     def focused_window(node):
         if node["focused"]:
             return node
@@ -230,7 +237,7 @@ def exercise_vim9(driver, fixtures, root, control, ime, keyboard, compositor):
         keyboard("-k", "Escape")
         command(":w")
         first_edit = "你" + original
-        wait_for(lambda: source.read_text(encoding="utf-8") == first_edit,
+        wait_for(lambda: saved_text_is(first_edit),
                  "native Vim did not save exactly one composed character")
 
         disconnect = root / "disconnect-vim.vim"
@@ -246,7 +253,7 @@ def exercise_vim9(driver, fixtures, root, control, ime, keyboard, compositor):
         wait_for(automatic_fallback, "disconnecting the bridge did not expose the live Vim terminal")
         assert identity("vim-identity-after") == original_identity, "the live fallback replaced the Vim PTY"
         driver.type("#vim9-input", "GoAETHER_VIM9_AFTER_BRIDGE_LOSS\ue00c:wq\ue007")
-        wait_for(lambda: source.read_text(encoding="utf-8") == first_edit + "AETHER_VIM9_AFTER_BRIDGE_LOSS\n",
+        wait_for(lambda: saved_text_is(first_edit + "AETHER_VIM9_AFTER_BRIDGE_LOSS\n"),
                  "the original Vim PTY did not save the edit after its bridge closed")
         wait_for(lambda: editor()["release"], "Vim exit did not drain its terminal")
         assert fixtures["birth"](original_identity[0]) is None, "the exited Vim process was not reaped"
