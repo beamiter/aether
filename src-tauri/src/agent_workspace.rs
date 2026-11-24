@@ -208,6 +208,23 @@ pub(crate) async fn workspace_catalog<R: tauri::Runtime>(
 }
 
 #[tauri::command]
+pub(crate) async fn workspace_remove_cli<R: tauri::Runtime>(
+    window: tauri::WebviewWindow<R>,
+    request: u32,
+    conversation: ConversationId,
+    catalog_generation: u32,
+    workspace: tauri::State<'_, Workspace>,
+) -> Result<Receipt<ConversationId>, String> {
+    super::require_terminal_window(&window)?;
+    admit(request)?;
+    let value = super::run_bridge(workspace.catalog.clone(), move |catalog| {
+        catalog.remove(catalog_generation, conversation)
+    })
+    .await?;
+    Ok(Receipt { request, value })
+}
+
+#[tauri::command]
 pub(crate) async fn workspace_attach<R: tauri::Runtime>(
     window: tauri::WebviewWindow<R>,
     request: u32,

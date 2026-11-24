@@ -1730,12 +1730,12 @@ def prepare_workspace(owned, env, launch):
     project = owned / "cli-project"
     project.mkdir()
     transcripts = {}
-    for account, title in [(profile, "Selected Workspace fixture"), (owned / ".codex", "Other Workspace fixture")]:
+    for account in (profile, owned / ".codex"):
         source = account / "sessions" / "2026" / "11" / "22" / "rollout.jsonl"
         source.parent.mkdir(parents=True)
         records = [
             {"type": "session_meta", "payload": {"id": WORKSPACE_ID, "cwd": str(project)}},
-            {"type": "event_msg", "payload": {"type": "user_message", "message": title}},
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "Workspace fixture"}},
             {"type": "event_msg", "payload": {"type": "task_complete"}},
         ]
         source.write_text("".join(json.dumps(record) + "\n" for record in records))
@@ -1826,6 +1826,7 @@ def exercise_workspace(driver, owned, binary, env, transcripts):
     trace = Path(env["AETHER_WORKSPACE_TRACE"])
     received = Path(env["AETHER_WORKSPACE_INPUT"])
     profile = env["CODEX_HOME"]
+    saved_files = {path: path.read_bytes() for path in transcripts.values()}
 
     def read_state():
         return driver.execute("""
@@ -1840,15 +1841,22 @@ def exercise_workspace(driver, owned, binary, env, transcripts):
             };
         """)
 
+    def select_conversation(conversation):
+        choices = read_state()["choices"]
+        position = next(index for index, row in enumerate(choices, 1) if row["id"] == conversation)
+        driver.click(f"#workspace-conversation option:nth-child({position})")
+        assert read_state()["selected"] == conversation
+
     def select_fixture():
         driver.click("#agent-workspace > summary")
         wait_for(lambda: len(read_state()["choices"]) == 2, "native Workspace catalog did not show both sources")
         choices = read_state()["choices"]
         assert len({choice["id"] for choice in choices}) == 2, "both profiles collapsed into one native UUID"
-        choice = next((index, row) for index, row in enumerate(choices, 1) if row["title"] == "Selected Workspace fixture")
-        driver.click(f"#workspace-conversation option:nth-child({choice[0]})")
-        assert read_state()["selected"] == choice[1]["id"]
-        return choice[1]["id"]
+        assert all(choice["title"].startswith("Workspace fixture · Profile ") for choice in choices), choices
+        conversation = next(row["id"] for row in choices
+                            if json.loads(row["id"].removeprefix("jterm:cli:v1:"))[2] == profile)
+        select_conversation(conversation)
+        return conversation
 
     def shows(text):
         def snapshot():
@@ -1959,6 +1967,24 @@ def exercise_workspace(driver, owned, binary, env, transcripts):
         driver.open(binary)
         wait_for(lambda: opened_page(driver), "embedded application did not reopen")
         assert select_fixture() == conversation
+        assert driver.execute("return document.querySelector('#workspace-remove').disabled;")
+        other = next(row["id"] for row in read_state()["choices"] if row["id"] != conversation)
+        select_conversation(other)
+        driver.click("#workspace-remove")
+        assert driver.execute("return document.querySelector('#workspace-remove-selection').textContent.includes('Profile ');")
+        driver.click("#workspace-remove-cancel")
+        assert {row["id"] for row in read_state()["choices"]} == {conversation, other}
+        driver.click("#workspace-remove")
+        driver.click("#workspace-remove-confirm")
+        wait_for(lambda: read_state()["status"] == "Conversation removed from Workspace.",
+                 "Workspace did not confirm removal of the selected source")
+        assert [row["id"] for row in read_state()["choices"]] == [conversation]
+        driver.click("#workspace-refresh")
+        wait_for(lambda: not driver.execute("return document.querySelector('#workspace-refresh').disabled;"),
+                 "the CLI catalog did not refresh after removing a source")
+        assert [row["id"] for row in read_state()["choices"]] == [conversation]
+        assert all(path.read_bytes() == data for path, data in saved_files.items())
+        assert birth(identity[0]) == identity[1]
         driver.click("#workspace-attach")
         wait_for(lambda: read_state()["writable"], "reopened app did not recover the same Workspace terminal")
         shows("WORKSPACE_REPLY:from-aether")
@@ -1983,7 +2009,9 @@ def exercise_workspace(driver, owned, binary, env, transcripts):
             "native_workspace_detached_host_answers_wide_viewport": True,
             "native_workspace_query_split_across_detach": True,
             "native_workspace_legacy_view_answers_without_duplicates": True,
+            "native_workspace_removes_only_the_confirmed_profile": True,
         }), flush=True)
+        print(json.dumps({"case": "PRODUCT.CLI.001.NATIVE.001", "backend": "x11", "result": "passed"}), flush=True)
     except Exception:
         print("Workspace fixture:", log.read_text()[-4000:], read_state(), flush=True)
         print("Workspace helper:", helper.poll() if helper is not None else None,

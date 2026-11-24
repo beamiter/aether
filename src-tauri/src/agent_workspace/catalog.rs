@@ -1,7 +1,7 @@
 use jterm_core::{
     agent_sessions::{AgentSession, SessionCatalog, SessionLibrarySnapshot},
     agent_workspace::{
-        ConversationId, ConversationKind, WorkspaceCliCatalogIndex, WorkspaceClient,
+        ConversationId, ConversationKind, RuntimeState, WorkspaceCliCatalogIndex, WorkspaceClient,
         WorkspaceCommand, WorkspaceReply,
     },
 };
@@ -13,7 +13,7 @@ const PAGE_ROWS: usize = 32;
 pub(super) struct Catalog {
     client: Option<WorkspaceClient>,
     sources: HashMap<ConversationId, AgentSession>,
-    shown: HashSet<ConversationId>,
+    shown: HashMap<ConversationId, Availability>,
     generation: u32,
     next: Option<u64>,
 }
@@ -32,7 +32,14 @@ struct Row {
     provider: String,
     directory: String,
     status: &'static str,
+    #[serde(flatten)]
+    availability: Availability,
+}
+
+#[derive(Clone, Copy, serde::Serialize)]
+struct Availability {
     reopenable: bool,
+    removable: bool,
 }
 
 impl Catalog {
@@ -87,12 +94,18 @@ impl Catalog {
             .into_iter()
             .filter(|row| row.kind == ConversationKind::Cli)
             .map(|row| {
-                let reopenable = !row.archived && self.sources.contains_key(&row.id);
-                if reopenable {
-                    self.shown.insert(row.id.clone());
+                let local = self.sources.contains_key(&row.id);
+                let availability = Availability {
+                    reopenable: local && !row.archived,
+                    removable: local
+                        && !row.runtime.is_live()
+                        && row.runtime != RuntimeState::Conflict,
+                };
+                if local {
+                    self.shown.insert(row.id.clone(), availability);
                 }
                 Row {
-                    reopenable,
+                    availability,
                     id: row.id,
                     title: row.title,
                     provider: row.provider,
@@ -114,12 +127,47 @@ impl Catalog {
         generation: u32,
         id: &ConversationId,
     ) -> Result<AgentSession, String> {
-        if generation != self.generation || !self.shown.contains(id) {
-            return Err("Workspace selection changed; refresh and select the conversation".into());
+        let (source, availability) = self.selected(generation, id)?;
+        if !availability.reopenable {
+            return Err("This Workspace conversation is unavailable to resume".into());
         }
+        Ok(source.clone())
+    }
+
+    pub(super) fn remove(
+        &mut self,
+        generation: u32,
+        id: ConversationId,
+    ) -> Result<ConversationId, String> {
+        let (source, availability) = self.selected(generation, &id)?;
+        if !availability.removable {
+            return Err("This Workspace conversation is unavailable to remove".into());
+        }
+        let result = self.request(WorkspaceCommand::DeleteCliSession {
+            id: id.clone(),
+            session: Box::new(source.clone()),
+        });
+        // Refresh after a lost receipt too. The host may already have committed it.
+        self.shown.clear();
+        self.next = None;
+        match result? {
+            WorkspaceReply::Ack => Ok(id),
+            _ => Err("Unexpected Workspace removal receipt".into()),
+        }
+    }
+
+    fn selected(
+        &self,
+        generation: u32,
+        id: &ConversationId,
+    ) -> Result<(&AgentSession, Availability), String> {
+        let Some(&availability) = self.shown.get(id).filter(|_| generation == self.generation)
+        else {
+            return Err("Workspace selection changed; refresh and select the conversation".into());
+        };
         self.sources
             .get(id)
-            .cloned()
+            .map(|source| (source, availability))
             .ok_or_else(|| "Workspace conversation no longer resolves to a local CLI source".into())
     }
 

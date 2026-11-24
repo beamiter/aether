@@ -569,6 +569,7 @@ fn application<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<
             paste_shell,
             close_shell,
             agent_workspace::workspace_catalog,
+            agent_workspace::workspace_remove_cli,
             agent_workspace::workspace_attach,
             agent_workspace::workspace_terminal,
             agent_workspace::workspace_chat,

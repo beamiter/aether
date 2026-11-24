@@ -160,6 +160,12 @@ answers once before Aether attaches. It also checks the live query and reviewed
 bracketed paste byte for byte. The final marker must appear with the exit
 receipt.
 
+The source-qualified CLI removal check uses two entries with the same title
+and provider UUID. It cancels once, confirms removal of the idle source, and
+refreshes the catalog before reattaching the still-running provider. It
+compares both fixture transcripts byte for byte and emits
+`PRODUCT.CLI.001.NATIVE.001` for X11.
+
 Add `--api-chat` to run an API conversation against a private loopback
 streaming provider. The real Workspace host acknowledges a multiline draft,
 rejects a competing controller, a stale draft save, and a duplicate

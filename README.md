@@ -138,6 +138,9 @@ profile and session ID. Select a conversation and choose **Attach terminal**
 to resume it or take over its running terminal after the other view detaches.
 **Detach terminal** releases the input lease while the host keeps the provider
 running. Reopening Aether can attach to that same provider later.
+Use **Remove from Workspace** on an idle local CLI conversation to review and
+remove its catalog entry and indexed evidence. The original transcript belongs
+to the CLI provider.
 The Session Host publishes the viewport and encodes input against the live
 terminal modes. It also answers supported terminal queries between attachments.
 Use **Ctrl+Shift+V** or **Shift+Insert** to paste into the terminal input.

@@ -12,7 +12,7 @@ const keys=/^(Arrow(Up|Down|Left|Right)|Home|End|Insert|Delete|PageUp|PageDown|F
 // Shared Catalog CLI source IDs contain [provider, host, home, native ID].
 // Group local profiles for display only; never surface any namespace part.
 function localProfileKey(row){
-  if(!row.reopenable)return null;
+  if(!row.reopenable&&!row.removable)return null;
   try{
     const source=JSON.parse(row.id.slice(CLI_ID_PREFIX.length));
     if(!Array.isArray(source)||source.length!==4||source[0]!==row.provider||
@@ -31,7 +31,7 @@ export function validateWorkspacePage(page){
   for(const row of page.rows){
     if(!conversationId(row?.id)||ids.has(row.id)||!boundedText(row.title,8192)||
        !boundedText(row.provider,128)||!boundedText(row.directory,8192)||
-       !boundedText(row.status,128)||typeof row.reopenable!=='boolean'){
+       !boundedText(row.status,128)||typeof row.reopenable!=='boolean'||typeof row.removable!=='boolean'){
       throw new Error('Invalid Workspace conversation.');
     }
     ids.add(row.id);
@@ -54,10 +54,14 @@ export function installWorkspace(document,invoke){
   const root=byId('agent-workspace'),refresh=byId('workspace-refresh'),more=byId('workspace-more');
   const previous=byId('workspace-previous');
   const select=byId('workspace-conversation'),attach=byId('workspace-attach'),detach=byId('workspace-detach');
+  const remove=byId('workspace-remove'),removeReview=byId('workspace-remove-review');
+  const removeSelection=byId('workspace-remove-selection');
+  const removeConfirm=byId('workspace-remove-confirm'),removeCancel=byId('workspace-remove-cancel');
   const selection=byId('workspace-selection'),status=byId('workspace-status'),panel=byId('workspace-view');
   const canvas=byId('workspace-canvas'),input=byId('workspace-input'),output=byId('workspace-output');
   const encoder=new TextEncoder();
   let request=0,loading=false,attempt=null,opening=false,active=null,detaching=false;
+  let removal=null,removing=false;
   let pages=[],pageIndex=-1,evictedOlderPages=false,sourceLabels=new Map();
   const page=()=>pages[pageIndex];
 
@@ -84,14 +88,22 @@ export function installWorkspace(document,invoke){
 
   const selected=()=>page()?.receipt.rows.find(row=>row.id===select.value);
   function controls(){
-    const changing=loading||opening||detaching;
+    const changing=loading||opening||detaching||removing;
     refresh.disabled=changing||!!active;
     previous.disabled=changing||!!active||pageIndex<1;
     more.disabled=changing||!!active||!(pageIndex+1<pages.length||page()?.receipt.next_before);
     select.disabled=changing||!!active||!page()?.receipt.rows.length;
-    attach.disabled=changing||!!active||!selected()?.reopenable;
+    attach.disabled=changing||!!active||!!removal||!selected()?.reopenable;
     detach.disabled=changing||!active;
+    remove.disabled=changing||!!active||!!removal||!selected()?.removable;
+    removeConfirm.disabled=changing||!removal;
     input.disabled=changing||!active?.writable;
+  }
+
+  function dismissRemoval(){
+    removal=null;
+    removeReview.hidden=true;
+    removeSelection.textContent='';
   }
 
   function showSelection(){
@@ -100,6 +112,7 @@ export function installWorkspace(document,invoke){
     selection.textContent=row?[`${row.provider} · ${row.status}`,row.directory,
       label?`${label} (on this page)`:null].filter(Boolean).join(' · '):'';
     attempt=null;
+    dismissRemoval();
     controls();
   }
 
@@ -135,8 +148,9 @@ export function installWorkspace(document,invoke){
   }
 
   async function load(cursor=null){
-    if(loading||active||opening||detaching)return;
+    if(loading||active||opening||detaching||removing)return;
     const oldSelection=cursor?'':select.value;
+    dismissRemoval();
     loading=true;controls();status.textContent='Reading the shared Workspace catalog…';
     try{
       const next=validateWorkspacePage(await call('workspace_catalog',{cursor}));
@@ -153,14 +167,18 @@ export function installWorkspace(document,invoke){
       // A failed or lost request can already have advanced the shared
       // catalog generation or server cursor. Retire the local navigation
       // receipts instead of replaying the same cursor or allowing attachment.
-      pages=[];pageIndex=-1;evictedOlderPages=false;sourceLabels.clear();
-      select.replaceChildren();showSelection();
+      clearCatalog();
       status.textContent=`${String(error?.message??error)} Refresh the catalog to continue.`;
     }finally{loading=false;controls();}
   }
 
+  function clearCatalog(){
+    pages=[];pageIndex=-1;evictedOlderPages=false;sourceLabels.clear();
+    select.replaceChildren();showSelection();
+  }
+
   function turnPage(change){
-    if(loading||active||opening||detaching||!page())return;
+    if(loading||active||opening||detaching||removing||!page())return;
     page().selection=select.value;
     const target=pageIndex+change;
     if(target>=0&&target<pages.length){
@@ -169,6 +187,36 @@ export function installWorkspace(document,invoke){
       const {generation,next_before:before}=page().receipt;
       void load({generation,before});
     }
+  }
+
+  function reviewRemoval(){
+    const row=selected();
+    if(remove.disabled||!row)return;
+    removal={conversation:row.id,catalogGeneration:page().receipt.generation};
+    removeSelection.textContent=[row.title||'Untitled conversation',selection.textContent].join(' · ');
+    removeReview.hidden=false;
+    controls();
+    removeCancel.focus();
+  }
+
+  async function confirmRemoval(){
+    if(removeConfirm.disabled||!removal)return;
+    const target=removal;
+    removing=true;
+    dismissRemoval();controls();
+    status.textContent='Removing the selected Workspace conversation…';
+    try{
+      if(await call('workspace_remove_cli',target)!==target.conversation){
+        throw new Error('Invalid Workspace removal receipt.');
+      }
+    }catch(error){
+      clearCatalog();
+      status.textContent=`${String(error?.message??error)} Refresh the catalog to confirm its state.`;
+      return;
+    }finally{removing=false;controls();}
+    clearCatalog();
+    await load();
+    if(page())status.textContent='Conversation removed from Workspace.';
   }
 
   function operate(view,operation){return call('workspace_terminal',{identity:view.identity,operation});}
@@ -299,7 +347,7 @@ export function installWorkspace(document,invoke){
 
   root.hidden=false;
   root.addEventListener('toggle',()=>{
-    if(!root.open)paste.reset();
+    if(!root.open){paste.reset();dismissRemoval();controls();}
     else if(!page()&&!loading)void load();
   });
   refresh.addEventListener('click',()=>void load());
@@ -308,6 +356,9 @@ export function installWorkspace(document,invoke){
   select.addEventListener('change',()=>{status.textContent='';showSelection();});
   attach.addEventListener('click',start);
   detach.addEventListener('click',release);
+  remove.addEventListener('click',reviewRemoval);
+  removeConfirm.addEventListener('click',confirmRemoval);
+  removeCancel.addEventListener('click',()=>{dismissRemoval();controls();remove.focus();});
   canvas.addEventListener('click',()=>input.focus());
   input.addEventListener('paste',event=>{
     event.preventDefault();

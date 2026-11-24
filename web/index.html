@@ -129,9 +129,16 @@
     <label>Conversation <select id="workspace-conversation" aria-describedby="workspace-selection" disabled></select></label>
     <button id="workspace-attach" type="button" disabled>Attach terminal</button>
     <button id="workspace-detach" type="button" disabled>Detach terminal</button>
+    <button id="workspace-remove" type="button" disabled>Remove from Workspace</button>
   </div>
   <p id="workspace-selection"></p>
   <p id="workspace-status" role="status"></p>
+  <section id="workspace-remove-review" aria-label="Review Workspace removal" hidden>
+    <p id="workspace-remove-selection"></p>
+    <p>Remove this conversation and its indexed evidence from Workspace?</p>
+    <button id="workspace-remove-confirm" type="button" disabled>Remove conversation</button>
+    <button id="workspace-remove-cancel" type="button">Cancel removal</button>
+  </section>
   <section id="workspace-view" aria-label="Workspace CLI terminal" hidden>
     <div class="viewport"><canvas id="workspace-canvas" aria-label="Workspace CLI terminal output"></canvas></div>
     <label>Workspace terminal input <textarea id="workspace-input" rows="2" spellcheck="false" autocomplete="off" disabled></textarea></label>

@@ -55,7 +55,7 @@ form{display:flex;gap:12px;align-items:center;margin-top:16px}label{flex:1}input
 .workspace-controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:12px 0}
 .workspace-controls label{min-width:180px}
 #workspace-conversation{display:block;max-width:100%;min-height:32px}
-#workspace-selection{overflow-wrap:anywhere}
+#workspace-selection,#workspace-remove-selection{overflow-wrap:anywhere;unicode-bidi:plaintext}
 #workspace-copy-visible{margin-top:8px}
 #workspace-output[hidden]{display:none}
 #workspace-api{margin-top:14px}
