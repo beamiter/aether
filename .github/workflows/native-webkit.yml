@@ -74,7 +74,7 @@ jobs:
             --rev d9e18fe636d2041fc23dabd7e3d6aa1159cad2e9 \
             --root "$RUNNER_TEMP/aether-shell-fixture" jsh
           sha256sum "$RUNNER_TEMP/aether-shell-fixture/bin/jsh"
-      - name: Local PTYs, Terminal Chat, Workflows, Workspace, API Chat, native task, notebook and Vim9 on X11
+      - name: Local PTYs, Terminal Chat, Workflows, Workspace, API Chat, native task, notebook, output review and Vim9 on X11
         timeout-minutes: 5
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
@@ -86,7 +86,7 @@ jobs:
             dbus-run-session -- timeout --kill-after=25s 240s \
               /usr/bin/python3 -B scripts/test-two-local-webkit.py "$app" \
                 --jsh "$RUNNER_TEMP/aether-shell-fixture/bin/jsh" \
-                --workspace --api-chat --native-task --notebook --vim9
+                --workspace --api-chat --native-task --notebook --output-review --vim9
       - name: Real PTY Kitty graphics and Canvas pixels on X11
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 2

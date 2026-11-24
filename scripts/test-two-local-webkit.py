@@ -1294,7 +1294,8 @@ def exercise_command_blocks(driver, owned, output_review=False):
              "Command inserted at the shell prompt.", "command was not inserted at the live prompt")
     recalled = owned / "recalled-line"
     driver.type("#ime-input", f"; printf recalled > {shlex.quote(str(recalled))}\ue007")
-    wait_for(lambda: recalled.is_file() and recalled.read_text() == "recalled", "recalled line was executed before explicit Enter")
+    wait_for(lambda: recalled.is_file() and recalled.read_text() == "recalled",
+             "the appended recall command did not run after explicit Enter")
 
     # The actual live PTY receives hidden input while a command is running.
     # The input is never included in that command's OSC metadata or output.
@@ -3018,8 +3019,14 @@ def exercise_vim9_overlays(driver, owned):
     driver.type("#vim9-input", "\ue00c")
     wait_for(lambda: not has_color(0x33, 0x55, 0x77), "accepted completion remained visible")
     driver.type("#vim9-input", ":ProbeChoice\ue007")
-    wait_for(accepted.is_file, "Vim did not write its completion selection")
-    assert accepted.read_text() == "chooseAlpha\n", accepted.read_text()
+    def completed_choice():
+        if accepted.is_file():
+            text = accepted.read_text()
+            if text.endswith("\n"):
+                return text
+
+    choice = wait_for(completed_choice, "Vim did not finish writing its completion selection")
+    assert choice == "chooseAlpha\n", repr(choice)
     driver.type("#vim9-input", ":close!\ue007")
     print(json.dumps({"native_vim9_overlays": ["popup pixels and dismissal", "completion pixels", "selection in Vim's own buffer"]}), flush=True)
 
