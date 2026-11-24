@@ -134,10 +134,15 @@ impl Host {
         self.sessions.expire(now, INACTIVITY);
     }
 
-    fn pump(&mut self) -> bool {
+    fn pump(&mut self, now: Instant) -> bool {
         let mut active = false;
-        for bridge in self.sessions.values_mut() {
-            active |= bridge.pump_unpublished().unwrap_or(false);
+        for (bridge, last_used) in self.sessions.activity_mut() {
+            if let Ok((running, output_bytes)) = bridge.pump_unpublished_with_activity() {
+                active |= running;
+                if output_bytes != 0 {
+                    *last_used = now;
+                }
+            }
         }
         active
     }
@@ -436,9 +441,10 @@ pub fn serve(socket: &Path) -> io::Result<()> {
     loop {
         let now = Instant::now();
         if now >= next_tick {
+            let active = host.pump(now);
             host.expire(now);
             next_tick = now
-                + if host.pump() {
+                + if active {
                     ACTIVE_IO_TICK
                 } else {
                     IDLE_OWNER_TICK
@@ -632,7 +638,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_after_child_exit_keeps_the_snapshot_read_only() {
+    fn unattended_exit_output_renews_retention_and_recovers_read_only() {
         let mut host = Host::default();
         let opened = host.execute(Command::Open { rows: 8, cols: 80 }).unwrap();
         let owner: Attachment = serde_json::from_value(opened).unwrap();
@@ -646,10 +652,12 @@ mod tests {
             bytes.len()
         );
         let deadline = Instant::now() + Duration::from_secs(5);
-        while host.pump() {
+        let expires_without_output = Instant::now() + INACTIVITY;
+        while host.pump(expires_without_output) {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(1));
         }
+        host.expire(expires_without_output);
         let result = host
             .execute(Command::Recover {
                 owner: owner.clone(),

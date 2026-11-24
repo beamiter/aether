@@ -219,8 +219,8 @@ owner once per request. The caller treats an interrupted input or open as
 uncertain and can recover an already identified session.
 
 The owner limits an account's service to four live PTYs and expires a session
-after ten minutes without a successful request. Each request is bounded to
-128 KiB and each reply to 16 MiB. The existing grid and input limits apply.
+after ten minutes without a successful request or PTY output. Each request is
+bounded to 128 KiB and each reply to 16 MiB. The existing grid and input limits apply.
 The socket directory and socket are private to the account. A lock serializes
 owner startup, and a live endpoint keeps its socket during a competing start.
 
