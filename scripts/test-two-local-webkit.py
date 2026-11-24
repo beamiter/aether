@@ -991,8 +991,10 @@ def exercise_height_shrink(driver):
     original = wait_for(lambda: state() if state()["writable"] else None, "resize fixture has a local PTY")
     rows = int(driver.execute("return document.querySelector('#rows').value"))
     assert rows > 8
-    driver.type("#input", r"stty -echo; printf '\033[3J\033[2J\033[H%s\033[999;1H%s' "
-                r"AETHER-RESIZE-ARCHIVE AETHER-RESIZE-LIVE; IFS= read -r pause")
+    driver.type("#input", r"stty -echo; printf '\033[3J\033[2J\033[H%s\033[%d;1H%s\033[%d;1H\0337%s\033[999;1H%s' "
+                f"AETHER-RESIZE-ARCHIVE {rows - 4} AETHER-RESIZE-LIVE {rows - 3} "
+                r"AETHER-RESIZE-DRAFT AETHER-RESIZE-END; IFS= read -r pause; "
+                r"printf '\0338\033[J%s' AETHER-RESIZE-REPAINT; IFS= read -r hold")
     driver.click("#send")
 
     def visible():
@@ -1005,18 +1007,35 @@ def exercise_height_shrink(driver):
         driver.click("#resize")
         wait_for(lambda: f" × {height} " in state()["cursor"], "native WebKit accepted the resized viewport")
 
-    wait_for(lambda: all(marker in visible() for marker in ("AETHER-RESIZE-ARCHIVE", "AETHER-RESIZE-LIVE")),
-             "both resize witnesses were visible before the shrink")
+    def initial_witnesses():
+        text = visible()
+        return all(marker in text for marker in ("AETHER-RESIZE-ARCHIVE", "AETHER-RESIZE-LIVE",
+                                                  "AETHER-RESIZE-DRAFT", "AETHER-RESIZE-END"))
+
+    wait_for(initial_witnesses, "all resize witnesses were visible before the shrink")
     resize(8)
     assert state()["current_tab"] == original["current_tab"]
     live = visible()
     assert "AETHER-RESIZE-LIVE" in live and "AETHER-RESIZE-ARCHIVE" not in live
     driver.click("#history-refresh")
     wait_for(lambda: "AETHER-RESIZE-ARCHIVE" in state()["dump"], "displaced top row reached the retained history")
+    driver.type("#input", "repaint")
+    driver.click("#send")
+
+    def repainted():
+        text = visible()
+        return text if "AETHER-RESIZE-REPAINT" in text else None
+
+    live = wait_for(repainted, "PTY repainted from its saved cursor after the shrink")
+    lines = [line.rstrip() for line in live.splitlines()]
+    origin = lines.index("AETHER-RESIZE-LIVE") + 1
+    assert lines[origin] == "AETHER-RESIZE-REPAINT", lines
+    assert "AETHER-RESIZE-DRAFT" not in live and "AETHER-RESIZE-END" not in live
     resize(rows)
     driver.click("#close")
     wait_for(lambda: state()["status"].startswith("Terminal closed"), "resize fixture closed")
-    print(json.dumps({"native_height_shrink_keeps_live_output_and_archives_displaced_rows": True}), flush=True)
+    print(json.dumps({"native_height_shrink_keeps_live_output_and_archives_displaced_rows": True,
+                      "native_height_shrink_keeps_saved_prompt_origin": True}), flush=True)
 
 
 def exercise_renderer_reload(driver, owned):
