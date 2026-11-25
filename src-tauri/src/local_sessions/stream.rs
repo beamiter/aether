@@ -222,8 +222,9 @@ mod tests {
         let owner = local
             .lock()
             .unwrap()
-            .open(false, SnapshotFormat::Channel, Arc::downgrade(&local))
-            .unwrap();
+            .open(false, SnapshotFormat::Channel, None, Arc::downgrade(&local))
+            .unwrap()
+            .owner;
         let (send, receive) = mpsc::channel();
         let channel = Channel::new(move |body| {
             if let InvokeResponseBody::Json(json) = body {

@@ -141,6 +141,7 @@ fn local_tab_activation_rotates_the_lease_after_an_ack_and_retries_exactly() {
                 true,
                 false,
                 super::SnapshotFormat::Compatibility,
+                None,
                 Arc::downgrade(local.inner()),
             )
             .err()
