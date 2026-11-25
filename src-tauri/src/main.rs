@@ -1,4 +1,4 @@
-use local_sessions::{LocalSessions, LocalShellStatus};
+use local_sessions::{HistoryRequest, LocalSessions, LocalShellStatus};
 use std::sync::{Arc, Mutex};
 use tauri::{ipc::Channel, webview::PageLoadEvent, Manager};
 use tauri_terminal_frame_bridge::{
@@ -41,15 +41,18 @@ async fn acknowledge(
 async fn open_shell<R: tauri::Runtime>(
     window: tauri::WebviewWindow<R>,
     integrated: Option<bool>,
+    pane_history_id: Option<String>,
     frame_version: Option<u8>,
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
-) -> Result<Attachment, String> {
+) -> Result<local_sessions::OpenedShell, String> {
     require_terminal_window(&window)?;
     let format = SnapshotFormat::negotiate(frame_version)?;
+    let integrated = integrated.unwrap_or(false);
+    let history = HistoryRequest::new(integrated, pane_history_id, window.path().app_data_dir().ok())?;
     let shared = bridge.inner().clone();
     let weak = Arc::downgrade(&shared);
     run_bridge(shared, move |bridge| {
-        bridge.open(integrated.unwrap_or(false), format, weak)
+        bridge.open(integrated, format, history, weak)
     })
     .await
 }
@@ -87,11 +90,14 @@ async fn activate_local_tab<R: tauri::Runtime>(
     target_epoch: Option<u32>,
     preserve_input: bool,
     integrated: Option<bool>,
+    pane_history_id: Option<String>,
     frame_version: Option<u8>,
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<Result<local_sessions::AttachedView, String>, String> {
     require_terminal_window(&window)?;
     let format = SnapshotFormat::negotiate(frame_version)?;
+    let integrated = integrated.unwrap_or(false);
+    let history = HistoryRequest::new(integrated, pane_history_id, window.path().app_data_dir().ok())?;
     let shared = bridge.inner().clone();
     let weak = Arc::downgrade(&shared);
     run_bridge(shared, move |bridge| {
@@ -99,8 +105,9 @@ async fn activate_local_tab<R: tauri::Runtime>(
             owner.as_ref(),
             target_epoch,
             preserve_input,
-            integrated.unwrap_or(false),
+            integrated,
             format,
+            history,
             weak,
         ))
     })

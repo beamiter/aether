@@ -1,8 +1,11 @@
 //! Local desktop ownership, separate from the SSH transport.
 mod chat;
+mod history;
 mod stream;
 mod worker;
 pub(crate) use chat::LocalShellStatus;
+pub(crate) use history::HistoryRequest;
+use history::{HistoryWriter, PaneHistory};
 use std::{
     collections::{btree_map::Entry, BTreeMap},
     sync::{Mutex, Weak},
@@ -134,6 +137,7 @@ impl<T, const LIMIT: usize> Registry<T, LIMIT> {
 
 struct OwnedLocalPty {
     bridge: LiveBridge,
+    history: Option<PaneHistory>,
     target: SessionSelector,
     pump_candidate: bool,
     parked_input: bool,
@@ -144,12 +148,23 @@ pub(crate) struct AttachedView {
     #[serde(flatten)]
     view: Resume<LocalSnapshot>,
     input_allowed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pane_history_id: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct OpenedShell {
+    #[serde(flatten)]
+    owner: Attachment,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pane_history_id: Option<String>,
 }
 
 struct PendingTab {
     source: Option<Attachment>,
     requested_epoch: Option<u32>,
     integrated: bool,
+    restored_pane: Option<String>,
     target: Attachment,
     input_allowed: bool,
 }
@@ -160,6 +175,7 @@ pub(crate) struct LocalSessions {
     last_epoch: u32,
     pump_after: Option<String>,
     worker: Option<LocalWorker>,
+    history_writer: Option<HistoryWriter>,
     pending_tab: Option<PendingTab>,
     stream: Option<LocalStream>,
 }
@@ -187,13 +203,16 @@ impl LocalSessions {
         &mut self,
         integrated: bool,
         format: SnapshotFormat,
+        history: Option<HistoryRequest>,
         shared: Weak<Mutex<Self>>,
-    ) -> Result<Attachment, String> {
+    ) -> Result<OpenedShell, String> {
         // Keep the ordinary opener fail-closed if *any* PTY remains.
         if !self.registry.sessions.is_empty() {
             return Err("close the existing session first".into());
         }
-        self.open_fresh(integrated, format, shared)
+        let owner = self.open_fresh(integrated, format, history, shared)?;
+        let pane_history_id = self.retained_bridge(owner.epoch)?.completed_pane_id().map(str::to_owned);
+        Ok(OpenedShell { owner, pane_history_id })
     }
 
     pub(crate) fn open_second(
@@ -206,7 +225,7 @@ impl LocalSessions {
             return Err("detach the single existing local shell before opening a second".into());
         }
         self.target_for_epoch(retained_epoch)?;
-        self.open_fresh(false, format, shared)
+        self.open_fresh(false, format, None, shared)
     }
 
     pub(crate) fn list_epochs(&self) -> Vec<u32> {
@@ -244,13 +263,15 @@ impl LocalSessions {
         &mut self,
         integrated: bool,
         format: SnapshotFormat,
+        history: Option<HistoryRequest>,
         shared: Weak<Mutex<Self>>,
     ) -> Result<Attachment, String> {
         self.ensure_worker(shared)?;
+        self.ensure_history_writer(history.is_some())?;
         let worker = self.worker.as_ref().unwrap();
         let prev_epoch = self.last_epoch;
         let owner = self.registry.open(|| {
-            let (owned, owner) = Self::spawn(prev_epoch, integrated, format, worker)?;
+            let (owned, owner) = Self::spawn(prev_epoch, integrated, format, history, worker)?;
             Ok((owner.session.clone(), owned, owner))
         })?;
         self.last_epoch = owner.epoch;
@@ -262,8 +283,23 @@ impl LocalSessions {
         prev_epoch: u32,
         integrated: bool,
         format: SnapshotFormat,
+        history: Option<HistoryRequest>,
         worker: &LocalWorker,
     ) -> Result<(OwnedLocalPty, Attachment), String> {
+        let history = match history {
+            Some(request) => {
+                let restoring = request.pane.is_some();
+                match PaneHistory::open(request) {
+                    Ok(opened) => Some(opened),
+                    Err(error) if restoring => return Err(error),
+                    Err(error) => {
+                        eprintln!("{error}");
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
         let mut bridge = LiveBridge::local_desktop_after(prev_epoch);
         bridge.enable_inline_graphics(format);
         bridge.set_hyperlink_policy(jterm_core::link::is_openable_osc8);
@@ -272,10 +308,17 @@ impl LocalSessions {
         } else {
             bridge.open(24, 80)?
         };
+        let history = if let Some((history, checkpoint)) = history {
+            history.restore(&mut bridge, epoch, checkpoint)?;
+            Some(history)
+        } else {
+            None
+        };
         worker.watch(&bridge)?;
         let owner = bridge.attachment(epoch)?;
         let owned = OwnedLocalPty {
             bridge,
+            history,
             target: SessionSelector {
                 session: owner.session.clone(),
                 epoch,
@@ -293,15 +336,18 @@ impl LocalSessions {
         preserve_input: bool,
         integrated: bool,
         format: SnapshotFormat,
+        history: Option<HistoryRequest>,
         shared: Weak<Mutex<Self>>,
     ) -> Result<AttachedView, String> {
         if integrated && target_epoch.is_some() {
             return Err("Choose the shell type when opening a new tab.".into());
         }
+        let restored_pane = history.as_ref().and_then(|request| request.pane.clone());
         if let Some(pending) = self.pending_tab.as_ref().filter(|pending| {
             pending.source.as_ref() == owner
                 && pending.requested_epoch == target_epoch
                 && pending.integrated == integrated
+                && pending.restored_pane == restored_pane
         }) {
             let owned = self.registry.reader(&pending.target.session)?;
             return Ok(AttachedView {
@@ -312,6 +358,7 @@ impl LocalSessions {
                         .pending_local_tab_with(&pending.target, snapshot_encoder(format))?,
                 },
                 input_allowed: pending.input_allowed,
+                pane_history_id: owned.bridge.completed_pane_id().map(str::to_owned),
             });
         }
 
@@ -337,6 +384,7 @@ impl LocalSessions {
             None => return Err("only two local shell tabs can be open".into()),
         };
         self.ensure_worker(shared)?;
+        self.ensure_history_writer(history.is_some())?;
 
         let (view, input_allowed) = if let Some(target) = target {
             let owned = self.registry.owned(&target.session)?;
@@ -355,6 +403,7 @@ impl LocalSessions {
                 self.last_epoch,
                 integrated,
                 format,
+                history,
                 self.worker.as_ref().unwrap(),
             )?;
             let Entry::Vacant(entry) = self.registry.sessions.entry(original.session) else {
@@ -377,10 +426,12 @@ impl LocalSessions {
         }
         let target = &view.owner;
         self.registry.reader = Some(target.session.clone());
+        let pane_history_id = self.retained_bridge(target.epoch)?.completed_pane_id().map(str::to_owned);
         self.pending_tab = Some(PendingTab {
             source: owner.cloned(),
             requested_epoch: target_epoch,
             integrated,
+            restored_pane,
             target: target.clone(),
             input_allowed,
         });
@@ -388,6 +439,7 @@ impl LocalSessions {
         Ok(AttachedView {
             view,
             input_allowed,
+            pane_history_id,
         })
     }
 
@@ -527,7 +579,26 @@ impl LocalSessions {
         Ok(())
     }
 
+    fn ensure_history_writer(&mut self, enabled: bool) -> Result<(), String> {
+        if enabled && self.history_writer.is_none() {
+            self.history_writer = Some(HistoryWriter::start(self.worker.as_ref().unwrap().thread())?);
+        }
+        Ok(())
+    }
+
     fn pump(&mut self) -> (bool, Option<Delivery>) {
+        let (mut active, delivery) = self.pump_terminals();
+        if let Some(writer) = &self.history_writer {
+            for pane in self.registry.sessions.values_mut() {
+                if let Some(history) = &mut pane.history {
+                    active |= history.update(writer, &pane.bridge, pane.target.epoch);
+                }
+            }
+        }
+        (active, delivery)
+    }
+
+    fn pump_terminals(&mut self) -> (bool, Option<Delivery>) {
         let detached = self.pump_detached();
         let preview = self
             .stream
@@ -732,10 +803,13 @@ impl LocalSessions {
     pub(crate) fn close(&mut self, owner: &Attachment) -> Result<CloseStatus, String> {
         // An already issued close still addresses this exact stable PTY and
         // epoch if recovery has since rotated its view generation.
-        let (_, result) = self.registry.close(&owner.session, |owned| {
+        let (closed, result) = self.registry.close(&owner.session, |owned| {
             let epoch = owned.bridge.validate_session(owner)?;
             owned.bridge.close(epoch)
         })?;
+        if let Some(history) = closed.history {
+            history.close();
+        }
         if self
             .stream
             .as_ref()

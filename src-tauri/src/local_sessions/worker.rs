@@ -48,6 +48,10 @@ impl LocalWorker {
         self.0.unpark();
     }
 
+    pub(super) fn thread(&self) -> Thread {
+        self.0.clone()
+    }
+
     pub(super) fn watch(&self, bridge: &LiveBridge) -> Result<(), String> {
         let thread = self.0.clone();
         bridge.notify_on_output(move || thread.unpark())

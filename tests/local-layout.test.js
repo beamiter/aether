@@ -26,6 +26,21 @@ test('versions one and two restore plain tabs with their saved layout',()=>{
  }
 });
 
+test('saved panes keep their own identities and reject duplicate or plain-shell ownership',()=>{
+ const paneId='6'.repeat(32);
+ const tab={shell:'jsh',presentation:'chat',paneId};
+ const layout={tabs:[tab,plainLocalTab],active:1,split:true};
+ let raw='';
+ const environment={localStorage:{setItem:(_,value)=>raw=value,getItem:()=>raw}};
+ saveLocalShellLayout(layout,environment);
+ assert.deepEqual(JSON.parse(raw),{version:4,...layout});
+ assert.deepEqual(readLocalShellLayout(environment),layout);
+ for(const tabs of [[tab,tab],[{...plainLocalTab,paneId},tab],[{...tab,paneId:'../outside'}]]){
+  raw=JSON.stringify({version:4,tabs,active:0,split:false});
+  assert.equal(readLocalShellLayout(environment),null);
+ }
+});
+
 test('invalid, stale and unavailable preferences do not restore a shell layout',()=>{
  for(const raw of ['{bad', 'null', '{}', ' '.repeat(257),
    '{"version":0,"count":2,"active":1}', '{"version":1,"count":3,"active":1}',

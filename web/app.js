@@ -6,7 +6,7 @@ import {installHistory} from './history.js';
 import {installCommandBlocks} from './command-blocks.js';
 import {installTerminalChat,validateChatStatus} from './terminal-chat.js';
 import {installWorkflows} from './workflows.js';
-import {plainLocalTab,readLocalShellLayout,saveLocalShellLayout} from './local-layout.js';
+import {plainLocalTab,readLocalShellLayout,saveLocalShellLayout,validPaneId} from './local-layout.js';
 import {acceptFull,acceptUpdate,clearPaint,paint} from './frames.js'; import {installIme} from './ime.js';
 import {acceptChannelFrame,channelCounter,CHANNEL_FRAME_VERSION} from './frames-v4.js';
 const canvas=document.querySelector('canvas'),status=document.querySelector('#status'),button=document.querySelector('#demo');
@@ -23,6 +23,7 @@ const localDrafts=new Map();
 const localTabEpochs=new Set();
 const localTabOwners=new Map();
 const localShellKinds=new Map();
+const localPaneIds=new Map();
 let changingTab=null,restoringLocalLayout=false;
 let state=null,epoch=null,owner=null,timer=null,polling=null,generation=0,transport=0,recovery=null;
 let sshSession=null,sshInputSuspended=false,detachedLocal=null;
@@ -96,7 +97,7 @@ function recordLocalLayout(){
     const shell=localShellKinds.get(session);
     // Retained roster rows expose epoch labels until their shell status arrives.
     if(!shell)return;
-    configurations.push({shell,presentation:terminalChat.modeFor(session)});
+    configurations.push({shell,presentation:terminalChat.modeFor(session),paneId:localPaneIds.get(session)});
   }
   savedLayout=epochs.length?{tabs:configurations,active:Math.max(0,epochs.indexOf(epoch)),split:splitEnabled&&epochs.length===2}:null;
   saveLocalShellLayout(savedLayout);
@@ -199,7 +200,7 @@ function setTabRoster(records){
   for(const [number,attachment] of localTabOwners){
     if(records.includes(number))continue;
     localTabOwners.delete(number);localDrafts.delete(attachment.session);
-    localShellKinds.delete(attachment.session);terminalChat.forget(attachment.session);
+    localShellKinds.delete(attachment.session);localPaneIds.delete(attachment.session);terminalChat.forget(attachment.session);
   }
   localTabEpochs.clear();
   for(const number of records)localTabEpochs.add(number);
@@ -212,9 +213,10 @@ function rememberLocalDraft(attachment) {
 function restoreLocalDraft(attachment) {
   input.value=localDrafts.get(attachment.session)??'';
 }
-function rememberLocalTab(attachment,configuration){
+function rememberLocalTab(attachment,configuration,paneId){
   localTabEpochs.add(attachment.epoch);
   localTabOwners.set(attachment.epoch,attachment);
+  if(paneId!==undefined)localPaneIds.set(attachment.session,paneId);
   if(configuration){
     localShellKinds.set(attachment.session,configuration.shell);
     terminalChat.restoreMode(attachment.session,configuration.presentation);
@@ -277,6 +279,11 @@ function acceptOwner(attachment) {
   if(!attachment||typeof attachment.session!=='string'||!/^[a-f0-9]{32}$/.test(attachment.session)||
       !valid(attachment.epoch)||!valid(attachment.generation)) throw new Error('invalid terminal attachment');
   return attachment;
+}
+function acceptLocalPane(result){
+  const pane=result?.pane_history_id;
+  if(pane!==undefined&&!validPaneId(pane))throw new Error('Invalid completed command pane identity.');
+  return pane;
 }
 const pasteReviewPanel=document.querySelector('#paste-review');
 const pasteReview=installPasteReview({panel:pasteReviewPanel,preview:document.querySelector('#paste-preview'),escaped:document.querySelector('#paste-escaped'),confirm:document.querySelector('#paste-confirm'),cancel:document.querySelector('#paste-cancel'),getEpoch:inputOwner,send:(text,attachment)=>{if(attachment===owner)enqueueLogical('paste_shell',{text});},onError:message=>{status.textContent=message;}});
@@ -362,6 +369,7 @@ function validateShellStatus(info,expectedEpoch){
   if(exitNotice!=null&&(typeof exitNotice!=='string'||exitNotice.length>256))throw new Error('invalid exit output notice');
   if(owner?.session!==sshSession){
     validateChatStatus(info.chat);
+    acceptLocalPane(info);
     if(info.history_oldest_row!==undefined)channelCounter(info.history_oldest_row);
   }
 }
@@ -370,8 +378,11 @@ function showShellStatus(info,mode){
   health.dataset.transport=mode;
   if(owner&&owner.session!==sshSession&&typeof info.command_blocks_enabled==='boolean'){
     const shell=info.command_blocks_enabled?'jsh':'plain';
-    if(localShellKinds.get(owner.session)!==shell){
+    const pane=info.pane_history_id;
+    if(localShellKinds.get(owner.session)!==shell||localPaneIds.get(owner.session)!==pane){
       localShellKinds.set(owner.session,shell);
+      if(pane===undefined)localPaneIds.delete(owner.session);
+      else localPaneIds.set(owner.session,pane);
       recordLocalLayout();
     }
   }
@@ -538,6 +549,7 @@ async function attemptLocalTab(){
     if(!change.view){
       const options=channelSnapshots();
       const launch=change.targetEpoch===null&&change.configuration.shell==='jsh'?{integrated:true}:{};
+      if(launch.integrated&&change.configuration.paneId)launch.paneHistoryId=change.configuration.paneId;
       const response=await invoke('activate_local_tab',{owner:change.source,targetEpoch:change.targetEpoch,
         preserveInput:change.preserveInput,...options,...launch});
       if(typeof response?.Err==='string'){
@@ -563,14 +575,15 @@ async function attemptLocalTab(){
           (before&&(next.session!==before.session||next.generation<=before.generation))){
         throw new Error('Invalid local shell tab response');
       }
-      change.view={owner:next,frame:acceptAttachedSnapshot(result.frame,next,options),writable:result.input_allowed};
+      change.view={owner:next,frame:acceptAttachedSnapshot(result.frame,next,options),
+        writable:result.input_allowed,paneId:acceptLocalPane(result)};
     }
     const next=change.view;
     paint(canvas,next.frame);
     await invokeAttached('ack_shell',{epoch:next.owner.epoch,revision:next.frame.revision},next.owner);
     owner=next.owner;epoch=owner.epoch;state=next.frame;describeCursor();
     restoreLocalDraft(owner);
-    rememberLocalTab(owner,change.targetEpoch===null?change.configuration:undefined);
+    rememberLocalTab(owner,change.targetEpoch===null?change.configuration:undefined,next.paneId);
     detachedLocal=null;
     colsInput.value=String(state.cols);rowsInput.value=String(state.rows.length);
     keyQueue={chain:Promise.resolve(),pending:0,locked:!next.writable};
@@ -648,15 +661,19 @@ async function openShell({destination=null,retained=null,fromRestore=false,confi
   const integrated=configuration.shell==='jsh';
   try{
     const options=channelSnapshots();
+    const launch=configuration.paneId?{integrated,paneHistoryId:configuration.paneId}:{integrated};
     const result=destination!==null?await invoke('ssh_terminal',{action:{operation:'open',destination}})
-      :retained?await invoke('open_second_local_shell',{epoch:retained,...options}):await invoke('open_shell',{integrated,...options});
+      :retained?await invoke('open_second_local_shell',{epoch:retained,...options}):await invoke('open_shell',{...launch,...options});
     if(generation!==attempt)return;
-    const opened=acceptOwner(destination===null?result:result?.owner??result);
+    const paneId=destination===null?acceptLocalPane(result):undefined;
+    const opened=destination===null&&paneId!==undefined?acceptOwner({
+      session:result.session,epoch:result.epoch,generation:result.generation,
+    }):acceptOwner(destination===null?result:result?.owner??result);
     if(retained&&(opened.epoch<=retained||opened.session===detachedLocal?.session||opened.generation!==1))
       throw new Error('Second local shell did not match the open response.');
     owner=opened;sshSession=destination===null?null:opened.session;
     localTransport='channel';localInputSuspended=false;
-    if(destination===null){detachedLocal=null;restoreLocalDraft(opened);rememberLocalTab(opened,configuration);}
+    if(destination===null){detachedLocal=null;restoreLocalDraft(opened);rememberLocalTab(opened,configuration,paneId);}
     epoch=owner.epoch;keyQueue={chain:Promise.resolve(),pending:0,locked:false};state=null;
     setActiveControls(true);
     if(destination===null){setLocalTools(true);recordLocalLayout();}
@@ -815,7 +832,7 @@ close.addEventListener('click',async()=>{
   // before Close can give up that view, even if the close response is lost.
   if(changingTab||!owner||close.disabled)return;
   generation++;transport++;polling=null;setLocalTools(false);filePreview.dismiss();pasteReview.reset();ime.reset();history.reset();stopTransport();const old=epoch,oldOwner=owner;epoch=null;owner=null;renderLocalTabs();resize.disabled=close.disabled=detach.disabled=input.disabled=send.disabled=true;
-  try{const result=await invokeAttached('close_shell',{epoch:old},oldOwner);if(oldOwner.session!==sshSession){input.value='';localDrafts.delete(oldOwner.session);localTabEpochs.delete(oldOwner.epoch);localTabOwners.delete(oldOwner.epoch);localShellKinds.delete(oldOwner.session);terminalChat.forget(oldOwner.session);if(localTabEpochs.size<2)splitEnabled=false;recordLocalLayout();}status.textContent=result?.cleanup_pending===false?'Terminal closed; direct child reaped. Descendant containment is not provided.':'Terminal closed; direct-child cleanup handed to bounded supervisor and may still be pending. Descendant containment is not provided.';if(typeof result?.save_warning==='string')status.textContent+=' '+result.save_warning;state=null;clearTerminalPaint();sshSession=null;sshInputSuspended=false;setOpenDisabled(false);attach.disabled=button.disabled=false;renderLocalTabs();}
+  try{const result=await invokeAttached('close_shell',{epoch:old},oldOwner);if(oldOwner.session!==sshSession){input.value='';localDrafts.delete(oldOwner.session);localTabEpochs.delete(oldOwner.epoch);localTabOwners.delete(oldOwner.epoch);localShellKinds.delete(oldOwner.session);localPaneIds.delete(oldOwner.session);terminalChat.forget(oldOwner.session);if(localTabEpochs.size<2)splitEnabled=false;recordLocalLayout();}status.textContent=result?.cleanup_pending===false?'Terminal closed; direct child reaped. Descendant containment is not provided.':'Terminal closed; direct-child cleanup handed to bounded supervisor and may still be pending. Descendant containment is not provided.';if(typeof result?.save_warning==='string')status.textContent+=' '+result.save_warning;state=null;clearTerminalPaint();sshSession=null;sshInputSuspended=false;setOpenDisabled(false);attach.disabled=button.disabled=false;renderLocalTabs();}
   catch(e){epoch=old;owner=oldOwner;blocks.updateOwner();terminalChat.updateOwner();close.disabled=detach.disabled=false;status.textContent=`Close error: ${String(e?.message??e)}. Retry Close to finish cleanup.`;}
 });
 document.querySelector('#command').addEventListener('submit',async event=>{

@@ -17,7 +17,9 @@ use std::collections::BTreeMap;
 mod command_blocks;
 mod raw_suffix;
 pub use crate::protocol::{CloseStatus, HistorySnapshot, SessionStatus};
-pub use command_blocks::{BlockSelection, CommandActivity, CommandBlockSnapshot, RetainedBlock};
+pub use command_blocks::{
+    BlockSelection, CommandActivity, CommandBlockSnapshot, CompletedPaneHistory, RetainedBlock,
+};
 use raw_suffix::RawSuffix;
 
 const HISTORY_PAGE_ROWS: usize = 128;
@@ -47,6 +49,7 @@ pub struct LiveBridge {
     submitted_chat_prompt: Option<crate::protocol_v4::Counter>,
     command_bookmarks: BTreeMap<String, String>,
     command_source_stream: Option<String>,
+    restored_commands: command_blocks::RestoredCommands,
     raw: RawSuffix<Attachment>,
 }
 impl LiveBridge {
@@ -166,6 +169,7 @@ impl LiveBridge {
         self.history_search = None;
         self.submitted_chat_prompt = None;
         self.command_source_stream = command_source_stream;
+        self.restored_commands = Default::default();
         self.raw = RawSuffix::default();
         Ok(epoch)
     }
@@ -833,6 +837,7 @@ impl LiveBridge {
         self.history_search = None;
         self.command_bookmarks.clear();
         self.command_source_stream = None;
+        self.restored_commands = Default::default();
         self.raw = RawSuffix::default();
         Ok(CloseStatus { cleanup_pending })
     }

@@ -12,6 +12,8 @@ pub(crate) struct LocalShellStatus {
     chat: TerminalChatStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     history_oldest_row: Option<Counter>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pane_history_id: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
@@ -47,10 +49,11 @@ impl LocalShellStatus {
         Ok(Self {
             shell,
             history_oldest_row: bridge.history_oldest_row(epoch)?,
+            pane_history_id: bridge.completed_pane_id().map(str::to_owned),
             chat: TerminalChatStatus {
                 surface,
                 prompt,
-                newest_completed: activity.newest_completed,
+                newest_completed: bridge.completed_pane_cursor(epoch)?,
             },
         })
     }

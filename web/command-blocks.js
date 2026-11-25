@@ -53,6 +53,12 @@ export function validateCommandBlockSnapshot(snapshot,owner){
       snapshot.bookmarked.some(sequence=>!snapshot.blocks.some(block=>block.sequence===sequence))){
     throw new Error('Invalid command block bookmarks.');
   }
+  const restored=snapshot.restored??[];
+  if(!Array.isArray(restored)||restored.length>snapshot.blocks.length||
+      new Set(restored).size!==restored.length||
+      restored.some(sequence=>!snapshot.blocks.some(block=>block.sequence===sequence))){
+    throw new Error('Invalid restored command blocks.');
+  }
 }
 
 export function validateFrozenReview(receipt,owner){
@@ -277,7 +283,7 @@ export function installCommandBlocks(document,{getOwner,read,bookmark,find,compa
     }
   }
 
-  function makeCard(block,attachment){
+  function makeCard(block,attachment,restored){
     const card=element('details',undefined,'command-block');
     card.dataset.sequence=block.sequence;
     card.dataset.revision=block.revision;
@@ -287,7 +293,7 @@ export function installCommandBlocks(document,{getOwner,read,bookmark,find,compa
     const outcome=block.exit===null?'Exit status unavailable':`Exit ${block.exit}`;
     summary.append(command,element('span',outcome,'command-block-outcome'));
     card.append(summary);
-    const provenance=element('p',`PTY-reported OSC 133 · ${block.execution_id}`,'command-block-meta');
+    const provenance=element('p',`${restored?'Restored · ':''}PTY-reported OSC 133 · ${block.execution_id}`,'command-block-meta');
     card.append(provenance);
     if(block.output_source){
       const source=block.output_source;
@@ -333,7 +339,7 @@ export function installCommandBlocks(document,{getOwner,read,bookmark,find,compa
       card.append(text);
       actions.append(copy);
     }
-    if(recall){
+    if(recall&&!restored){
       const insert=element('button','Insert command at shell prompt');
       insert.type='button';insert.className='command-block-recall';
       insert.addEventListener('click',()=>{
@@ -364,6 +370,7 @@ export function installCommandBlocks(document,{getOwner,read,bookmark,find,compa
       search.setAvailable(snapshot.blocks.length>0);
       const retained=new Map(snapshot.blocks.map(block=>[block.sequence,block.revision]));
       const bookmarked=new Set(snapshot.bookmarked);
+      const restored=new Set(snapshot.restored);
       let anchor,anchorTop;
       if(chat&&list.scrollTop>0){
         const top=list.getBoundingClientRect().top;
@@ -376,7 +383,7 @@ export function installCommandBlocks(document,{getOwner,read,bookmark,find,compa
       }
       for(const block of [...snapshot.blocks].reverse()){
         let card=cards.get(block.sequence);
-        if(!card){card=makeCard(block,attachment);cards.set(block.sequence,card);list.prepend(card);}
+        if(!card){card=makeCard(block,attachment,restored.has(block.sequence));cards.set(block.sequence,card);list.prepend(card);}
         showBookmark(card,bookmarked.has(block.sequence));
       }
       bookmarkFilter.hidden=!snapshot.enabled;
@@ -386,7 +393,7 @@ export function installCommandBlocks(document,{getOwner,read,bookmark,find,compa
       status.textContent=!snapshot.enabled
         ?'Command blocks are available for local sessions opened with jsh.'
         :snapshot.blocks.length
-          ?'Showing completed commands reported by this local PTY.'
+          ?'Showing completed commands for this pane.'
           :'Waiting for a completed command reported by this local jsh.';
     }catch(error){
       if(request===reading&&getOwner()===attachment)status.textContent=String(error?.message??error);
