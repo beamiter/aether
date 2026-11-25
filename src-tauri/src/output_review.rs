@@ -153,6 +153,15 @@ impl FrozenReview {
                 .exit
                 .map_or_else(|| "unavailable".to_owned(), |code| code.to_string());
             let _ = writeln!(out, "PTY-reported OSC 133 · exit {exit}\n");
+            if let Some(source) = &record.output_source {
+                let (start_cols, start_rows) = source.start_size;
+                let (end_cols, end_rows) = source.end_size;
+                let _ = writeln!(
+                    out,
+                    "PTY bytes `[{}, {})` · marker events {}–{} · grid {start_cols}×{start_rows} to {end_cols}×{end_rows}\n",
+                    source.byte_start, source.byte_end, source.start_event, source.end_event,
+                );
+            }
             append_literal(&mut out, "Command", &record.command);
             if let Some(cwd) = &record.cwd {
                 append_literal(&mut out, "Working directory", cwd);
@@ -218,6 +227,14 @@ mod tests {
             outcome: CompletedBlockOutcome::Success,
             provenance: CompletionProvenance::ShellReported,
             output: Ok(output.into()),
+            output_source: Some(jterm_engine::command_blocks::CommandOutputSource {
+                bytes: 101..201,
+                start_event: 3,
+                end_event: 4,
+                start_size: (80, 24),
+                end_size: (80, 24),
+                resized: false,
+            }),
         })
     }
 
@@ -244,6 +261,12 @@ mod tests {
             "more\n\x60\x60\x60\x60\n</script>\n"
         );
         assert_eq!(document["after"]["revision"], revision);
+        assert_eq!(document["after"]["output_source"]["byte_start"], "101");
+        assert_eq!(document["after"]["output_source"]["end_event"], "4");
+        assert_eq!(
+            document["after"]["output_source"]["start_size"],
+            serde_json::json!([80, 24])
+        );
         assert_eq!(document["review"]["owner"]["generation"], 8);
         assert!(!json.content.contains("current"));
         let markdown = reviews

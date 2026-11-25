@@ -9,6 +9,17 @@ const sha256=value=>typeof value==='string'&&/^[0-9a-f]{64}$/.test(value);
 const uuid4=value=>typeof value==='string'&&/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
 const sameOwner=(left,right)=>left?.session===right.session&&left?.epoch===right.epoch&&left?.generation===right.generation;
 
+function validOutputSource(source){
+  if(!source||![source.byte_start,source.byte_end,source.start_event,source.end_event].every(
+      value=>decimal(value)&&BigInt(value)<=0xffffffffffffffffn))return false;
+  const size=value=>Array.isArray(value)&&value.length===2&&value.every(
+      dimension=>Number.isInteger(dimension)&&dimension>0&&dimension<=65535);
+  return BigInt(source.byte_end)>=BigInt(source.byte_start)&&BigInt(source.start_event)>0n&&
+      BigInt(source.end_event)>BigInt(source.start_event)&&size(source.start_size)&&size(source.end_size)&&
+      typeof source.resized==='boolean'&&
+      (source.resized||source.start_size.every((dimension,index)=>dimension===source.end_size[index]));
+}
+
 export function validateCommandBlockSnapshot(snapshot,owner){
   const identity=snapshot?.owner;
   if(!sameOwner(identity,owner)||typeof snapshot.enabled!=='boolean'||
@@ -28,6 +39,7 @@ export function validateCommandBlockSnapshot(snapshot,owner){
         (block.shell_session!==null&&!bounded(block.shell_session,128))||
         (block.shell_sequence!==null&&!decimal(block.shell_sequence))||
         (block.exit!==null&&(!Number.isInteger(block.exit)||block.exit< -2147483648||block.exit>2147483647))||
+        (block.output_source!==undefined&&!validOutputSource(block.output_source))||
         !['text','screen_operation','byte_limit'].includes(output?.kind)||
         (output.kind==='text'&&(!bounded(output.text,MAX_OUTPUT_BYTES)||/[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(output.text)))){
       throw new Error('Invalid command block record.');

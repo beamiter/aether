@@ -1640,7 +1640,12 @@ def exercise_bookmark_retention(driver, card):
     wait_for(bookmarked, "the original record could not be bookmarked again")
     driver.click(filter_button)
     for index in range(8):
-        driver.type("#ime-input", f"printf 'BOOKMARK_EVICT_{index}\\n'\ue007")
+        command = f"printf 'BOOKMARK_EVICT_{index}\\n'"
+        driver.type("#ime-input", command + "\ue007")
+        wait_for(lambda: driver.execute(f"""
+            return Array.from(document.querySelectorAll('#command-block-list details summary code'))
+                .some(command => command.textContent === {json.dumps(command)});
+        """), "the replacement command did not reach the retained transcript")
     wait_for(empty, "evicting the command did not clear the filtered list")
     assert not driver.execute(f"return !!document.querySelector({json.dumps(card)});")
 
@@ -1701,13 +1706,24 @@ def exercise_frozen_output_review(driver, owned, send, refresh_for, blocks, befo
             assert exported["after"]["revision"] == after_revision
             assert exported["before"]["output"] == {"kind": "text", "text": "AETHER_BLOCK_ONE\n"}
             assert exported["after"]["output"] == {"kind": "text", "text": "/tmp\n"}
+            previous, latest = (exported[side]["output_source"] for side in ("before", "after"))
+            for side, source in (("before", previous), ("after", latest)):
+                assert 0 < int(source["start_event"]) < int(source["end_event"]), source
+                assert int(source["byte_end"]) - int(source["byte_start"]) >= len(
+                    exported[side]["output"]["text"].encode()
+                ), source
+                assert all(value > 0 for size in ("start_size", "end_size") for value in source[size])
+            assert int(previous["byte_end"]) < int(latest["byte_start"])
+            assert int(previous["end_event"]) < int(latest["start_event"])
         else:
             assert content.startswith("# Frozen command output review\n")
             assert before_revision in content and after_revision in content
             assert frozen["diff"] in content
+            assert content.count("PTY bytes `[") == 2
         assert "REVIEW_REPLACEMENT" not in content
     print(json.dumps({"native_output_review_exact_owned_records": True,
                       "native_output_review_stays_frozen_after_retention_eviction": True,
+                      "native_output_review_preserves_pty_ranges_markers_and_geometry": True,
                       "native_output_review_downloads_markdown_and_json": True}), flush=True)
 
 

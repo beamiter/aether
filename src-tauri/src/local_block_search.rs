@@ -63,9 +63,11 @@ fn search(snapshot: &CommandBlockSnapshot, query: &str) -> BlockMatches {
         if label.len() < block.command.len() {
             label.push('…');
         }
+        let output = block.captured_output();
+        scan_incomplete |= output.is_none();
         let surfaces = [
             (Surface::Command, Some(block.command.as_str())),
-            (Surface::Output, block.captured_output()),
+            (Surface::Output, output),
         ];
         for (surface, text) in surfaces {
             let Some(text) = text else { continue };

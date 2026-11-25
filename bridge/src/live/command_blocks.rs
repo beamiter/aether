@@ -1,6 +1,6 @@
 use super::LiveBridge;
 use crate::{protocol_v4::Counter, semantic::Attachment};
-use jterm_engine::command_blocks::{CommandBlock, OutputUnavailable};
+use jterm_engine::command_blocks::{CommandBlock, CommandOutputSource, OutputUnavailable};
 use sha2::{Digest, Sha256};
 
 #[derive(serde::Serialize)]
@@ -29,9 +29,36 @@ pub struct RetainedBlock {
     pub cwd: Option<String>,
     pub exit: Option<i32>,
     pub provenance: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_source: Option<RetainedOutputSource>,
     output: Output,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub revision: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct RetainedOutputSource {
+    pub byte_start: String,
+    pub byte_end: String,
+    pub start_event: String,
+    pub end_event: String,
+    pub start_size: (usize, usize),
+    pub end_size: (usize, usize),
+    pub resized: bool,
+}
+
+impl From<&CommandOutputSource> for RetainedOutputSource {
+    fn from(source: &CommandOutputSource) -> Self {
+        Self {
+            byte_start: source.bytes.start.to_string(),
+            byte_end: source.bytes.end.to_string(),
+            start_event: source.start_event.to_string(),
+            end_event: source.end_event.to_string(),
+            start_size: source.start_size,
+            end_size: source.end_size,
+            resized: source.resized,
+        }
+    }
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -71,6 +98,10 @@ impl From<&CommandBlock> for RetainedBlock {
             cwd: record.cwd.clone(),
             exit: record.outcome.reported_exit_code(),
             provenance: record.provenance.schema_name(),
+            output_source: record
+                .output_source
+                .as_ref()
+                .map(RetainedOutputSource::from),
             output,
             revision: String::new(),
         };
@@ -295,7 +326,47 @@ mod tests {
             outcome: CompletedBlockOutcome::Success,
             provenance: CompletionProvenance::ShellReported,
             output: output.map(ToOwned::to_owned),
+            output_source: None,
         })
+    }
+
+    #[test]
+    fn captured_sources_preserve_64_bit_identity_in_the_wire_projection() {
+        let mut terminal = jterm_engine::terminal::Terminal::new(24, 80).unwrap();
+        terminal.observe_command_blocks();
+        let start = b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b]133;C;id=run;command=printf%20fixture\x07";
+        let output = b"captured\r\n";
+        let end = b"\x1b]133;D;0;id=run\x1b\\";
+        for bytes in [start.as_slice(), output, end] {
+            terminal.feed(bytes).unwrap();
+        }
+        let mut record = terminal.completed_command_blocks().unwrap()[0].clone();
+        let wire =
+            |record: &CommandBlock| serde_json::to_value(RetainedBlock::from(record)).unwrap();
+        let first = wire(&record);
+        assert_eq!(first["execution_id"], "run");
+        assert_eq!(
+            first["output_source"]["byte_start"],
+            start.len().to_string()
+        );
+        assert_eq!(
+            first["output_source"]["byte_end"],
+            (start.len() + output.len()).to_string()
+        );
+        assert_eq!(first["output_source"]["start_event"], "3");
+        assert_eq!(
+            first["output_source"]["start_size"],
+            serde_json::json!([80, 24])
+        );
+
+        let source = record.output_source.as_mut().unwrap();
+        source.bytes = u64::MAX - 9..u64::MAX - 1;
+        let second = wire(&record);
+        assert_eq!(
+            second["output_source"]["byte_start"],
+            (u64::MAX - 9).to_string()
+        );
+        assert_ne!(first["revision"], second["revision"]);
     }
 
     #[test]

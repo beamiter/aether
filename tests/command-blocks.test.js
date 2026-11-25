@@ -26,6 +26,23 @@ test('command block records require exact attachment identity and bounded ordere
   ])assert.throws(()=>validateCommandBlockSnapshot({...snapshot,...change},owner));
 });
 
+test('command sources preserve raw 64-bit offsets and ordered marker events',()=>{
+  const source={
+    byte_start:'18446744073709551604',byte_end:'18446744073709551615',
+    start_event:'3',end_event:'4',start_size:[80,24],end_size:[80,24],resized:false,
+  };
+  const read=output_source=>validateCommandBlockSnapshot({
+    ...snapshot,blocks:[{...block,output_source}],
+  },owner);
+  assert.doesNotThrow(()=>read(source));
+  for(const override of [
+    {byte_start:Number(source.byte_start)},{byte_end:'18446744073709551616'},
+    {byte_end:'18446744073709551603'},{end_event:'3'},{start_event:'0'},
+    {end_size:[81,24]},{start_size:[80,0]},
+  ])assert.throws(()=>read({...source,...override}));
+  assert.doesNotThrow(()=>read({...source,end_size:[81,24],resized:true}));
+});
+
 test('command bookmarks reference only retained records and contain no duplicates',()=>{
   const blocks=[{...block,sequence:'5'},block];
   assert.doesNotThrow(()=>validateCommandBlockSnapshot({...snapshot,blocks,bookmarked:['4']},owner));
