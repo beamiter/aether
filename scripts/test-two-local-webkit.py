@@ -1230,6 +1230,7 @@ def exercise_command_blocks(driver, owned, output_review=False, *, read_clipboar
               command: card.querySelector('code').textContent,
               body: card.textContent,
               output: card.querySelector('textarea')?.value ?? null,
+              source: card.querySelector('.command-block-output-source')?.textContent ?? null,
               open: card.open,
             }));
         """)
@@ -1360,6 +1361,18 @@ def exercise_command_blocks(driver, owned, output_review=False, *, read_clipboar
     assert state()["split"] and birth(identity[0]) == identity[1], "block view changed the live PTY"
     if output_review:
         exercise_frozen_output_review(driver, owned, send, refresh_for, blocks, command)
+        assert re.fullmatch(r"PTY bytes \[\d+, \d+\) · marker events \d+–\d+ · grid \d+×\d+",
+                            first["source"] or ""), first
+        driver.click("#command-block-return")
+        over_limit = r"head -c 17408 /dev/zero | tr '\000' Q"
+        send(over_limit)
+        driver.click("#command-block-toggle")
+        unavailable = refresh_for(over_limit)
+        assert unavailable["output"] is None and "command block size limit" in unavailable["body"], unavailable
+        source = re.fullmatch(r"PTY bytes \[(\d+), (\d+)\) · marker events \d+–\d+ · grid \d+×\d+",
+                              unavailable["source"] or "")
+        assert source and int(source[2]) - int(source[1]) == 17408, unavailable
+        print(json.dumps({"native_command_card_shows_pty_source_with_unavailable_output": True}), flush=True)
     driver.click("#close")
     wait_for(lambda: birth(identity[0]) != identity[1], "closed integrated shell was not reaped")
     click_tab(driver, plain_tab)
