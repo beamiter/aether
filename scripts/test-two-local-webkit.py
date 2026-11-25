@@ -1205,7 +1205,7 @@ def exercise_restart(driver, owned, binary, integrated=False):
     print(json.dumps(result), flush=True)
 
 
-def exercise_command_blocks(driver, owned, output_review=False):
+def exercise_command_blocks(driver, owned, output_review=False, *, read_clipboard=None):
     # Leave room to reach the expanded card after its review controls appear.
     driver.command("POST", "/window/rect", {"width": 1380, "height": 1000})
 
@@ -1277,8 +1277,16 @@ def exercise_command_blocks(driver, owned, output_review=False):
             return null;
         """)
 
-    if wait_for(copy_status, "native block output copy did not select only captured text") == "clipboard" and shutil.which("xclip"):
-        assert subprocess.check_output(["xclip", "-selection", "clipboard", "-o"], timeout=2) == first["output"].encode()
+    if wait_for(copy_status, "native block output copy did not select only captured text") == "clipboard":
+        expected_output = first["output"].encode()
+        if read_clipboard is not None:
+            try:
+                wait_for(lambda: read_clipboard() == expected_output,
+                         "Wayland clipboard did not receive the completed block text")
+            except AssertionError as error:
+                raise AssertionError((expected_output, read_clipboard())) from error
+        elif shutil.which("xclip"):
+            assert subprocess.check_output(["xclip", "-selection", "clipboard", "-o"], timeout=2) == expected_output
     driver.click("#command-block-return")
     assert state()["focused"] == "ime-input"
     send("pwd")

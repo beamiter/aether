@@ -299,6 +299,11 @@ def run(args):
         (fixture_bin / "jsh").symlink_to(args.jsh.resolve(strict=True))
         env["PATH"] = str(fixture_bin) + ":" + env["PATH"]
         fixtures["prepare_workflows"](root, env)
+    if args.output_review:
+        downloads = root / "Downloads"
+        downloads.mkdir()
+        (Path(env["XDG_CONFIG_HOME"]) / "user-dirs.dirs").write_text(
+            f"XDG_DOWNLOAD_DIR={json.dumps(str(downloads))}\n")
     config = root / "sway.conf"
     config.write_text("xwayland disable\noutput * resolution 1440x1100\nseat seat0 fallback true\nfocus_follows_mouse no\n")
     with contextlib.ExitStack() as cleanup:
@@ -404,6 +409,21 @@ def run(args):
 
             result = exercise_vim9(driver, fixtures, root, control, ime, keyboard, compositor)
             result.update(backend="wayland", binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest())
+            (root / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+            print(json.dumps(result), flush=True)
+            return
+        if args.output_review:
+            wl_paste = Path(args.wtype).with_name("wl-paste")
+
+            def read_clipboard():
+                payload = subprocess.check_output([wl_paste, "--no-newline", "--type", "text"],
+                                                  env=env, timeout=5)
+                # WebKit's Wayland plain-text clipboard uses CRLF.
+                return payload.replace(b"\r\n", b"\n")
+
+            fixtures["exercise_command_blocks"](driver, root, output_review=True, read_clipboard=read_clipboard)
+            result = {"case_id": "PRODUCT.REVIEW.001.NATIVE.001", "result": "passed",
+                      "backend": "wayland", "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest()}
             (root / "result.json").write_text(json.dumps(result, indent=2) + "\n")
             print(json.dumps(result), flush=True)
             return
@@ -599,10 +619,13 @@ if __name__ == "__main__":
     journey = parser.add_mutually_exclusive_group()
     journey.add_argument("--companion-daemon", type=Path, help="run the private native Eva journey")
     journey.add_argument("--vim9", action="store_true", help="run the real Vim9 Wayland composition and bridge-loss journey")
+    journey.add_argument("--output-review", action="store_true", help="verify the frozen output review and downloaded source")
     parser.add_argument("--sway", default="sway")
     parser.add_argument("--wtype", default="wtype")
     parser.add_argument("--compositor-libraries", type=Path)
     args = parser.parse_args()
     if args.companion_daemon and not args.jsh:
         parser.error("--companion-daemon requires the real --jsh fixture")
+    if args.output_review and not args.jsh:
+        parser.error("--output-review requires the real --jsh fixture")
     run(args)
