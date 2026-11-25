@@ -764,10 +764,12 @@ impl LocalSessions {
             .ok_or("terminal session closed")?;
         owned.bridge.enable_inline_graphics(format);
         let input_allowed = owned.bridge.can_resume_local_input();
+        let pane_history_id = owned.bridge.completed_pane_id().map(str::to_owned);
         self.retire_stale_stream(&view.owner);
         Ok(AttachedView {
             view,
             input_allowed,
+            pane_history_id,
         })
     }
 
