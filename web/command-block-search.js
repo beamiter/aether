@@ -1,3 +1,24 @@
+function selectStyledRange(document, target, start, end) {
+  const nodes = document.createTreeWalker(target, NodeFilter.SHOW_TEXT);
+  const range = document.createRange();
+  let offset = 0, hasStart = false;
+  for (let node = nodes.nextNode(); node; node = nodes.nextNode()) {
+    const next = offset + node.length;
+    if (!hasStart && next >= start) {
+      range.setStart(node, start - offset);
+      hasStart = true;
+    }
+    if (next >= end) {
+      range.setEnd(node, end - offset);
+      const selection = document.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      break;
+    }
+    offset = next;
+  }
+}
+
 export function installBlockSearch(document, {getOwner, scan, cardFor}) {
   const form = document.querySelector('#command-block-search');
   const input = document.querySelector('#command-block-query');
@@ -20,8 +41,9 @@ export function installBlockSearch(document, {getOwner, scan, cardFor}) {
     if (request !== current || getOwner() !== current.owner) return;
     const card = cardFor(hit.record);
     const output = hit.surface === 'output';
-    const target = card?.querySelector(output ? 'textarea' : 'summary code');
-    const text = output ? target?.value : target?.textContent;
+    const textarea = output ? card?.querySelector('textarea') : null;
+    const target = textarea ?? card?.querySelector(output ? '.command-block-annotated-output' : 'summary code');
+    const text = textarea?.value ?? target?.textContent;
     if (text?.slice(hit.start, hit.end) !== current.query) {
       status.textContent = 'Refresh blocks to open this result, then search again.';
       return;
@@ -29,7 +51,8 @@ export function installBlockSearch(document, {getOwner, scan, cardFor}) {
     card.open = true;
     if (output) {
       target.focus();
-      target.setSelectionRange(hit.start, hit.end);
+      if (textarea) target.setSelectionRange(hit.start, hit.end);
+      else selectStyledRange(document, target, hit.start, hit.end);
     } else {
       target.parentElement.focus();
       const range = document.createRange();

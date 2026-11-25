@@ -234,6 +234,7 @@ mod tests {
             outcome: CompletedBlockOutcome::Success,
             provenance: CompletionProvenance::ShellReported,
             output: Ok(output.into()),
+            output_annotations: None,
             output_source: Some(jterm_engine::command_blocks::CommandOutputSource {
                 bytes: 101..201,
                 start_event: 3,

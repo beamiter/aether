@@ -55,6 +55,20 @@ test('command bookmarks reference only retained records and contain no duplicate
   }
 });
 
+test('styled output uses UTF-8 byte ranges independent of the displayed characters',()=>{
+  const output_annotations={spans:[{bytes:{start:0,end:3},colors:[0x021fabc1,0,0],flags:65}],links:[]};
+  const check=overrides=>validateCommandBlockSnapshot({
+    ...snapshot,blocks:[{...block,output_annotations,...overrides}],
+  },owner);
+  assert.doesNotThrow(()=>check({}));
+  assert.throws(()=>check({output:{kind:'screen_operation'}}));
+  for(const span of [
+    {bytes:{start:1,end:3},colors:[0,0,0],flags:0},
+    {bytes:{start:0,end:3},colors:[0x01000107,0,0],flags:0},
+    {bytes:{start:0,end:3},colors:[0,0,0],flags:384},
+  ])assert.throws(()=>check({output_annotations:{spans:[span],links:[]}}));
+});
+
 test('frozen output receipts bind to the exact local attachment',()=>{
   const receipt={owner,reviewId:'87dea754-7433-48a5-9c44-bcaf5137a207',
     complete:true,summary:'+1 added',comparison:'-old\n+new\n'};

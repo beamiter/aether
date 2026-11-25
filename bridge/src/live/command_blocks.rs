@@ -4,6 +4,7 @@ use jterm_engine::{
     command_blocks::{CommandBlock, CommandOutputSource, OutputUnavailable},
     shell_markers,
 };
+use jterm_protocol::finished_output::OutputAnnotations;
 use sha2::{Digest, Sha256};
 
 const MAX_BLOCKS: usize = 8;
@@ -41,6 +42,8 @@ pub struct RetainedBlock {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_source: Option<RetainedOutputSource>,
     output: Output,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output_annotations: Option<OutputAnnotations>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub revision: String,
 }
@@ -132,6 +135,11 @@ impl RetainedBlock {
                 stream.map(|stream| OutputSourceIdentity::new(stream, record.sequence));
             source
         });
+        let output_annotations = record
+            .output
+            .as_ref()
+            .ok()
+            .and_then(|text| OutputAnnotations::new(text, record.output_annotations.as_ref()?));
         let mut block = Self {
             sequence: sequence.to_string(),
             execution_id: record.execution_id.clone(),
@@ -143,6 +151,7 @@ impl RetainedBlock {
             provenance: record.provenance.schema_name().to_owned(),
             output_source,
             output,
+            output_annotations,
             revision: String::new(),
         };
         // Include every retained field, including capture availability.
@@ -196,6 +205,12 @@ pub struct CompletedPaneHistory {
 impl CompletedPaneHistory {
     pub fn cursor(&self) -> u64 {
         self.next_sequence.saturating_sub(1)
+    }
+
+    pub fn has_output_annotations(&self) -> bool {
+        self.records
+            .iter()
+            .any(|record| record.output_annotations.is_some())
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -272,6 +287,10 @@ impl RetainedBlock {
                     && !text.chars().any(|character| {
                         character.is_control() && !matches!(character, '\n' | '\t')
                     })
+            })
+            && self.output_annotations.as_ref().is_none_or(|annotations| {
+                self.captured_output()
+                    .is_some_and(|text| annotations.clone().restore(text).is_some())
             })
             && self.valid_revision()
     }
@@ -589,6 +608,7 @@ mod tests {
             outcome: CompletedBlockOutcome::Success,
             provenance: CompletionProvenance::ShellReported,
             output: output.map(ToOwned::to_owned),
+            output_annotations: None,
             output_source: None,
         })
     }
@@ -598,7 +618,7 @@ mod tests {
         let mut terminal = jterm_engine::terminal::Terminal::new(24, 80).unwrap();
         terminal.observe_command_blocks();
         let start = b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b]133;C;id=run;command=printf%20fixture\x07";
-        let output = b"captured\r\n";
+        let output = b"\x1b[38;2;31;171;193mcaptured\x1b[0m\r\n";
         let end = b"\x1b]133;D;0;id=run\x1b\\";
         for bytes in [start.as_slice(), output, end] {
             terminal.feed(bytes).unwrap();
@@ -608,6 +628,15 @@ mod tests {
             |record: &CommandBlock| serde_json::to_value(RetainedBlock::from(record)).unwrap();
         let first = wire(&record);
         assert_eq!(first["execution_id"], "run");
+        assert_eq!(first["output"]["text"], "captured\n");
+        assert_eq!(
+            first["output_annotations"]["spans"][0]["bytes"],
+            serde_json::json!({"start": 0, "end": 8})
+        );
+        assert_eq!(
+            first["output_annotations"]["spans"][0]["colors"][0],
+            0x02_1f_ab_c1
+        );
         assert_eq!(
             first["output_source"]["byte_start"],
             start.len().to_string()

@@ -18,7 +18,8 @@ use std::{
 };
 use tauri_terminal_frame_bridge::live::{CompletedPaneHistory, LiveBridge};
 
-const VERSION: u32 = 1;
+const TEXT_VERSION: u32 = 1;
+const STYLED_VERSION: u32 = 2;
 const MAX_CHECKPOINT_BYTES: u64 = 2 * 1024 * 1024;
 const RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -117,7 +118,10 @@ impl Archive {
             Err(error) => return Err(error),
         };
         let checkpoint: Checkpoint = serde_json::from_str(&bytes)?;
-        if checkpoint.version != VERSION || checkpoint.pane != self.pane {
+        if !matches!(checkpoint.version, TEXT_VERSION | STYLED_VERSION)
+            || checkpoint.pane != self.pane
+            || (checkpoint.version == TEXT_VERSION && checkpoint.history.has_output_annotations())
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "incompatible pane history",
@@ -135,7 +139,11 @@ impl Archive {
             return Ok(());
         }
         let checkpoint = Checkpoint {
-            version: VERSION,
+            version: if history.has_output_annotations() {
+                STYLED_VERSION
+            } else {
+                TEXT_VERSION
+            },
             pane: self.pane.clone(),
             history,
         };
@@ -297,7 +305,7 @@ mod tests {
         assert!(Archive::lock(request()).is_err());
         assert!(archive.load().unwrap().is_none());
         let bytes = serde_json::to_vec(&serde_json::json!({
-            "version": VERSION + 1, "pane": pane,
+            "version": STYLED_VERSION + 1, "pane": pane,
             "history": { "next_sequence": 1, "records": [] }
         }))
         .unwrap();

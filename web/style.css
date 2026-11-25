@@ -35,6 +35,7 @@ form{display:flex;gap:12px;align-items:center;margin-top:16px}label{flex:1}input
 .command-block-outcome{margin-inline:10px;color:#a5c7fa;font-size:13px}
 .command-block-meta{font-size:13px;overflow-wrap:anywhere;unicode-bidi:plaintext}
 .command-block textarea{margin-bottom:8px;unicode-bidi:plaintext}
+.command-block-annotated-output{max-height:14rem;overflow:auto;overflow-wrap:anywhere;white-space:pre-wrap;unicode-bidi:plaintext;tab-size:8;margin:8px 0;padding:8px;border:1px solid #52627a;border-radius:5px}
 .command-block-actions{display:flex;flex-wrap:wrap;gap:6px}
 #terminal-chat-transcript #command-block-list{max-height:18rem;overflow:auto;overflow-anchor:none}
 #terminal-chat-dock:not([hidden]){display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:2rem;margin:6px 0;color:#acbacb}

@@ -1,4 +1,5 @@
 import {installBlockSearch} from './command-block-search.js';
+import {annotatedOutput,decodeOutputAnnotations} from './command-output-annotations.js';
 
 const MAX_BLOCKS=8;
 const MAX_OUTPUT_BYTES=16*1024;
@@ -46,6 +47,10 @@ export function validateCommandBlockSnapshot(snapshot,owner){
         !['text','screen_operation','byte_limit'].includes(output?.kind)||
         (output.kind==='text'&&(!bounded(output.text,MAX_OUTPUT_BYTES)||/[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(output.text)))){
       throw new Error('Invalid command block record.');
+    }
+    if(block.output_annotations!==undefined){
+      if(output.kind!=='text')throw new Error('Invalid command output annotations.');
+      decodeOutputAnnotations(output.text,block.output_annotations);
     }
     previous=BigInt(block.sequence);
   }
@@ -312,23 +317,33 @@ export function installCommandBlocks(document,{getOwner,read,bookmark,find,compa
     }else if(!block.output.text){
       card.append(element('p','No output.'));
     }else{
-      const text=element('textarea');
-      text.value=block.output.text;
-      text.readOnly=true;
-      text.rows=Math.min(10,Math.max(2,block.output.text.split('\n').length));
-      text.setAttribute('aria-label','Command output');
-      text.spellcheck=false;
+      const styled=block.output_annotations!==undefined;
+      const output=styled?annotatedOutput(document,block.output.text,block.output_annotations):element('textarea');
+      if(!styled){
+        output.value=block.output.text;
+        output.readOnly=true;
+        output.rows=Math.min(10,Math.max(2,block.output.text.split('\n').length));
+        output.spellcheck=false;
+      }
+      output.setAttribute('aria-label','Command output');
       const copy=element('button','Copy output');
       copy.type='button';
       copy.addEventListener('click',async()=>{
         if(getOwner()!==attachment)return;
         try{
           if(!globalThis.navigator?.clipboard?.writeText)throw new Error('Clipboard unavailable');
-          await globalThis.navigator.clipboard.writeText(text.value);
+          await globalThis.navigator.clipboard.writeText(block.output.text);
           if(getOwner()===attachment&&!panel.hidden)status.textContent='Output copied.';
         }catch{
-          if(getOwner()!==attachment||panel.hidden||!text.isConnected)return;
-          text.focus();text.select();
+          if(getOwner()!==attachment||panel.hidden||!output.isConnected)return;
+          output.focus();
+          if(styled){
+            const range=document.createRange();
+            range.selectNodeContents(output);
+            const selection=document.getSelection();
+            selection.removeAllRanges();
+            selection.addRange(range);
+          }else output.select();
           let copied=false;
           try{copied=!!document.execCommand?.('copy');}catch{/* Selection stays available. */}
           status.textContent=copied
@@ -336,7 +351,7 @@ export function installCommandBlocks(document,{getOwner,read,bookmark,find,compa
             :'Output selected. Use your system copy shortcut.';
         }
       });
-      card.append(text);
+      card.append(output);
       actions.append(copy);
     }
     if(recall&&!restored){
