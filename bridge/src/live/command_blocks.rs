@@ -38,6 +38,8 @@ pub struct RetainedBlock {
 
 #[derive(serde::Serialize)]
 pub struct RetainedOutputSource {
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<OutputSourceIdentity>,
     pub byte_start: String,
     pub byte_end: String,
     pub start_event: String,
@@ -47,9 +49,29 @@ pub struct RetainedOutputSource {
     pub resized: bool,
 }
 
+#[derive(serde::Serialize)]
+pub struct OutputSourceIdentity {
+    pub stream_id: String,
+    pub execution_id: String,
+}
+
+impl OutputSourceIdentity {
+    fn new(stream: &str, sequence: u64) -> Self {
+        let mut identity = Sha256::new();
+        identity.update(b"aether.command-output-source.v1\0");
+        identity.update(stream.as_bytes());
+        identity.update(sequence.to_be_bytes());
+        Self {
+            stream_id: stream.to_owned(),
+            execution_id: format!("{:x}", identity.finalize()),
+        }
+    }
+}
+
 impl From<&CommandOutputSource> for RetainedOutputSource {
     fn from(source: &CommandOutputSource) -> Self {
         Self {
+            identity: None,
             byte_start: source.bytes.start.to_string(),
             byte_end: source.bytes.end.to_string(),
             start_event: source.start_event.to_string(),
@@ -84,11 +106,22 @@ enum Output {
 
 impl From<&CommandBlock> for RetainedBlock {
     fn from(record: &CommandBlock) -> Self {
+        Self::project(record, None)
+    }
+}
+
+impl RetainedBlock {
+    fn project(record: &CommandBlock, stream: Option<&str>) -> Self {
         let output = match &record.output {
             Ok(text) => Output::Text { text: text.clone() },
             Err(OutputUnavailable::ScreenOperation) => Output::ScreenOperation,
             Err(OutputUnavailable::ByteLimit) => Output::ByteLimit,
         };
+        let output_source = record.output_source.as_ref().map(|source| {
+            let mut source = RetainedOutputSource::from(source);
+            source.identity = stream.map(|stream| OutputSourceIdentity::new(stream, record.sequence));
+            source
+        });
         let mut block = Self {
             sequence: record.sequence.to_string(),
             execution_id: record.execution_id.clone(),
@@ -98,10 +131,7 @@ impl From<&CommandBlock> for RetainedBlock {
             cwd: record.cwd.clone(),
             exit: record.outcome.reported_exit_code(),
             provenance: record.provenance.schema_name(),
-            output_source: record
-                .output_source
-                .as_ref()
-                .map(RetainedOutputSource::from),
+            output_source,
             output,
             revision: String::new(),
         };
@@ -111,9 +141,7 @@ impl From<&CommandBlock> for RetainedBlock {
         block.revision = format!("{:x}", Sha256::digest(wire));
         block
     }
-}
 
-impl RetainedBlock {
     pub fn captured_output(&self) -> Option<&str> {
         match &self.output {
             Output::Text { text } => Some(text),
@@ -292,9 +320,15 @@ impl LiveBridge {
             .expect("validated local PTY")
             .terminal()
             .completed_command_blocks();
+        let stream = self.command_source_stream.as_deref();
         let blocks: Vec<_> = records
             .into_iter()
-            .flat_map(|blocks| blocks.iter().rev().map(RetainedBlock::from))
+            .flat_map(|blocks| {
+                blocks
+                    .iter()
+                    .rev()
+                    .map(move |record| RetainedBlock::project(record, stream))
+            })
             .collect();
         let bookmarked = blocks
             .iter()
@@ -367,6 +401,26 @@ mod tests {
             (u64::MAX - 9).to_string()
         );
         assert_ne!(first["revision"], second["revision"]);
+
+        let stream = "3625146840963580e7df3e478ad06731";
+        let identified = RetainedBlock::project(&record, Some(stream));
+        let repeated = RetainedBlock::project(&record, Some(stream));
+        assert_eq!(identified.revision, repeated.revision);
+        let wire = serde_json::to_value(&identified).unwrap();
+        assert_eq!(wire["output_source"]["stream_id"], stream);
+        assert_eq!(
+            wire["output_source"]["execution_id"].as_str().unwrap().len(),
+            64
+        );
+        assert_eq!(wire["execution_id"], "run");
+        let other_stream = RetainedBlock::project(&record, Some("18ebf80f2977a1f4c5f36ba4812e5d63"));
+        assert_ne!(other_stream.revision, identified.revision);
+        record.sequence += 1;
+        let same_stream = RetainedBlock::project(&record, Some(stream));
+        assert_ne!(
+            identified.output_source.unwrap().identity.unwrap().execution_id,
+            same_stream.output_source.unwrap().identity.unwrap().execution_id,
+        );
     }
 
     #[test]

@@ -35,10 +35,14 @@ test('command sources preserve raw 64-bit offsets and ordered marker events',()=
     ...snapshot,blocks:[{...block,output_source}],
   },owner);
   assert.doesNotThrow(()=>read(source));
+  const identity={stream_id:'b'.repeat(32),execution_id:'c'.repeat(64)};
+  assert.doesNotThrow(()=>read({...source,...identity}));
   for(const override of [
     {byte_start:Number(source.byte_start)},{byte_end:'18446744073709551616'},
     {byte_end:'18446744073709551603'},{end_event:'3'},{start_event:'0'},
     {end_size:[81,24]},{start_size:[80,0]},
+    {stream_id:identity.stream_id},{execution_id:identity.execution_id},
+    {...identity,stream_id:'shell-reported-id'},{...identity,execution_id:'7'},
   ])assert.throws(()=>read({...source,...override}));
   assert.doesNotThrow(()=>read({...source,end_size:[81,24],resized:true}));
 });

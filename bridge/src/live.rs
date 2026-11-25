@@ -46,6 +46,7 @@ pub struct LiveBridge {
     history_search: Option<HistorySearch>,
     submitted_chat_prompt: Option<crate::protocol_v4::Counter>,
     command_bookmarks: BTreeMap<String, String>,
+    command_source_stream: Option<String>,
     raw: RawSuffix<Attachment>,
 }
 impl LiveBridge {
@@ -135,6 +136,7 @@ impl LiveBridge {
         }
         let epoch = self.epoch.checked_add(1).ok_or("epoch exhausted")?;
         let id = semantic::session_id()?;
+        let command_source_stream = self.local_desktop.then(semantic::session_id).transpose()?;
         let frame_epoch = std::num::NonZeroU64::new(u64::from(epoch)).ok_or("invalid epoch")?;
         let mut session = spawn(frame_epoch)?;
         session.enable_ordered_input();
@@ -163,6 +165,7 @@ impl LiveBridge {
         self.accepted = None;
         self.history_search = None;
         self.submitted_chat_prompt = None;
+        self.command_source_stream = command_source_stream;
         self.raw = RawSuffix::default();
         Ok(epoch)
     }
@@ -829,6 +832,7 @@ impl LiveBridge {
         self.resumed_from = None;
         self.history_search = None;
         self.command_bookmarks.clear();
+        self.command_source_stream = None;
         self.raw = RawSuffix::default();
         Ok(CloseStatus { cleanup_pending })
     }

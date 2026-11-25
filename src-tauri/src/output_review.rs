@@ -154,6 +154,13 @@ impl FrozenReview {
                 .map_or_else(|| "unavailable".to_owned(), |code| code.to_string());
             let _ = writeln!(out, "PTY-reported OSC 133 · exit {exit}\n");
             if let Some(source) = &record.output_source {
+                if let Some(identity) = &source.identity {
+                    let _ = writeln!(
+                        out,
+                        "PTY stream `{}` · execution `{}`\n",
+                        identity.stream_id, identity.execution_id
+                    );
+                }
                 let (start_cols, start_rows) = source.start_size;
                 let (end_cols, end_rows) = source.end_size;
                 let _ = writeln!(

@@ -6,12 +6,15 @@ const encoder=new TextEncoder();
 const decimal=value=>typeof value==='string'&&/^[0-9]{1,20}$/.test(value);
 const bounded=(value,limit)=>typeof value==='string'&&value.length<=limit&&encoder.encode(value).length<=limit;
 const sha256=value=>typeof value==='string'&&/^[0-9a-f]{64}$/.test(value);
+const streamId=value=>typeof value==='string'&&/^[0-9a-f]{32}$/.test(value);
 const uuid4=value=>typeof value==='string'&&/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
 const sameOwner=(left,right)=>left?.session===right.session&&left?.epoch===right.epoch&&left?.generation===right.generation;
 
 function validOutputSource(source){
   if(!source||![source.byte_start,source.byte_end,source.start_event,source.end_event].every(
       value=>decimal(value)&&BigInt(value)<=0xffffffffffffffffn))return false;
+  if((source.stream_id!==undefined||source.execution_id!==undefined)&&
+      (!streamId(source.stream_id)||!sha256(source.execution_id)))return false;
   const size=value=>Array.isArray(value)&&value.length===2&&value.every(
       dimension=>Number.isInteger(dimension)&&dimension>0&&dimension<=65535);
   return BigInt(source.byte_end)>=BigInt(source.byte_start)&&BigInt(source.start_event)>0n&&
@@ -290,8 +293,10 @@ export function installCommandBlocks(document,{getOwner,read,bookmark,find,compa
       const source=block.output_source;
       const start=source.start_size.join('×');
       const grid=source.resized?`${start} to ${source.end_size.join('×')}`:start;
-      card.append(element('p',`PTY bytes [${source.byte_start}, ${source.byte_end}) · marker events ${source.start_event}–${source.end_event} · grid ${grid}`,
-        'command-block-meta command-block-output-source'));
+      const metadata=element('p',`PTY bytes [${source.byte_start}, ${source.byte_end}) · marker events ${source.start_event}–${source.end_event} · grid ${grid}`,
+        'command-block-meta command-block-output-source');
+      if(source.stream_id)metadata.title=`PTY stream ${source.stream_id}\nExecution ${source.execution_id}`;
+      card.append(metadata);
     }
     if(block.cwd)card.append(element('p',block.cwd,'command-block-meta'));
     if(block.output.kind!=='text'){
