@@ -529,8 +529,7 @@ def run(args):
         wait_for(lambda: other_receipt.read_bytes() == b"zw", "returning to the window changed PTY input")
         assert receipt.read_bytes() == expected
 
-        with binary.open("rb") as executable:
-            digest = hashlib.file_digest(executable, "sha256").hexdigest()
+        digest = hashlib.sha256(binary.read_bytes()).hexdigest()
         result = dict(binary_sha256=digest, backend="wayland", transport="channel",
                       preedit_bytes=0, committed_hex=expected.hex(),
                       preedit_geometry=anchor, cursor_rectangle=cursor, pane_switch_cancelled_preedit=True,
