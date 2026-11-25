@@ -318,8 +318,11 @@ SetEnv JTERM_WORKSPACE_STATE_DIR={state}
             exercise_files(driver, owned)
             exercise_workspace(driver, app, host_id, store)
             def digest(path):
+                sha = hashlib.sha256()
                 with path.open("rb") as content:
-                    return hashlib.file_digest(content, "sha256").hexdigest()
+                    for chunk in iter(lambda: content.read(1024 * 1024), b""):
+                        sha.update(chunk)
+                return sha.hexdigest()
             print(json.dumps({"case": "PRODUCT.REMOTE.001.NATIVE.001", "backend": backend, "result": "passed",
                               "desktop_sha256": digest(app), "helper_sha256": digest(helper)}), flush=True)
         except Exception:

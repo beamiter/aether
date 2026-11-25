@@ -85,7 +85,10 @@ def exercise_companion(driver, fixtures, profile, close_window, handoff=None):
         return value["current_tab"] if value["writable"] else None
 
     def received_status(outcome):
-        ledger = json.loads((profile / "dialogue-index.json").read_text())
+        try:
+            ledger = json.loads((profile / "dialogue-index.json").read_text())
+        except FileNotFoundError:
+            return []
         return [record for record in ledger["results"] if record["status"] == outcome]
 
     toggle = wait_for(lambda: named(Atspi.Role.TOGGLE_BUTTON, "Eva"), "Eva's GTK control did not appear")
@@ -370,11 +373,12 @@ def run(args):
         driver.open(binary)
         cleanup.callback(driver.close)
         wait_for(lambda: fixtures["opened_page"](driver), "embedded Aether page did not load")
+        swaymsg = Path(args.sway).with_name("swaymsg")
         if args.companion_daemon:
             compositor_ipc = wait_for(lambda: next(runtime.glob("sway-ipc.*.sock"), None), "no private compositor IPC")
 
             def close_window(process):
-                subprocess.run(["swaymsg", "-s", str(compositor_ipc), f"[pid={process}] kill"],
+                subprocess.run([swaymsg, "-s", str(compositor_ipc), f"[pid={process}] kill"],
                                env=compositor_env, check=True, capture_output=True, timeout=5)
 
             result = exercise_companion(driver, fixtures, profile, close_window)
@@ -390,7 +394,6 @@ def run(args):
         if args.vim9:
             compositor_ipc = wait_for(lambda: next(runtime.glob("sway-ipc.*.sock"), None),
                                       "no private compositor IPC")
-            swaymsg = Path(args.sway).with_name("swaymsg")
 
             def compositor(*arguments):
                 return json.loads(subprocess.check_output([swaymsg, "-s", compositor_ipc, *arguments],
