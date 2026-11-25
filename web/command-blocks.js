@@ -286,6 +286,13 @@ export function installCommandBlocks(document,{getOwner,read,bookmark,find,compa
     card.append(summary);
     const provenance=element('p',`PTY-reported OSC 133 · ${block.execution_id}`,'command-block-meta');
     card.append(provenance);
+    if(block.output_source){
+      const source=block.output_source;
+      const start=source.start_size.join('×');
+      const grid=source.resized?`${start} to ${source.end_size.join('×')}`:start;
+      card.append(element('p',`PTY bytes [${source.byte_start}, ${source.byte_end}) · marker events ${source.start_event}–${source.end_event} · grid ${grid}`,
+        'command-block-meta command-block-output-source'));
+    }
     if(block.cwd)card.append(element('p',block.cwd,'command-block-meta'));
     if(block.output.kind!=='text'){
       card.append(element('p',block.output.kind==='byte_limit'
