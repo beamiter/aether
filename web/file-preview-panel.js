@@ -1,4 +1,5 @@
 import {createFilePreview,selectedReferenceAtCell} from './file-preview.js';
+import {nextSourceMatch, sourceDocument, sourceMatchStatus} from './file-preview-source.js';
 import {terminalCellAt} from './viewport.js';
 // This panel is explicitly local and independent of terminal/Codex output.
 // Directory selection grants a snapshot, not arbitrary path or remote access.
@@ -9,6 +10,42 @@ export function installFilePreviewPanel(document,{getFrame=()=>null,getEpoch=()=
  const raster=document.querySelector('#preview-raster');
  const confirmation=document.querySelector('#preview-confirmation'),confirm=document.querySelector('#preview-confirm-local'),showButton=document.querySelector('#preview-show');
  const edit=document.querySelector('#preview-vim9');
+ const tools = document.querySelector('#preview-source-tools');
+ const query = document.querySelector('#preview-source-query');
+ const matchCase = document.querySelector('#preview-source-case');
+ const previous = document.querySelector('#preview-source-prev');
+ const next = document.querySelector('#preview-source-next');
+ const findStatus = document.querySelector('#preview-source-find-status');
+ let source = null, hits = [], activeMatch = -1, truncated = false;
+
+ function findResults() {
+  if (!source || !query) return;
+  ({hits, truncated} = source.find(query.value, matchCase.checked));
+  activeMatch = -1;
+  previous.disabled = next.disabled = hits.length === 0;
+  findStatus.textContent = query.value ? sourceMatchStatus(hits, activeMatch, truncated) : '';
+  body.textContent = source.text;
+ }
+ function revealMatch(backwards) {
+  activeMatch = nextSourceMatch(hits, activeMatch, null, backwards);
+  if (activeMatch < 0) return;
+  const {start, end} = hits[activeMatch];
+  const mark = document.createElement('mark');
+  mark.textContent = source.text.slice(start, end);
+  body.replaceChildren(source.text.slice(0, start), mark, source.text.slice(end));
+  mark.scrollIntoView?.({block: 'nearest'});
+  findStatus.textContent = sourceMatchStatus(hits, activeMatch, truncated);
+ }
+ query?.addEventListener('input', findResults);
+ matchCase?.addEventListener('change', findResults);
+ previous?.addEventListener('click', () => revealMatch(true));
+ next?.addEventListener('click', () => revealMatch(false));
+ query?.addEventListener('keydown', event => {
+  if (event.key !== 'Enter' || event.isComposing || !hits.length) return;
+  event.preventDefault();
+  revealMatch(event.shiftKey);
+ });
+
  function editControl(){
   edit.hidden=!snapshot||!openInVim||(origin!==null&&!isLocalTerminal());
   edit.disabled=edit.hidden||opening;
@@ -21,7 +58,17 @@ export function installFilePreviewPanel(document,{getFrame=()=>null,getEpoch=()=
   confirmation.hidden=true;
   raster.width=1;raster.height=1;raster.hidden=true;
   if(item?.bitmap){raster.width=item.width;raster.height=item.height;const context=raster.getContext('2d');if(!context)throw Error('Image canvas unavailable.');context.drawImage(item.bitmap,0,0);raster.hidden=false;}
-  panel.hidden=!item;title.textContent=item?item.path:'';body.textContent=item?.bitmap?'Local image preview':item?item.text:'';
+  panel.hidden=!item;title.textContent=item?item.path:'';
+  source = item && !item.bitmap ? sourceDocument(item.text) : null;
+  body.textContent = source?.text ?? (item?.bitmap ? 'Local image preview' : '');
+  if (tools && query && matchCase && previous && next && findStatus) {
+   tools.hidden = !source;
+   query.value = '';
+   previous.disabled = next.disabled = true;
+   findStatus.textContent = '';
+   hits = [];
+   activeMatch = -1;
+  }
   if(moveFocus)(item?body:showButton).focus();
  },onError(message){selectionError=true;notice.textContent=message;}});
  const single=document.querySelector('#preview-single');

@@ -1,8 +1,9 @@
+import {installTerminalSelection} from './terminal-selection.js';
 import {validateReloadView,retainedReloadView,saveReloadTicket,takeReloadTicket} from './ssh-reload.js';
 import {installFilePreviewPanel} from './file-preview-panel.js';
 import {openVim9Snapshot} from './vim9-workbench.js';
 import {installPasteReview} from './paste.js';
-import {resizeQueue,cursorTarget,terminalCellAt} from './viewport.js';
+import {dimensions,resizeQueue,cursorTarget,terminalCellAt,viewportDimensions} from './viewport.js';
 import {installHistory} from './history.js';
 import {installCommandBlocks} from './command-blocks.js';
 import {installTerminalChat,validateChatStatus} from './terminal-chat.js';
@@ -34,7 +35,25 @@ const savedSshSelect=document.querySelector('#saved-ssh-shell'),resumeSavedSsh=d
 let savedSshShells=[],savedSshRequest=0;
 let localStream=null,localTransport='channel',localInputSuspended=false,localFrameRecovery=false;
 let splitEnabled=false,splitEpochs=[],splitLayout=1,settingSplit=false,peerState=null;
-const filePreview=installFilePreviewPanel(document,{getFrame:()=>state,getEpoch:()=>changingTab?null:epoch,getSession:()=>changingTab?null:owner?.session,
+const selectionOverlay = document.querySelector('#terminal-selection');
+const copySelection = document.querySelector('#copy-selection');
+const liveSelection = selectionOverlay && typeof canvas.setPointerCapture === 'function'
+  ? installTerminalSelection({
+    canvas, overlay: selectionOverlay, document,
+    onFrame(frame) {
+      if (frame) paint(canvas, frame);
+      else clearPaint(canvas);
+      describeCursor(frame);
+    },
+    onSelection(available) { if (copySelection) copySelection.disabled = !available; },
+  })
+  : null;
+function paintLiveFrame(frame) {
+  if (liveSelection) liveSelection.present(frame);
+  else paint(canvas, frame);
+}
+const visibleLiveFrame = () => liveSelection?.visibleFrame() ?? state;
+const filePreview=installFilePreviewPanel(document,{getFrame:visibleLiveFrame,getEpoch:()=>changingTab?null:epoch,getSession:()=>changingTab?null:owner?.session,
   getOwner:()=>!changingTab&&!recovery&&owner?JSON.stringify([owner.session,owner.epoch,owner.generation]):null,isLocalTerminal:()=>!sshSession,
   openInVim:typeof openVim9Snapshot==='function'?openVim9Snapshot:null});
 const imeInput=document.querySelector('#ime-input');
@@ -62,7 +81,7 @@ document.addEventListener?.('keydown',event=>{
   if(event.key==='Tab'&&!event.isComposing&&event.keyCode!==229&&ime.isComposing())ime.reset();
 },true);
 globalThis.addEventListener?.('blur',()=>ime.reset());
-canvas.addEventListener('click',event=>{if(!event.ctrlKey)imeInput.focus();});
+canvas.addEventListener('click',event=>{if(!event.defaultPrevented&&!event.ctrlKey)imeInput.focus();});
 const resize=document.querySelector('#resize');
 const invoke=globalThis.__TAURI__?.core?.invoke;
 const Channel=globalThis.__TAURI__?.core?.Channel;
@@ -392,7 +411,7 @@ button.addEventListener('click',async()=>{
       frame=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));
     }
     if(currentGeneration!==generation)return;
-    const next=acceptFull(state,frame);paint(canvas,next);state=next;describeCursor();
+    const next=acceptFull(state,frame);paintLiveFrame(next);state=next;describeCursor();
     if(invoke) await invoke('acknowledge',{session:state.session,epoch:state.epoch,revision:state.revision});
     status.textContent=`Rust frame ${state.revision} accepted. No PTY attached.`;
   }catch(e){if(currentGeneration!==generation)return;status.textContent=`Stopped: ${String(e?.message??e)}. Restart the app to reset.`;}
@@ -469,7 +488,7 @@ async function receiveLocalStream(stream,event){
     let revision=null;
     if(event.frame!==null){
       const next=acceptChannelFrame(stream.frame,event.frame,{...attachment,frameVersion:CHANNEL_FRAME_VERSION});
-      paint(canvas,next);state=next;stream.frame=next;revision=next.revision;describeCursor();
+      paintLiveFrame(next);state=next;stream.frame=next;revision=next.revision;describeCursor();
     }
     paintPeer(peer);
     recoverFrame=false;
@@ -529,7 +548,7 @@ document.addEventListener?.('visibilitychange',()=>{if(document.hidden)ime.reset
 async function poll(){
   if(epoch===null||changingTab||localStream||localTransport==='recovery'||polling?.epoch===epoch)return;const current=epoch,attachment=owner,ticket={epoch,transport};polling=ticket;
   try{const frame=await invokeAttached('poll_shell',{epoch:current},attachment);if(epoch!==current||ticket.transport!==transport)return;
-    if(frame){const next=acceptUpdate(state,frame,attachment);paint(canvas,next);state=next;describeCursor();await invokeAttached('ack_shell',{epoch:current,revision:next.revision},attachment);}
+    if(frame){const next=acceptUpdate(state,frame,attachment);paintLiveFrame(next);state=next;describeCursor();await invokeAttached('ack_shell',{epoch:current,revision:next.revision},attachment);}
     if(epoch!==current||ticket.transport!==transport)return;
     const info=await invokeAttached('shell_status',{epoch:current},attachment);if(epoch!==current||ticket.transport!==transport)return;
     validateShellStatus(info,current);showShellStatus(info,'poll');
@@ -558,6 +577,7 @@ async function poll(){
 function setActiveControls(writable){
   input.disabled=send.disabled=resize.disabled=!writable||restoringLocalLayout;
   close.disabled=detach.disabled=restoringLocalLayout;
+  if (writable && fitSize?.checked) void Promise.resolve().then(requestFit);
 }
 function startLocalTab(targetEpoch,{fromRestore=false,focusTerminal=false,configuration=plainLocalTab}={}) {
   if(sshSession!==null||changingTab||recovery||restoringLocalLayout&&!fromRestore||
@@ -592,7 +612,7 @@ async function attemptLocalTab(){
         preserveInput:change.preserveInput,...options,...launch});
       if(typeof response?.Err==='string'){
         const previous=change.previousFrame;
-        if(previous){paint(canvas,previous);state=previous;describeCursor();}
+        if(previous){paintLiveFrame(previous);state=previous;describeCursor();}
         setActiveControls(change.preserveInput);resize.disabled=change.resizeDisabled;
         if(!owner)close.disabled=detach.disabled=true;
         if(owner)setLocalTools(true);
@@ -617,7 +637,7 @@ async function attemptLocalTab(){
         writable:result.input_allowed,paneId:acceptLocalPane(result)};
     }
     const next=change.view;
-    paint(canvas,next.frame);
+    paintLiveFrame(next.frame);
     await invokeAttached('ack_shell',{epoch:next.owner.epoch,revision:next.frame.revision},next.owner);
     const previousEpoch=epoch;
     owner=next.owner;epoch=owner.epoch;state=next.frame;describeCursor();
@@ -853,7 +873,7 @@ async function reconnect(selected=null,saved=null){
     const previousEpoch=epoch;owner=nextOwner;epoch=owner.epoch;updateSplitPair(previousEpoch);keyQueue={chain:Promise.resolve(),pending:0,locked:true};
     localTransport='channel';localInputSuspended=false;
     input.disabled=send.disabled=resize.disabled=true;close.disabled=detach.disabled=false;
-    paint(canvas,next);state=next;describeCursor();
+    paintLiveFrame(next);state=next;describeCursor();
     await invokeAttached('ack_shell',{epoch:nextOwner.epoch,revision:next.revision},nextOwner);
     if(owner!==nextOwner)return;
     status.textContent=saved?'Reconnected to the saved SSH shell on '+saved.destination+' in view-only mode.'
@@ -869,7 +889,8 @@ async function reconnect(selected=null,saved=null){
   finally{if(generation===attempt&&epoch===null){setOpenDisabled(sshSession!==null);attach.disabled=false;button.disabled=sshSession!==null;}}
 }
 function clearTerminalPaint(){
-  clearPaint(canvas);
+  if (liveSelection) liveSelection.reset();
+  else clearPaint(canvas);
   canvas.title='';canvas.style.cursor='';
   rememberLocalGeometry(state);
   document.querySelector('#cursor-status').textContent='';
@@ -933,26 +954,62 @@ document.querySelector('#command').addEventListener('submit',async event=>{
 const colsInput=document.querySelector('#cols'),rowsInput=document.querySelector('#rows');
 colsInput.value ||= '100';rowsInput.value ||= '24';
 const sizes=resizeQueue({getEpoch:()=>changingTab||recovery?null:owner,invoke:(command,{epoch:attachment,...args})=>invokeAttached(command,{epoch:attachment.epoch,...args},attachment),onDone:async()=>{await poll();await history.refreshProjection();},onError:e=>{status.textContent=String(e?.message??e);}});
-resize.addEventListener('click',async()=>{if(epoch===null||input.disabled)return;try{await sizes.request(Number(rowsInput.value),Number(colsInput.value));}catch(e){status.textContent=String(e?.message??e);}});
-function describeCursor(){
+const fitSize = document.querySelector('#fit-size');
+const fitViewport = document.querySelector('#active-pane .viewport');
+let lastFit = null;
+function requestFit() {
+  if (!fitSize?.checked || !owner || changingTab || recovery || resize.disabled) return;
+  const size = viewportDimensions(fitViewport, globalThis.getComputedStyle?.(fitViewport));
+  if (!size || (lastFit?.owner === owner && lastFit.rows === size.rows && lastFit.cols === size.cols)) return;
+  lastFit = {owner, ...size};
+  if (state?.rows.length === size.rows && state.cols === size.cols) return;
+  void sizes.request(size.rows, size.cols);
+}
+if (fitSize && fitViewport) {
+  fitSize.disabled = !invoke;
+  fitSize.addEventListener('change', () => {
+    lastFit = null;
+    fitViewport.classList.toggle('fit-terminal', fitSize.checked);
+    if (fitSize.checked) requestFit();
+    else sizes.cancelPending();
+  });
+  if (invoke && typeof ResizeObserver === 'function') new ResizeObserver(requestFit).observe(fitViewport);
+}
+resize.addEventListener('click', async () => {
+  if (epoch === null || input.disabled) return;
+  try {
+    const {rows, cols} = dimensions(Number(rowsInput.value), Number(colsInput.value));
+    if (fitSize?.checked) {
+      fitSize.checked = false;
+      fitViewport?.classList.remove('fit-terminal');
+      lastFit = null;
+    }
+    await sizes.request(rows, cols);
+  } catch (e) {
+    status.textContent = String(e?.message ?? e);
+  }
+});
+function describeCursor(frame=visibleLiveFrame()){
   canvas.title='';canvas.style.cursor='';
-  if(!state)return;
-  const left=`${(canvas.offsetLeft||0)+state.cursor_col*12}px`;
-  const top=`${(canvas.offsetTop||0)+state.cursor_row*24}px`;
+  if(!frame)return;
+  const surface=selectionOverlay?.parentElement ?? canvas;
+  const left=`${(surface.offsetLeft||0)+frame.cursor_col*12}px`;
+  const top=`${(surface.offsetTop||0)+frame.cursor_row*24}px`;
   for(const layer of [imeInput,terminalPreedit]){
     layer.style.left=left;layer.style.top=top;
   }
   rememberLocalGeometry(state);
-  document.querySelector('#cursor-status').textContent=`${state.cols} × ${state.rows.length} cells · cursor row ${state.cursor_row+1}, column ${state.cursor_col+1} · ${state.cursor_shape}${state.cursor_visible?'':' (hidden)'}${state.pending_wrap?' · wrap pending':''}`;
+  document.querySelector('#cursor-status').textContent=`${frame.cols} × ${frame.rows.length} cells · cursor row ${frame.cursor_row+1}, column ${frame.cursor_col+1} · ${frame.cursor_shape}${frame.cursor_visible?'':' (hidden)'}${frame.pending_wrap?' · wrap pending':''}`;
 }
 function hyperlinkAt(event){
-  if(!owner||state?.version!==CHANNEL_FRAME_VERSION||state.session!==owner.session||state.epoch!==owner.epoch)return null;
-  const point=terminalCellAt(state,canvas,event.clientX,event.clientY);
+  const frame=visibleLiveFrame();
+  if(!owner||frame?.version!==CHANNEL_FRAME_VERSION||frame.session!==owner.session||frame.epoch!==owner.epoch)return null;
+  const point=terminalCellAt(frame,canvas,event.clientX,event.clientY);
   if(!point)return null;
-  const cells=state.rows[point.row];
+  const cells=frame.rows[point.row];
   const cell=cells[point.col].width===0?cells[point.col-1]:cells[point.col];
-  const target=state.hyperlinks[cell.hyperlink_id];
-  return target?{...point,target}:null;
+  const target=frame.hyperlinks[cell.hyperlink_id];
+  return target?{...point,target,revision:frame.revision}:null;
 }
 canvas.addEventListener('pointermove',event=>{
   const link=hyperlinkAt(event);
@@ -966,14 +1023,15 @@ canvas.addEventListener('click',event=>{
   if(!link)return;
   event.preventDefault();
   const attachment=owner;
-  void invoke('open_terminal_hyperlink',{owner:attachment,revision:state.revision,row:link.row,col:link.col}).catch(error=>{
+  void invoke('open_terminal_hyperlink',{owner:attachment,revision:link.revision,row:link.row,col:link.col}).catch(error=>{
     if(owner===attachment)status.textContent=String(error?.message??error);
   });
 },true);
 function revealLiveCursor(){
-  if(!state)return;
+  const frame=visibleLiveFrame();
+  if(!frame)return;
   const viewport=document.querySelector('#active-pane .viewport');
-  viewport.scrollTo(cursorTarget(state,canvas,viewport));
+  viewport.scrollTo(cursorTarget(frame,selectionOverlay?.parentElement ?? canvas,viewport));
 }
 document.querySelector('#reveal-cursor').addEventListener('click',revealLiveCursor);
 
@@ -1027,17 +1085,28 @@ function paste(event){
 }
 canvas.addEventListener('paste',paste);imeInput.addEventListener('paste',paste);
 
+copySelection?.addEventListener('click', () => {
+  const selection = liveSelection?.snapshot();
+  if (!selection) return;
+  history.reset();
+  const output = document.querySelector('#history-output');
+  output.value = selection.text;
+  output.focus();
+  output.select();
+});
+
 document.querySelector('#copy-visible').addEventListener('click',()=>{
-  if(!state)return;
+  const frame = visibleLiveFrame();
+  if(!frame)return;
   history.reset();
   const output=document.querySelector('#history-output');
   // Match Rust archive copy: strip ASCII blank padding, not displayed
   // Unicode spaces such as NBSP or the wide ideographic space.
-  output.value=state.rows.map((row,index)=>{
+  output.value=frame.rows.map((row,index)=>{
     const text=row.filter(cell=>cell.width!==0).map(cell=>cell.text).join('');
-    return row.wrapped?text:text.replace(/ +$/,'')+(index+1<state.rows.length?'\n':'');
+    return row.wrapped?text:text.replace(/ +$/,'')+(index+1<frame.rows.length?'\n':'');
   }).join('');
-  document.querySelector('#history-label').textContent=`Visible grid snapshot ${state.revision}. Select and copy normally.`;
+  document.querySelector('#history-label').textContent=`Visible grid snapshot ${frame.revision}. Select and copy normally.`;
 });
 
 async function recoverOutput(previousStatus=null){
@@ -1077,7 +1146,7 @@ async function recoverOutput(previousStatus=null){
     }
     owner=nextOwner;
     if(nextOwner.session!==sshSession)rememberLocalTab(nextOwner);
-    paint(canvas,next);state=next;describeCursor();
+    paintLiveFrame(next);state=next;describeCursor();
     await invokeAttached('ack_shell',{epoch:current,revision:next.revision});
     if(epoch!==current||transport!==ticket)return;
     if(nextOwner.session===sshSession){
@@ -1137,7 +1206,7 @@ async function claimSshReload(){
     owner=nextOwner;epoch=nextOwner.epoch;sshSession=nextOwner.session;state=next;
     keyQueue={chain:Promise.resolve(),pending:0,locked:true};input.disabled=send.disabled=resize.disabled=true;
     close.disabled=detach.disabled=false;
-    paint(canvas,next);describeCursor();renderLocalTabs();
+    paintLiveFrame(next);describeCursor();renderLocalTabs();
     await invokeAttached('ack_shell',{epoch:nextOwner.epoch,revision:next.revision},nextOwner);
     if(owner!==nextOwner)return;
     if(result.input_allowed){keyQueue.locked=false;input.disabled=send.disabled=resize.disabled=false;}
