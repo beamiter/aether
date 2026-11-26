@@ -64,6 +64,16 @@ rows and reconnect with the retained shell. **Recover output snapshot** can
 replace an invalid Channel frame or resume compatibility polling after a
 transport stall. SSH terminal sessions use polling over the existing relay.
 
+Local terminal applications can request mouse clicks, dragging and wheel
+reports. Hold **Shift** to select text or scroll the Aether view while the
+application has mouse tracking enabled. The reports target the active,
+painted terminal grid.
+
+Resizing changes the local PTY geometry immediately. Aether continues to
+process output and input while holding the last complete frame through a
+short repaint burst. It publishes once output is quiet or the one-second
+hold limit is reached.
+
 Use **Refresh history / copy snapshot** to read the local archive. The history
 viewport displays retained styles and images at the current terminal width.
 Select cells in the viewport or use the text field to copy its snapshot.
@@ -344,8 +354,8 @@ commit; this link alone is not a claim that a particular commit passed.
 
 This native smoke does not test physical mouse input, compositor screenshots,
 Wayland, platform IME or native clipboard behavior. Process ownership covers
-only the direct shell, not descendant containment. The product shell uses
-`TERM=dumb`; the Vim smoke opts into `TERM=xterm`. Unsupported sequences and
+only the direct shell, not descendant containment. Local Shell and the Vim
+smoke use the shared `jterm-256color` profile. Unsupported sequences and
 Unicode shaping limitations remain explicit. See [lifecycle policy](LIFECYCLE-POLICY.md) and
 [session contracts](session/README.md).
 

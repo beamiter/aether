@@ -106,8 +106,7 @@ export function installTerminalSelection({canvas, overlay, document, onFrame, on
     if (drag || !event.isPrimary || event.button !== 0) return;
     suppressClick = false;
     if (!visible || event.defaultPrevented || event.pointerType !== 'mouse' ||
-        event.ctrlKey || event.altKey || event.metaKey ||
-        (event.shiftKey && (!visible.mouse || visible.mouse.tracking === 'off'))) return;
+        event.ctrlKey || event.altKey || event.metaKey) return;
     const anchor = cellAt(visible, canvas, event, false);
     if (anchor === null) return;
     canvas.setPointerCapture(event.pointerId);

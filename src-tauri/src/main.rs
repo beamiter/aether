@@ -376,6 +376,19 @@ async fn key_shell(
     .await
 }
 #[tauri::command]
+async fn mouse_shell<R: tauri::Runtime>(
+    window: tauri::WebviewWindow<R>,
+    owner: Attachment,
+    report: tauri_terminal_frame_bridge::live::MouseReport,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
+) -> Result<bool, String> {
+    require_terminal_window(&window)?;
+    run_input(bridge.inner().clone(), owner, move |bridge, epoch| {
+        bridge.mouse(epoch, report)
+    })
+    .await
+}
+#[tauri::command]
 async fn submit_local_chat<R: tauri::Runtime>(
     window: tauri::WebviewWindow<R>,
     owner: Attachment,
@@ -623,6 +636,7 @@ fn application<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<
             write_shell,
             resize_shell,
             key_shell,
+            mouse_shell,
             submit_local_chat,
             local_workflows::local_workflow_library,
             local_workflows::insert_local_workflow,

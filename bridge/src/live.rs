@@ -14,13 +14,18 @@ use jterm_engine::{
     terminal::{HistoryPage, Terminal},
 };
 use jterm_headless_session_spike::{Session, WakeSink};
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 mod command_blocks;
+mod mouse;
 mod raw_suffix;
 pub use crate::protocol::{CloseStatus, HistorySnapshot, SessionStatus};
 pub use command_blocks::{
     BlockSelection, CommandActivity, CommandBlockSnapshot, CompletedPaneHistory, RetainedBlock,
 };
+pub use mouse::{MouseReport, MouseView};
 use raw_suffix::RawSuffix;
 
 const HISTORY_PAGE_ROWS: usize = 128;
@@ -29,6 +34,32 @@ const MAX_HISTORY_OFFSET: usize = 1024;
 // Match the web canvas's intrinsic cell geometry. Device scaling is applied
 // only by its compositor and does not change the terminal's cell dimensions.
 const CELL_PIXELS: (u16, u16) = (12, 24);
+const RESIZE_QUIET: Duration = Duration::from_millis(120);
+const RESIZE_LIMIT: Duration = Duration::from_secs(1);
+
+struct ResizeRepaint {
+    quiet_at: Instant,
+    limit: Instant,
+    completed: Option<CellFrame>,
+}
+
+impl ResizeRepaint {
+    fn new(now: Instant) -> Self {
+        Self {
+            quiet_at: now + RESIZE_QUIET,
+            limit: now + RESIZE_LIMIT,
+            completed: None,
+        }
+    }
+
+    fn extend(&mut self, now: Instant) {
+        self.quiet_at = (now + RESIZE_QUIET).min(self.limit);
+    }
+
+    fn held(&self, now: Instant) -> bool {
+        now < self.quiet_at
+    }
+}
 
 #[derive(Default)]
 pub struct LiveBridge {
@@ -46,6 +77,8 @@ pub struct LiveBridge {
     unpublished_background: bool,
     hyperlink_policy: Option<jterm_engine::hyperlink::HyperlinkPolicy>,
     stable: Option<RetainedCellFrame>,
+    resize_repaint: Option<ResizeRepaint>,
+    mouse: mouse::Mouse,
     #[cfg(test)]
     frame_budget_override:
         Option<std::sync::Arc<jterm_engine::retained_bytes::RetainedBytesBudget>>,
@@ -350,6 +383,7 @@ impl LiveBridge {
         self.generation = self.next_detached_generation(owner)?;
         self.session.as_mut().unwrap().retire_pending_input();
         self.raw.retire_view();
+        self.mouse.retire();
         self.input_attached = false;
         self.flight = None;
         self.accepted = None;
@@ -408,11 +442,46 @@ impl LiveBridge {
 
     fn poll_io(&mut self, capture: bool) -> Result<usize, String> {
         let session = self.session.as_mut().unwrap();
-        let result = session.drive_with_sync_capture(capture);
+        let result = session.drive_with_sync_capture(capture || self.resize_repaint.is_some());
         if session.write_error().is_some() {
             self.input_attached = false;
         }
-        result
+        let bytes = result?;
+        if self.local_desktop {
+            self.mouse.observe(session.terminal());
+        }
+        if let Some(repaint) = &mut self.resize_repaint {
+            let now = Instant::now();
+            if bytes != 0 && repaint.held(now) {
+                repaint.extend(now);
+            }
+            if let Some(frame) = session.take_completed_sync_frame() {
+                repaint.completed = Some(frame);
+            }
+        }
+        Ok(bytes)
+    }
+
+    fn resize_held(&self, now: Instant) -> bool {
+        self.resize_repaint
+            .as_ref()
+            .is_some_and(|repaint| repaint.held(now))
+            && self
+                .session
+                .as_ref()
+                .is_some_and(|session| !session.is_drained())
+    }
+
+    fn take_completed_frame(&mut self) -> Option<CellFrame> {
+        let repaint = self
+            .resize_repaint
+            .take()
+            .and_then(|repaint| repaint.completed);
+        self.session
+            .as_mut()
+            .unwrap()
+            .take_completed_sync_frame()
+            .or(repaint)
     }
 
     /// A local desktop owner may drain a detached PTY after witnessing that
@@ -453,8 +522,11 @@ impl LiveBridge {
         }
         self.unpublished_background = true;
         let output_bytes = self.poll_io(true)?;
-        let session = self.session.as_mut().unwrap();
-        let completed = session.take_completed_sync_frame();
+        if self.resize_held(Instant::now()) {
+            return Ok((true, output_bytes));
+        }
+        let completed = self.take_completed_frame();
+        let session = self.session.as_ref().unwrap();
         let active = !session.is_drained();
         let frame = if !active || !session.terminal().publication_held() {
             Some(session.terminal().frame()?)
@@ -508,11 +580,11 @@ impl LiveBridge {
     fn poll_frame(&mut self, epoch: u32, snapshot: bool) -> Result<Option<CellFrame>, String> {
         self.check(epoch)?;
         self.poll_io(self.flight.is_none())?;
-        let session = self.session.as_mut().unwrap();
-        if self.flight.is_some() {
+        if self.flight.is_some() || self.resize_held(Instant::now()) {
             return Ok(None);
         }
-        let completed = session.take_completed_sync_frame();
+        let completed = self.take_completed_frame();
+        let session = self.session.as_ref().unwrap();
         let frame = if !session.is_drained() && session.terminal().publication_held() {
             match completed {
                 Some(frame) => frame,
@@ -706,7 +778,21 @@ impl LiveBridge {
 
     fn current_snapshot(&self) -> Result<CellFrame, String> {
         let session = self.session.as_ref().unwrap();
+        if self.resize_held(Instant::now()) {
+            return self
+                .stable
+                .as_deref()
+                .cloned()
+                .ok_or_else(|| "terminal frame publication is temporarily busy".into());
+        }
         if !session.is_drained() && session.terminal().publication_held() {
+            if let Some(completed) = self
+                .resize_repaint
+                .as_ref()
+                .and_then(|repaint| repaint.completed.as_ref())
+            {
+                return Ok(completed.clone());
+            }
             self.stable
                 .as_deref()
                 .cloned()
@@ -846,6 +932,40 @@ impl LiveBridge {
         self.check(epoch)?;
         self.session.as_mut().unwrap().submit_input(bytes)
     }
+    pub fn mouse_view(&self, epoch: u32) -> Result<Option<MouseView>, String> {
+        self.check(epoch)?;
+        if !self.local_desktop || !self.input_attached || self.resize_held(Instant::now()) {
+            return Ok(None);
+        }
+        let session = self.session.as_ref().unwrap();
+        if session.is_exited() || session.write_error().is_some() {
+            return Ok(None);
+        }
+        Ok(self
+            .flight
+            .as_ref()
+            .or(self.accepted.as_ref())
+            .and_then(|frame| self.mouse.view(session.terminal(), frame.stamp())))
+    }
+
+    pub fn mouse(&mut self, epoch: u32, report: MouseReport) -> Result<bool, String> {
+        self.check(epoch)?;
+        if !self.local_desktop || self.resize_held(Instant::now()) {
+            return Ok(false);
+        }
+        // Drive first so a mode change or a layout update already waiting in
+        // the reader invalidates the painted pointer target.
+        self.poll_io(self.flight.is_none())?;
+        for frame in self.flight.iter().chain(self.accepted.iter()) {
+            if self.mouse.matches(frame.stamp(), &report) {
+                return self
+                    .mouse
+                    .send(self.session.as_mut().unwrap(), frame.stamp(), report);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn key(
         &mut self,
         epoch: u32,
@@ -896,7 +1016,23 @@ impl LiveBridge {
     }
     pub fn resize(&mut self, epoch: u32, rows: usize, cols: usize) -> Result<(), String> {
         self.check(epoch)?;
-        self.session.as_mut().unwrap().resize(rows, cols)
+        let session = self.session.as_mut().unwrap();
+        let changed = if self.local_desktop {
+            let frame = session.terminal().frame()?;
+            (frame.rows().len(), frame.cols()) != (rows, cols)
+        } else {
+            false
+        };
+        session.resize(rows, cols)?;
+        if changed {
+            let now = Instant::now();
+            if let Some(repaint) = &mut self.resize_repaint {
+                repaint.extend(now);
+            } else {
+                self.resize_repaint = Some(ResizeRepaint::new(now));
+            }
+        }
+        Ok(())
     }
     pub fn close(&mut self, epoch: u32) -> Result<CloseStatus, String> {
         self.check(epoch)?;
@@ -906,6 +1042,8 @@ impl LiveBridge {
         self.id.clear();
         self.input_attached = false;
         self.stable = None;
+        self.resize_repaint = None;
+        self.mouse = mouse::Mouse::default();
         self.flight = None;
         self.accepted = None;
         self.resumed_from = None;
@@ -1327,6 +1465,101 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn resize_repaint_updates_the_pty_before_publishing_and_caps_the_hold() {
+        let start = Instant::now();
+        let mut repaint = ResizeRepaint::new(start);
+        repaint.extend(start + RESIZE_LIMIT - Duration::from_millis(1));
+        assert!(repaint.held(start + RESIZE_LIMIT - Duration::from_millis(1)));
+        assert!(!repaint.held(start + RESIZE_LIMIT));
+
+        let mut bridge = LiveBridge::local_desktop();
+        let epoch = bridge.open(4, 80).unwrap();
+        let initial = bridge.recover_frame(epoch).unwrap();
+        bridge.acknowledge(epoch, initial.revision).unwrap();
+        bridge.resize(epoch, 8, 100).unwrap();
+        let live = bridge.session.as_ref().unwrap().terminal().frame().unwrap();
+        assert_eq!((live.rows().len(), live.cols()), (8, 100));
+
+        // Use an explicit deadline so scheduler pauses do not change the test.
+        bridge.resize_repaint.as_mut().unwrap().quiet_at = Instant::now() + Duration::from_secs(10);
+        assert_eq!(
+            bridge.current_snapshot().unwrap().stamp().revision,
+            u64::from(initial.revision)
+        );
+        assert!(bridge.poll(epoch).unwrap().is_none());
+        bridge.resize_repaint.as_mut().unwrap().quiet_at = Instant::now();
+
+        let repainted = bridge.poll(epoch).unwrap().unwrap();
+        assert_eq!((repainted.rows.len(), repainted.cols), (8, 100));
+        bridge.close(epoch).unwrap();
+    }
+
+    #[test]
+    fn local_mouse_uses_the_published_surface_and_delivers_real_pty_reports() {
+        let mut bridge = LiveBridge::local_desktop();
+        let epoch = bridge.open(6, 100).unwrap();
+        let command = b"stty -echo -icanon min 1 time 0; printf '\\033[?1002;1006h'; od -An -v -w18 -tx1 -N18\n";
+        write_owned_line(&mut bridge, epoch, command);
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let view = loop {
+            assert!(Instant::now() < deadline, "mouse mode never appeared");
+            if let Some(frame) = bridge.poll(epoch).unwrap() {
+                bridge.acknowledge(epoch, frame.revision).unwrap();
+            }
+            if let Some(view) = bridge.mouse_view(epoch).unwrap() {
+                break serde_json::to_value(view).unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(view["tracking"], "drag");
+        let report = |kind: &str, layout: &serde_json::Value, generation: u64| {
+            serde_json::from_value::<MouseReport>(serde_json::json!({
+                "layout": layout, "revision": view["revision"], "generation": generation,
+                "row": 1, "col": 2, "kind": kind, "button": "left", "alt": false, "ctrl": false,
+            }))
+            .unwrap()
+        };
+        let generation = view["generation"].as_u64().unwrap();
+        assert!(!bridge
+            .mouse(epoch, report("press", &view["layout"], generation + 1))
+            .unwrap());
+        assert!(!bridge
+            .mouse(epoch, report("release", &view["layout"], generation))
+            .unwrap());
+        assert!(bridge
+            .mouse(epoch, report("press", &view["layout"], generation))
+            .unwrap());
+        assert!(bridge
+            .mouse(epoch, report("release", &view["layout"], generation))
+            .unwrap());
+
+        let expected = "1b 5b 3c 30 3b 33 3b 32 4d 1b 5b 3c 30 3b 33 3b 32 6d";
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "mouse reports did not reach the real PTY"
+            );
+            if let Some(frame) = bridge.poll(epoch).unwrap() {
+                bridge.acknowledge(epoch, frame.revision).unwrap();
+                if frame.rows.iter().any(|row| {
+                    row.iter()
+                        .map(|cell| cell.text.as_str())
+                        .collect::<String>()
+                        .contains(expected)
+                }) {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        bridge.resize(epoch, 8, 100).unwrap();
+        assert!(!bridge
+            .mouse(epoch, report("press", &view["layout"], generation))
+            .unwrap());
+        bridge.close(epoch).unwrap();
+    }
+
     #[test]
     fn real_pty_completed_cycle_publishes_before_next_hold_timeout() {
         use std::time::{Duration, Instant};

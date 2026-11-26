@@ -1,3 +1,4 @@
+import {installTerminalMouse} from './terminal-mouse.js';
 import {installTerminalSelection} from './terminal-selection.js';
 import {validateReloadView,retainedReloadView,saveReloadTicket,takeReloadTicket} from './ssh-reload.js';
 import {installFilePreviewPanel} from './file-preview-panel.js';
@@ -28,6 +29,7 @@ const localShellKinds=new Map();
 const localPaneIds=new Map();
 const localTabGeometry=new Map();
 let changingTab=null,restoringLocalLayout=false;
+let mouseView=null;
 let state=null,epoch=null,owner=null,timer=null,polling=null,generation=0,transport=0,recovery=null;
 let sshSession=null,sshInputSuspended=false,detachedLocal=null,sshReloadNeeded=false,retainedLayoutBlocked=false;
 const showSavedSsh=document.querySelector('#show-saved-ssh'),savedSshPanel=document.querySelector('#saved-ssh');
@@ -58,6 +60,22 @@ const filePreview=installFilePreviewPanel(document,{getFrame:visibleLiveFrame,ge
   openInVim:typeof openVim9Snapshot==='function'?openVim9Snapshot:null});
 const imeInput=document.querySelector('#ime-input');
 const terminalPreedit=document.querySelector('#terminal-preedit');
+const terminalMouse = typeof canvas.setPointerCapture === 'function'
+  ? installTerminalMouse({
+    canvas,
+    getFrame() {
+      if (input.disabled || changingTab || recovery || !owner || owner.session === sshSession ||
+          mouseView?.owner !== owner) return null;
+      const frame = visibleLiveFrame();
+      if (!frame || frame.session !== owner.session || frame.epoch !== owner.epoch ||
+          String(frame.revision) !== mouseView.mouse.revision ||
+          String(frame.layout) !== mouseView.mouse.layout) return null;
+      return {...frame, mouse: mouseView.mouse};
+    },
+    send: report => enqueueLogical('mouse_shell', {report}),
+    focus: () => imeInput.focus(),
+  })
+  : null;
 const terminalChatSend=document.querySelector('#terminal-chat-send');
 const inputOwner=()=>!input.disabled?owner:null;
 function refreshTerminalControls(){terminalChat.updateOwner();workflows.updateOwner();}
@@ -425,6 +443,15 @@ function validateShellStatus(info,expectedEpoch){
     validateChatStatus(info.chat);
     acceptLocalPane(info);
     if(info.history_oldest_row!==undefined)channelCounter(info.history_oldest_row);
+    if (info.mouse !== undefined) {
+      const mouse = info.mouse;
+      if (!mouse || !['button', 'drag', 'any'].includes(mouse.tracking) ||
+          !Number.isInteger(mouse.generation) || mouse.generation < 1 || mouse.generation > 0xffffffff) {
+        throw new Error('invalid terminal mouse state');
+      }
+      channelCounter(mouse.layout);
+      channelCounter(mouse.revision);
+    }
   }
 }
 function showShellStatus(info,mode){
@@ -447,10 +474,14 @@ function showShellStatus(info,mode){
     terminalChat.showStatus(info,owner);
     if(info.history_oldest_row!==undefined)history.updateRetained(owner,info.history_oldest_row);
   }
+  mouseView = owner && owner.session !== sshSession && info.mouse ? {owner, mouse: info.mouse} : null;
+  terminalMouse?.frameChanged();
   workflows.updateOwner();
   if(document.activeElement===imeInput||document.activeElement===canvas)terminalChat.followCursor();
 }
 function stopTransport(){
+  mouseView = null;
+  terminalMouse?.frameChanged();
   clearInterval(timer);
   if(localStream){
     if(localStream.animation!==null)cancelAnimationFrame(localStream.animation);
@@ -770,7 +801,7 @@ async function openShell({destination=null,retained=null,fromRestore=false,confi
     setActiveControls(true);
     if(destination===null){setLocalTools(true);recordLocalLayout();}
     renderLocalTabs();
-    status.textContent=retained?'Second local shell opened; the first remains retained.':destination!==null?`SSH shell connected to ${destination}.`:integrated?'Local jsh opened. Completed commands are available in Command blocks.':'Experimental /bin/sh; TERM=dumb. Focus terminal for experimental keyboard input; no native GUI/IME acceptance.';
+    status.textContent=retained?'Second local shell opened; the first remains retained.':destination!==null?`SSH shell connected to ${destination}.`:integrated?'Local jsh opened. Completed commands are available in Command blocks.':'Experimental /bin/sh opened. Focus the terminal to type.';
     if(destination!==null&&typeof result?.save_warning==='string')status.textContent+=' '+result.save_warning;
     await startTransport();
   }catch(e){if(generation===attempt){status.textContent=retained?'Second shell open unconfirmed: '+String(e?.message??e)+'. Show retained local shells before trying again.':String(e?.message??e);if(!fromRestore){setOpenDisabled(false);attach.disabled=button.disabled=false;}}}
@@ -1044,6 +1075,8 @@ function ownsInput(attachment,queue){
 function enqueueLogical(command,payload,onReceipt){
   if(epoch===null||input.disabled)return;
   const queue=keyQueue;
+  const mouse=command==='mouse_shell';
+  if (mouse && queue.pending >= (payload.report.kind === 'release' ? 128 : 126)) return;
   if(queue.pending>=128){pasteReview.reset();queue.locked=true;status.textContent='Keyboard queue full; input locked. Close/reopen before retrying.';input.disabled=send.disabled=true;return;}
   const current=epoch,attachment=owner;queue.pending++;
   queue.chain=queue.chain.then(async()=>{
@@ -1052,7 +1085,7 @@ function enqueueLogical(command,payload,onReceipt){
       const result=await invokeAttached(command,{epoch:current,...payload},attachment);
       if(ownsInput(attachment,queue))onReceipt?.(result);
     }
-    catch(e){if(ownsInput(attachment,queue)){pasteReview.reset();queue.locked=true;input.disabled=send.disabled=true;status.textContent=`Input not accepted: ${String(e?.message??e)}. Close/reopen before retrying.`;}}
+    catch(e){if(!mouse&&ownsInput(attachment,queue)){pasteReview.reset();queue.locked=true;input.disabled=send.disabled=true;status.textContent=`Input not accepted: ${String(e?.message??e)}. Close/reopen before retrying.`;}}
   }).finally(()=>{queue.pending--;});
   return queue.chain;
 }

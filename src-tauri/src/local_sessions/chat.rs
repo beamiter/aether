@@ -1,7 +1,7 @@
 use jterm_core::chat_mode::{resolve_surface, ChatSessionState, ChatSurface};
 use serde::Serialize;
 use tauri_terminal_frame_bridge::{
-    live::{LiveBridge, SessionStatus},
+    live::{LiveBridge, MouseView, SessionStatus},
     protocol_v4::Counter,
 };
 
@@ -10,6 +10,8 @@ pub(crate) struct LocalShellStatus {
     #[serde(flatten)]
     shell: SessionStatus,
     chat: TerminalChatStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mouse: Option<MouseView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     history_oldest_row: Option<Counter>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -48,6 +50,7 @@ impl LocalShellStatus {
         };
         Ok(Self {
             shell,
+            mouse: bridge.mouse_view(epoch)?,
             history_oldest_row: bridge.history_oldest_row(epoch)?,
             pane_history_id: bridge.completed_pane_id().map(str::to_owned),
             chat: TerminalChatStatus {
