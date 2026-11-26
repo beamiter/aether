@@ -1411,6 +1411,8 @@ def exercise_terminal_chat(driver, owned):
                 command: card.querySelector('code').textContent,
                 body: card.textContent,
                 output: card.querySelector('textarea')?.value ?? null,
+                output_surface: Boolean(card.querySelector('[aria-label="Command output"]')),
+                empty_output: Array.from(card.querySelectorAll('p')).some(p => p.textContent === 'No output.'),
               })),
             };
         """)
@@ -1478,7 +1480,9 @@ def exercise_terminal_chat(driver, owned):
     assert not fullscreen['transcript'] and not fullscreen['chrome'] and not fullscreen['legacy']
     driver.type(terminal, "\ue00c:q!\ue007")
     assert phase("prompt")['transcript']
-    assert card_for(editor)['output'] == ''
+    editor_card = card_for(editor)
+    assert editor_card["empty_output"] and not editor_card["output_surface"], editor_card
+    assert "Exit 0" in editor_card["body"] and "TERMINAL_CHAT_VIM" not in editor_card["body"], editor_card
     assert birth(identity[0]) == identity[1] and receipt.read_text() == "x"
     driver.click("#close")
     wait_for(lambda: birth(identity[0]) != identity[1], "Terminal Chat leaked the original PTY child")
