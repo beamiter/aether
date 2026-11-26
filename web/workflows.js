@@ -13,6 +13,7 @@ export function installWorkflows(document, {context, retained, invoke, insert, r
 
   function close(restoreFocus = false) {
     active = null;
+    results.dataset.searchReady = 'false';
     picker.hidden = true;
     toggle.setAttribute('aria-expanded', 'false');
     toggle.disabled = !context();
@@ -33,8 +34,13 @@ export function installWorkflows(document, {context, retained, invoke, insert, r
       ? 'Insert at cursor' : `Insert in shell ${active.owner.epoch}`;
   }
 
-  function list(view, response) {
+  function resultsReady(view) {
+    return Boolean(view?.catalogId && !view.searching && view.renderedQuery === search.value);
+  }
+
+  function list(view, response, query) {
     view.catalogId = response.catalogId;
+    view.renderedQuery = query;
     results.replaceChildren(...response.rows.map(row => {
       const item = document.createElement('li');
       const select = document.createElement('button');
@@ -69,6 +75,7 @@ export function installWorkflows(document, {context, retained, invoke, insert, r
     insertButton.disabled = false;
     insertButton.textContent = 'Insert at cursor';
     results.replaceChildren();
+    results.dataset.searchReady = 'false';
     picker.hidden = false;
     toggle.setAttribute('aria-expanded', 'true');
     status.textContent = 'Loading workflows…';
@@ -82,7 +89,7 @@ export function installWorkflows(document, {context, retained, invoke, insert, r
           action: 'open', owner: view.owner, prompt: view.prompt,
         });
         if (!isCurrent(view)) return;
-        list(view, response);
+        list(view, response, '');
         await searchLibrary(view);
       } catch (error) {
         if (isCurrent(view)) status.textContent = String(error?.message ?? error);
@@ -93,23 +100,28 @@ export function installWorkflows(document, {context, retained, invoke, insert, r
   async function searchLibrary(view) {
     if (!view?.catalogId || view.searching || view.selected) return;
     view.searching = true;
+    results.dataset.searchReady = 'false';
     try {
       while (isCurrent(view) && !view.selected && view.query !== search.value) {
         view.query = search.value;
         const response = await invoke({action: 'search', catalogId: view.catalogId, query: view.query});
-        if (isCurrent(view) && !view.selected && view.query === search.value) list(view, response);
+        if (isCurrent(view) && !view.selected && view.query === search.value) list(view, response, view.query);
       }
     } catch (error) {
-      if (isCurrent(view) && !view.selected) status.textContent = String(error?.message ?? error);
+      if (isCurrent(view) && !view.selected) {
+        view.query = view.renderedQuery;
+        status.textContent = String(error?.message ?? error);
+      }
     } finally {
       view.searching = false;
+      if (isCurrent(view)) results.dataset.searchReady = String(resultsReady(view));
     }
   }
 
   search.addEventListener('input', () => searchLibrary(active));
 
   async function selectWorkflow(view, name) {
-    if (!isCurrent(view) || view.selecting || view.selected || view.searching || view.query !== search.value) return;
+    if (!isCurrent(view) || view.selecting || view.selected || !resultsReady(view)) return;
     const query = view.query;
     view.selecting = true;
     try {

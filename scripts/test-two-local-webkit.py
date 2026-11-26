@@ -1544,6 +1544,8 @@ def exercise_terminal_workflows(driver, owned, *, verify_bookmarks=True):
               available: !document.querySelector('#workflows').disabled,
               open: !document.querySelector('#workflow-picker').hidden,
               rows: Array.from(document.querySelectorAll('#workflow-results button'), el => el.textContent),
+              query: document.querySelector('#workflow-search').value,
+              ready: document.querySelector('#workflow-results').dataset.searchReady === 'true',
               fields: !document.querySelector('#workflow-fields').hidden,
               command: document.querySelector('#workflow-command').textContent,
               defaults: Array.from(document.querySelectorAll('#workflow-args input'), el => el.value),
@@ -1560,7 +1562,12 @@ def exercise_terminal_workflows(driver, owned, *, verify_bookmarks=True):
     wait_for(lambda: view()["rows"].count("Local report") == 1 and "YAML check" in view()["rows"],
              "the workflow library did not use config precedence and the additive override")
     driver.type("#workflow-search", "native-report-fixture")
-    wait_for(lambda: view()["rows"] == ["Local report"], "workflow tag search did not narrow the results")
+    def final_report_result():
+        state = view()
+        return (state["ready"] and state["query"] == "native-report-fixture"
+                and state["rows"] == ["Local report"])
+
+    wait_for(final_report_result, "workflow tag search did not settle on the final query")
     driver.click("#workflow-results li:first-child button")
     wait_for(lambda: view()["fields"], "workflow arguments did not open")
     assert view()["defaults"] == ["", "default"] and "{value}-{suffix}" in view()["command"]
@@ -1691,6 +1698,24 @@ def exercise_bookmark_retention(driver, card):
     def empty():
         return driver.execute("return !document.querySelector('#command-block-no-bookmarks').hidden;")
 
+    def card_state():
+        return driver.execute("""
+            const card = document.querySelector(%s);
+            const filter = document.querySelector('#command-block-bookmarked');
+            const pin = card?.querySelector('.command-block-bookmark');
+            const rect = pin?.getBoundingClientRect();
+            const centerX = rect && rect.left + rect.width / 2;
+            const centerY = rect && rect.top + rect.height / 2;
+            return {
+              present: Boolean(card), hidden: card?.hidden ?? null, open: card?.open ?? null,
+              filter: filter.getAttribute('aria-pressed'),
+              pinWidth: rect?.width ?? null, pinHeight: rect?.height ?? null,
+              pinInViewport: Boolean(rect && centerX >= 0 && centerY >= 0 &&
+                  centerX < innerWidth && centerY < innerHeight),
+              pinHit: Boolean(pin && rect && pin.contains(document.elementFromPoint(centerX, centerY))),
+            };
+        """ % json.dumps(card))
+
     wait_for(bookmarked, "switching tabs lost the original command bookmark")
     filter_button = "#command-block-bookmarked"
     pin = card + " .command-block-bookmark"
@@ -1699,7 +1724,18 @@ def exercise_bookmark_retention(driver, card):
     driver.click(pin)
     wait_for(empty, "removing the bookmark left the record in the filtered list")
     driver.click(filter_button)
-    driver.click(pin)
+    try:
+        state = wait_for(
+            lambda: (s if (s := card_state())["filter"] == "false" and s["present"]
+                     and not s["hidden"] else None),
+            "the original card did not return after clearing the filter",
+        )
+        if not state["open"]:
+            driver.click(card + " summary")
+            wait_for(lambda: card_state()["open"], "the original card did not expand")
+        driver.click(pin)
+    except (AssertionError, ProtocolError) as error:
+        raise AssertionError(f"could not click the original bookmark again: {card_state()}") from error
     wait_for(bookmarked, "the original record could not be bookmarked again")
     driver.click(filter_button)
     for index in range(8):
