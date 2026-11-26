@@ -361,3 +361,51 @@ test('a removed projected source discards both its displayed selection and super
  const current=refresh.handlers.click();requests[2].resolve(projection('11','Q'));await current;
  assert.equal(output.value,'Q');assert.equal(viewport.hidden,false);
 });
+
+test('projected history preserves exact backward selection while reflowing overlapping pages',async()=>{
+ const element=()=>({value:'',textContent:'',handlers:{},style:{},dataset:{},
+  setSelectionRange(start,end,direction='none'){
+   Object.assign(this,{selectionStart:start,selectionEnd:end,selectionDirection:direction});
+  },addEventListener(name,handle){this.handlers[name]=handle;}});
+ const owner={session:'owner',epoch:1,generation:2},requests=[];
+ const output=element(),older=element(),refresh=element();
+ const viewport={...element(),scrollTop:0,clientHeight:96};
+ const context={setTransform(){},clearRect(){},save(){},beginPath(){},rect(){},clip(){},fillText(){},restore(){},fillRect(){}};
+ installHistory({older,newer:element(),refresh,output,label:element(),getOwner:()=>owner,
+  visual:{viewport,spacer:element(),canvas:{...element(),getContext:()=>context}},enableProjection:()=>true,
+  invoke:(_,args)=>new Promise(resolve=>requests.push({args,resolve}))});
+ function projection(parts,offset){
+  let text='';
+  const rows=parts.map(([row,column,glyphs,wrapped=false])=>{
+   const text_offsets=[text.length],cells=glyphs.flatMap(glyph=>{
+    text+=glyph;text_offsets.push(text.length);
+    const cell={text:glyph,foreground:'#ffffff',background:'#000000',width:glyph==='中'?2:1,style:0};
+    if(cell.width===1)return [cell];
+    text_offsets.push(text.length);
+    return [cell,{...cell,text:' ',width:0}];
+   });
+   if(!wrapped)text+='\n';
+   return {source:{row:String(row),column},text_offsets,paint:{wrapped,cells}};
+  });
+  return JSON.stringify({owner,version:5,revision:'19',cols:8,offset,total_rows:100,rows,text:text.slice(0,-1)});
+ }
+ const first=refresh.handlers.click();
+ requests[0].resolve(projection([[20,0,['A','中','B'],true],[20,4,['C']],[21,0,['D']]],0));
+ await first;
+ output.setSelectionRange(1,5,'backward');
+ assert.equal(output.value.slice(output.selectionStart,output.selectionEnd),'中BC\n');
+
+ const pending=older.handlers.click();
+ assert.deepEqual(requests[1].args.anchor,{row:'20',column:0});
+ requests[1].resolve(projection([[19,0,['X']],[20,0,['A','中'],true],[20,3,['B','C']],[21,0,['D']]],3));
+ await pending;
+ assert.equal(output.value,'X\nA中BC\nD');
+ assert.equal(output.value.slice(output.selectionStart,output.selectionEnd),'中BC\n');
+ assert.equal(output.selectionDirection,'backward');
+
+ const replaced=refresh.handlers.click();
+ requests[2].resolve(projection([[34,0,['A','中'],true],[34,3,['B','C']],[35,0,['D']]],3));
+ await replaced;
+ assert.equal(output.value,'A中BC\nD');
+ assert.deepEqual([output.selectionStart,output.selectionEnd],[0,0]);
+});

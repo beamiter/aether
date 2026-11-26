@@ -1,4 +1,4 @@
-export function installWorkflows(document, {context, invoke, insert, returnToTerminal, announce}) {
+export function installWorkflows(document, {context, retained, invoke, insert, returnToTerminal, announce}) {
   const toggle = document.querySelector('#workflows');
   const picker = document.querySelector('#workflow-picker');
   const search = document.querySelector('#workflow-search');
@@ -15,17 +15,22 @@ export function installWorkflows(document, {context, invoke, insert, returnToTer
     active = null;
     picker.hidden = true;
     toggle.setAttribute('aria-expanded', 'false');
+    toggle.disabled = !context();
     if (restoreFocus) returnToTerminal();
   }
 
   function isCurrent(view) {
     const next = context();
-    return active === view && next?.owner === view.owner && next.prompt === view.prompt;
+    return active === view && (
+      next?.owner === view.owner && next.prompt === view.prompt || view.selected && retained(view.owner)
+    );
   }
 
   function updateOwner() {
-    toggle.disabled = !context();
     if (active && !isCurrent(active)) close();
+    toggle.disabled = !active && !context();
+    if(active?.selected)insertButton.textContent = context()?.owner?.session === active.owner.session
+      ? 'Insert at cursor' : `Insert in shell ${active.owner.epoch}`;
   }
 
   function list(view, response) {
@@ -62,6 +67,7 @@ export function installWorkflows(document, {context, invoke, insert, returnToTer
     search.parentElement.hidden = results.hidden = false;
     fields.hidden = true;
     insertButton.disabled = false;
+    insertButton.textContent = 'Insert at cursor';
     results.replaceChildren();
     picker.hidden = false;
     toggle.setAttribute('aria-expanded', 'true');
@@ -150,7 +156,7 @@ export function installWorkflows(document, {context, invoke, insert, returnToTer
         catalogId: view.catalogId,
         name: view.selected,
         values: Object.fromEntries(view.inputs.map(([name, value]) => [name, value.value])),
-      }, reason => {
+      }, view.owner, reason => {
         confirmed = true;
         if (!isCurrent(view)) return;
         if (reason) {
@@ -161,6 +167,9 @@ export function installWorkflows(document, {context, invoke, insert, returnToTer
         close(picker.contains(document.activeElement) || (restoreFocus && document.activeElement === document.body));
         announce('Workflow queued at the shell cursor. Review the line before pressing Enter.');
       });
+    } catch (error) {
+      confirmed = true;
+      if(isCurrent(view))status.textContent = String(error?.message??error);
     } finally {
       view.inserting = false;
       if (active === view) insertButton.disabled = false;

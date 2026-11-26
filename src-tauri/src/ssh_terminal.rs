@@ -1,5 +1,6 @@
 //! Native SSH terminal adapter. The WebView receives the existing v3 cell records.
 mod catalog;
+mod reload;
 
 use self::catalog::{SavedShell, Store};
 use serde::Deserialize;
@@ -23,17 +24,35 @@ const SESSION_UNAVAILABLE: &str = "terminal session unavailable";
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, tag = "operation", rename_all = "snake_case")]
 pub(crate) enum Action {
-    Open { destination: String },
+    Open {
+        destination: String,
+    },
     Attach,
+    PrepareReload {
+        owner: Attachment,
+        view: reload::View,
+    },
+    ClaimReload {
+        ticket: String,
+    },
+    RecoverReloadLayout,
     ListSaved,
-    RestoreSaved { id: String },
-    ForgetSaved { id: String },
-    Request { command: Command },
+    RestoreSaved {
+        id: String,
+    },
+    ForgetSaved {
+        id: String,
+    },
+    Request {
+        command: Command,
+    },
 }
 
 #[derive(Default)]
 pub(crate) struct SshTerminal {
     session: Option<RemoteSession>,
+    pending_reload: Option<reload::Pending>,
+    retained_reload: Option<reload::RetainedLayout>,
 }
 
 struct RemoteSession {
@@ -56,9 +75,10 @@ pub(crate) async fn ssh_terminal<R: tauri::Runtime>(
     terminal: tauri::State<'_, Arc<Mutex<SshTerminal>>>,
 ) -> Result<Value, String> {
     super::require_terminal_window(&window)?;
+    let label = window.label().to_owned();
     let store = window.path().app_data_dir().ok().map(Store::new);
     super::run_bridge(terminal.inner().clone(), move |terminal| {
-        terminal.execute(action, store.as_ref())
+        terminal.execute(action, store.as_ref(), &label)
     })
     .await
 }
@@ -110,8 +130,37 @@ fn validate_snapshot(
 }
 
 impl SshTerminal {
-    fn execute(&mut self, action: Action, store: Option<&Store>) -> Result<Value, String> {
+    fn execute(
+        &mut self,
+        action: Action,
+        store: Option<&Store>,
+        window: &str,
+    ) -> Result<Value, String> {
+        if self
+            .pending_reload
+            .as_ref()
+            .is_some_and(|pending| pending.expired(std::time::Instant::now()))
+        {
+            self.retained_reload = self
+                .pending_reload
+                .take()
+                .map(|pending| pending.retained_layout());
+            if let Some(session) = self.session.as_mut() {
+                session.read_only = true;
+            }
+        }
+        if let Action::ClaimReload { ticket } = action {
+            return self.claim_reload(&ticket, window);
+        }
+        if matches!(action, Action::RecoverReloadLayout) {
+            return self.recover_reload_layout(window);
+        }
+        if self.pending_reload.is_some() {
+            return Err("The SSH writer is locked while its document is replaced.".into());
+        }
         match action {
+            Action::PrepareReload { owner, view } => self.prepare_reload(owner, view, window),
+            Action::ClaimReload { .. } | Action::RecoverReloadLayout => unreachable!(),
             Action::Open { destination } => {
                 if self.session.is_some() {
                     return Err("Close the existing SSH terminal first.".into());
@@ -187,6 +236,7 @@ impl SshTerminal {
                     Err(reason) if reason == SESSION_UNAVAILABLE => {
                         let warning = session.forget_saved(store).err();
                         self.session = None;
+                        self.retained_reload = None;
                         if let Some(warning) = warning {
                             return Ok(json!({"ended":true,"message":warning}));
                         }
@@ -194,6 +244,7 @@ impl SshTerminal {
                     }
                     Err(reason) if reason == HOST_CHANGED => {
                         self.session = None;
+                        self.retained_reload = None;
                         return Ok(json!({
                             "ended": true,
                             "message": "The SSH terminal owner changed. Check the saved host before reconnecting.",
@@ -249,6 +300,7 @@ impl SshTerminal {
                         let mut result = match session.exchange(command, true) {
                             Err(reason) if reason == HOST_CHANGED => {
                                 self.session = None;
+                                self.retained_reload = None;
                                 return Ok(json!({
                                     "cleanup_pending": true,
                                     "save_warning": "The SSH terminal owner changed. Any saved entry was kept.",
@@ -266,6 +318,7 @@ impl SshTerminal {
                             receipt.insert("save_warning".into(), Value::String(reason));
                         }
                         self.session = None;
+                        self.retained_reload = None;
                         Ok(result)
                     }
                     Command::Ack { revision, .. } => {
@@ -280,6 +333,120 @@ impl SshTerminal {
                 }
             }
         }
+    }
+
+    fn prepare_reload(
+        &mut self,
+        owner: Attachment,
+        view: reload::View,
+        window: &str,
+    ) -> Result<Value, String> {
+        view.validate()?;
+        let session = self
+            .session
+            .as_mut()
+            .ok_or("No SSH terminal is connected.")?;
+        if session.detached || owner != session.owner || !session.input_allowed() {
+            return Err(
+                "Only the current acknowledged SSH writer can replace its document.".into(),
+            );
+        }
+        // Advance at the host before exposing the ticket. Old document input
+        // cannot race a reload or regain authority through an idempotent recover.
+        let recovered = match session.recover_with_grant(owner, true) {
+            Ok(result) => result,
+            Err(error) => {
+                session.read_only = true;
+                return Err(error);
+            }
+        };
+        if recovered.get("input_allowed") != Some(&Value::Bool(true)) {
+            session.read_only = true;
+            return Err("The SSH host did not renew input permission.".into());
+        }
+        let pending = reload::Pending::new(
+            session.owner.clone(),
+            view,
+            window,
+            std::time::Instant::now(),
+        );
+        let result = json!({"ticket": pending.ticket});
+        self.retained_reload = None;
+        self.pending_reload = Some(pending);
+        Ok(result)
+    }
+
+    fn claim_reload(&mut self, ticket: &str, window: &str) -> Result<Value, String> {
+        // Take before any network operation; failures and duplicate claims never
+        // replay a writer grant. Saved-session restore remains a separate reader.
+        let pending = self
+            .pending_reload
+            .take()
+            .ok_or("No one-use SSH writer handoff is available.")?;
+        let session = self
+            .session
+            .as_mut()
+            .ok_or("No SSH terminal is connected.")?;
+        if let Err(error) = pending.authorize(
+            ticket,
+            window,
+            &session.owner,
+            session.read_only,
+            session.input_uncertain,
+            std::time::Instant::now(),
+        ) {
+            session.read_only = true;
+            self.retained_reload = Some(pending.retained_layout());
+            return Err(error);
+        }
+        self.retained_reload = Some(pending.retained_layout());
+        match session.recover_with_grant(pending.owner, true) {
+            Ok(mut result) => {
+                result
+                    .as_object_mut()
+                    .ok_or("Invalid SSH handoff snapshot.")?
+                    .insert(
+                        "view".into(),
+                        serde_json::to_value(pending.view)
+                            .map_err(|_| "Invalid retained layout.")?,
+                    );
+                Ok(result)
+            }
+            Err(error) => {
+                session.read_only = true;
+                Err(error)
+            }
+        }
+    }
+
+    fn recover_reload_layout(&mut self, window: &str) -> Result<Value, String> {
+        if self
+            .pending_reload
+            .as_ref()
+            .is_some_and(|pending| !pending.belongs_to(window))
+        {
+            return Err("The retained layout belongs to another window.".into());
+        }
+        // An orphaned/malformed ticket cannot regain writer authority. Preserve
+        // only reader metadata; no host attach, process launch or input occurs.
+        if let Some(pending) = self.pending_reload.take() {
+            self.retained_reload = Some(pending.retained_layout());
+            if let Some(session) = self.session.as_mut() {
+                session.read_only = true;
+            }
+        }
+        let Some(retained) = self.retained_reload.take() else {
+            return Ok(Value::Null);
+        };
+        let session = self
+            .session
+            .as_mut()
+            .ok_or("The original SSH actor is unavailable.")?;
+        if retained.matches(window, &session.owner) {
+            session.read_only = true;
+        }
+        let view = retained.take(window, &session.owner, std::time::Instant::now())?;
+        Ok(json!({"view": view}))
     }
 
     fn restore_saved(&mut self, id: &str, store: &Store) -> Result<Value, String> {
@@ -350,6 +517,7 @@ impl SshTerminal {
             == Some(id)
         {
             self.session = None;
+            self.retained_reload = None;
         }
     }
 }
@@ -381,6 +549,14 @@ impl RemoteSession {
     }
 
     fn recover(&mut self, previous: Attachment) -> Result<Value, String> {
+        self.recover_with_grant(previous, false)
+    }
+
+    fn recover_with_grant(
+        &mut self,
+        previous: Attachment,
+        explicit: bool,
+    ) -> Result<Value, String> {
         if previous != self.owner && self.recovered_from.as_ref() != Some(&previous) {
             return Err("The SSH terminal attachment changed.".into());
         }
@@ -390,11 +566,7 @@ impl RemoteSession {
             },
             true,
         )?;
-        let host_allowed = match result.get("input_allowed") {
-            Some(Value::Bool(allowed)) => *allowed,
-            None => true, // Older helpers do not send an explicit grant.
-            Some(_) => return Err("Invalid SSH terminal recovery input grant.".into()),
-        };
+        let host_allowed = input_grant(&result, explicit)?;
         self.install_snapshot(&result, &previous)?;
         self.recovered_from = Some(previous);
         self.input_uncertain |= !host_allowed;
@@ -428,6 +600,15 @@ impl RemoteSession {
     }
 }
 
+fn input_grant(result: &Value, explicit: bool) -> Result<bool, String> {
+    match result.get("input_allowed") {
+        Some(Value::Bool(allowed)) => Ok(*allowed),
+        None if !explicit => Ok(true), // Existing legacy recovery compatibility only.
+        None => Err("The SSH host did not explicitly grant input permission.".into()),
+        Some(_) => Err("Invalid SSH terminal recovery input grant.".into()),
+    }
+}
+
 fn is_input(command: &Command) -> bool {
     matches!(
         command,
@@ -437,4 +618,178 @@ fn is_input(command: &Command) -> bool {
             | Command::Paste { .. }
             | Command::Resize { .. }
     )
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    fn owner() -> Attachment {
+        Attachment {
+            session: "a".repeat(32),
+            epoch: 4,
+            generation: 7,
+        }
+    }
+    fn terminal(age: Duration) -> SshTerminal {
+        let view=serde_json::from_value(json!({"version":1,"tabs":[],"splitEnabled":false,"splitEpochs":[],"detachedLocal":null,"remoteDraft":""})).unwrap();
+        SshTerminal {
+            retained_reload: None,
+            pending_reload: Some(reload::Pending::new(
+                owner(),
+                view,
+                "main",
+                Instant::now() - age,
+            )),
+            session: Some(RemoteSession {
+                endpoint: Endpoint::new("localhost", None, None).unwrap(),
+                instance: None,
+                saved_id: None,
+                relay: None,
+                owner: owner(),
+                detached: false,
+                read_only: false,
+                input_uncertain: false,
+                recovered_from: None,
+                pending_snapshot: None,
+            }),
+        }
+    }
+    #[test]
+    fn ssh_reload_pending_blocks_old_input_and_wrong_claim_consumes_without_network() {
+        let mut t = terminal(Duration::ZERO);
+        assert!(t
+            .execute(
+                Action::Request {
+                    command: Command::Text {
+                        owner: owner(),
+                        text: "forbidden".into()
+                    }
+                },
+                None,
+                "main"
+            )
+            .is_err());
+        assert!(t.execute(Action::Attach, None, "main").is_err());
+        assert!(t
+            .execute(
+                Action::ClaimReload {
+                    ticket: "wrong".into()
+                },
+                None,
+                "main"
+            )
+            .is_err());
+        assert!(t.pending_reload.is_none());
+        assert!(t.session.as_ref().unwrap().read_only);
+        assert!(t
+            .execute(
+                Action::ClaimReload {
+                    ticket: "wrong".into()
+                },
+                None,
+                "main"
+            )
+            .is_err());
+        assert!(t.session.as_ref().unwrap().relay.is_none());
+    }
+    #[test]
+    fn ssh_reload_expiry_and_foreign_generation_keep_writer_closed() {
+        let mut t = terminal(Duration::from_secs(31));
+        assert!(t
+            .execute(
+                Action::Request {
+                    command: Command::Text {
+                        owner: owner(),
+                        text: "forbidden".into()
+                    }
+                },
+                None,
+                "main"
+            )
+            .is_err());
+        assert!(t.pending_reload.is_none());
+        assert!(t.session.as_ref().unwrap().read_only);
+        let mut t = terminal(Duration::ZERO);
+        let ticket = t.pending_reload.as_ref().unwrap().ticket.clone();
+        t.session.as_mut().unwrap().owner.generation += 1;
+        assert!(t
+            .execute(Action::ClaimReload { ticket }, None, "main")
+            .is_err());
+        assert!(t.session.as_ref().unwrap().read_only);
+        assert!(t.session.as_ref().unwrap().relay.is_none());
+    }
+    #[test]
+    fn ssh_reload_invalid_expired_and_orphaned_handoffs_recover_metadata_once_without_input() {
+        for mode in ["invalid", "expired", "orphan"] {
+            let mut t = terminal(if mode == "expired" {
+                Duration::from_secs(31)
+            } else {
+                Duration::ZERO
+            });
+            let ticket = t.pending_reload.as_ref().unwrap().ticket.clone();
+            if mode != "orphan" {
+                assert!(t
+                    .execute(
+                        Action::ClaimReload {
+                            ticket: if mode == "invalid" {
+                                "wrong".into()
+                            } else {
+                                ticket
+                            }
+                        },
+                        None,
+                        "main"
+                    )
+                    .is_err());
+            }
+            let result = t
+                .execute(Action::RecoverReloadLayout, None, "main")
+                .unwrap();
+            assert!(result.get("view").is_some());
+            assert!(result.get("input_allowed").is_none());
+            assert!(result.get("owner").is_none());
+            assert_eq!(result["view"]["remoteDraft"], "");
+            assert!(t.session.as_ref().unwrap().read_only);
+            assert!(t.session.as_ref().unwrap().relay.is_none());
+            assert!(t
+                .execute(Action::RecoverReloadLayout, None, "main")
+                .unwrap()
+                .is_null());
+            assert!(t
+                .execute(
+                    Action::Request {
+                        command: Command::Text {
+                            owner: owner(),
+                            text: "forbidden".into()
+                        }
+                    },
+                    None,
+                    "main"
+                )
+                .is_err());
+        }
+    }
+    #[test]
+    fn ssh_reload_metadata_cannot_cross_window_or_ssh_actor() {
+        let mut t = terminal(Duration::ZERO);
+        assert!(t
+            .execute(Action::RecoverReloadLayout, None, "other")
+            .is_err());
+        assert!(t.pending_reload.is_some());
+        let mut t = terminal(Duration::from_secs(31));
+        t.session.as_mut().unwrap().owner.session = "c".repeat(32);
+        assert!(t
+            .execute(Action::RecoverReloadLayout, None, "main")
+            .is_err());
+        assert!(t.retained_reload.is_none());
+    }
+    #[test]
+    fn ssh_reload_requires_explicit_host_grant_without_changing_legacy_recover() {
+        assert!(input_grant(&json!({}), false).unwrap());
+        assert!(input_grant(&json!({}), true).is_err());
+        assert!(input_grant(&json!({"input_allowed":"true"}), true).is_err());
+        assert!(!input_grant(&json!({"input_allowed":false}), true).unwrap());
+        assert!(input_grant(&json!({"input_allowed":true}), true).unwrap());
+    }
 }

@@ -55,7 +55,7 @@ jobs:
             librsvg2-dev libxdo-dev libssl-dev webkit2gtk-driver \
             xvfb xauth dbus-daemon fonts-dejavu-core xdotool xclip imagemagick metacity ripgrep vim \
             openssh-client openssh-server bubblewrap sway wtype libwayland-dev \
-            python3-gi gir1.2-atspi-2.0 at-spi2-core fakeroot nodejs
+            python3-gi gir1.2-atspi-2.0 at-spi2-core fakeroot ncurses-bin nodejs
           sudo install -d -m 0755 /run/sshd
           dpkg-query -W libwebkit2gtk-4.1-0 webkit2gtk-driver xvfb nodejs
       - name: Build desktop at the workflow revision
@@ -130,6 +130,23 @@ jobs:
             "$CARGO_TARGET_DIR/debug/tauri-terminal-lab" --output "$fixture_dir/evidence" \
             --ime-client "$fixture_dir/clients/native-ime-client" \
             --jsh "$RUNNER_TEMP/aether-shell-fixture/bin/jsh"
+      - name: Frozen command output review and export on Wayland
+        id: wayland-output-review
+        if: ${{ !cancelled() && steps.wayland-fixtures.outcome == 'success' }}
+        timeout-minutes: 4
+        run: |
+          fixture_dir="${AETHER_WAYLAND_FIXTURES:?}"
+          dbus-run-session -- /usr/bin/python3 -B scripts/test-wayland-ime.py \
+            "$CARGO_TARGET_DIR/debug/tauri-terminal-lab" --output "$fixture_dir/output-review-evidence" \
+            --ime-client "$fixture_dir/clients/native-ime-client" \
+            --jsh "$RUNNER_TEMP/aether-shell-fixture/bin/jsh" --output-review
+      - name: Upload the Wayland output review journey result
+        if: ${{ !cancelled() && steps.wayland-output-review.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: aether-wayland-output-review-result
+          path: ${{ env.AETHER_WAYLAND_FIXTURES }}/output-review-evidence/result.json
+          if-no-files-found: error
       - name: Vim9 composition and PTY continuity after bridge loss on Wayland
         id: wayland-vim9
         if: ${{ !cancelled() && steps.wayland-fixtures.outcome == 'success' }}
@@ -212,7 +229,7 @@ jobs:
           install -D -m 0755 "$CARGO_TARGET_DIR/debug/aether-terminal-host" "$stage/candidate/host"
           cargo build --locked --manifest-path rollback-base/src-tauri/Cargo.toml --bin tauri-terminal-lab
           cargo build --locked --manifest-path rollback-base/bridge/Cargo.toml --bin aether-terminal-host
-          previous=$(scripts/package-linux-deb.sh "$CARGO_TARGET_DIR/debug/tauri-terminal-lab" \
+          previous=$(scripts/package-linux-deb.sh --legacy "$CARGO_TARGET_DIR/debug/tauri-terminal-lab" \
             "$CARGO_TARGET_DIR/debug/aether-terminal-host" "$stage/packages" 0.0.1-qa)
           candidate=$(scripts/package-linux-deb.sh "$stage/candidate/desktop" "$stage/candidate/host" \
             "$stage/packages" 0.0.2-qa)

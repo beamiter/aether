@@ -230,9 +230,11 @@ def main():
         host, address, host_log = start_host('control', control=True)
         xt('windowsize', app, 960, 420)
         time.sleep(.4)
-        click(app, 32, 274)
+        click(app, 32, 253)  # Allow keyboard and pointer, above clipboard consent.
         viewer = connect(address)
         prove_parent(viewer)
+        wait(lambda: 'authenticated session started (screen + pointer + keyboard)'
+             in host_log.read_text(), 'keyboard and pointer negotiation')
         wait(lambda: frame(host_log, 1), 'controlled video')
         _, _, w, h = bounds(viewer)
         assert not shift_held()

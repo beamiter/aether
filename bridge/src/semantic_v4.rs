@@ -5,13 +5,52 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use jterm_engine::{
     frame::{CellFrame, Row, Screen},
     history_reflow::HistoryAnchor,
+    retained_bytes::{RetainedBytes, RetainedBytesBudget},
     terminal::{HistoryPage, InlineImage},
     Color, HyperlinkId, UnderlineStyle,
 };
 use std::{
     collections::{btree_map::Entry, BTreeMap, BTreeSet},
     io::{self, Write},
+    sync::{Arc, OnceLock},
 };
+
+const JSON_WORKSPACE_BYTES: usize = wire::MAX_ENCODED_FRAME_BYTES + wire::MAX_ENCODED_IMAGE_BYTES;
+const PROCESS_JSON_WORKSPACE_BYTES: usize = 4 * JSON_WORKSPACE_BYTES;
+const ENCODERS_BUSY: &str = "terminal channel encoders are temporarily busy";
+
+pub(crate) struct FrameScratch {
+    _reservation: RetainedBytes,
+}
+
+impl FrameScratch {
+    pub(crate) fn acquire() -> Option<Self> {
+        static PROCESS: OnceLock<Arc<RetainedBytesBudget>> = OnceLock::new();
+        let process = PROCESS
+            .get_or_init(|| Arc::new(RetainedBytesBudget::new(PROCESS_JSON_WORKSPACE_BYTES)));
+        Self::reserve_from(process)
+    }
+
+    fn reserve_from(process: &Arc<RetainedBytesBudget>) -> Option<Self> {
+        Some(Self {
+            _reservation: process.reserve(JSON_WORKSPACE_BYTES)?,
+        })
+    }
+
+    pub(crate) fn encode(
+        &self,
+        previous: Option<&CellFrame>,
+        frame: &CellFrame,
+        session: &str,
+        version: u8,
+    ) -> Result<(wire::Counter, String), String> {
+        let update = update(previous, frame, session, version)?;
+        let images = match &update {
+            wire::Update::Snapshot { images, .. } | wire::Update::Delta { images, .. } => images,
+        };
+        Ok((update.revision(), encode_json(&update, images)?))
+    }
+}
 
 pub(crate) fn encode(
     previous: Option<&CellFrame>,
@@ -19,21 +58,23 @@ pub(crate) fn encode(
     session: &str,
     version: u8,
 ) -> Result<(wire::Counter, String), String> {
-    let update = update(previous, frame, session, version)?;
-    let images = match &update {
-        wire::Update::Snapshot { images, .. } | wire::Update::Delta { images, .. } => images,
-    };
-    Ok((update.revision(), encode_json(&update, images)?))
+    FrameScratch::acquire()
+        .ok_or(ENCODERS_BUSY)?
+        .encode(previous, frame, session, version)
 }
 
 fn encode_json(
     value: &impl serde::Serialize,
     images: &[wire::ImageResource],
 ) -> Result<String, String> {
+    let limit =
+        wire::MAX_ENCODED_FRAME_BYTES + images.iter().map(|image| image.rgba.len()).sum::<usize>();
+    if limit > JSON_WORKSPACE_BYTES {
+        return Err("terminal frame exceeds its encoding workspace".into());
+    }
     let mut data = BoundedJson {
         bytes: Vec::new(),
-        limit: wire::MAX_ENCODED_FRAME_BYTES
-            + images.iter().map(|image| image.rgba.len()).sum::<usize>(),
+        limit,
     };
     serde_json::to_writer(&mut data, value).map_err(|error| error.to_string())?;
     String::from_utf8(data.bytes).map_err(|_| "invalid frame encoding".into())
@@ -63,6 +104,7 @@ pub(crate) fn encode_history(
     {
         return Err("invalid history projection bounds".into());
     }
+    let _scratch = FrameScratch::acquire().ok_or(ENCODERS_BUSY)?;
     let mut projection = Projection {
         images_enabled: true,
         ..Projection::default()
@@ -371,6 +413,14 @@ impl Write for BoundedJson {
         if bytes.len() > self.limit - self.bytes.len() {
             return Err(io::Error::other("terminal frame exceeds JSON byte limit"));
         }
+        let required = self.bytes.len() + bytes.len();
+        let capacity = self.bytes.capacity();
+        if required > capacity {
+            let target = required.max(capacity.saturating_mul(2)).min(self.limit);
+            self.bytes
+                .try_reserve_exact(target - self.bytes.len())
+                .map_err(io::Error::other)?;
+        }
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
     }
@@ -388,6 +438,34 @@ mod tests {
         CursorShape, TerminalCell,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn process_encoding_workspace_defers_new_encoders_until_reservations_are_released() {
+        let budget = Arc::new(RetainedBytesBudget::new(2 * JSON_WORKSPACE_BYTES));
+        let a = FrameScratch::reserve_from(&budget).unwrap();
+        let b = FrameScratch::reserve_from(&budget).unwrap();
+        assert!(FrameScratch::reserve_from(&budget).is_none());
+        assert_eq!(budget.usage().retained_bytes, 2 * JSON_WORKSPACE_BYTES);
+        drop(a);
+        let c = FrameScratch::reserve_from(&budget).unwrap();
+        drop(b);
+        drop(c);
+        assert_eq!(budget.usage().retained_bytes, 0);
+    }
+
+    #[test]
+    fn incremental_json_writes_do_not_grow_past_the_reserved_workspace() {
+        let mut writer = BoundedJson {
+            bytes: Vec::new(),
+            limit: 19,
+        };
+        writer.write_all(b"1234567890").unwrap();
+        writer.write_all(b"abcdefghi").unwrap();
+        assert_eq!(writer.bytes, b"1234567890abcdefghi");
+        assert_eq!(writer.bytes.capacity(), 19);
+        assert!(writer.write_all(b"x").is_err());
+        assert_eq!(writer.bytes.len(), 19);
+    }
 
     fn sample(revision: u64, screen: Screen, wrapped: bool) -> CellFrame {
         let mut cell = TerminalCell {

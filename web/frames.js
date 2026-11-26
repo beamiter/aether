@@ -1,3 +1,5 @@
+import {createRasterCanvasCache} from './raster-canvas-cache.js';
+
 export const CELL_WIDTH = 12, CELL_HEIGHT = 24;
 
 // One Unicode scalar occupies at most two UTF-16 units.
@@ -70,22 +72,7 @@ export function acceptUpdate(previous, update, expected = {session:'frame-demo',
   return finishFrame(frame, previous.cols, rows);
 }
 const painted = new WeakMap();
-const rasterCanvases = new WeakMap();
-
-function rasterCanvas(document, resource) {
-  const cached = rasterCanvases.get(resource);
-  if (cached) return cached;
-  const canvas = document.createElement('canvas');
-  canvas.width = resource.width;
-  canvas.height = resource.height;
-  const context = canvas.getContext('2d');
-  const pixels = context.createImageData(resource.width,resource.height);
-  const rgba = globalThis.atob(resource.rgba);
-  for (let i = 0; i < rgba.length; i++) pixels.data[i] = rgba.charCodeAt(i);
-  context.putImageData(pixels,0,0);
-  rasterCanvases.set(resource,canvas);
-  return canvas;
-}
+const rasterCanvas = createRasterCanvasCache(32 * 1024 * 1024);
 
 function paintImages(canvas, g, frame, dirty, cw, ch) {
   for (const y of dirty) for (const {id,column,slice} of frame.rows[y].imageSlices ?? []) {

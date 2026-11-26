@@ -12,6 +12,7 @@ import tempfile
 PACKAGE = "aether-terminal"
 DESKTOP = Path("usr/bin/tauri-terminal-lab")
 HOST = Path("usr/bin/aether-terminal-host")
+TERMINFO = Path("usr/share/terminfo/j/jterm-256color")
 
 
 def run(*command):
@@ -61,17 +62,28 @@ def test_packages(previous, candidate):
             return {path.name: digest(root / path) for path in (DESKTOP, HOST)}
 
         old_build = install(previous, old_version)
+        old_terminfo = (root / TERMINFO).read_bytes() if (root / TERMINFO).exists() else None
         old_desktop = private / DESKTOP.name
         shutil.copy2(root / DESKTOP, old_desktop)
         new_build = install(candidate, new_version)
         assert old_build[DESKTOP.name] != new_build[DESKTOP.name], "rehearsal requires distinct desktop builds"
+        terminfo = root / TERMINFO
+        compiled = subprocess.run([root / HOST, "terminfo"], check=True,
+                                  capture_output=True, timeout=10).stdout
+        assert terminfo.read_bytes() == compiled, "installed terminfo differs from the runtime"
+        assert run("env", "TERM=jterm-256color", f"TERMINFO={terminfo.parent.parent}",
+                   "tput", "colors") == "256"
+        terminfo_sha256 = digest(terminfo)
         rollback["exercise"](old_desktop, root / DESKTOP)
         assert install(previous, old_version) == old_build, "downgrade did not restore the original binaries"
+        restored_terminfo = terminfo.read_bytes() if terminfo.exists() else None
+        assert restored_terminfo == old_terminfo, "downgrade did not restore the original terminfo installation"
 
     print(json.dumps({"case": "INSTALL.LINUX.DEB.001",
                       "previous_version": old_version, "candidate_version": new_version,
                       "previous_package_sha256": digest(previous), "candidate_package_sha256": digest(candidate),
                       "previous_binaries_sha256": old_build, "candidate_binaries_sha256": new_build,
+                      "terminfo_sha256": terminfo_sha256, "terminfo_restored": True,
                       "clean_install": True, "upgraded": True, "rolled_back": True}, sort_keys=True))
 
 

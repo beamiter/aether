@@ -9,6 +9,7 @@ use crate::{
 };
 use jterm_engine::{
     frame::CellFrame,
+    frame_retention::{process_frame_budget, RetainedCellFrame},
     history_reflow::HistoryAnchor,
     terminal::{HistoryPage, Terminal},
 };
@@ -38,13 +39,16 @@ pub struct LiveBridge {
     input_attached: bool,
     input_waits_for_snapshot: bool,
     resumed_from: Option<u32>,
-    flight: Option<CellFrame>,
-    accepted: Option<CellFrame>,
+    flight: Option<RetainedCellFrame>,
+    accepted: Option<RetainedCellFrame>,
     local_desktop: bool,
     inline_graphics: bool,
     unpublished_background: bool,
     hyperlink_policy: Option<jterm_engine::hyperlink::HyperlinkPolicy>,
-    stable: Option<CellFrame>,
+    stable: Option<RetainedCellFrame>,
+    #[cfg(test)]
+    frame_budget_override:
+        Option<std::sync::Arc<jterm_engine::retained_bytes::RetainedBytesBudget>>,
     history_search: Option<HistorySearch>,
     submitted_chat_prompt: Option<crate::protocol_v4::Counter>,
     command_bookmarks: BTreeMap<String, String>,
@@ -105,13 +109,7 @@ impl LiveBridge {
     }
 
     fn open_shell(&mut self, rows: usize, cols: usize, integrated: bool) -> Result<u32, String> {
-        self.open_session(|epoch| {
-            if integrated {
-                Session::spawn_integrated_with_epoch(rows, cols, epoch)
-            } else {
-                Session::spawn_with_epoch(rows, cols, epoch)
-            }
-        })
+        self.open_session(|epoch| Session::spawn_family_with_epoch(rows, cols, epoch, integrated))
     }
 
     /// Launch a dedicated local editor from a host-authorized argv and cwd.
@@ -155,7 +153,7 @@ impl LiveBridge {
         if let Some(policy) = self.hyperlink_policy {
             session.enable_hyperlinks(policy);
         }
-        self.stable = Some(session.terminal().frame()?);
+        self.record_stable(session.terminal().frame()?);
         self.unpublished_background = false;
         self.epoch = epoch;
         self.id = id;
@@ -458,10 +456,13 @@ impl LiveBridge {
         let session = self.session.as_mut().unwrap();
         let completed = session.take_completed_sync_frame();
         let active = !session.is_drained();
-        if !active || !session.terminal().publication_held() {
-            self.stable = Some(session.terminal().frame()?);
-        } else if let Some(frame) = completed {
-            self.stable = Some(frame);
+        let frame = if !active || !session.terminal().publication_held() {
+            Some(session.terminal().frame()?)
+        } else {
+            completed
+        };
+        if let Some(frame) = frame {
+            self.record_stable(frame);
         }
         Ok((active, output_bytes))
     }
@@ -516,7 +517,10 @@ impl LiveBridge {
             match completed {
                 Some(frame) => frame,
                 None if snapshot || self.unpublished_background => {
-                    self.stable.clone().ok_or("missing stable frame")?
+                    let Some(stable) = self.stable.as_deref() else {
+                        return Ok(None);
+                    };
+                    stable.clone()
                 }
                 None => return Ok(None),
             }
@@ -534,13 +538,49 @@ impl LiveBridge {
         Ok(Some(frame))
     }
 
-    fn publish(&mut self, frame: CellFrame) {
+    fn record_stable(&mut self, frame: CellFrame) {
+        let frame = match self.stable.as_mut() {
+            Some(stable) if stable.stamp() == frame.stamp() => return,
+            Some(stable) => match stable.try_replace(frame) {
+                Ok(()) => return,
+                Err(frame) => frame,
+            },
+            None => frame,
+        };
+        if let Ok(frame) = RetainedCellFrame::try_retain(frame, self.frame_budget()) {
+            self.stable = Some(frame);
+        }
+    }
+
+    fn frame_budget(&self) -> &std::sync::Arc<jterm_engine::retained_bytes::RetainedBytesBudget> {
+        #[cfg(test)]
+        if let Some(budget) = self.frame_budget_override.as_ref() {
+            return budget;
+        }
+        process_frame_budget()
+    }
+
+    fn reserve_publication(&self, frame: CellFrame) -> Option<RetainedCellFrame> {
+        if let Some(stable) = self
+            .stable
+            .as_ref()
+            .filter(|stable| stable.stamp() == frame.stamp())
+        {
+            return Some(stable.clone());
+        }
+        RetainedCellFrame::try_retain(frame, self.frame_budget()).ok()
+    }
+
+    fn publish(&mut self, frame: RetainedCellFrame) {
         self.stable = Some(frame.clone());
         self.flight = Some(frame);
     }
 
     pub fn poll(&mut self, epoch: u32) -> Result<Option<WireFrame>, String> {
         let Some(frame) = self.poll_frame(epoch, false)? else {
+            return Ok(None);
+        };
+        let Some(frame) = self.reserve_publication(frame) else {
             return Ok(None);
         };
         let wire = from_engine(&frame, &self.id, epoch)?;
@@ -552,7 +592,10 @@ impl LiveBridge {
         let Some(frame) = self.poll_frame(epoch, false)? else {
             return Ok(None);
         };
-        let update = semantic::update(self.accepted.as_ref(), &frame, &self.id, epoch)?;
+        let Some(frame) = self.reserve_publication(frame) else {
+            return Ok(None);
+        };
+        let update = semantic::update(self.accepted.as_deref(), &frame, &self.id, epoch)?;
         self.publish(frame);
         Ok(Some(update))
     }
@@ -565,18 +608,44 @@ impl LiveBridge {
         snapshot: bool,
         format: SnapshotFormat,
     ) -> Result<Option<(crate::protocol_v4::Counter, String)>, String> {
+        self.poll_channel_with_scratch(
+            epoch,
+            snapshot,
+            format,
+            crate::semantic_v4::FrameScratch::acquire(),
+        )
+    }
+
+    fn poll_channel_with_scratch(
+        &mut self,
+        epoch: u32,
+        snapshot: bool,
+        format: SnapshotFormat,
+        scratch: Option<crate::semantic_v4::FrameScratch>,
+    ) -> Result<Option<(crate::protocol_v4::Counter, String)>, String> {
         let version = format
             .channel_version()
             .ok_or("terminal Channel version required")?;
+        let Some(scratch) = scratch else {
+            self.check(epoch)?;
+            // Encoding is deferrable. Keep advancing the owner, including
+            // its last completed synchronized paint boundary, and leave the
+            // existing delivery/ack state alone.
+            self.pump_unpublished()?;
+            return Ok(None);
+        };
         let Some(frame) = self.poll_frame(epoch, snapshot)? else {
+            return Ok(None);
+        };
+        let Some(frame) = self.reserve_publication(frame) else {
             return Ok(None);
         };
         let previous = if snapshot {
             None
         } else {
-            self.accepted.as_ref()
+            self.accepted.as_deref()
         };
-        let update = crate::semantic_v4::encode(previous, &frame, &self.id, version)?;
+        let update = scratch.encode(previous, &frame, &self.id, version)?;
         self.publish(frame);
         Ok(Some(update))
     }
@@ -592,7 +661,9 @@ impl LiveBridge {
         encode: impl FnOnce(&CellFrame, &str, u32) -> Result<F, String>,
     ) -> Result<F, String> {
         self.check(epoch)?;
-        let frame = self.current_snapshot()?;
+        let frame = self
+            .reserve_publication(self.current_snapshot()?)
+            .ok_or("terminal frame publication is temporarily busy")?;
         let wire = encode(&frame, &self.id, epoch)?;
         self.publish(frame);
         Ok(wire)
@@ -623,19 +694,23 @@ impl LiveBridge {
             .channel_version()
             .ok_or("terminal Channel version required")?;
         self.check(epoch)?;
+        let Some(scratch) = crate::semantic_v4::FrameScratch::acquire() else {
+            return Ok(None);
+        };
         let frame = self.current_snapshot()?;
         if revision.is_some_and(|revision| revision.get() >= frame.stamp().revision) {
             return Ok(None);
         }
-        crate::semantic_v4::encode(None, &frame, &self.id, version).map(Some)
+        scratch.encode(None, &frame, &self.id, version).map(Some)
     }
 
     fn current_snapshot(&self) -> Result<CellFrame, String> {
         let session = self.session.as_ref().unwrap();
         if !session.is_drained() && session.terminal().publication_held() {
             self.stable
-                .clone()
-                .ok_or_else(|| "missing stable frame".into())
+                .as_deref()
+                .cloned()
+                .ok_or_else(|| "terminal frame publication is temporarily busy".into())
         } else {
             session.terminal().frame()
         }
@@ -1014,6 +1089,112 @@ mod tests {
         assert!(bridge
             .open_prepared_editor(4, 32, &argv, &cwd, &[])
             .is_err());
+    }
+
+    #[test]
+    fn busy_channel_encoder_defers_first_publication_but_drains_the_real_pty() {
+        use std::{
+            ffi::OsString,
+            thread,
+            time::{Duration, Instant},
+        };
+
+        let argv = ["/bin/sh", "-c", "printf 'OWNED WHILE CHANNEL IS BUSY'"].map(OsString::from);
+        let mut bridge = LiveBridge::local_desktop();
+        let epoch = bridge
+            .open_prepared_editor(4, 40, &argv, &std::env::temp_dir(), &[])
+            .unwrap();
+        let owner = bridge.attachment(epoch).unwrap();
+        let timeout = Instant::now() + Duration::from_secs(3);
+        loop {
+            assert!(bridge
+                .poll_channel_with_scratch(epoch, true, SnapshotFormat::Channel, None)
+                .unwrap()
+                .is_none());
+            assert!(!bridge.has_unacknowledged_frame());
+            if bridge.session.as_ref().unwrap().is_drained() {
+                break;
+            }
+            assert!(Instant::now() < timeout);
+            thread::sleep(Duration::from_millis(10));
+        }
+        let (_, frame) = bridge
+            .poll_channel_frame(epoch, true, SnapshotFormat::Channel)
+            .unwrap()
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(json["stamp"]["session"], owner.session);
+        let line: String = json["rows"][0]["cells"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|cell| cell["text"].as_str().unwrap())
+            .collect();
+        assert!(line.starts_with("OWNED WHILE CHANNEL IS BUSY"));
+        assert!(bridge.has_unacknowledged_frame());
+        bridge.close(epoch).unwrap();
+    }
+
+    #[test]
+    fn decoded_frame_pressure_drains_the_real_pty_and_recovers_the_same_attachment() {
+        use jterm_engine::retained_bytes::RetainedBytesBudget;
+        use std::{
+            ffi::OsString,
+            sync::Arc,
+            thread,
+            time::{Duration, Instant},
+        };
+
+        let capacity = 1024 * 1024;
+        let budget = Arc::new(RetainedBytesBudget::new(capacity));
+        let busy = budget.reserve(capacity).unwrap();
+        let mut bridge = LiveBridge {
+            frame_budget_override: Some(Arc::clone(&budget)),
+            ..LiveBridge::local_desktop()
+        };
+        let argv = ["/bin/sh", "-c", "printf 'AFTER FRAME PRESSURE'"].map(OsString::from);
+        let epoch = bridge
+            .open_prepared_editor(4, 40, &argv, &std::env::temp_dir(), &[])
+            .unwrap();
+        let owner = bridge.attachment(epoch).unwrap();
+        assert!(bridge.resume(Some(&owner)).is_err());
+        assert_eq!(bridge.attachment(epoch).unwrap(), owner);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            assert!(bridge
+                .poll_channel_frame(epoch, true, SnapshotFormat::Channel)
+                .unwrap()
+                .is_none());
+            assert!(!bridge.has_unacknowledged_frame());
+            if bridge.status(epoch).unwrap().drained {
+                break;
+            }
+            assert!(Instant::now() < deadline, "PTY did not drain");
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(busy);
+        let (revision, frame) = bridge
+            .poll_channel_frame(epoch, true, SnapshotFormat::Channel)
+            .unwrap()
+            .unwrap();
+        let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(frame["stamp"]["session"], owner.session);
+        let line: String = frame["rows"][0]["cells"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|cell| cell["text"].as_str().unwrap())
+            .collect();
+        assert!(line.starts_with("AFTER FRAME PRESSURE"));
+        let published_bytes = budget.usage().retained_bytes;
+        assert!(published_bytes > 0);
+        bridge
+            .acknowledge_publication(epoch, revision.get())
+            .unwrap();
+        assert_eq!(bridge.attachment(epoch).unwrap(), owner);
+        assert_eq!(budget.usage().retained_bytes, published_bytes);
+        bridge.close(epoch).unwrap();
+        assert_eq!(budget.usage().retained_bytes, 0);
     }
 
     #[test]

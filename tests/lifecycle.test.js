@@ -1,3 +1,4 @@
+import {validateReloadView,retainedReloadView,saveReloadTicket,takeReloadTicket} from '../web/ssh-reload.js';
 import {installPasteReview} from '../web/paste.js';
 import {resizeQueue,cursorTarget,terminalCellAt} from '../web/viewport.js';
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import vm from 'node:vm';
@@ -5,13 +6,14 @@ import {installHistory} from '../web/history.js';
 import {installCommandBlocks} from '../web/command-blocks.js';
 import {installTerminalChat,validateChatStatus} from '../web/terminal-chat.js';
 import {installWorkflows} from '../web/workflows.js';
-import {plainLocalTab,readLocalShellLayout,saveLocalShellLayout} from '../web/local-layout.js';
+import {plainLocalTab,readLocalShellLayout,saveLocalShellLayout,MAX_LOCAL_SHELLS,validLocalGeometry,localSplitPair} from '../web/local-layout.js';
 import {acceptFull,acceptUpdate,clearPaint,paint as paintFrame} from '../web/frames.js'; import {installIme} from '../web/ime.js';
 import {acceptChannelFrame,channelCounter,CHANNEL_FRAME_VERSION} from '../web/frames-v4.js';
 const tick=()=>new Promise(r=>setImmediate(r));
 const deferred=()=>{let resolve,reject;const promise=new Promise((a,b)=>{resolve=a;reject=b});return {promise,resolve,reject};};
 function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsupported:"0"}), Encoder=TextEncoder, paint=()=>{},storage={},Channel,animation={}){
  const invoke=async(name,args)=>{
+  if(name==='ssh_terminal'&&args?.action?.operation==='recover_reload_layout')return animation.recoverReloadLayout?.()??null;
   const {owner,...parameters}=args??{};
   const keepsOwner=['activate_local_tab','subscribe_local_shell','ack_local_stream','set_local_observer','observe_local_shell','local_command_blocks'].includes(name);
   const legacy=owner&&!keepsOwner?{epoch:owner.epoch,...parameters}:args;
@@ -29,8 +31,8 @@ function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsuppo
  const elements=new Map(),timers=new Map();let id=0;
  const element=()=>({disabled:false,value:'',textContent:'',style:{},dataset:{},handlers:{},focus(){},append(){},scrollTo(){},setAttribute(){},replaceChildren(...options){this.options=options;},addEventListener(name,fn){this.handlers[name]=fn}});
  const el=selector=>{if(!elements.has(selector))elements.set(selector,element());return elements.get(selector)};
- const context={installFilePreviewPanel:()=>({dismiss(){}}),document:{querySelector:el,createElement:element},__TAURI__:{core:{invoke,Channel}},acceptFull,acceptUpdate,clearPaint,acceptChannelFrame,channelCounter,CHANNEL_FRAME_VERSION,installIme,installHistory,installCommandBlocks,installTerminalChat,installWorkflows,validateChatStatus,installPasteReview,resizeQueue,cursorTarget,terminalCellAt,paint,TextEncoder:Encoder,TextDecoder,
- plainLocalTab,readLocalShellLayout:()=>readLocalShellLayout(storage),saveLocalShellLayout:value=>saveLocalShellLayout(value,storage),
+ const context={validateReloadView,retainedReloadView,saveReloadTicket,takeReloadTicket,installFilePreviewPanel:()=>({dismiss(){}}),document:{querySelector:el,createElement:element},__TAURI__:{core:{invoke,Channel}},acceptFull,acceptUpdate,clearPaint,acceptChannelFrame,channelCounter,CHANNEL_FRAME_VERSION,installIme,installHistory,installCommandBlocks,installTerminalChat,installWorkflows,validateChatStatus,installPasteReview,resizeQueue,cursorTarget,terminalCellAt,paint,TextEncoder:Encoder,TextDecoder,
+ plainLocalTab,MAX_LOCAL_SHELLS,validLocalGeometry,localSplitPair,readLocalShellLayout:()=>readLocalShellLayout(storage),saveLocalShellLayout:value=>saveLocalShellLayout(value,storage),
  setInterval(fn){timers.set(++id,fn);return id},clearInterval(i){timers.delete(i)},setTimeout,...animation};
  vm.runInNewContext(fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8').replace(/^import .*\n/gm,''),context);
  return {el,timers,click:s=>el(s).handlers.click(),submit:()=>el('#command').handlers.submit({preventDefault(){}}),submitSsh:()=>el('#ssh-terminal-form').handlers.submit({preventDefault(){}})};
@@ -1035,10 +1037,11 @@ test('restore creates fresh tabs with their saved shell and presentation, then s
  assert.deepEqual(calls.filter(([name])=>name==='activate_local_tab').map(([,args])=>args.targetEpoch),[null,first.epoch]);
  assert.deepEqual(calls.filter(([name])=>name==='activate_local_tab').map(([,args])=>args.integrated),[true,undefined]);
  assert(!calls.some(([name])=>name==='write_shell'||name==='key_shell'||name==='text_shell'));
- assert.deepEqual(readLocalShellLayout(storage),layout);
+ const withGeometry={...layout,tabs:layout.tabs.map(tab=>({...tab,geometry:{rows:frame.rows.length,cols:frame.cols}})),panes:[]};
+ assert.deepEqual(readLocalShellLayout(storage),withGeometry);
  h.el('#local-tab-list').options.find(tab=>tab.dataset.epoch==='8').handlers.click();await tick();
  assert.equal(h.el('#command').hidden,true);
- assert.deepEqual(readLocalShellLayout(storage),{...layout,active:1});
+ assert.deepEqual(readLocalShellLayout(storage),{...withGeometry,active:1});
 });
 
 test('failure to restore the jsh tab leaves the plain shell usable and the preference intact',async()=>{
@@ -1294,4 +1297,155 @@ test('a late closed SSH snapshot cannot paint into a retained local shell that s
  assert.equal(freshPolls,1);
  assert.equal(h.el('#input').disabled,true);
  assert.match(h.el('#status').textContent,/view-only/);
+});
+
+test('public restore opens three fresh tabs, confirms each size, preserves split pair and active tab',async()=>{
+ const sizes=[{rows:17,cols:71},{rows:12,cols:83},{rows:19,cols:95}];
+ const layout={tabs:sizes.map(geometry=>({...plainLocalTab,geometry})),active:1,split:true,panes:[0,1]};
+ const storage=layoutStorage(layout),calls=[],owners=new Map(),physical=new Map();let next=100,revision=1;
+ const raw=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+ function frame(owner){
+  const size=physical.get(owner.epoch);
+  return {...raw,session:owner.session,epoch:owner.epoch,revision:++revision,layout:revision,cols:size.cols,
+   rows:Array.from({length:size.rows},()=>Array.from({length:size.cols},()=>({...raw.rows[0][0],text:' ',width:1})))};
+ }
+ const h=harness(async(name,args)=>{
+  calls.push([name,structuredClone(args)]);
+  if(name==='list_local_shells')return [];
+  if(name==='open_shell'){
+   const owner={session:'a'.repeat(32),epoch:++next,generation:1};owners.set(owner.epoch,owner);physical.set(owner.epoch,{rows:24,cols:80});return owner;
+  }
+  if(name==='activate_local_tab'){
+   let owner;
+   if(args.targetEpoch===null){owner={session:String.fromCharCode(97+owners.size).repeat(32),epoch:++next,generation:1};physical.set(owner.epoch,{rows:24,cols:80});}
+   else owner={...owners.get(args.targetEpoch),generation:owners.get(args.targetEpoch).generation+1};
+   owners.set(owner.epoch,owner);return {Ok:{owner,frame:frame(owner),input_allowed:true}};
+  }
+  if(name==='resize_shell'){physical.set(args.epoch,{rows:args.rows,cols:args.cols});return null;}
+  if(name==='poll_shell')return frame(owners.get(args.epoch));
+  if(name==='observe_local_shell')return frame(owners.get(args.epoch));
+  if(name==='ack_shell')return null;
+  throw Error('unexpected IPC '+name);
+ },undefined,undefined,undefined,storage);
+ assert.deepEqual(readLocalShellLayout(storage),layout);
+ assert.equal(h.el('#saved-local-layout').hidden,false);
+ await h.click('#restore-local-layout');
+ assert.equal(h.el('#status').textContent,'Opened 3 fresh shells in the saved layout.');
+ assert.equal(h.el('#local-tab-list').options.length,3);
+ assert.equal(h.el('#cols').value,'83');assert.equal(h.el('#rows').value,'12');
+ assert.equal(h.el('#terminal-panes').dataset.split,'right');
+ assert.deepEqual(calls.filter(([name])=>name==='resize_shell').map(([,args])=>({rows:args.rows,cols:args.cols})),sizes);
+ assert.deepEqual(calls.filter(([name])=>name==='activate_local_tab').map(([,args])=>args.targetEpoch),[null,null,102]);
+ assert(!calls.some(([name])=>['write_shell','key_shell','text_shell','paste_shell'].includes(name)));
+ await [...h.timers.values()][0]();
+ assert.equal(h.el('#peer-canvas').dataset.geometry,'71x17');
+ assert.deepEqual(readLocalShellLayout(storage),layout);
+ h.el('#local-tab-list').options.find(button=>button.dataset.epoch==='103').handlers.click();await tick();
+ await [...h.timers.values()][0]();
+ assert.equal(h.el('#peer-canvas').dataset.geometry,'71x17');
+ assert.equal(h.el('#cols').value,'95');assert.equal(h.el('#rows').value,'19');
+ const saved=readLocalShellLayout(storage);assert.equal(saved.active,2);assert.deepEqual(saved.panes,[0,2]);
+ assert.deepEqual(saved.tabs.map(tab=>tab.geometry),sizes);
+});
+
+
+test('ordinary SSH link loss retains recovery and rejects an unowned late commit',async()=>{
+ const old={session:'a'.repeat(32),epoch:1,generation:1},next={...old,generation:2};
+ const frame={...JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8')),session:old.session,epoch:1};
+ let lost=false;const sent=[];
+ const h=harness(async(name,{action})=>{
+  assert.equal(name,'ssh_terminal');
+  if(action.operation==='open')return old;
+  const c=action.command;
+  if(c.kind==='poll'){if(lost)throw Error('owned SSH link lost');return null;}
+  if(c.kind==='status')return {epoch:1,exited:false,drained:false,write_error:null,unsupported:'0',dropped_reply_bytes:'0'};
+  if(c.kind==='recover'){lost=false;return {owner:next,frame,input_allowed:true};}
+  if(c.kind==='text'){sent.push([c.owner,c.text]);return null;}
+  if(c.kind==='ack')return null;
+  throw Error(c.kind);
+ });
+ h.el('#ssh-terminal-host').value='fixture@127.0.0.1';await h.submitSsh();
+ const ime=h.el('#ime-input');
+ lost=true;await [...h.timers.values()][0]();
+ assert.equal(h.el('#input').disabled,true);assert.equal(h.el('#terminal-preedit').hidden,true);
+ await h.click('#recover');assert.equal(h.el('#input').disabled,false);
+ ime.handlers.compositionend({data:'你好'});ime.handlers.input({data:'你好',inputType:'insertText'});await tick();assert.deepEqual(sent,[]);
+ ime.handlers.compositionstart();ime.handlers.compositionupdate({data:'世界'});ime.handlers.compositionend({data:'世界'});ime.handlers.input({data:'世界',inputType:'insertText'});await tick();
+ assert.equal(sent.length,1);assert.equal(sent[0][0].generation,2);assert.equal(sent[0][1],'世界');
+});
+
+test('composing SSH link loss uses one native reload ticket and fresh granted generation without launching',async()=>{
+ const old={session:'a'.repeat(32),epoch:1,generation:1},next={...old,generation:3};
+ const frame={...JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8')),session:old.session,epoch:1};
+ const items=new Map(),sessionStorage={getItem:k=>items.get(k),setItem:(k,v)=>items.set(k,v),removeItem:k=>items.delete(k)};
+ let lost=false,reloads=0,view,prepared=0,claimed=0;const sent=[];
+ const reply=async(name,{action})=>{
+  assert.equal(name,'ssh_terminal');
+  if(action.operation==='open')return old;
+  if(action.operation==='prepare_reload'){prepared++;assert.deepEqual(action.owner,old);view=action.view;return {ticket:'f'.repeat(32)};}
+  if(action.operation==='claim_reload'){claimed++;assert.equal(items.size,0);return {owner:next,frame,input_allowed:true,view};}
+  const c=action.command;
+  if(c.kind==='poll'){if(lost)throw Error('owned SSH link lost');return null;}
+  if(c.kind==='status')return {epoch:1,exited:false,drained:false,write_error:null,unsupported:'0',dropped_reply_bytes:'0'};
+  if(c.kind==='text'){sent.push([c.owner,c.text]);return null;}
+  if(c.kind==='ack')return null;
+  throw Error('unexpected '+c.kind);
+ };
+ const h=harness(reply,undefined,TextEncoder,()=>{},{},undefined,{sessionStorage,location:{reload(){reloads++;}}});
+ h.el('#ssh-terminal-host').value='private';await h.submitSsh();h.el('#input').value='kept draft';
+ const oldField=h.el('#ime-input');oldField.handlers.compositionstart();oldField.handlers.compositionupdate({data:'你好'});
+ lost=true;await [...h.timers.values()][0]();await h.click('#recover');
+ assert.equal(prepared,1);assert.equal(reloads,1);assert.equal(h.el('#input').disabled,true);
+ oldField.handlers.compositionend({data:'你好'});oldField.handlers.input({data:'你好',inputType:'insertText'});await tick();assert.deepEqual(sent,[]);
+ lost=false;
+ const restored=harness(reply,undefined,TextEncoder,()=>{},{},undefined,{sessionStorage});await tick();await tick();
+ assert.equal(claimed,1);assert.equal(restored.el('#input').value,'kept draft');assert.equal(restored.el('#input').disabled,false);
+ const field=restored.el('#ime-input');field.handlers.compositionstart();field.handlers.compositionend({data:'世界'});await tick();
+ assert.equal(sent.length,1);assert.equal(sent[0][0].generation,3);assert.equal(sent[0][1],'世界');
+});
+
+test('expired SSH claim recovers only retained local metadata, keeps input closed, and never launches',async()=>{
+ const local={session:'b'.repeat(32),epoch:4,generation:2};
+ const view={version:1,tabs:[{owner:local,shell:'plain',paneId:null,geometry:{cols:81,rows:21},draft:'LOCAL UNSENT'}],splitEnabled:false,splitEpochs:[],detachedLocal:local,remoteDraft:'REMOTE MUST NOT ENTER LOCAL'};
+ const items=new Map([['aether.ssh-writer-reload','f'.repeat(32)]]),sessionStorage={getItem:k=>items.get(k),removeItem:k=>items.delete(k)};
+ const calls=[];
+ const h=harness(async(name,args)=>{
+  calls.push([name,args]);
+  if(name==='ssh_terminal'&&args.action.operation==='claim_reload')throw Error('expired');
+  if(name==='list_local_shells')return [4];
+  throw Error('unexpected launch or input '+name);
+ },undefined,TextEncoder,()=>{},{},undefined,{sessionStorage,recoverReloadLayout:()=>({view})});
+ await tick();await tick();
+ assert.equal(h.el('#saved-local-layout').hidden,true);assert.equal(h.el('#input').disabled,true);assert.equal(h.el('#input').value,'');
+ assert.deepEqual(h.el('#local-tab-list').options.map(tab=>tab.dataset.epoch),['4']);
+ assert.match(h.el('#status').textContent,/view-only/);assert.equal(items.size,0);
+ assert.equal(calls.filter(([name])=>name==='open_shell'||name==='open_second_local_shell'||name==='activate_local_tab').length,0);
+});
+
+test('malformed or missing SSH ticket can consume orphaned reader metadata without claiming a writer',async()=>{
+ for(const ticket of ['malformed',null]){
+  const items=new Map(ticket===null?[]:[['aether.ssh-writer-reload',ticket]]),sessionStorage={getItem:k=>items.get(k),removeItem:k=>items.delete(k)};
+  let claims=0;const view={version:1,tabs:[],splitEnabled:false,splitEpochs:[],detachedLocal:null,remoteDraft:''};
+  const h=harness(async(name,args)=>{if(name==='list_local_shells')return [];if(name==='ssh_terminal'){claims++;throw Error('writer claim forbidden');}throw Error(name);},undefined,TextEncoder,()=>{},{},undefined,{sessionStorage,recoverReloadLayout:()=>({view})});
+  await tick();await tick();assert.equal(claims,0);assert.equal(h.el('#input').disabled,true);assert.match(h.el('#status').textContent,/not completed/);
+ }
+});
+
+test('a delayed reader metadata reply cannot replace a newly opened local pane',async()=>{
+ const pending=deferred();const local={session:'b'.repeat(32),epoch:4,generation:2};
+ const view={version:1,tabs:[{owner:local,shell:'plain',paneId:null,geometry:null,draft:'STALE'}],splitEnabled:false,splitEpochs:[],detachedLocal:null,remoteDraft:''};
+ const h=harness(async name=>{if(name==='open_shell')return 42;if(name==='poll_shell')return null;throw Error(name);},undefined,TextEncoder,()=>{},{},undefined,{recoverReloadLayout:()=>pending.promise});
+ await h.click('#open');h.el('#input').value='FRESH';pending.resolve({view});await tick();await tick();
+ assert.equal(h.el('#input').disabled,false);assert.equal(h.el('#input').value,'FRESH');
+ assert.deepEqual(h.el('#local-tab-list').options.map(tab=>tab.dataset.epoch),['42']);
+});
+
+test('failed handoff without metadata never launches a saved layout while retained state exists or is unknown',async()=>{
+ for(const unavailable of [false,true]){
+  const items=new Map([['aether.ssh-writer-reload','invalid']]),sessionStorage={getItem:k=>items.get(k),removeItem:k=>items.delete(k)};
+  const storage=layoutStorage({tabs:[plainLocalTab],active:0,split:false});let opens=0;
+  const h=harness(async name=>{if(name==='list_local_shells'){if(unavailable)throw Error('unavailable');return [4];}if(name==='open_shell'){opens++;return 5;}throw Error(name);},undefined,TextEncoder,()=>{},storage,undefined,{sessionStorage});
+  await tick();await tick();assert.equal(h.el('#saved-local-layout').hidden,true);assert.equal(h.el('#restore-local-layout').disabled,true);
+  await h.click('#restore-local-layout');assert.equal(opens,0);assert.equal(h.el('#input').disabled,true);
+ }
 });

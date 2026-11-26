@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
-import {acceptsRun, readNotebookFile} from '../web/notebook-panel.js';
+import {acceptsRun, readNotebookFile, copyNotebookStream} from '../web/notebook-panel.js';
 
 const selected = (name, bytes, size = bytes.length) => ({
   name, size, arrayBuffer: async () => Uint8Array.from(bytes).buffer,
@@ -22,4 +22,23 @@ test('a partial or stopped receipt can only update the exact current notebook ce
   assert.equal(acceptsRun({...previous, revision: 2, cell: 2}, 'd', previous), false);
   assert.equal(acceptsRun({...previous, revision: 2, runId: 'retired'}, 'd', previous), false);
   assert.equal(acceptsRun(previous, 'd', previous), false);
+});
+
+
+test('native notebook copy preserves exact lane bytes including trailing LF and Unicode', async () => {
+  const snapshot = {stdout: 'line α\n\n', stderr: 'err\tβ\n'};
+  const calls = [];
+  const invoke = async (...args) => calls.push(args);
+  await copyNotebookStream(snapshot, 'stdout', invoke);
+  await copyNotebookStream(snapshot, 'stderr', invoke);
+  assert.deepEqual(calls, [['copy_terminal_text', {text: snapshot.stdout}], ['copy_terminal_text', {text: snapshot.stderr}]]);
+});
+
+test('native notebook copy refuses missing or mismatched lanes and propagates native failure', async () => {
+  let invoked = false;
+  for (const [snapshot, lane] of [[null, 'stdout'], [{stdout:'a'}, 'both'], [{stderr:null}, 'stderr']]) {
+    await assert.rejects(copyNotebookStream(snapshot, lane, async () => { invoked = true; }));
+  }
+  assert.equal(invoked, false);
+  await assert.rejects(copyNotebookStream({stdout:''}, 'stdout', async () => {throw Error('clipboard unavailable');}), /clipboard unavailable/);
 });

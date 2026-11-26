@@ -1,3 +1,4 @@
+import {validateReloadView,retainedReloadView,saveReloadTicket,takeReloadTicket} from './ssh-reload.js';
 import {installFilePreviewPanel} from './file-preview-panel.js';
 import {openVim9Snapshot} from './vim9-workbench.js';
 import {installPasteReview} from './paste.js';
@@ -6,7 +7,7 @@ import {installHistory} from './history.js';
 import {installCommandBlocks} from './command-blocks.js';
 import {installTerminalChat,validateChatStatus} from './terminal-chat.js';
 import {installWorkflows} from './workflows.js';
-import {plainLocalTab,readLocalShellLayout,saveLocalShellLayout,validPaneId} from './local-layout.js';
+import {plainLocalTab,readLocalShellLayout,saveLocalShellLayout,validPaneId,MAX_LOCAL_SHELLS,validLocalGeometry,localSplitPair} from './local-layout.js';
 import {acceptFull,acceptUpdate,clearPaint,paint} from './frames.js'; import {installIme} from './ime.js';
 import {acceptChannelFrame,channelCounter,CHANNEL_FRAME_VERSION} from './frames-v4.js';
 const canvas=document.querySelector('canvas'),status=document.querySelector('#status'),button=document.querySelector('#demo');
@@ -24,14 +25,15 @@ const localTabEpochs=new Set();
 const localTabOwners=new Map();
 const localShellKinds=new Map();
 const localPaneIds=new Map();
+const localTabGeometry=new Map();
 let changingTab=null,restoringLocalLayout=false;
 let state=null,epoch=null,owner=null,timer=null,polling=null,generation=0,transport=0,recovery=null;
-let sshSession=null,sshInputSuspended=false,detachedLocal=null;
+let sshSession=null,sshInputSuspended=false,detachedLocal=null,sshReloadNeeded=false,retainedLayoutBlocked=false;
 const showSavedSsh=document.querySelector('#show-saved-ssh'),savedSshPanel=document.querySelector('#saved-ssh');
 const savedSshSelect=document.querySelector('#saved-ssh-shell'),resumeSavedSsh=document.querySelector('#resume-saved-ssh'),forgetSavedSsh=document.querySelector('#forget-saved-ssh');
 let savedSshShells=[],savedSshRequest=0;
 let localStream=null,localTransport='channel',localInputSuspended=false,localFrameRecovery=false;
-let splitEnabled=false,splitLayout=1,settingSplit=false,peerState=null;
+let splitEnabled=false,splitEpochs=[],splitLayout=1,settingSplit=false,peerState=null;
 const filePreview=installFilePreviewPanel(document,{getFrame:()=>state,getEpoch:()=>changingTab?null:epoch,getSession:()=>changingTab?null:owner?.session,
   getOwner:()=>!changingTab&&!recovery&&owner?JSON.stringify([owner.session,owner.epoch,owner.generation]):null,isLocalTerminal:()=>!sshSession,
   openInVim:typeof openVim9Snapshot==='function'?openVim9Snapshot:null});
@@ -85,35 +87,52 @@ function setLocalTools(available) {
   }
 }
 function renderSavedLayout(){
-  savedLayoutPanel.hidden=!savedLayout||owner!==null||sshSession!==null||localTabEpochs.size>0;
-  restoreLayout.disabled=open.disabled||restoringLocalLayout;
+  savedLayoutPanel.hidden=retainedLayoutBlocked||!savedLayout||owner!==null||sshSession!==null||localTabEpochs.size>0;
+  restoreLayout.disabled=retainedLayoutBlocked||open.disabled||restoringLocalLayout;
+}
+function rememberLocalGeometry(frame){
+  if(!frame||!localTabEpochs.has(frame.epoch)||localTabOwners.get(frame.epoch)?.session!==frame.session)return;
+  const geometry={cols:frame.cols,rows:frame.rows.length};
+  if(!validLocalGeometry(geometry))return;
+  const old=localTabGeometry.get(frame.epoch);
+  if(old?.rows===geometry.rows&&old?.cols===geometry.cols)return;
+  localTabGeometry.set(frame.epoch,geometry);recordLocalLayout();
+}
+function updateSplitPair(previous=null){
+  if(splitEnabled)splitEpochs=localSplitPair([...localTabEpochs].sort((a,b)=>a-b),epoch,splitEpochs,previous);
 }
 function recordLocalLayout(){
-  if(restoringLocalLayout)return;
+  if(restoringLocalLayout||changingTab||settingSplit)return;
   const epochs=[...localTabEpochs].sort((a,b)=>a-b);
   const configurations=[];
   for(const number of epochs){
     const session=localTabOwners.get(number)?.session;
     const shell=localShellKinds.get(session);
-    // Retained roster rows expose epoch labels until their shell status arrives.
     if(!shell)return;
     configurations.push({shell,presentation:terminalChat.modeFor(session),paneId:localPaneIds.get(session)});
   }
-  savedLayout=epochs.length?{tabs:configurations,active:Math.max(0,epochs.indexOf(epoch)),split:splitEnabled&&epochs.length===2}:null;
-  saveLocalShellLayout(savedLayout);
-  renderSavedLayout();
+  const active=Math.max(0,epochs.indexOf(epoch));
+  const split=splitEnabled&&splitEpochs.length===2&&splitEpochs.every(number=>epochs.includes(number));
+  const complete=epochs.every(number=>localTabGeometry.has(number));
+  if(epochs.length>2&&!complete)return;
+  savedLayout=epochs.length?{tabs:configurations,active,split}:null;
+  if(savedLayout&&complete){
+    savedLayout.tabs=configurations.map((tab,index)=>({...tab,geometry:localTabGeometry.get(epochs[index])}));
+    savedLayout.panes=split?splitEpochs.map(number=>epochs.indexOf(number)):[];
+  }
+  saveLocalShellLayout(savedLayout);renderSavedLayout();
 }
 function observerTarget(){
-  if(!splitEnabled||!owner||sshSession!==null||localTabEpochs.size!==2)return null;
-  const other=[...localTabEpochs].find(number=>number!==epoch);
+  if(!splitEnabled||!owner||sshSession!==null||localTabEpochs.size<2||!splitEpochs.includes(epoch))return null;
+  const other=splitEpochs.find(number=>number!==epoch&&localTabEpochs.has(number));
   return other===undefined?null:{epoch:other,layout:splitLayout};
 }
 function renderSplit(){
   const target=observerTarget();
-  splitToggle.disabled=!owner||sshSession!==null||localTabEpochs.size!==2||!!changingTab||!!recovery||restoringLocalLayout||settingSplit;
+  splitToggle.disabled=!owner||sshSession!==null||localTabEpochs.size<2||!!changingTab||!!recovery||restoringLocalLayout||settingSplit;
   splitToggle.setAttribute('aria-pressed',String(!!target));
   splitToggle.textContent=target?'Single pane':'Split panes';
-  panes.dataset.split=target?(epoch<target.epoch?'left':'right'):'';
+  panes.dataset.split=target?(splitEpochs[0]===epoch?'left':'right'):'';
   peerPane.hidden=!target;
   focusPeer.disabled=splitToggle.disabled;
   if(target)focusPeer.textContent=`Focus Shell ${target.epoch}`;
@@ -140,7 +159,7 @@ function renderLocalTabs(focusActive=false) {
     return tab;
   });
   tabList.replaceChildren(...buttons);
-  newTab.disabled=newJshTab.disabled=!owner||changingTab!==null||recovery!==null||restoringLocalLayout||localTabEpochs.size!==1;
+  newTab.disabled=newJshTab.disabled=!owner||changingTab!==null||recovery!==null||restoringLocalLayout||localTabEpochs.size>=MAX_LOCAL_SHELLS;
   retryTab.hidden=!changingTab||changingTab.busy||restoringLocalLayout;
   if(focusActive)activeButton?.focus();
 }
@@ -160,6 +179,7 @@ function paintPeer(frame){
   if(!frame)return;
   paint(peerCanvas,frame);peerState=frame;
   peerCanvas.dataset.geometry=`${frame.cols}x${frame.rows.length}`;
+  rememberLocalGeometry(frame);
 }
 function sameObservation(left,right){
   return left?.epoch===right?.epoch&&left?.layout===right?.layout;
@@ -179,6 +199,7 @@ async function syncObserver(stream){
 splitToggle.addEventListener('click',async()=>{
   if(splitToggle.disabled)return;
   splitEnabled=!splitEnabled;splitLayout++;
+  splitEpochs=splitEnabled?[...localTabEpochs].filter(number=>number!==epoch).slice(0,1).concat(epoch).sort((a,b)=>a-b):[];
   settingSplit=true;renderSplit();recordLocalLayout();
   const attachment=owner;
   try{
@@ -188,7 +209,7 @@ splitToggle.addEventListener('click',async()=>{
     }
   }
   catch(error){if(owner===attachment)status.textContent=`Split pane unavailable: ${String(error?.message??error)}`;}
-  finally{settingSplit=false;renderSplit();}
+  finally{settingSplit=false;renderSplit();recordLocalLayout();}
 });
 function selectPeer(){
   const target=observerTarget();
@@ -200,11 +221,11 @@ function setTabRoster(records){
   for(const [number,attachment] of localTabOwners){
     if(records.includes(number))continue;
     localTabOwners.delete(number);localDrafts.delete(attachment.session);
-    localShellKinds.delete(attachment.session);localPaneIds.delete(attachment.session);terminalChat.forget(attachment.session);
+    localShellKinds.delete(attachment.session);localPaneIds.delete(attachment.session);localTabGeometry.delete(number);terminalChat.forget(attachment.session);
   }
   localTabEpochs.clear();
   for(const number of records)localTabEpochs.add(number);
-  renderLocalTabs();
+  updateSplitPair();renderLocalTabs();
 }
 function rememberLocalDraft(attachment) {
   if(input.value)localDrafts.set(attachment.session,input.value);
@@ -231,7 +252,7 @@ function updateLocalSelection(){
 }
 async function listLocalShellEpochs(){
   const records=await invoke('list_local_shells');
-  if(!Array.isArray(records)||records.length>2)throw new Error('invalid local shell list');
+  if(!Array.isArray(records)||records.length>MAX_LOCAL_SHELLS)throw new Error('invalid local shell list');
   if(records.some(epoch=>!Number.isInteger(epoch)||epoch<=0||epoch>0xffffffff)||
       new Set(records).size!==records.length)throw new Error('invalid retained local shell');
   return records;
@@ -244,6 +265,7 @@ showLocal.addEventListener('click',async()=>{
     const records=await listLocalShellEpochs();
     if(request!==localListRequest||generation!==attempt||showLocal.disabled)return;
     roster=records;
+    if(!records.length)retainedLayoutBlocked=false;
     setTabRoster(records);
     const options=roster.map(epoch=>{
       const option=document.createElement('option');option.value=String(epoch);
@@ -256,7 +278,7 @@ showLocal.addEventListener('click',async()=>{
     openSecond.disabled=epoch!==null||roster.length!==1;localOptions.hidden=false;
     if(epoch===null){
       if(!roster.length)status.textContent='No retained local shell.';
-      else if(roster.length===2)status.textContent='Choose which local shell to reconnect view-only.';
+      else if(roster.length>1)status.textContent='Choose which local shell to reconnect view-only.';
     }
   }catch(e){
     if(request!==localListRequest||generation!==attempt||showLocal.disabled)return;
@@ -291,6 +313,8 @@ const history=installHistory({older:document.querySelector('#history-older'),new
  invoke:(command,{owner:attachment,...args})=>invokeAttached(command,{epoch:attachment.epoch,...args},attachment),
  getOwner:()=>changingTab?null:owner,
  visual:{viewport:document.querySelector('#history-viewport'),spacer:document.querySelector('#history-grid-size'),canvas:document.querySelector('#history-canvas')},
+ copyControls:{button:document.querySelector('#history-copy'),status:document.querySelector('#history-copy-status'),
+  write:text=>invoke('copy_terminal_text',{text})},
  enableProjection:attachment=>typeof Channel==='function'&&attachment.session!==sshSession,
  searchControls:{form:document.querySelector('#history-find-form'),query:document.querySelector('#history-find-query'),
   find:document.querySelector('#history-find'),older:document.querySelector('#history-find-older'),
@@ -298,6 +322,7 @@ const history=installHistory({older:document.querySelector('#history-older'),new
   enabled:attachment=>attachment.session!==sshSession&&!restoringLocalLayout&&!recovery}});
 const localView=()=>owner&&owner.session!==sshSession&&!changingTab&&!recovery&&!restoringLocalLayout?owner:null;
 const blocks=installCommandBlocks(document,{
+  copyText:text=>invoke('copy_terminal_text',{text}),
   getOwner:localView,
   read:attachment=>invokeAttached('local_command_blocks',{epoch:attachment.epoch},attachment),
   bookmark:(attachment,selection,bookmarked)=>invokeAttached('set_local_command_bookmark',{
@@ -338,8 +363,18 @@ const workflows=installWorkflows(document,{
     return attachment&&inputOwner()===attachment&&prompt&&ime.isSettled()&&pasteReviewPanel.hidden
       ?{owner:attachment,prompt}:null;
   },
+  retained:attachment=>localTabOwners.get(attachment.epoch)?.session===attachment.session,
   invoke:request=>invoke('local_workflow_library',{request}),
-  insert:(choice,receipt)=>enqueueLogical('insert_local_workflow',choice,receipt),
+  insert:async(choice,target,receipt)=>{
+    // Keep keyboard focus out of the PTY until insertion has settled. A
+    // repeated Enter from the form must not execute the inserted line.
+    if(owner?.session!==target.session)await startLocalTab(target.epoch);
+    const attachment=inputOwner();
+    if(changingTab||attachment?.session!==target.session||attachment.epoch!==target.epoch||!ime.isSettled()||!pasteReviewPanel.hidden){
+      throw new Error('The original shell is unavailable for input.');
+    }
+    return enqueueLogical('insert_local_workflow',choice,receipt);
+  },
   returnToTerminal:()=>{(input.disabled?canvas:imeInput).focus();},
   announce:message=>{status.textContent=message;},
 });
@@ -440,8 +475,10 @@ async function receiveLocalStream(stream,event){
     recoverFrame=false;
     showShellStatus(event.status,'channel');
     stream.sequence=sequence;stream.lastSeen=Date.now();
-    await invoke('ack_local_stream',{owner:stream.owner,streamId:stream.channel.id,sequence:event.sequence,
-      revision});
+    const acknowledging=invoke('ack_local_stream',{owner:stream.owner,streamId:stream.channel.id,sequence:event.sequence,revision});
+    stream.acknowledging=acknowledging;
+    await acknowledging;
+    if(stream.acknowledging===acknowledging)stream.acknowledging=null;
     if(localStream===stream&&event.status.drained&&stream.sequence===sequence)clearInterval(timer);
   }catch(error){
     // A later delivery proves that the previous acknowledgement was applied,
@@ -510,7 +547,8 @@ async function poll(){
     if(epoch!==current||ticket.transport!==transport)return;
     const isSsh=attachment.session===sshSession;
     sshInputSuspended=isSsh&&!keyQueue.locked&&!keyQueue.pending&&!input.disabled;
-    pasteReview.reset();keyQueue.locked=true;clearInterval(timer);
+    sshReloadNeeded=isSsh&&sshInputSuspended&&ime.isComposing();
+    pasteReview.reset();ime.reset();keyQueue.locked=true;clearInterval(timer);
     status.textContent=isSsh?`SSH terminal paused: ${String(e?.message??e)}. Use Recover output snapshot.`:`Shell stopped: ${String(e?.message??e)}. Close/reopen before continuing.`;
     input.disabled=send.disabled=resize.disabled=true;
     terminalChat.updateOwner();
@@ -581,9 +619,11 @@ async function attemptLocalTab(){
     const next=change.view;
     paint(canvas,next.frame);
     await invokeAttached('ack_shell',{epoch:next.owner.epoch,revision:next.frame.revision},next.owner);
+    const previousEpoch=epoch;
     owner=next.owner;epoch=owner.epoch;state=next.frame;describeCursor();
     restoreLocalDraft(owner);
     rememberLocalTab(owner,change.targetEpoch===null?change.configuration:undefined,next.paneId);
+    updateSplitPair(previousEpoch);rememberLocalGeometry(state);
     detachedLocal=null;
     colsInput.value=String(state.cols);rowsInput.value=String(state.rows.length);
     keyQueue={chain:Promise.resolve(),pending:0,locked:!next.writable};
@@ -605,8 +645,32 @@ const jshLocalTab={shell:'jsh',presentation:'terminal'};
 newJshTab.addEventListener('click',()=>{if(!newJshTab.disabled)return startLocalTab(null,{configuration:jshLocalTab});});
 retryTab.addEventListener('click',attemptLocalTab);
 
+async function restoreLocalGeometry(configuration){
+  const geometry=configuration.geometry;
+  if(!geometry)return; // Historical versions did not record physical sizes.
+  const attachment=owner;
+  const awaitFrame=async(wanted=null)=>{
+    const until=Date.now()+5000;
+    while(owner===attachment&&!keyQueue.locked){
+      if(localStream?.acknowledging)await localStream.acknowledging;
+      if(!localStream)await poll();
+      if(state?.session===attachment.session&&state.epoch===attachment.epoch&&!polling&&
+          (!wanted||(state.cols===wanted.cols&&state.rows.length===wanted.rows)))return;
+      if(Date.now()>=until)break;
+      await new Promise(resolve=>setTimeout(resolve,20));
+    }
+    throw new Error('Restored pane geometry could not be confirmed. Existing shells were retained; no automatic retry.');
+  };
+  await awaitFrame();
+  if(state.cols!==geometry.cols||state.rows.length!==geometry.rows){
+    await invokeAttached('resize_shell',{epoch:attachment.epoch,...geometry},attachment);
+    await awaitFrame(geometry);
+  }
+  rememberLocalGeometry(state);
+}
+
 restoreLayout.addEventListener('click',async()=>{
-  if(restoreLayout.disabled||!savedLayout||owner||localTabEpochs.size||restoringLocalLayout)return;
+  if(retainedLayoutBlocked||restoreLayout.disabled||!savedLayout||owner||localTabEpochs.size||restoringLocalLayout)return;
   const layout=savedLayout;
   splitEnabled=layout.split;splitLayout++;
   restoringLocalLayout=true;
@@ -628,18 +692,26 @@ restoreLayout.addEventListener('click',async()=>{
       throw new Error(reason);
     }
     if(keyQueue.locked)throw new Error(status.textContent);
-    if(layout.tabs.length===2){
-      await startLocalTab(null,{fromRestore:true,configuration:layout.tabs[1]});
+    const created=[first.epoch];
+    await restoreLocalGeometry(layout.tabs[0]);
+    for(const configuration of layout.tabs.slice(1)){
+      const previous=owner;
+      await startLocalTab(null,{fromRestore:true,configuration});
       if(changingTab)return;
-      if(owner===first||keyQueue.locked)throw new Error(status.textContent);
-      if(layout.active===0){
-        await startLocalTab(first.epoch,{fromRestore:true});
-        if(changingTab)return;
-        if(owner.epoch!==first.epoch||keyQueue.locked)throw new Error(status.textContent);
-      }
+      if(owner===previous||keyQueue.locked)throw new Error(status.textContent);
+      created.push(owner.epoch);
+      await restoreLocalGeometry(configuration);
     }
+    splitEpochs=layout.split?(layout.panes??[0,1]).map(index=>created[index]):[];splitLayout++;
+    if(owner.epoch!==created[layout.active]){
+      await startLocalTab(created[layout.active],{fromRestore:true});
+      if(changingTab)return;
+      if(owner.epoch!==created[layout.active]||keyQueue.locked)throw new Error(status.textContent);
+    }
+    renderSplit();
+    if(localStream)await syncObserver(localStream);
     complete=true;
-    status.textContent=layout.tabs.length===1?'Opened one fresh shell in the saved layout.':'Opened two fresh shells in the saved layout.';
+    status.textContent=layout.tabs.length===1?'Opened one fresh shell in the saved layout.':layout.tabs.length===2?'Opened two fresh shells in the saved layout.':`Opened ${layout.tabs.length} fresh shells in the saved layout.`;
   }catch(e){
     status.textContent=`Shell layout restore incomplete. ${String(e?.message??e)}`;
   }finally{
@@ -674,7 +746,7 @@ async function openShell({destination=null,retained=null,fromRestore=false,confi
     owner=opened;sshSession=destination===null?null:opened.session;
     localTransport='channel';localInputSuspended=false;
     if(destination===null){detachedLocal=null;restoreLocalDraft(opened);rememberLocalTab(opened,configuration,paneId);}
-    epoch=owner.epoch;keyQueue={chain:Promise.resolve(),pending:0,locked:false};state=null;
+    const previousEpoch=epoch;epoch=owner.epoch;updateSplitPair(previousEpoch);keyQueue={chain:Promise.resolve(),pending:0,locked:false};state=null;
     setActiveControls(true);
     if(destination===null){setLocalTools(true);recordLocalLayout();}
     renderLocalTabs();
@@ -778,7 +850,7 @@ async function reconnect(selected=null,saved=null){
     const next=acceptAttachedSnapshot(result.frame,nextOwner,options);
     if(saved)sshSession=nextOwner.session;
     if(!remote){detachedLocal=null;restoreLocalDraft(nextOwner);rememberLocalTab(nextOwner);}
-    owner=nextOwner;epoch=owner.epoch;keyQueue={chain:Promise.resolve(),pending:0,locked:true};
+    const previousEpoch=epoch;owner=nextOwner;epoch=owner.epoch;updateSplitPair(previousEpoch);keyQueue={chain:Promise.resolve(),pending:0,locked:true};
     localTransport='channel';localInputSuspended=false;
     input.disabled=send.disabled=resize.disabled=true;close.disabled=detach.disabled=false;
     paint(canvas,next);state=next;describeCursor();
@@ -799,6 +871,7 @@ async function reconnect(selected=null,saved=null){
 function clearTerminalPaint(){
   clearPaint(canvas);
   canvas.title='';canvas.style.cursor='';
+  rememberLocalGeometry(state);
   document.querySelector('#cursor-status').textContent='';
   const health=document.querySelector('#health');health.textContent='';delete health.dataset.transport;
 }
@@ -832,7 +905,7 @@ close.addEventListener('click',async()=>{
   // before Close can give up that view, even if the close response is lost.
   if(changingTab||!owner||close.disabled)return;
   generation++;transport++;polling=null;setLocalTools(false);filePreview.dismiss();pasteReview.reset();ime.reset();history.reset();stopTransport();const old=epoch,oldOwner=owner;epoch=null;owner=null;renderLocalTabs();resize.disabled=close.disabled=detach.disabled=input.disabled=send.disabled=true;
-  try{const result=await invokeAttached('close_shell',{epoch:old},oldOwner);if(oldOwner.session!==sshSession){input.value='';localDrafts.delete(oldOwner.session);localTabEpochs.delete(oldOwner.epoch);localTabOwners.delete(oldOwner.epoch);localShellKinds.delete(oldOwner.session);localPaneIds.delete(oldOwner.session);terminalChat.forget(oldOwner.session);if(localTabEpochs.size<2)splitEnabled=false;recordLocalLayout();}status.textContent=result?.cleanup_pending===false?'Terminal closed; direct child reaped. Descendant containment is not provided.':'Terminal closed; direct-child cleanup handed to bounded supervisor and may still be pending. Descendant containment is not provided.';if(typeof result?.save_warning==='string')status.textContent+=' '+result.save_warning;state=null;clearTerminalPaint();sshSession=null;sshInputSuspended=false;setOpenDisabled(false);attach.disabled=button.disabled=false;renderLocalTabs();}
+  try{const result=await invokeAttached('close_shell',{epoch:old},oldOwner);if(oldOwner.session!==sshSession){input.value='';localDrafts.delete(oldOwner.session);localTabEpochs.delete(oldOwner.epoch);localTabOwners.delete(oldOwner.epoch);localShellKinds.delete(oldOwner.session);localPaneIds.delete(oldOwner.session);localTabGeometry.delete(oldOwner.epoch);terminalChat.forget(oldOwner.session);if(localTabEpochs.size<2){splitEnabled=false;splitEpochs=[];}else updateSplitPair();recordLocalLayout();}status.textContent=result?.cleanup_pending===false?'Terminal closed; direct child reaped. Descendant containment is not provided.':'Terminal closed; direct-child cleanup handed to bounded supervisor and may still be pending. Descendant containment is not provided.';if(typeof result?.save_warning==='string')status.textContent+=' '+result.save_warning;state=null;clearTerminalPaint();sshSession=null;sshInputSuspended=false;setOpenDisabled(false);attach.disabled=button.disabled=false;renderLocalTabs();}
   catch(e){epoch=old;owner=oldOwner;blocks.updateOwner();terminalChat.updateOwner();close.disabled=detach.disabled=false;status.textContent=`Close error: ${String(e?.message??e)}. Retry Close to finish cleanup.`;}
 });
 document.querySelector('#command').addEventListener('submit',async event=>{
@@ -869,6 +942,7 @@ function describeCursor(){
   for(const layer of [imeInput,terminalPreedit]){
     layer.style.left=left;layer.style.top=top;
   }
+  rememberLocalGeometry(state);
   document.querySelector('#cursor-status').textContent=`${state.cols} × ${state.rows.length} cells · cursor row ${state.cursor_row+1}, column ${state.cursor_col+1} · ${state.cursor_shape}${state.cursor_visible?'':' (hidden)'}${state.pending_wrap?' · wrap pending':''}`;
 }
 function hyperlinkAt(event){
@@ -972,6 +1046,14 @@ async function recoverOutput(previousStatus=null){
   ime.reset();
   setLocalTools(false);renderLocalTabs();
   try {
+    if(attachment.session===sshSession&&sshReloadNeeded){
+      sshReloadNeeded=false;
+      const result=await invoke('ssh_terminal',{action:{operation:'prepare_reload',owner:attachment,view:captureSshReloadView()}});
+      if(epoch!==current||transport!==ticket)return;
+      saveReloadTicket(result?.ticket,globalThis.sessionStorage);
+      globalThis.location.reload();
+      return;
+    }
     const isLocal=attachment.session!==sshSession;
     let options=isLocal&&(localTransport==='channel'||localTransport==='recovery'&&localFrameRecovery)?channelSnapshots():{};
     let result;
@@ -1017,3 +1099,86 @@ async function recoverOutput(previousStatus=null){
   finally{if(recovery===operation){recovery=null;if(epoch===current&&transport===ticket){detach.disabled=false;setLocalTools(true);renderLocalTabs();}}}
 }
 document.querySelector('#recover').addEventListener('click',()=>recoverOutput());
+
+
+function captureSshReloadView(){
+  return validateReloadView({version:1,tabs:[...localTabEpochs].sort((a,b)=>a-b).map(number=>{
+    const retained=localTabOwners.get(number);
+    return {owner:retained,shell:localShellKinds.get(retained?.session),paneId:localPaneIds.get(retained?.session)??null,
+      geometry:localTabGeometry.get(number)??null,draft:localDrafts.get(retained?.session)??''};
+  }),splitEnabled,splitEpochs:splitEnabled?[...splitEpochs]:[],detachedLocal,remoteDraft:input.value});
+}
+function restoreSshReloadView(view,{remoteDraft=true}={}){
+  // Rehydrate identities only. The saved-layout launch action is intentionally
+  // never called: all of these terminals already exist in the native runtime.
+  for(const tab of view.tabs){
+    localTabEpochs.add(tab.owner.epoch);localTabOwners.set(tab.owner.epoch,tab.owner);
+    localShellKinds.set(tab.owner.session,tab.shell);
+    if(tab.paneId!==null)localPaneIds.set(tab.owner.session,tab.paneId);
+    if(tab.geometry!==null)localTabGeometry.set(tab.owner.epoch,tab.geometry);
+    if(tab.draft)localDrafts.set(tab.owner.session,tab.draft);
+  }
+  splitEnabled=view.splitEnabled;splitEpochs=view.splitEpochs;detachedLocal=view.detachedLocal;
+  if(remoteDraft)input.value=view.remoteDraft;
+}
+async function claimSshReload(){
+  let ticket,grant=false;
+  try{ticket=takeReloadTicket(globalThis.sessionStorage);}catch(error){await recoverSshReloadLayout(error);return;}
+  if(!invoke)return;
+  if(!ticket){await recoverSshReloadLayout();return;}
+  setOpenDisabled(true);attach.disabled=button.disabled=true;
+  try{
+    const result=await invoke('ssh_terminal',{action:{operation:'claim_reload',ticket}});
+    const view=validateReloadView(result?.view),nextOwner=acceptOwner(result?.owner);
+    if(typeof result.input_allowed!=='boolean')throw new Error('Missing SSH host input grant.');
+    grant=result.input_allowed;
+    const next=acceptFull(null,result.frame,nextOwner);
+    restoreSshReloadView(view);
+    owner=nextOwner;epoch=nextOwner.epoch;sshSession=nextOwner.session;state=next;
+    keyQueue={chain:Promise.resolve(),pending:0,locked:true};input.disabled=send.disabled=resize.disabled=true;
+    close.disabled=detach.disabled=false;
+    paint(canvas,next);describeCursor();renderLocalTabs();
+    await invokeAttached('ack_shell',{epoch:nextOwner.epoch,revision:next.revision},nextOwner);
+    if(owner!==nextOwner)return;
+    if(result.input_allowed){keyQueue.locked=false;input.disabled=send.disabled=resize.disabled=false;}
+    status.textContent=result.input_allowed?'SSH output recovered in a fresh input view.':'SSH view recovered. Input remains disabled.';
+    await startTransport();
+  }catch(error){
+    keyQueue.locked=true;input.disabled=send.disabled=resize.disabled=true;
+    if(owner?.session===sshSession&&grant&&!keyQueue.pending)sshInputSuspended=true;
+    status.textContent=`SSH input view reset failed: ${String(error?.message??error)}. Reconnect view-only; do not resend pending input.`;
+    if(owner===null)await recoverSshReloadLayout(error);
+  }
+}
+
+async function recoverSshReloadLayout(reason=null){
+  if(!invoke)return;
+  const attempt=generation,previous=owner;let relevant=!!reason;
+  if(reason){retainedLayoutBlocked=true;keyQueue.locked=true;input.disabled=send.disabled=resize.disabled=true;}
+  try{
+    const result=await invoke('ssh_terminal',{action:{operation:'recover_reload_layout'}});
+    if(generation!==attempt||owner!==previous)return;
+    if(!result&&!reason)return;
+    relevant=true;
+    const retained=await listLocalShellEpochs();
+    if(generation!==attempt||owner!==previous)return;
+    retainedLayoutBlocked=retained.length>0;
+    if(result?.view){
+      const view=retainedReloadView(result.view,retained);
+      restoreSshReloadView(view,{remoteDraft:false});
+    }
+    setTabRoster(retained);
+    keyQueue.locked=true;input.disabled=send.disabled=resize.disabled=true;
+    status.textContent='SSH writer recovery was not completed. Retained local panes are available view-only; use Saved SSH shells for a reader. Unsent remote input was not restored.';
+  }catch(error){
+    if(generation!==attempt||owner!==previous)return;
+    relevant=true;retainedLayoutBlocked=true;
+    status.textContent='SSH writer recovery is locked. List retained local shells or reconnect Saved SSH view-only. No saved-layout shells were launched.';
+  }finally{
+    if(relevant&&generation===attempt&&owner===previous){
+      if(owner===null){setOpenDisabled(false);attach.disabled=false;button.disabled=false;}
+      renderLocalTabs();
+    }
+  }
+}
+void claimSshReload();

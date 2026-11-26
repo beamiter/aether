@@ -282,8 +282,10 @@ def exercise(app, destination, helper, legacy_helper=False):
                         saved_catalog_remains_empty=True, artifacts=str(root))
 
         submit("stty -echo; printf '\\033[1;1H\\033[48;2;22;63;91m%20s\\033[0m' ''; "
-               "printf '\\033[2;1H\\033[2K%s\\r\\n' ECHO_DISABLED")
+               "printf '\\033[2;1H\\033[2K%s\\r\\n' ECHO_DISABLED; "
+               "printf 'TERM profile: %s %s\\r\\n' \"$TERM\" \"$(tput colors)\"")
         wait(lambda: visible("ECHO_DISABLED"), "initial remote output reaches WebKit")
+        wait(lambda: visible("TERM profile: jterm-256color 256"), "remote PTY terminfo profile")
         wait(lambda: state()["pixel"] == [22, 63, 91, 255], "remote RGB row is not painted on canvas")
         quote = shlex.quote
         detached_writer = shlex.join([
@@ -456,6 +458,7 @@ def exercise(app, destination, helper, legacy_helper=False):
 
         return dict(
             native_webview=True, detached_content_recovered=True,
+            native_remote_terminfo_profile=True,
             same_pty_input_resumed=True, read_only_grid=True, read_only_write_blocked=True,
             remote_pty_reaped=True, clean_native_exit=True, native_clipboard=True,
             native_remote_rgb_paint=True, detached_pty_bytes=DETACHED_WRITES * len(DETACHED_WRITE),

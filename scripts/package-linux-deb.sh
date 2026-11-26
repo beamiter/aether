@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+legacy=false
+if [[ ${1:-} == --legacy ]]; then
+    legacy=true
+    shift
+fi
 if (( $# < 3 || $# > 4 )); then
-    printf 'Usage: %s DESKTOP_BINARY SSH_HOST_BINARY OUTPUT_DIRECTORY [PACKAGE_VERSION]\n' "$0" >&2
+    printf 'Usage: %s [--legacy] DESKTOP_BINARY SSH_HOST_BINARY OUTPUT_DIRECTORY [PACKAGE_VERSION]\n' "$0" >&2
     exit 2
 fi
 
@@ -22,13 +27,22 @@ stage=$(mktemp -d "$output/.aether-bundle.XXXXXX")
 trap 'rm -r -- "$stage"' EXIT
 install -D -m 0755 -- "$desktop" "$stage/release/tauri-terminal-lab"
 install -m 0755 -- "$host" "$stage/release/aether-terminal-host"
+terminfo=
+if ! "$legacy"; then
+    terminfo="$stage/jterm-256color"
+    "$host" terminfo > "$terminfo"
+    test -s "$terminfo"
+fi
 
-overlay=$(python3 -B - "$stage/release/aether-terminal-host" "${4:-}" <<'PY'
+overlay=$(python3 -B - "$stage/release/aether-terminal-host" "$terminfo" "${4:-}" <<'PY'
 import json
 import sys
 
-host, version = sys.argv[1:]
-config = {"bundle": {"linux": {"deb": {"files": {"/usr/bin/aether-terminal-host": host}}}}}
+host, terminfo, version = sys.argv[1:]
+files = {"/usr/bin/aether-terminal-host": host}
+if terminfo:
+    files["/usr/share/terminfo/j/jterm-256color"] = terminfo
+config = {"bundle": {"linux": {"deb": {"files": files}}}}
 if version:
     config["version"] = version
 print(json.dumps(config))

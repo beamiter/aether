@@ -401,15 +401,17 @@ def exercise(driver, owned):
     archive_query = "AETHER_ARCHIVE_NEEDLE"
     archive_command = ("stty -echo; printf 'older %s%s\\r\\n' AETHER_ARCHIVE_ NEEDLE; seq 1 90; "
                        "printf 'newer %s%s\\r\\n' AETHER_ARCHIVE_ NEEDLE; seq 91 124; "
+                       "printf 'TERM profile: %s %s\\r\\n' \"$TERM\" \"$(tput colors)\"; "
                        "printf '%s%s\\r\\n' AETHER_HISTORY_ READY")
     driver.type("#input", archive_command)
     driver.click("#send")
 
     def archived():
         driver.click("#copy-visible")
-        return "AETHER_HISTORY_READY" in state()["dump"].splitlines()
+        rows = state()["dump"].splitlines()
+        return "AETHER_HISTORY_READY" in rows and "TERM profile: jterm-256color 256" in rows
 
-    wait_for(archived, "the real PTY did not finish writing the retained archive")
+    wait_for(archived, "the real PTY did not publish its terminfo profile and retained output")
     driver.click("#history-refresh")
     wait_for(lambda: state()["dump"].count(archive_query) == 2,
              "native history reader did not show scrolled PTY output")
@@ -612,6 +614,7 @@ def exercise(driver, owned):
     close_without_stale_presentation(driver, state, a_identity, b_identity, "surviving owned tab was not reaped")
     assert not forbidden_a.exists() and not forbidden_b.exists(), "a writable tab replayed another draft"
     print(json.dumps({"native_webkitgtk": True, "owned_local_ptys": 2,
+                      "native_pty_terminfo_profile": True,
                       "local_frames_delivered_by_tauri_channel": True,
                       "local_channel_recovers_same_pty": True,
                       "distinct_canvas_colors_and_markers": True, "explicit_view_only_reattach": True,
@@ -1343,7 +1346,7 @@ def exercise_command_blocks(driver, owned, output_review=False, *, read_clipboar
     wait_for(ready_prompt, "Vim did not return to the live jsh prompt")
     driver.click("#command-block-toggle")
     fullscreen = refresh_for(editor)
-    assert fullscreen["output"] is None and "screen operations" in fullscreen["body"], fullscreen
+    assert fullscreen["output"] == "" and "AETHER_NATIVE_VIM" not in fullscreen["body"], fullscreen
     driver.click("#command-block-return")
 
     driver.click("#new-local-tab")
@@ -1472,14 +1475,22 @@ def exercise_terminal_chat(driver, owned):
     assert not fullscreen['transcript'] and not fullscreen['chrome'] and not fullscreen['legacy']
     driver.type(terminal, "\ue00c:q!\ue007")
     assert phase("prompt")['transcript']
-    assert card_for(editor)['output'] is None
+    assert card_for(editor)['output'] == ''
     assert birth(identity[0]) == identity[1] and receipt.read_text() == "x"
     driver.click("#close")
     wait_for(lambda: birth(identity[0]) != identity[1], "Terminal Chat leaked the original PTY child")
+    wait_for(lambda: driver.execute(
+        "return document.querySelector('#status').textContent.startsWith('Terminal closed') && "
+        "!document.querySelector('#open').disabled"
+    ), "the close receipt did not enable a new shell")
 
     driver.click("#open")
-    wait_for(lambda: not driver.execute(f"return document.querySelector('{toggle}').disabled;"),
-             "the ordinary shell did not acquire a local view")
+    def plain_ready():
+        state = driver.execute(READ)
+        return (state["transport"] == "channel" and state["writable"]
+                and not driver.execute(f"return document.querySelector('{toggle}').disabled;"))
+
+    wait_for(plain_ready, "the ordinary shell did not acquire a writable Channel view")
     driver.click(toggle)
     fallback = phase("passthrough")
     assert not fallback['transcript'] and not fallback['send'] and not fallback['legacy']
@@ -1516,7 +1527,7 @@ def prepare_workflows(owned, env):
         'name: YAML check\ncommand: printf yaml\n', encoding="utf-8")
 
 
-def exercise_terminal_workflows(driver, owned):
+def exercise_terminal_workflows(driver, owned, *, verify_bookmarks=True):
     terminal = "#ime-input"
     receipt = owned / "workflow-result"
 
@@ -1530,6 +1541,7 @@ def exercise_terminal_workflows(driver, owned):
               command: document.querySelector('#workflow-command').textContent,
               defaults: Array.from(document.querySelectorAll('#workflow-args input'), el => el.value),
               message: document.querySelector('#workflow-status').textContent,
+              insert: document.querySelector('#workflow-insert').textContent,
             };
         """)
 
@@ -1559,36 +1571,59 @@ def exercise_terminal_workflows(driver, owned):
     expected = "alpha beta-default\nedited\n"
     wait_for(lambda: receipt.is_file() and receipt.read_text() == expected,
              "the workflow did not stay editable in the selected jsh prompt")
-    exercise_completed_block_search(driver)
-    bookmarked = bookmark_selected_command(driver)
+    if verify_bookmarks:
+        exercise_completed_block_search(driver)
+        bookmarked = bookmark_selected_command(driver)
 
     wait_for(lambda: view()["available"], "workflows did not follow the next shell prompt")
     driver.click("#workflows")
     wait_for(lambda: view()["rows"][:1] == ["Local report"], "the next prompt did not open its own catalog")
     driver.click("#workflow-results li:first-child button")
     wait_for(lambda: view()["fields"], "the workflow form did not open before switching tabs")
+    driver.type("#workflow-args label:first-child input", "quoted value")
     driver.click("#new-local-tab")
     peer = wait_for(lambda: (tab if (tab := driver.execute(READ)["current_tab"]) != original else None),
                     "the other shell tab did not activate")
-    assert not view()["open"] and not view()["available"], "the old picker survived the tab switch"
+    wait_for(lambda: view()["open"] and view()["fields"] and view()["insert"] == f"Insert in shell {original}",
+             "the selected workflow lost its original shell target on focus change")
+    assert view()["defaults"] == ["quoted value", "default"]
     assert not driver.execute("return document.querySelector('#command-block-matches').children.length;")
+    assert receipt.read_text() == expected, "changing focus executed the workflow"
+    driver.click("#workflow-insert")
+    wait_for(lambda: driver.execute(READ)["current_tab"] == original and not view()["open"] and
+             driver.execute(READ)["status"].startswith("Workflow queued at the shell cursor."),
+             "workflow was not inserted at the original terminal after switching focus")
+    assert receipt.read_text() == expected, "insert executed without explicit Enter"
+    driver.type(terminal, "\ue007")
+    expected += "quoted value-default\n"
+    wait_for(lambda: receipt.read_text() == expected, "quoted/default workflow was not inserted exactly once")
+    click_tab(driver, peer)
+    peer_receipt = owned / "workflow-peer-receipt"
+    driver.type(terminal, "\ue007")
+    driver.type(terminal, f"printf peer > {shlex.quote(str(peer_receipt))}\ue007")
+    wait_for(lambda: peer_receipt.is_file() and peer_receipt.read_text() == "peer", "peer shell did not process its own input")
+    assert receipt.read_text() == expected, "input also reached the peer shell"
     click_tab(driver, original)
     wait_for(lambda: view()["available"], "workflows did not return with the integrated shell")
     assert not view()["open"] and receipt.read_text() == expected
-    exercise_bookmark_retention(driver, bookmarked)
+    if verify_bookmarks:
+        exercise_bookmark_retention(driver, bookmarked)
     driver.click("#close")
     click_tab(driver, peer)
     driver.click("#close")
     wait_for(lambda: driver.execute(READ)["status"].startswith("Terminal closed"),
              "the workflow fixture shells did not close")
-    return {
+    witnesses = {
         "native_workflow_shared_discovery_and_precedence": True,
         "native_workflow_required_and_default_arguments": True,
         "native_workflow_inserts_editable_text_with_explicit_enter": True,
-        "native_workflow_picker_retires_on_tab_switch": True,
-        "native_completed_block_search_selects_owned_command_and_output_ranges": True,
-        "native_bookmark_follows_exact_owned_command_until_eviction": True,
+        "native_workflow_selected_form_keeps_original_pane_across_focus_switch": True,
+        "native_workflow_inserts_into_original_pane_once_and_peer_is_untouched": True,
     }
+    if verify_bookmarks:
+        witnesses.update(native_completed_block_search_selects_owned_command_and_output_ranges=True,
+                         native_bookmark_follows_exact_owned_command_until_eviction=True)
+    return witnesses
 
 
 def exercise_completed_block_search(driver):
@@ -3346,7 +3381,8 @@ def private_accessibility_address():
 
 
 def run(binary, jsh, workspace, api, native, notebook=False, output_review=False, vim9=False,
-        inline_graphics_only=False, history_graphics_only=False, workspace_only=False, backend="x11"):
+        inline_graphics_only=False, history_graphics_only=False, workspace_only=False, backend="x11",
+        vim_binary=None, workflow_only=False):
     executable = shutil.which("WebKitWebDriver")
     if not executable:
         raise RuntimeError("run with official WebKitWebDriver")
@@ -3377,7 +3413,7 @@ def run(binary, jsh, workspace, api, native, notebook=False, output_review=False
         if jsh:
             (launch / "jsh").symlink_to(jsh)
         if jsh or vim9:
-            (launch / "vim").symlink_to(Path(shutil.which("vim")).resolve())
+            (launch / "vim").symlink_to(vim_binary or Path(shutil.which("vim")).resolve())
         if vim9:
             (launch / "rg").symlink_to(Path(shutil.which("rg")).resolve())
         transcripts = prepare_workspace(owned, env, launch) if workspace or workspace_only else None
@@ -3421,6 +3457,15 @@ def run(binary, jsh, workspace, api, native, notebook=False, output_review=False
                 wait_for(lambda: opened_page(driver), "embedded Aether tauri: page did not load")
                 if workspace_only:
                     exercise_workspace(driver, owned, binary, env, transcripts)
+                    return
+                if workflow_only:
+                    results = exercise_terminal_workflows(driver, owned, verify_bookmarks=False)
+                    binary_hash = hashlib.sha256()
+                    with binary.open("rb") as artifact:
+                        for chunk in iter(lambda: artifact.read(1024 * 1024), b""):
+                            binary_hash.update(chunk)
+                    print(json.dumps({"case": "PRODUCT.WORKFLOW.001.NATIVE.001", "result": "passed",
+                                      "backend": backend, "binary_sha256": binary_hash.hexdigest(), **results}), flush=True)
                     return
                 if inline_graphics_only:
                     exercise_inline_graphics(driver, owned)
@@ -3466,27 +3511,36 @@ if __name__ == "__main__":
     parser.add_argument("--jsh", type=Path, help="installed jsh for the command-block, Terminal Chat and workflow journeys")
     parser.add_argument("--workspace", action="store_true", help="include the isolated shared Workspace host and CLI PTY journey")
     parser.add_argument("--workspace-only", action="store_true", help="run the isolated Workspace CLI journey by itself")
-    parser.add_argument("--backend", choices=("x11", "wayland"), default="x11", help="display backend for the Workspace-only journey")
+    parser.add_argument("--workflow-only", action="store_true", help="run the isolated Workflow journey by itself")
+    parser.add_argument("--backend", choices=("x11", "wayland"), default="x11", help="display backend for standalone journeys")
     parser.add_argument("--api-chat", action="store_true", help="include the isolated local streaming API conversation")
     parser.add_argument("--native-task", action="store_true", help="include the isolated scoped native Codex task and approval")
     parser.add_argument("--notebook", action="store_true", help="include native file selection and a supervised notebook run/stop")
     parser.add_argument("--output-review", action="store_true", help="compare and export actual local jsh outputs after eviction")
     parser.add_argument("--vim9", action="store_true", help="open an actual local workbench and edit/save through Vim and its fallback PTY")
+    parser.add_argument("--vim-binary", type=Path, help="exact Vim executable for an isolated native fixture")
     parser.add_argument("--inline-graphics-only", action="store_true", help="exercise real PTY image rendering and reconnect")
     parser.add_argument("--history-graphics-only", action="store_true", help="exercise projected history rendering and selection")
     args = parser.parse_args()
     if not args.binary.is_absolute() or args.binary.is_symlink() or not args.binary.is_file() or not os.access(args.binary, os.X_OK):
         parser.error("an absolute regular executable is required")
     if args.jsh and (not args.jsh.is_absolute() or not args.jsh.is_file() or not os.access(args.jsh, os.X_OK)
-                     or not shutil.which("vim")):
+                     or not (args.vim_binary or shutil.which("vim"))):
         parser.error("--jsh requires an absolute installed jsh executable and Vim")
     if args.output_review and not args.jsh:
         parser.error("--output-review requires --jsh")
-    if args.vim9 and any(not shutil.which(tool) for tool in ("vim", "rg", "xdotool")):
+    if args.workflow_only and (not args.jsh or args.workspace_only):
+        parser.error("--workflow-only requires --jsh and a standalone run")
+    if args.vim_binary and (not args.vim_binary.is_absolute() or not args.vim_binary.is_file()
+                            or not os.access(args.vim_binary, os.X_OK)):
+        parser.error("--vim-binary requires an absolute executable path")
+    if args.vim9 and (not (args.vim_binary or shutil.which("vim"))
+                      or any(not shutil.which(tool) for tool in ("rg", "xdotool"))):
         parser.error("--vim9 requires Vim 9, ripgrep and xdotool")
-    if args.backend == "wayland" and not args.workspace_only:
-        parser.error("--backend wayland requires --workspace-only")
+    if args.backend == "wayland" and not (args.workspace_only or args.workflow_only):
+        parser.error("--backend wayland requires a standalone journey")
     signal.signal(signal.SIGTERM, interrupted)
     run(args.binary, args.jsh, args.workspace, args.api_chat, args.native_task, args.notebook,
         args.output_review, args.vim9, args.inline_graphics_only, args.history_graphics_only,
-        workspace_only=args.workspace_only, backend=args.backend)
+        workspace_only=args.workspace_only, backend=args.backend,
+        vim_binary=args.vim_binary.resolve() if args.vim_binary else None, workflow_only=args.workflow_only)

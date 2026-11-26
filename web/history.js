@@ -18,6 +18,32 @@ export function acceptHistory(value, epoch) {
 // Maximum ordinary page size in LiveBridge::history.
 const HISTORY_PAGE_ROWS=128;
 const oldestOffset=(total,rows=HISTORY_PAGE_ROWS)=>Math.max(0,total-rows);
+
+// A projected row starts at a raw history cell. A shared source plus exact
+// intervening text identifies the same selection even when the page or the
+// soft-wrap boundaries move. A matching string by itself could be another row.
+function remapSelection(previous,next,start,end){
+  if(!previous||!next||!(end>start))return null;
+  const key=({row,column})=>`${row}:${column}`;
+  const nextOffsets=new Map(next.sources.map((source,index)=>[key(source),next.offsets[index][0]]));
+  let before,after;
+  for(let index=0;index<previous.sources.length;index++){
+    const oldOffset=previous.offsets[index][0];
+    const newOffset=nextOffsets.get(key(previous.sources[index]));
+    if(newOffset===undefined)continue;
+    if(oldOffset<=start)before={oldOffset,newOffset};
+    else{after={oldOffset,newOffset};break;}
+  }
+  for(const point of [before,after]){
+    if(!point)continue;
+    const {oldOffset,newOffset}=point,shift=newOffset-oldOffset;
+    const first=Math.min(oldOffset,start),last=Math.max(oldOffset,end);
+    if(first+shift<0||last+shift>next.text.length)continue;
+    if(previous.text.slice(first,last)===next.text.slice(first+shift,last+shift))return [start+shift,end+shift];
+  }
+  return null;
+}
+
 function historyGrid({viewport,spacer,canvas},output) {
   const overscan = 3;
   let page = null, tile = null, pointer = null;
@@ -99,7 +125,7 @@ function historyGrid({viewport,spacer,canvas},output) {
   };
 }
 
-export function installHistory({older,newer,refresh,output,label,invoke,getOwner,searchControls,visual,enableProjection}) {
+export function installHistory({older,newer,refresh,output,label,invoke,getOwner,searchControls,copyControls,visual,enableProjection}) {
   let group=null,activeSearch=null,searchId=0,retained=null;
   const grid=visual?historyGrid(visual,output):null;
   const format=owner=>grid&&enableProjection?.(owner)?{frameVersion:CHANNEL_FRAME_VERSION}:{};
@@ -109,12 +135,29 @@ export function installHistory({older,newer,refresh,output,label,invoke,getOwner
   const isExpired=(page,owner)=>page?.sources.length&&retained?.owner===owner&&
     channelCounter(page.sources[0].row)<retained.first;
 
+  function updateCopy(){
+    if(copyControls)copyControls.button.disabled=!(getOwner()&&output.selectionEnd>output.selectionStart);
+  }
+
+  async function copySelection(){
+    const owner=getOwner(),text=output.value.slice(output.selectionStart,output.selectionEnd);
+    if(!owner||!text)return;
+    try{
+      await copyControls.write(text);
+      if(getOwner()===owner)copyControls.status.textContent='Selection copied.';
+    }catch(error){
+      if(getOwner()===owner)copyControls.status.textContent=String(error?.message??error);
+    }
+  }
+
   function dropPage(message){
     group=null;
     stopSearch();
     output.value='';
     grid?.show(null);
     label.textContent=message;
+    if(copyControls)copyControls.status.textContent='';
+    updateCopy();
   }
 
   function updateSearchControls(){
@@ -182,6 +225,7 @@ export function installHistory({older,newer,refresh,output,label,invoke,getOwner
             end<=start||page.text.slice(start,end)!==current.query)throw new Error('invalid history search range');
         if(output.value!==page.text)output.value=page.text;
         output.focus();output.setSelectionRange(start,end);
+        updateCopy();
         const lineHeight=parseFloat(globalThis.getComputedStyle?.(output)?.lineHeight);
         if(Number.isFinite(lineHeight)&&output.clientHeight){
           const line=page.text.slice(0,start).split('\n').length-1;
@@ -223,11 +267,11 @@ export function installHistory({older,newer,refresh,output,label,invoke,getOwner
     // Refresh (delta zero) still explicitly requests current archive metadata.
     if(delta!==0&&desired===current.desired&&current.total!==null)return current.promise??Promise.resolve();
     current.desired=desired;
-    current.pending={offset:desired,corrected:false};
+    current.pending={offset:desired,corrected:false,centerSelection:delta===0};
     if(current.promise)return current.promise;
     current.promise=(async()=>{
       while(current.pending!==null&&isCurrent()){
-        const {offset:requested,corrected}=current.pending;current.pending=null;
+        const {offset:requested,corrected,centerSelection}=current.pending;current.pending=null;
         try {
           const source=current.projection?.sources[0];
           const select=output.selectionEnd>output.selectionStart;
@@ -249,18 +293,28 @@ export function installHistory({older,newer,refresh,output,label,invoke,getOwner
             // Repeated shrink cannot spin; the next refresh is user-driven.
             if(corrected)throw new Error('Archive changed during navigation. Refresh to view archived rows.');
             current.desired=max;
-            current.pending={offset:max,corrected:true};
+            current.pending={offset:max,corrected:true,centerSelection};
             continue;
           }
           const samePage=projection?sameSource(current.projection?.sources[0],projection.sources[0]):
             current.total===snapshot.total_rows&&current.offset===snapshot.offset;
           const unchanged=samePage&&output.value===snapshot.text;
+          // Read the live selection after the IPC. A drag made while the
+          // snapshot was in flight should be the one adopted by the new page.
+          const range=unchanged?null:remapSelection(current.projection,projection,output.selectionStart,output.selectionEnd);
+          const direction=output.selectionDirection;
           current.offset=current.desired=snapshot.offset;current.total=snapshot.total_rows;current.rows=rows;
           current.projection=projection;current.search=false;
           // Refresh can advance the revision without changing this page.
           // Assigning even identical text would collapse the browser selection.
-          if(!unchanged){output.value=snapshot.text;output.setSelectionRange(0,0);}
-          grid?.show(projection,unchanged&&select?output.selectionStart:null);
+          if(!unchanged){
+            output.value=snapshot.text;
+            if(range)output.setSelectionRange(range[0],range[1],direction);
+            else output.setSelectionRange(0,0);
+          }
+          const selected=output.selectionEnd>output.selectionStart;
+          grid?.show(projection,centerSelection&&selected?output.selectionStart:null);
+          updateCopy();
           const end=snapshot.total_rows-snapshot.offset,start=Math.max(1,end-rows+1);
           label.textContent=`Snapshot ${snapshot.revision}: ${end>0?`archived rows ${start}–${end}`:'no archived rows'} of ${snapshot.total_rows}; ${snapshot.offset} newer rows skipped. Select text and copy normally. Refresh for new output.`;
         }catch(e){
@@ -279,6 +333,17 @@ export function installHistory({older,newer,refresh,output,label,invoke,getOwner
     return current.promise;
   }
   older.addEventListener('click',()=>load(20));newer.addEventListener('click',()=>load(-20));refresh.addEventListener('click',()=>load(0));
+  if(copyControls){
+    copyControls.button.addEventListener('click',copySelection);
+    output.addEventListener('select',updateCopy);
+    output.addEventListener('keydown',event=>{
+      if((event.ctrlKey||event.metaKey)&&!event.altKey&&!event.shiftKey&&event.key.toLowerCase()==='c'&&
+          output.selectionEnd>output.selectionStart){
+        event.preventDefault();void copySelection();
+      }
+    });
+    updateCopy();
+  }
   if(searchControls){
     searchControls.form.addEventListener('submit',event=>{event.preventDefault();return find(true);});
     searchControls.older.addEventListener('click',()=>find(false));

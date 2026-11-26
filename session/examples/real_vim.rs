@@ -2,6 +2,7 @@
 use jterm_engine::frame::Screen;
 use jterm_headless_session_spike::Session;
 use std::{
+    num::NonZeroU64,
     path::PathBuf,
     thread::sleep,
     time::{Duration, Instant},
@@ -44,8 +45,13 @@ fn main() {
     let dir: PathBuf = std::env::temp_dir().join(format!("jterm-vim-{}", std::process::id()));
     std::fs::create_dir(&dir).unwrap();
     let file = dir.join("smoke.txt");
-    let mut s = Session::spawn(24, 80).unwrap();
-    let cmd=format!("printf 'PRIMARY_SENTINEL\\n'; TERM=xterm {} -Nu NONE -n -i NONE {}; printf 'VIM_RETURNED\\n'\n",quote(vim.to_str().unwrap()),quote(file.to_str().unwrap()));
+    let mut s = Session::spawn_family_with_epoch(24, 80, NonZeroU64::MIN, false).unwrap();
+    let cmd = format!(
+        "test \"$TERM\" = jterm-256color && test \"$(tput colors)\" = 256 && \
+         printf '\\120RIMARY_SENTINEL\\n' && {} -Nu NONE -n -i NONE {}; printf '\\126IM_RETURNED\\n'\n",
+        quote(vim.to_str().unwrap()),
+        quote(file.to_str().unwrap())
+    );
     send(&mut s, cmd.as_bytes());
     until(&mut s, "Vim alternate entry", |s| {
         s.terminal().frame().unwrap().stamp().screen == Screen::Alternate

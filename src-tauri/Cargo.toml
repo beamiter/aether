@@ -5,9 +5,9 @@ edition = "2021"
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 [dependencies]
-jterm_core = { git = "https://github.com/beamiter/jterm_core", rev = "53974b89f87086c3f0d7429c4de67d33e2fe6bcd" }
-jterm_engine = { git = "https://github.com/beamiter/jterm_core", rev = "53974b89f87086c3f0d7429c4de67d33e2fe6bcd" }
-jterm_remote_client = { git = "https://github.com/beamiter/jterm_core", rev = "53974b89f87086c3f0d7429c4de67d33e2fe6bcd" }
+jterm_core = { git = "https://github.com/beamiter/jterm_core", rev = "06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e" }
+jterm_engine = { git = "https://github.com/beamiter/jterm_core", rev = "06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e" }
+jterm_remote_client = { git = "https://github.com/beamiter/jterm_core", rev = "06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e" }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -20,6 +20,7 @@ companion-host = { version = "0.1.0", git = "https://github.com/beamiter/jcompan
 gdkwayland-sys = "0.18"
 gdkx11 = "0.18"
 gtk = "0.18"
+webkit2gtk = { version = "=2.0.2", features = ["v2_28"] }
 wayland-client = { version = "0.31", features = ["system"] }
 wayland-protocols = { version = "0.32", features = ["client"] }
 

@@ -112,6 +112,7 @@
 <section id="paste-review" hidden aria-label="Review multiline paste"><h2>Review multiline paste</h2><p>Newlines may execute commands. Verify every line before sending. This review applies even when bracketed paste is enabled; terminal modes can change.</p><textarea id="paste-preview" readonly rows="6" spellcheck="false" aria-label="Clipboard text with visual line breaks" aria-describedby="paste-line-endings"></textarea><p id="paste-line-endings">The preview displays CR, LF and CRLF as line breaks. The original clipboard text is shown below as a quoted string: \r means carriage return, \n means line feed, \t means tab and \\ means a literal backslash. Unicode format characters, including bidirectional controls and zero-width joiners, appear as \uXXXX escapes (two escapes for a supplementary character); this does not remove them from the paste. Other characters remain literal, so this is not a complete code-point listing. On delivery, each CRLF pair, lone CR or LF becomes one carriage return. Bracketed paste markers depend on the terminal mode at delivery.</p><pre id="paste-escaped" tabindex="0" role="region" aria-label="Original clipboard text with escaped line endings and format characters" aria-describedby="paste-line-endings"></pre><button id="paste-confirm" type="button" disabled>Send reviewed paste</button> <button id="paste-cancel" type="button">Cancel paste</button></section>
 <section aria-label="Terminal history">
   <button id="copy-visible">Snapshot visible text</button> <button id="history-older">Older 20 rows</button> <button id="history-newer">Newer 20 rows</button> <button id="history-refresh">Refresh history / copy snapshot</button>
+  <button id="history-copy" type="button" disabled>Copy selection</button>
   <form id="history-find-form" hidden>
     <label>Find in local history <input id="history-find-query" type="search" maxlength="128" autocomplete="off" spellcheck="false"></label>
     <button id="history-find" type="submit">Find</button>
@@ -120,6 +121,7 @@
   </form>
   <p id="history-find-status" role="status"></p>
   <p id="history-label">Bounded snapshot, select and copy manually.</p>
+  <p id="history-copy-status" role="status"></p>
   <div id="history-viewport" class="viewport" hidden tabindex="0" role="region" aria-label="Archived terminal viewport">
     <div id="history-grid-size"><canvas id="history-canvas" aria-label="Archived terminal grid"></canvas></div>
   </div>
@@ -412,8 +414,8 @@
     <section id="notebook-run-result" hidden aria-labelledby="notebook-run-title">
       <h3 id="notebook-run-title"></h3>
       <div class="notebook-streams">
-        <div><h4>stdout</h4><pre id="notebook-stdout" aria-label="Standard output" tabindex="0"></pre></div>
-        <div><h4>stderr</h4><pre id="notebook-stderr" aria-label="Standard error" tabindex="0"></pre></div>
+        <div><h4>stdout</h4><button type="button" id="notebook-copy-stdout" disabled>Copy stdout</button><pre id="notebook-stdout" aria-label="Standard output" tabindex="0"></pre></div>
+        <div><h4>stderr</h4><button type="button" id="notebook-copy-stderr" disabled>Copy stderr</button><pre id="notebook-stderr" aria-label="Standard error" tabindex="0"></pre></div>
       </div>
       <p id="notebook-output-limit" class="note" hidden>Output exceeded 256 KiB. The retained prefix is shown.</p>
     </section>

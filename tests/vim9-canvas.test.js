@@ -58,3 +58,22 @@ test('Vim overlays clip to screen rectangles and stack by z-index then oldest po
   scene.completion.runs[0].row = 2;
   assert.equal(canPaintVim9(scene, metrics, terminal), false);
 });
+
+test('Vim undercurl preserves the special color and wave across highlight boundaries', () => {
+  const calls = [];
+  const context = new Proxy({}, {
+    get: (object, name) => object[name] ?? ((...args) => calls.push([name, ...args])),
+  });
+  const style = {undercurl: true, special: 0xfe2244};
+  const scene = {...frame, cursor: null, runs: [
+    {row: 0, column: 0, cells: 1, text: 'A', style},
+    {row: 0, column: 1, cells: 1, text: 'B', style},
+  ]};
+  paintVim9({style: {}, getContext: () => context}, scene, metrics);
+  assert.equal(context.strokeStyle, '#fe2244');
+  assert.equal(calls.filter(call => call[0] === 'stroke').length, 2);
+  const points = calls.filter(call => call[0] === 'lineTo');
+  assert.ok(new Set(points.map(point => point[2])).size > 2);
+  assert.deepEqual(points[11].slice(1), calls.filter(call => call[0] === 'moveTo')[1].slice(1));
+  assert.equal(points.at(-1)[1], 24);
+});

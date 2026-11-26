@@ -40,9 +40,10 @@ dependencies = [
 [[package]]
 name = "jterm_engine"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core?rev=53974b89f87086c3f0d7429c4de67d33e2fe6bcd#53974b89f87086c3f0d7429c4de67d33e2fe6bcd"
+source = "git+https://github.com/beamiter/jterm_core?rev=06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e#06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e"
 dependencies = [
  "smallvec",
+ "unicode-normalization",
  "unicode-segmentation",
  "unicode-width",
 ]
@@ -50,7 +51,7 @@ dependencies = [
 [[package]]
 name = "jterm_runtime"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core?rev=53974b89f87086c3f0d7429c4de67d33e2fe6bcd#53974b89f87086c3f0d7429c4de67d33e2fe6bcd"
+source = "git+https://github.com/beamiter/jterm_core?rev=06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e#06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e"
 dependencies = [
  "crossbeam-channel",
  "jterm_engine",
@@ -123,6 +124,21 @@ name = "smallvec"
 version = "1.16.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
+
+[[package]]
+name = "tinyvec"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "unicode-segmentation"

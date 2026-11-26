@@ -151,6 +151,11 @@ impl LocalStream {
         preview: Option<(Counter, PeerUpdate)>,
     ) -> Result<(bool, Option<Delivery>), String> {
         let frame = bridge.poll_channel_frame(self.owner.epoch, self.sequence == 0, self.format)?;
+        // An initial publication can be deferred under encoder pressure. Do
+        // not let a status-only update consume the sequence for the full base.
+        if self.sequence == 0 && frame.is_none() {
+            return Ok((true, None));
+        }
         let status = LocalShellStatus::read(bridge, self.owner.epoch)?;
         let now = Instant::now();
         let ready = !status.drained();

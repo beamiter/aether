@@ -172,8 +172,11 @@ impl LocalWorkflows {
         enqueue: impl FnOnce(Counter, &str) -> Result<(), String>,
     ) -> Result<(), String> {
         let catalog = self.catalog(id)?;
-        if &catalog.owner != owner {
-            return Err("This workflow was selected for a different terminal view.".into());
+        // A tab activation can rotate the view lease. The insertion still
+        // targets the original PTY and prompt, while LocalSessions::input
+        // independently validates the current writable attachment.
+        if catalog.owner.session != owner.session || catalog.owner.epoch != owner.epoch {
+            return Err("This workflow was selected for a different terminal session.".into());
         }
         let workflow = catalog.find(name)?;
         let command = render(workflow, values)?;
@@ -250,8 +253,12 @@ mod tests {
             generation: 3,
             ..owner.clone()
         };
+        let foreign = Attachment {
+            epoch: 2,
+            ..reattached.clone()
+        };
         assert!(workflows
-            .insert(id, &reattached, "Report", &values, refused)
+            .insert(id, &foreign, "Report", &values, refused)
             .is_err());
         assert!(workflows
             .insert(id, &owner, "Report", &HashMap::new(), refused)
@@ -262,11 +269,17 @@ mod tests {
             ))
             .is_err());
         workflows
-            .insert(id, &owner, "Report", &values, |bound_prompt, command| {
-                assert_eq!(bound_prompt, prompt);
-                assert_eq!(command, "printf '%s' '世界'");
-                Ok(())
-            })
+            .insert(
+                id,
+                &reattached,
+                "Report",
+                &values,
+                |bound_prompt, command| {
+                    assert_eq!(bound_prompt, prompt);
+                    assert_eq!(command, "printf '%s' '世界'");
+                    Ok(())
+                },
+            )
             .unwrap();
         assert!(workflows
             .insert(id, &owner, "Report", &values, refused)

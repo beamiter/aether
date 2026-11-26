@@ -258,6 +258,51 @@ async fn open_terminal_hyperlink<R: tauri::Runtime>(
 }
 
 #[tauri::command]
+async fn copy_terminal_text<R: tauri::Runtime>(
+    window: tauri::WebviewWindow<R>,
+    text: String,
+) -> Result<(), String> {
+    use gtk::prelude::WidgetExt;
+
+    require_terminal_window(&window)?;
+    if text.is_empty() || text.len() > 1024 * 1024 || text.contains('\0') {
+        return Err("Clipboard text must be between 1 byte and 1 MiB without NUL.".into());
+    }
+
+    let (sender, mut receiver) = tauri::async_runtime::channel(1);
+    let owner = window.clone();
+    window
+        .run_on_main_thread(move || {
+            let result = owner
+                .gtk_window()
+                .map_err(|error| error.to_string())
+                .and_then(|native| {
+                    let display = WidgetExt::display(&native);
+                    let clipboard = gtk::Clipboard::default(&display)
+                        .ok_or_else(|| "The system clipboard is unavailable.".to_owned())?;
+                    // GTK's generic setter converts newlines for the Wayland
+                    // plain-text MIME targets. Publish the originally selected
+                    // bytes under each UTF-8 target instead.
+                    let targets = ["UTF8_STRING", "text/plain;charset=utf-8", "text/plain"]
+                        .map(|mime| gtk::TargetEntry::new(mime, gtk::TargetFlags::empty(), 0));
+                    if clipboard.set_with_data(&targets, move |_, data, _| {
+                        data.set(&data.target(), 8, text.as_bytes());
+                    }) {
+                        Ok(())
+                    } else {
+                        Err("The system clipboard refused the selection.".into())
+                    }
+                });
+            let _ = sender.try_send(result);
+        })
+        .map_err(|error| error.to_string())?;
+    receiver
+        .recv()
+        .await
+        .ok_or_else(|| "The system clipboard is unavailable.".to_owned())?
+}
+
+#[tauri::command]
 async fn shell_status(
     owner: Attachment,
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
@@ -557,6 +602,7 @@ fn application<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<
             set_local_observer,
             ack_local_stream,
             open_terminal_hyperlink,
+            copy_terminal_text,
             shell_status,
             history_shell,
             local_command_blocks,
@@ -607,6 +653,18 @@ fn main() {
     let builder = application(tauri::Builder::default());
     #[cfg(target_os = "linux")]
     let builder = builder.setup(|app| {
+        if let Some(window) = app.get_webview_window("main") {
+            window.with_webview(|platform| {
+                use webkit2gtk::{InputMethodContextExt, WebViewExt};
+                if let Some(context) = platform.inner().input_method_context() {
+                    // Wry disables preedit for generic popup positioning.
+                    // Terminal composition needs native start/update events to
+                    // capture its attachment before a later commit. Preserve
+                    // that boundary instead of admitting anonymous end events.
+                    context.set_enable_preedit(true);
+                }
+            })?;
+        }
         if companion_host::shared_mode_requested() {
             if let Some(window) = app.get_webview_window("main") {
                 companion::install(&window)?;

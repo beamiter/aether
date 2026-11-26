@@ -20,8 +20,11 @@ use tauri_terminal_frame_bridge::{
 };
 use worker::LocalWorker;
 
+const MAX_LOCAL_SHELLS: usize = 8;
+
 /// Stable PTY ownership and the single reader lease. View generations and
 /// input permissions remain inside each bridge, not in the table key.
+
 struct Registry<T, const LIMIT: usize> {
     sessions: BTreeMap<String, T>,
     reader: Option<String>,
@@ -105,7 +108,7 @@ impl<T, const LIMIT: usize> Registry<T, LIMIT> {
         let active = self.reader.as_deref();
         let admitted = |id: &String, value: &T| active != Some(id.as_str()) && ready(value);
         // One bounded eligible turn; wrap in stable key order. The desktop
-        // cap is two, so even the skipped/blocked scan is bounded.
+        // tab capacity is bounded, including skipped or blocked sessions.
         let mut fallback = None;
         for (id, value) in &mut self.sessions {
             if !admitted(id, value) {
@@ -171,7 +174,7 @@ struct PendingTab {
 
 #[derive(Default)]
 pub(crate) struct LocalSessions {
-    registry: Registry<OwnedLocalPty, 2>,
+    registry: Registry<OwnedLocalPty, MAX_LOCAL_SHELLS>,
     last_epoch: u32,
     pump_after: Option<String>,
     worker: Option<LocalWorker>,
@@ -211,8 +214,14 @@ impl LocalSessions {
             return Err("close the existing session first".into());
         }
         let owner = self.open_fresh(integrated, format, history, shared)?;
-        let pane_history_id = self.retained_bridge(owner.epoch)?.completed_pane_id().map(str::to_owned);
-        Ok(OpenedShell { owner, pane_history_id })
+        let pane_history_id = self
+            .retained_bridge(owner.epoch)?
+            .completed_pane_id()
+            .map(str::to_owned);
+        Ok(OpenedShell {
+            owner,
+            pane_history_id,
+        })
     }
 
     pub(crate) fn open_second(
@@ -380,8 +389,8 @@ impl LocalSessions {
             }
             Some(_) => return Err("local tab already active".into()),
             None if owner.is_none() => return Err("select an existing shell tab".into()),
-            None if self.registry.sessions.len() < 2 => None,
-            None => return Err("only two local shell tabs can be open".into()),
+            None if self.registry.sessions.len() < MAX_LOCAL_SHELLS => None,
+            None => return Err("local shell tab capacity reached".into()),
         };
         self.ensure_worker(shared)?;
         self.ensure_history_writer(history.is_some())?;
@@ -426,7 +435,10 @@ impl LocalSessions {
         }
         let target = &view.owner;
         self.registry.reader = Some(target.session.clone());
-        let pane_history_id = self.retained_bridge(target.epoch)?.completed_pane_id().map(str::to_owned);
+        let pane_history_id = self
+            .retained_bridge(target.epoch)?
+            .completed_pane_id()
+            .map(str::to_owned);
         self.pending_tab = Some(PendingTab {
             source: owner.cloned(),
             requested_epoch: target_epoch,
@@ -581,7 +593,9 @@ impl LocalSessions {
 
     fn ensure_history_writer(&mut self, enabled: bool) -> Result<(), String> {
         if enabled && self.history_writer.is_none() {
-            self.history_writer = Some(HistoryWriter::start(self.worker.as_ref().unwrap().thread())?);
+            self.history_writer = Some(HistoryWriter::start(
+                self.worker.as_ref().unwrap().thread(),
+            )?);
         }
         Ok(())
     }
@@ -828,7 +842,35 @@ impl LocalSessions {
 
 #[cfg(test)]
 mod tests {
-    use super::Registry;
+    use super::{Registry, MAX_LOCAL_SHELLS};
+
+    #[test]
+    fn bounded_tab_registry_admits_three_without_changing_single_reader_rules() {
+        let mut table = Registry::<u8, MAX_LOCAL_SHELLS>::default();
+        for index in 0..MAX_LOCAL_SHELLS {
+            let name = format!("tab-{index}");
+            table.open(|| Ok((name.clone(), index as u8, ()))).unwrap();
+            table.detach(&name, |_| Ok(())).unwrap();
+        }
+        let mut attempted = false;
+        assert!(table
+            .open(|| {
+                attempted = true;
+                Ok(("overflow".into(), 0, ()))
+            })
+            .is_err());
+        assert!(
+            !attempted,
+            "capacity rejection must happen before process creation"
+        );
+        assert!(table
+            .attach(None, |_| Ok(()))
+            .unwrap_err()
+            .contains("select"));
+        table.attach(Some("tab-2"), |_| Ok(())).unwrap();
+        assert!(table.reader("tab-1").is_err());
+        assert_eq!(*table.reader("tab-2").unwrap(), 2);
+    }
 
     #[test]
     fn two_retained_owners_have_only_one_reader_and_implicit_attach_is_ambiguous() {

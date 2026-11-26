@@ -7,13 +7,21 @@ ANSI parser. **This is not a daily-use terminal.**
 
 ## Shared core
 
-The three Cargo manifests pin the shared crates to
-`902a84287aab38bee2d6e8baaac924101f1127cc`. `jterm_runtime` owns the local PTY, direct child and
+The three Cargo workspaces pin their shared crates to the same Git revision.
+`jterm_runtime` owns the local PTY, direct child and
 output drain. Its `jterm_engine::terminal::Terminal` owns parsing, screen
 state, input encoding, history and immutable frames. The session host supplies
 each frame stream's epoch. Run `python3 scripts/check-core-pin.py` to verify
 that every shared package in the manifests and lockfiles uses that Git commit.
 [Core upgrade verification](docs/CORE-UPGRADE.md)
+
+Local Shell and jsh tabs and new sessions on the SSH helper use
+`TERM=jterm-256color`. The shared entry specifies the supported cursor and
+screen controls, 256-color palette, function keys and bracketed paste.
+The Debian package installs the compiled entry under `/usr/share/terminfo`.
+The standalone binaries also supply the same entry to ncurses through the
+child environment. The real Vim PTY check uses this profile for editing,
+Unicode text, resizing and returning from the alternate screen.
 
 ## Terminal session synchronization
 

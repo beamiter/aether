@@ -1,9 +1,17 @@
-use std::{io, path::PathBuf};
+use std::{
+    io::{self, Write},
+    path::PathBuf,
+};
 use tauri_terminal_frame_bridge::terminal_transport;
 
 fn run() -> io::Result<()> {
     let mut args = std::env::args_os().skip(1);
     let action = args.next();
+    if action.as_deref() == Some(std::ffi::OsStr::new("terminfo")) && args.len() == 0 {
+        return io::stdout()
+            .lock()
+            .write_all(jterm_headless_session_spike::terminal_profile::COMPILED_ENTRY);
+    }
     if action.as_deref() == Some(std::ffi::OsStr::new("files")) && args.len() == 0 {
         return tauri_terminal_frame_bridge::remote_files::serve(
             io::stdin().lock(),
@@ -25,7 +33,7 @@ fn run() -> io::Result<()> {
     }
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: aether-terminal-host {serve|stdio} [absolute-socket-path] | files",
+        "usage: aether-terminal-host {serve|stdio} [absolute-socket-path] | files | terminfo",
     ))
 }
 

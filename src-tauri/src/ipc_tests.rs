@@ -942,3 +942,97 @@ printf '%s' "$$" > {written}
         "retained PTY did not return the final pressure marker"
     );
 }
+
+#[test]
+fn three_local_tabs_keep_physical_geometry_and_observers_cannot_resize() {
+    let app = super::application(tauri::test::mock_builder())
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .unwrap();
+    let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build()
+        .unwrap();
+    let first = invoke(&window, "open_shell", json!({}));
+    invoke(
+        &window,
+        "resize_shell",
+        json!({"owner":first,"rows":17,"cols":71}),
+    );
+    let second_view = invoke(
+        &window,
+        "activate_local_tab",
+        json!({"owner":first,"targetEpoch":null,"preserveInput":true}),
+    );
+    let second = second_view["Ok"]["owner"].clone();
+    invoke(
+        &window,
+        "ack_shell",
+        json!({"owner":second,"revision":second_view["Ok"]["frame"]["revision"]}),
+    );
+    invoke(
+        &window,
+        "resize_shell",
+        json!({"owner":second,"rows":12,"cols":83}),
+    );
+    let third_view = invoke(
+        &window,
+        "activate_local_tab",
+        json!({"owner":second,"targetEpoch":null,"preserveInput":true}),
+    );
+    let third = third_view["Ok"]["owner"].clone();
+    invoke(
+        &window,
+        "ack_shell",
+        json!({"owner":third,"revision":third_view["Ok"]["frame"]["revision"]}),
+    );
+    invoke(
+        &window,
+        "resize_shell",
+        json!({"owner":third,"rows":19,"cols":95}),
+    );
+    assert_eq!(
+        invoke(&window, "list_local_shells", json!({})),
+        json!([first["epoch"], second["epoch"], third["epoch"]])
+    );
+    for (target, rows, cols) in [(&first, 17, 71), (&second, 12, 83)] {
+        let frame = invoke(
+            &window,
+            "observe_local_shell",
+            json!({"owner":third,"epoch":target["epoch"],"revision":null}),
+        );
+        assert_eq!(frame["cols"], cols);
+        assert_eq!(frame["rows"].as_array().unwrap().len(), rows);
+        assert!(tauri::test::get_ipc_response(
+            &window,
+            request("resize_shell", json!({"owner":target,"rows":1,"cols":1}))
+        )
+        .is_err());
+    }
+    invoke(&window, "detach_shell", json!({"owner":third}));
+    let reader = invoke(
+        &window,
+        "attach_selected_local_shell",
+        json!({"epoch":first["epoch"]}),
+    );
+    let readonly = reader["owner"].clone();
+    invoke(
+        &window,
+        "ack_shell",
+        json!({"owner":readonly,"revision":reader["frame"]["revision"]}),
+    );
+    let denied = tauri::test::get_ipc_response(
+        &window,
+        request("resize_shell", json!({"owner":readonly,"rows":1,"cols":1})),
+    )
+    .unwrap_err();
+    assert!(denied.to_string().contains("read-only"));
+    let peer = invoke(
+        &window,
+        "observe_local_shell",
+        json!({"owner":readonly,"epoch":second["epoch"],"revision":null}),
+    );
+    assert_eq!(peer["cols"], 83);
+    assert_eq!(peer["rows"].as_array().unwrap().len(), 12);
+    for owner in [&readonly, &second, &third] {
+        invoke(&window, "close_shell", json!({"owner":owner}));
+    }
+}

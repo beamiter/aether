@@ -73,7 +73,21 @@ export function paintVim9(canvas, frame, metrics, dpr = globalThis.devicePixelRa
       context.fillText(run.text, startX, startY + line / 2, runWidth);
     }
     const lineWidth = Math.max(1 / scale, 1);
-    if (style.underline || style.undercurl) {
+    if (style.undercurl) {
+      context.strokeStyle = rgb(style.special, palette.foreground);
+      context.lineWidth = lineWidth;
+      context.beginPath();
+      // Anchor the wave to the grid so adjacent highlight runs join smoothly.
+      const baseline = startY + line - 3;
+      const period = Math.max(4, cell / 2);
+      for (let offset = 0; offset <= Math.ceil(runWidth); offset++) {
+        const distance = Math.min(offset, runWidth);
+        const waveY = baseline + Math.sin((run.column * cell + distance) * 2 * Math.PI / period);
+        if (offset === 0) context.moveTo(startX, waveY);
+        else context.lineTo(startX + distance, waveY);
+      }
+      context.stroke();
+    } else if (style.underline) {
       context.fillStyle = rgb(style.special, palette.foreground);
       context.fillRect(startX, startY + line - 3, runWidth, lineWidth);
     }

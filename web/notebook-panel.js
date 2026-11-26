@@ -21,6 +21,13 @@ export function acceptsRun(snapshot, documentId, previous, cell = previous?.cell
     (!previous || (snapshot.runId === previous.runId && snapshot.revision > previous.revision));
 }
 
+export async function copyNotebookStream(snapshot, lane, invoke) {
+  if (!snapshot || !['stdout', 'stderr'].includes(lane) || typeof snapshot[lane] !== 'string') {
+    throw Error('No captured notebook stream to copy.');
+  }
+  await invoke('copy_terminal_text', {text: snapshot[lane]});
+}
+
 function outcomeLabel(outcome) {
   if (outcome.kind === 'running') return 'Running';
   if (outcome.kind === 'failed') return `Failed (${outcome.reason})`;
@@ -39,6 +46,7 @@ function installNotebook(document, invoke) {
   const parts = byId('notebook-parts');
   const result = byId('notebook-run-result');
   let current = null, run = null, busy = false, stopPending = false, timer = null;
+  const copying = new Set();
   const request = (action, fields = {}) => invoke('local_notebook', {request: {action, ...fields}});
   const notice = message => { status.textContent = message; };
 
@@ -47,6 +55,7 @@ function installNotebook(document, invoke) {
     picker.disabled = locked;
     open.disabled = locked || picker.files.length !== 1;
     close.disabled = locked || !current;
+    for (const lane of ['stdout', 'stderr']) byId('notebook-copy-' + lane).disabled = !run || busy || copying.has(lane);
     for (const button of parts.querySelectorAll('button[data-notebook-run]')) button.disabled = locked;
     for (const button of parts.querySelectorAll('button[data-notebook-stop]')) {
       button.disabled = busy || stopPending || !isRunning(run) || Number(button.dataset.notebookStop) !== run.cell;
@@ -162,6 +171,23 @@ function installNotebook(document, invoke) {
     });
   }
 
+  for (const lane of ['stdout', 'stderr']) {
+    byId('notebook-copy-' + lane).addEventListener('click', async () => {
+      if (!run || busy || copying.has(lane)) return;
+      const captured = run;
+      copying.add(lane);
+      controls();
+      try {
+        await copyNotebookStream(captured, lane, invoke);
+        if (run === captured) notice(`Captured ${lane} copied.`);
+      } catch (error) {
+        if (run === captured) notice(`Could not copy ${lane}: ${String(error)}`);
+      } finally {
+        copying.delete(lane);
+        controls();
+      }
+    });
+  }
   picker.addEventListener('change', controls);
   byId('notebook-open-form').addEventListener('submit', event => {
     event.preventDefault();

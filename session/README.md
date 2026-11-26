@@ -9,7 +9,9 @@ semantic dispatcher. No byte parsing is performed in JavaScript.
 - `Terminal::new(rows, cols)` admits at most 128 × 256 cells.
 - `feed(bytes)` accepts up to 64 KiB and returns protocol reply bytes.
 - `resize`, `frame() -> CellFrame`, `visible_text`, `unsupported_count`.
-- Linux `Session::spawn(rows, cols)` starts fixed `/bin/sh -i` with `TERM=dumb`.
+- Linux `Session::spawn(rows, cols)` keeps the original compatibility profile.
+- Aether launches local and SSH shells through `Session::spawn_family_with_epoch`.
+  This binds the shared `jterm-256color` terminfo and its device replies to the new PTY.
 - `write(bytes)` accepts at most 4 KiB and returns the accepted byte count;
   **the caller must retain and retry the unaccepted suffix**.
 - `poll()` is nonblocking, reads at most 64 KiB, flushes bounded protocol replies,

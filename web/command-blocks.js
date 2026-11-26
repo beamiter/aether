@@ -73,7 +73,7 @@ export function validateFrozenReview(receipt,owner){
   }
 }
 
-export function installCommandBlocks(document,{getOwner,read,bookmark,find,compare,exportReview,recall,returnToTerminal}){
+export function installCommandBlocks(document,{getOwner,read,bookmark,find,compare,exportReview,recall,returnToTerminal,copyText}){
   const controls=document.querySelector('#command-blocks');
   const toggle=document.querySelector('#command-block-toggle');
   const panel=document.querySelector('#command-block-panel');
@@ -331,8 +331,11 @@ export function installCommandBlocks(document,{getOwner,read,bookmark,find,compa
       copy.addEventListener('click',async()=>{
         if(getOwner()!==attachment)return;
         try{
-          if(!globalThis.navigator?.clipboard?.writeText)throw new Error('Clipboard unavailable');
-          await globalThis.navigator.clipboard.writeText(block.output.text);
+          if(copyText)await copyText(block.output.text);
+          else{
+            if(!globalThis.navigator?.clipboard?.writeText)throw new Error('Clipboard unavailable');
+            await globalThis.navigator.clipboard.writeText(block.output.text);
+          }
           if(getOwner()===attachment&&!panel.hidden)status.textContent='Output copied.';
         }catch{
           if(getOwner()!==attachment||panel.hidden||!output.isConnected)return;
@@ -345,7 +348,9 @@ export function installCommandBlocks(document,{getOwner,read,bookmark,find,compa
             selection.addRange(range);
           }else output.select();
           let copied=false;
-          try{copied=!!document.execCommand?.('copy');}catch{/* Selection stays available. */}
+          // A failed native write must not be reported as an exact clipboard
+          // success through WebKit's newline-normalizing fallback.
+          if(!copyText)try{copied=!!document.execCommand?.('copy');}catch{/* Selection stays available. */}
           status.textContent=copied
             ?'Output copied.'
             :'Output selected. Use your system copy shortcut.';
