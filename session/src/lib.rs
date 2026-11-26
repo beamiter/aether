@@ -1,6 +1,6 @@
 //! Linux-only exploratory session. Shared Rust parser/state is the only VT authority.
 //! Not a complete terminal: bounded physical history only; no IME UI, graphics, OSC
-//! policy, grapheme composition, or process-tree containment. Never advertise as TERM=xterm.
+//! policy, grapheme composition, or process-tree containment.
 use jterm_engine::{
     frame::{CellFrame, Cursor, Limits, Row, Screen, Stamp},
     parser::{Event, Parser, ParserLimits, ParserProfile, StringKind},
@@ -16,6 +16,9 @@ use std::{
     sync::Arc,
 };
 use unicode_width::UnicodeWidthChar;
+
+mod mouse;
+pub use mouse::{MouseButton, MouseIntent, MouseState, MouseTracking, Presentation};
 
 const MAX_ROWS: usize = 128;
 const MAX_COLS: usize = 256;
@@ -99,7 +102,8 @@ pub struct Terminal {
     history: VecDeque<ScrollbackLine>,
     sync_started: Option<std::time::Instant>,
     capture_sync_end: bool,
-    completed_sync_frame: Option<CellFrame>,
+    completed_sync_frame: Option<Presentation>,
+    mouse_generation: u32,
 }
 impl Terminal {
     pub fn new(rows: usize, cols: usize) -> Result<Self, String> {
@@ -126,6 +130,7 @@ impl Terminal {
             sync_started: None,
             capture_sync_end: false,
             completed_sync_frame: None,
+            mouse_generation: 1,
         })
     }
     /// Paint publication only; parsing, PTY draining and replies remain live.
@@ -545,6 +550,7 @@ impl Terminal {
                                     continue;
                                 }
                                 1 | 25 | 2004 => (),
+                                mode if mouse::MOUSE_MODES.contains(&mode) => (),
                                 _ => {
                                     self.unsupported();
                                     continue;
@@ -689,6 +695,7 @@ impl Terminal {
                 && self.sync_started.is_some()
                 && matches!(&event, Event::Csi { private_prefix: Some(b'?'), intermediates, final_byte: b'l', params, .. }
                     if intermediates.is_empty() && params.contains(&2026));
+            let mouse_before = mouse::affects_mouse(&event).then(|| self.mouse_flags());
             let dispatch = semantics::dispatch_local(&mut self.screen, &mut self.protocol, &event);
             if sync_query {
                 self.protocol.modes_mut().remove(&2026);
@@ -740,11 +747,17 @@ impl Terminal {
                     }
                 },
             }
+            if mouse_before.is_some_and(|before| before != self.mouse_flags()) {
+                self.mouse_generation = self
+                    .mouse_generation
+                    .checked_add(1)
+                    .ok_or("mouse generation exhausted")?;
+            }
             if capture_end {
                 // Exactly one bounded immutable frame per opted-in PTY poll.
                 // Reserve a distinct live revision even when no more bytes arrive.
                 let next = self.revision.checked_add(1).ok_or("revision exhausted")?;
-                self.completed_sync_frame = Some(self.frame()?);
+                self.completed_sync_frame = Some(self.presentation()?);
                 self.revision = next;
                 self.capture_sync_end = false;
             }
@@ -871,16 +884,16 @@ mod reaper {
             Err(std::io::Error::last_os_error().to_string())
         }
     }
-    pub(super) fn check_child_wait_ownership() -> Result<(), String> {
+    pub(super) fn ensure_children_waitable() -> Result<(), String> {
         let mut action = std::mem::MaybeUninit::<libc::sigaction>::uninit();
         if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), action.as_mut_ptr()) } != 0 {
             return Err(std::io::Error::last_os_error().to_string());
         }
         let action = unsafe { action.assume_init() };
-        if action.sa_sigaction != libc::SIG_DFL || action.sa_flags & libc::SA_NOCLDWAIT != 0 {
-            return Err(
-                "exclusive child wait ownership requires default SIGCHLD disposition".into(),
-            );
+        // GLib can install a SIGCHLD handler for children registered with it.
+        // Those exact-PID waits coexist with the session's exclusive child wait.
+        if action.sa_sigaction == libc::SIG_IGN || action.sa_flags & libc::SA_NOCLDWAIT != 0 {
+            return Err("exclusive child wait ownership requires waitable children".into());
         }
         Ok(())
     }
@@ -1208,6 +1221,8 @@ mod reaper {
 
 /// Fixed /bin/sh demo host, no arbitrary executable/path API. Poll is nonblocking.
 /// Only the direct shell is owned/reaped: do not use as a production session manager.
+/// An embedding host must leave this child waitable and reserve its wait for
+/// Session. Other child watchers must wait only for their own children.
 #[cfg(target_os = "linux")]
 pub struct Session {
     master: Option<Box<dyn MasterPty + Send>>,
@@ -1230,7 +1245,7 @@ impl Session {
     pub fn spawn(rows: usize, cols: usize) -> Result<Self, String> {
         let terminal = Terminal::new(rows, cols)?;
         let lease = reaper::global()?.reserve()?;
-        reaper::check_child_wait_ownership()?;
+        reaper::ensure_children_waitable()?;
         let reap_ticket = lease.ticket.clone();
         let pair = native_pty_system()
             .openpty(PtySize {
@@ -1253,7 +1268,12 @@ impl Session {
         let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
         let mut command = CommandBuilder::new("/bin/sh");
         command.arg("-i");
-        command.env("TERM", "dumb");
+        command.env("TERM", "aether");
+        command.env(
+            "TERMINFO",
+            include_str!(concat!(env!("OUT_DIR"), "/aether.terminfo")),
+        );
+        command.env("COLORTERM", "truecolor");
         command.env("PS1", "$ ");
         command.env("ENV", "/dev/null");
         let child = pair
@@ -1387,7 +1407,7 @@ impl Session {
             self.replies.extend(replies);
         }
     }
-    pub fn take_completed_sync_frame(&mut self) -> Option<CellFrame> {
+    pub fn take_completed_sync_frame(&mut self) -> Option<Presentation> {
         self.terminal.completed_sync_frame.take()
     }
     pub fn poll(&mut self) -> Result<usize, String> {
@@ -2366,12 +2386,18 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn real_pty_resize_limits_match_kernel_and_reject_without_mutation() {
         let mut s = Session::spawn(4, 8).unwrap();
+        let mut previous = s.terminal().frame().unwrap().stamp();
         for (rows, cols) in [(1, 1), (128, 256), (3, 9)] {
             s.resize(rows, cols).unwrap();
             let kernel = s.master.as_ref().unwrap().get_size().unwrap();
             assert_eq!((kernel.rows as usize, kernel.cols as usize), (rows, cols));
             let frame = s.terminal().frame().unwrap();
             assert_eq!((frame.rows().len(), frame.cols()), (rows, cols));
+            let stamp = frame.stamp();
+            assert_eq!(stamp.epoch, previous.epoch);
+            assert_eq!(stamp.layout, previous.layout + 1);
+            assert_eq!(stamp.revision, previous.revision + 1);
+            previous = stamp;
         }
         // Real slave output drives DECSCUSR, visibility and clamped positioning.
         let command = b"printf '\\033[6 q\\033[?25l\\033[999;999H'; exit\n";
@@ -2464,7 +2490,7 @@ mod sync_publication_tests {
         t.feed(b"\x1b[?2026hA\x1b[?2026l\x1b[?2026hB\x1b[?2026l\x1b[?2026hC")
             .unwrap();
         assert!(t.publication_held());
-        let completed = t.completed_sync_frame.take().unwrap();
+        let completed = t.completed_sync_frame.take().unwrap().frame;
         assert_eq!(completed.rows()[0].cells[0].character, 'A');
         assert_eq!(completed.rows()[0].cells[1].character, ' ');
         assert!(t.revision > completed.stamp().revision);

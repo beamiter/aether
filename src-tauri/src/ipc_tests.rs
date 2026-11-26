@@ -3,6 +3,9 @@
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 use tauri::{test::MockRuntime, Manager};
+use tauri_terminal_frame_bridge::live::LiveBridge;
+
+use super::application::{self, Workspace};
 
 fn request(command: &str, body: Value) -> tauri::webview::InvokeRequest {
     tauri::webview::InvokeRequest {
@@ -25,7 +28,7 @@ fn invoke(window: &tauri::WebviewWindow<MockRuntime>, command: &str, body: Value
 
 #[test]
 fn command_dispatch_returns_while_backend_lock_is_busy() {
-    let app = super::application(tauri::test::mock_builder())
+    let app = application::configure(tauri::test::mock_builder(), Workspace::default())
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
         .unwrap();
     let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
@@ -35,7 +38,7 @@ fn command_dispatch_returns_while_backend_lock_is_busy() {
     let (locked_tx, locked_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let holder = std::thread::spawn(move || {
-        let state = handle.state::<std::sync::Arc<std::sync::Mutex<super::LiveBridge>>>();
+        let state = handle.state::<std::sync::Arc<std::sync::Mutex<LiveBridge>>>();
         let _guard = state.lock().unwrap();
         locked_tx.send(()).unwrap();
         // A broken synchronous handler must fail rather than deadlock the test.
@@ -63,7 +66,7 @@ fn command_dispatch_returns_while_backend_lock_is_busy() {
 
 #[test]
 fn tauri_ipc_real_pty_lifecycle_and_wire_contract() {
-    let app = super::application(tauri::test::mock_builder())
+    let app = application::configure(tauri::test::mock_builder(), Workspace::default())
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
         .unwrap();
     let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
@@ -141,7 +144,113 @@ fn tauri_ipc_real_pty_lifecycle_and_wire_contract() {
         tauri::test::get_ipc_response(&window, request("poll_shell", json!({"epoch": epoch})))
             .is_err()
     );
-    let next = invoke(&window, "open_shell", json!({})).as_u64().unwrap();
+    for invalid in [json!({"rows": 14}), json!({"rows": 0, "cols": 72})] {
+        assert!(tauri::test::get_ipc_response(&window, request("open_shell", invalid)).is_err());
+    }
+    let next = invoke(&window, "open_shell", json!({"rows": 14, "cols": 72}))
+        .as_u64()
+        .unwrap();
     assert!(next > epoch);
+    let first = invoke(&window, "poll_shell", json!({"epoch": next}));
+    assert_eq!(first["rows"].as_array().unwrap().len(), 14);
+    assert_eq!(first["cols"], 72);
     invoke(&window, "close_shell", json!({"epoch": next}));
+}
+
+#[test]
+fn tauri_mouse_command_delivers_the_displayed_mode_to_the_pty() {
+    let app = application::configure(tauri::test::mock_builder(), Workspace::default())
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .unwrap();
+    let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build()
+        .unwrap();
+    let epoch = invoke(&window, "open_shell", json!({}));
+    let command = concat!(
+        "stty -echo -icanon min 1 time 0; printf '\\033[?1000;1006h'; ",
+        "report=$(dd bs=1 count=9 2>/dev/null | od -An -tx1 -v | tr -d ' \\n'); ",
+        "printf '\\nMOUSE_RX=%s\\n' \"$report\"; exit",
+    );
+    invoke(
+        &window,
+        "text_shell",
+        json!({"epoch": epoch, "text": command}),
+    );
+    invoke(
+        &window,
+        "key_shell",
+        json!({"epoch": epoch, "name": "Enter", "shift": false, "alt": false, "ctrl": false}),
+    );
+
+    let row_text = |row: &Value| {
+        row.as_array()
+            .unwrap()
+            .iter()
+            .map(|cell| cell["text"].as_str().unwrap())
+            .collect::<String>()
+    };
+    let wait_for_frame = |what, matches: &dyn Fn(&Value) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut last = Value::Null;
+        loop {
+            let frame = invoke(&window, "poll_shell", json!({"epoch": epoch}));
+            if !frame.is_null() {
+                invoke(
+                    &window,
+                    "ack_shell",
+                    json!({"epoch": epoch, "revision": frame["revision"]}),
+                );
+                if matches(&frame) {
+                    return frame;
+                }
+                last = frame;
+            }
+            if Instant::now() >= deadline {
+                let rows = last["rows"].as_array().map(|rows| {
+                    rows.iter()
+                        .map(row_text)
+                        .filter(|row| !row.trim().is_empty())
+                        .collect::<Vec<_>>()
+                });
+                panic!(
+                    "{what} missing; last mouse mode {}, rows {rows:?}",
+                    last["mouse"]
+                );
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    let active = wait_for_frame("Mouse tracking", &|frame| {
+        frame["mouse"]["tracking"] == "button"
+    });
+    let mut report = json!({
+        "kind": "press", "layout": active["layout"], "generation": active["mouse"]["generation"],
+        "row": 2, "col": 4, "button": "left", "alt": false, "ctrl": false,
+    });
+    report["generation"] = json!(active["mouse"]["generation"].as_u64().unwrap() + 1);
+    assert_eq!(
+        invoke(
+            &window,
+            "mouse_shell",
+            json!({"epoch": epoch, "report": report})
+        ),
+        false
+    );
+    report["generation"] = active["mouse"]["generation"].clone();
+    assert_eq!(
+        invoke(
+            &window,
+            "mouse_shell",
+            json!({"epoch": epoch, "report": report})
+        ),
+        true
+    );
+    wait_for_frame("Exact mouse receipt", &|frame| {
+        frame["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row_text(row).trim_end() == "MOUSE_RX=1b5b3c303b353b334d")
+    });
+    invoke(&window, "close_shell", json!({"epoch": epoch}));
 }

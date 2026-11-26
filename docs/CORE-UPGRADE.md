@@ -1,4 +1,31 @@
-# Shared core upgrade: 8d0c0aa
+# Shared core upgrades
+
+## f0107af
+
+The engine and desktop Workspace client use
+`f0107afaf631d29d06358abec3997f1b5712b627`. The shared host adds the
+confirmed saved CLI session deletion command and records deleted source
+identities across catalog rediscovery. The original provider transcript stays
+on disk.
+
+## 8e904f3
+
+Aether moved to `8e904f3b10b3235ff225f37227866f6f5ef4024f` in its git
+dependency declarations and all three Cargo lockfiles. The published
+`jterm_engine` adds a publication guard for dimensions that change without a
+layout advance. The Aether session and WebView also check this invariant across
+real PTY resizing and full-frame admission. The session's Unicode width
+requirement now matches the 0.2.3 version in all three locks.
+
+The full-frame wire carries engine-owned screen identity and soft-wrap flags.
+Legacy version 3 browser fixtures remain readable. The input and rendering
+paths still share the same Rust engine.
+
+The desktop Agent Workspace locks `jterm_core` to the same revision for its
+conversation catalog, search filters and read-only host protocol. The pin guard
+checks both packages in the desktop lockfile.
+
+## 8d0c0aa
 
 Validated against Aether import `49963b4da6b99ab49a410c25a7451bcce7888491` on
 2026-11-14 UTC. The exact new engine revision is

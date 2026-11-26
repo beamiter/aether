@@ -9,7 +9,9 @@ semantic dispatcher. No byte parsing is performed in JavaScript.
 - `Terminal::new(rows, cols)` admits at most 128 × 256 cells.
 - `feed(bytes)` accepts up to 64 KiB and returns protocol reply bytes.
 - `resize`, `frame() -> CellFrame`, `visible_text`, `unsupported_count`.
-- Linux `Session::spawn(rows, cols)` starts fixed `/bin/sh -i` with `TERM=dumb`.
+- Linux `Session::spawn(rows, cols)` starts fixed `/bin/sh -i` with `TERM=aether`
+  and the compiled entry from [terminfo/aether.ti](terminfo/aether.ti).
+  The build uses `tic` from ncurses-bin.
 - `write(bytes)` accepts at most 4 KiB and returns the accepted byte count;
   **the caller must retain and retry the unaccepted suffix**.
 - `poll()` is nonblocking, reads at most 64 KiB, flushes bounded protocol replies,
@@ -104,9 +106,10 @@ mouse selection or an OS clipboard integration.
 A single global reaper has exactly 32 slots. A slot is reserved **before** PTY or
 child creation; setup failure releases the reservation. Reaper thread creation,
 pidfd-open and pidfd signal-0 capability checks happen before any child is spawned.
-The adapter requires default SIGCHLD disposition with no SA_NOCLDWAIT (read-only
-check; it never changes signal settings). The embedding process must not install
-an external reaper, call waitpid(-1), or change that disposition concurrently.
+The adapter rejects SIG_IGN and SA_NOCLDWAIT for SIGCHLD and leaves the host's
+disposition in place. The host must keep the PTY child waitable and reserve its
+waits for the adapter. Other child watchers may wait for their own specific
+children, as GTK's GLib watcher does.
 
 Immediately after spawn the still-owned child gets a pidfd. If that fails, PTY
 handles are closed and the owned child is handed off in observe-only quarantine;

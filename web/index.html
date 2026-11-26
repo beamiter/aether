@@ -1,13 +1,147 @@
 <!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Terminal frame bridge laboratory</title><link rel="stylesheet" href="style.css">
-<main><p class="tag">TAURI 2 / SELF-OWNED RUST CORE</p><h1>Frame bridge laboratory</h1>
-<p>Transport / paint prototype with a limited Linux shell experiment. Real PTY / basic Vim tested; not a daily terminal or native GUI acceptance.</p>
-<button id="recover">Recover output snapshot</button> <button id="demo">Load frame</button> <button id="open" disabled>Open experimental shell</button> <button id="close" disabled>Close shell</button> <label>Columns <input id="cols" type="number" min="1" max="256" step="1" value="100"></label> <label>Rows <input id="rows" type="number" min="1" max="128" step="1" value="24"></label> <button id="resize" disabled>Apply size</button> <button id="reveal-cursor">Show cursor</button><p id="cursor-status"></p><p id="status" role="status">Ready. ANSI parsing never runs in this WebView.</p>
-<p class="note">The scrollable canvas shows the live grid only. Show cursor brings its position into view without changing terminal state. Archived history is a separate snapshot below.</p><div class="viewport"><p id="health" aria-live="polite"></p>
-<canvas tabindex="0" aria-label="Experimental terminal; click to focus keyboard and composition input"></canvas></div>
+<title>Aether Terminal</title><link rel="stylesheet" href="style.css">
+<main><h1>Aether Terminal</h1>
+<p>Experimental Linux terminal powered by jterm_engine.</p>
+<details id="agent-workspace">
+  <summary>Agent Workspace</summary>
+  <div class="workspace-panel">
+    <form id="workspace-filters">
+      <label class="workspace-query">Search conversations and indexed history
+        <input id="workspace-query" type="search" maxlength="512" spellcheck="false" autocomplete="off" placeholder="title:release or body:&quot;missing field&quot;">
+      </label>
+      <label>Type <select id="workspace-kind">
+        <option value="all">All types</option><option value="cli">CLI sessions</option>
+        <option value="api">API chats</option><option value="task">Tasks</option>
+      </select></label>
+      <label>Library <select id="workspace-library">
+        <option value="active">Active</option><option value="archived">Archived</option><option value="all">All conversations</option>
+      </select></label>
+      <label>Provider <select id="workspace-provider"><option value="">All providers</option></select></label>
+      <label>Project <select id="workspace-project"><option value="">All projects</option></select></label>
+      <label>Activity <select id="workspace-activity">
+        <option value="all">All activity</option><option value="running">Running</option><option value="needs_you">Needs you</option>
+      </select></label>
+      <label class="workspace-check"><input id="workspace-pinned" type="checkbox"> Pinned only</label>
+      <div class="workspace-actions">
+        <button id="workspace-clear" type="button">Clear filters</button>
+        <button id="workspace-refresh" type="button">Refresh</button>
+      </div>
+    </form>
+    <p id="workspace-status" role="status"></p>
+    <p id="workspace-delete-message" role="status"></p>
+    <div class="workspace-columns">
+      <div class="workspace-results">
+        <ul id="workspace-rows" aria-label="Conversations"></ul>
+        <button id="workspace-more" type="button" hidden>Show more conversations</button>
+        <section id="workspace-history" aria-labelledby="workspace-history-title" hidden>
+          <h3 id="workspace-history-title">History matches</h3>
+          <p id="workspace-history-status" role="status"></p>
+          <ul id="workspace-hits" aria-label="Indexed history matches"></ul>
+          <button id="workspace-history-more" type="button" hidden>Show more history matches</button>
+        </section>
+      </div>
+      <section id="workspace-detail" aria-labelledby="workspace-detail-title" hidden>
+        <header><h3 id="workspace-detail-title"></h3><button id="workspace-detail-close" type="button">Close details</button></header>
+        <p id="workspace-detail-status" role="status"></p>
+        <dl id="workspace-detail-facts"></dl>
+        <pre id="workspace-detail-text" tabindex="0" aria-label="Read-only conversation evidence" hidden></pre>
+        <button id="workspace-delete" type="button" hidden>Delete saved session…</button>
+      </section>
+    </div>
+    <dialog id="workspace-delete-confirmation" aria-labelledby="workspace-delete-title" aria-describedby="workspace-delete-scope">
+      <h3 id="workspace-delete-title">Delete saved CLI session?</h3>
+      <p id="workspace-delete-target"></p>
+      <p id="workspace-delete-scope">Remove the saved entry and its indexed history from Agent Workspace. The original provider history is kept.</p>
+      <div class="workspace-actions">
+        <button id="workspace-delete-cancel" type="button" autofocus>Cancel</button>
+        <button id="workspace-delete-confirm" type="button">Delete saved session</button>
+      </div>
+    </dialog>
+  </div>
+</details>
+<div class="terminal-controls">
+  <button id="open" disabled>Open experimental shell</button> <button id="close" disabled>Close shell</button>
+  <button id="demo">Load frame</button> <button id="recover">Recover output snapshot</button>
+  <button id="reveal-cursor">Show cursor</button>
+</div>
+<div class="terminal-controls" role="group" aria-label="Terminal size">
+  <label><input id="fit-size" type="checkbox" checked disabled> Fit to window</label>
+  <label>Columns <input id="cols" type="number" min="1" max="256" step="1" value="80"></label>
+  <label>Rows <input id="rows" type="number" min="1" max="128" step="1" value="24"></label>
+  <button id="resize" disabled>Apply fixed size</button>
+</div>
+<p id="cursor-status"></p><p id="status" role="status">Ready. ANSI parsing never runs in this WebView.</p>
+<p class="note">Drag to select terminal text. Hold Shift while dragging when an application uses the mouse. Select snapshot for copying keeps the selection available after the grid updates.</p>
+<p id="health" aria-live="polite"></p><div class="viewport">
+<div class="terminal-surface"><canvas tabindex="0" aria-label="Experimental terminal; click to focus keyboard and composition input"></canvas><div id="terminal-selection" aria-hidden="true"></div></div></div>
 <label>Terminal keyboard / IME (experimental)<textarea id="ime-input" rows="2" spellcheck="false" autocomplete="off" aria-label="Terminal keyboard and input method composition"></textarea></label>
 <section id="paste-review" hidden aria-label="Review multiline paste"><h2>Review multiline paste</h2><p>Newlines may execute commands. Verify every line before sending. This review applies even when bracketed paste is enabled; terminal modes can change.</p><textarea id="paste-preview" readonly rows="6" spellcheck="false" aria-label="Clipboard text with visual line breaks" aria-describedby="paste-line-endings"></textarea><p id="paste-line-endings">The preview displays CR, LF and CRLF as line breaks. The original clipboard text is shown below as a quoted string: \r means carriage return, \n means line feed, \t means tab and \\ means a literal backslash. Unicode format characters, including bidirectional controls and zero-width joiners, appear as \uXXXX escapes (two escapes for a supplementary character); this does not remove them from the paste. Other characters remain literal, so this is not a complete code-point listing. On delivery, each CRLF pair, lone CR or LF becomes one carriage return. Bracketed paste markers depend on the terminal mode at delivery.</p><pre id="paste-escaped" tabindex="0" role="region" aria-label="Original clipboard text with escaped line endings and format characters" aria-describedby="paste-line-endings"></pre><button id="paste-confirm" type="button" disabled>Send reviewed paste</button> <button id="paste-cancel" type="button">Cancel paste</button></section>
-<section><button id="copy-visible">Snapshot visible text</button> <button id="history-older">Older 20 rows</button> <button id="history-newer">Newer 20 rows</button> <button id="history-refresh">Refresh history / copy snapshot</button><p id="history-label">Bounded snapshot, select and copy manually.</p><textarea id="history-output" readonly rows="12" spellcheck="false" aria-label="Terminal history text snapshot for selection and copy"></textarea></section>
+<section><button id="copy-selection" disabled>Select snapshot for copying</button> <button id="copy-visible">Snapshot visible text</button> <button id="history-older">Older 20 rows</button> <button id="history-newer">Newer 20 rows</button> <button id="history-refresh">Refresh history / copy snapshot</button><p id="history-label">Bounded snapshot, select and copy manually.</p><textarea id="history-output" readonly rows="12" spellcheck="false" aria-label="Terminal text snapshot for selection and copy"></textarea></section>
 <form id="command"><label>Shell command <input id="input" autocomplete="off" placeholder="printf hello" disabled></label> <button id="send" disabled>Send line</button></form><p class="note">Experimental: fixed /bin/sh; focus terminal for logical keyboard input. Multiline clipboard paste requires review before sending; newlines may execute commands when bracketed paste is off. Still required: production process containment, Unicode shaping, native keyboard/IME acceptance and broad Vim compatibility, delta resync, IME and accessibility.</p></main>
-<section aria-label="Explicit local file preview"><h2>Local file preview (experimental)</h2><p>This opt-in preview reads only files selected below. Ctrl+left-click an exact visible relative file name to select it, then confirm Preview selected file. The confirmation is required because terminal output cannot prove a local or remote identity. Positive :line or :line:column suffixes select the same file (no line navigation). Wrapped paths, absolute paths and OSC 8 links are not resolved. Markdown, TSX, HTML and SVG are plain source text, never executed. Static PNG and baseline JPEG are limited to 2 MiB, 4096 per side and 4 megapixels. Other image formats are not decoded. Re-select the folder to refresh its snapshot.</p><label>Select a trusted local folder (at most 2048 total files) <input id="preview-folder" type="file" webkitdirectory multiple></label><label>Select one file (large projects, no folder enumeration) <input id="preview-single" type="file"></label><label>Preview file <select id="preview-files" disabled></select></label><button id="preview-show" type="button" disabled>Preview selected file</button> <button id="preview-clear" type="button">Clear local access</button><p id="preview-notice" role="status">No local files authorized.</p></section><aside id="file-preview" hidden aria-label="Local source preview"><button id="preview-close" type="button">Close preview</button><h2 id="preview-title"></h2><p>Confirm this reference belongs to your selected local folder, not a remote session.</p><button id="preview-confirm-local" type="button">Preview selected local file</button><canvas id="preview-raster" hidden aria-label="Selected local raster image"></canvas><pre id="preview-source" tabindex="0" aria-label="Source text, not executable"></pre></aside>
-<script type="module" src="app.js"></script></html>
+<section id="preview-selection" aria-labelledby="preview-heading">
+  <h2 id="preview-heading">Local file preview</h2>
+  <p>Choose a trusted folder or a single file. Ctrl+left-click a visible folder-relative reference, then confirm it belongs to the selected local folder.</p>
+  <div class="preview-controls">
+    <label>Trusted folder (up to 2048 files) <input id="preview-folder" type="file" webkitdirectory multiple></label>
+    <label>Single local file <input id="preview-single" type="file"></label>
+    <label>Preview file <select id="preview-files" disabled></select></label>
+    <button id="preview-show" type="button" disabled>Preview selected file</button>
+    <button id="preview-clear" type="button">Clear local access</button>
+  </div>
+  <p id="preview-notice" role="status">No local files authorized.</p>
+</section>
+<aside id="file-preview" hidden aria-label="Local file preview">
+  <header class="preview-header">
+    <h2 id="preview-title"></h2>
+    <button id="preview-close" type="button">Close preview</button>
+  </header>
+  <p id="preview-details"></p>
+  <p id="preview-panel-status" role="status"></p>
+  <div id="preview-confirmation" hidden>
+    <button id="preview-confirm-local" type="button">Preview selected local file</button>
+  </div>
+  <div id="preview-tools" class="preview-controls" hidden>
+    <button id="preview-copy-path" type="button">Copy path</button>
+    <button id="preview-reload" type="button" title="Reselect the local snapshot to refresh it">Reload</button>
+  </div>
+  <div id="preview-source-tools" hidden>
+    <div class="preview-controls">
+      <button id="preview-copy-text" type="button">Copy text</button>
+      <button id="preview-copy-line" type="button" disabled>Copy line</button>
+      <form id="preview-line-form" class="preview-controls">
+        <label>Line <input id="preview-line" type="number" min="1" step="1" required></label>
+        <button id="preview-go" type="submit">Go to line</button>
+      </form>
+    </div>
+    <p id="preview-line-status" role="status"></p>
+    <div class="preview-controls">
+      <label>Find <input id="preview-query" type="search" maxlength="4096" spellcheck="false" autocomplete="off"></label>
+      <label><input id="preview-match-case" type="checkbox" checked> Match case</label>
+      <button id="preview-prev" type="button" disabled>Prev</button>
+      <button id="preview-next" type="button" disabled>Next</button>
+    </div>
+    <p id="preview-matches" role="status"></p>
+  </div>
+  <div id="preview-image-tools" class="preview-controls" hidden>
+    <label>Zoom <select id="preview-zoom">
+      <option value="fit">Fit image</option>
+      <option value="25">25%</option>
+      <option value="50">50%</option>
+      <option value="75">75%</option>
+      <option value="100">100% (actual size)</option>
+      <option value="125">125%</option>
+      <option value="150">150%</option>
+      <option value="200">200%</option>
+      <option value="400">400%</option>
+    </select></label>
+  </div>
+  <div id="preview-content" hidden>
+    <canvas id="preview-raster" hidden tabindex="0" aria-label="Selected local raster image"></canvas>
+    <pre id="preview-source" tabindex="0" aria-label="Read-only source text"></pre>
+  </div>
+  <div id="preview-copy-fallback" hidden>
+    <label>Copy selection <textarea id="preview-copy-value" rows="3" readonly></textarea></label>
+  </div>
+</aside>
+<script type="module" src="app.js"></script>
+<script type="module" src="agent-workspace.js"></script></html>

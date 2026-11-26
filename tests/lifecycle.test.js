@@ -1,19 +1,163 @@
 import {installPasteReview} from '../web/paste.js';
-import {resizeQueue,cursorTarget} from '../web/viewport.js';
+import {dimensions,resizeQueue,cursorTarget,viewportDimensions} from '../web/viewport.js';
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import vm from 'node:vm';
 import {installHistory} from '../web/history.js';
 import {acceptFull} from '../web/frames.js'; import {installIme} from '../web/ime.js';
+import {installTerminalSelection} from '../web/terminal-selection.js';
+import {installTerminalMouse} from '../web/terminal-mouse.js';
 const tick=()=>new Promise(r=>setImmediate(r));
 const deferred=()=>{let resolve,reject;const promise=new Promise((a,b)=>{resolve=a;reject=b});return {promise,resolve,reject};};
-function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsupported:"0"}), Encoder=TextEncoder){
+function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsupported:"0"}), Encoder=TextEncoder, viewportSize=null){
  const invoke=(name,args)=>name==='shell_status'?Promise.resolve(health(args)).then(s=>({drained:false,write_error:null,dropped_reply_bytes:'0',...s})):rawInvoke(name,args);
- const elements=new Map(),timers=new Map();let id=0;
- const el=selector=>{if(!elements.has(selector))elements.set(selector,{disabled:false,value:'',textContent:'',style:{},handlers:{},focus(){},addEventListener(name,fn){this.handlers[name]=fn}});return elements.get(selector)};
- const context={installFilePreviewPanel:()=>({dismiss(){}}),document:{querySelector:el},__TAURI__:{core:{invoke}},acceptFull,installIme,installHistory,installPasteReview,resizeQueue,cursorTarget,paint(){},TextEncoder:Encoder,TextDecoder,
+ const elements=new Map(),timers=new Map(),painted=[];let id=0;
+ const el=selector=>{
+  if(!elements.has(selector)){
+   const listeners=new Map();
+   elements.set(selector,{disabled:false,value:'',textContent:'',style:{},handlers:{},focus(){},select(){this.selected=true},replaceChildren(){},
+    addEventListener(name,fn,options){
+     const group=listeners.get(name)??[];
+     group.push({fn,capture:options?.capture??false});
+     group.sort((left,right)=>Number(right.capture)-Number(left.capture));
+     listeners.set(name,group);
+     this.handlers[name]=event=>{
+      let result;
+      for(const {fn} of group)result=fn(event)??result;
+      return result;
+     };
+    }});
+  }
+  return elements.get(selector);
+ };
+ const context={installFilePreviewPanel:()=>({dismiss(){}}),document:{querySelector:el,createElement:()=>({style:{}})},__TAURI__:{core:{invoke}},acceptFull,installIme,installHistory,installPasteReview,installTerminalSelection,installTerminalMouse,dimensions,resizeQueue,cursorTarget,viewportDimensions,paint(_,frame){painted.push(frame.revision);},TextEncoder:Encoder,TextDecoder,
  setInterval(fn){timers.set(++id,fn);return id},clearInterval(i){timers.delete(i)},setTimeout};
+ el('#fit-size').checked=true;
+ let onViewportChange;
+ function setViewport(cols,rows){
+  const viewport=el('.viewport'),width=cols*12+26,height=rows*24+26;
+  viewport.offsetWidth=width;viewport.clientWidth=width-2;
+  viewport.getBoundingClientRect=()=>({width,height});
+  onViewportChange?.();
+ }
+ if(viewportSize){
+  context.getComputedStyle=()=>({borderLeftWidth:'1px',borderRightWidth:'1px',borderTopWidth:'1px',borderBottomWidth:'1px',paddingLeft:'12px',paddingRight:'12px',paddingTop:'12px',paddingBottom:'12px'});
+  context.ResizeObserver=class{constructor(callback){onViewportChange=callback;}observe(node){assert.equal(node,el('.viewport'));}};
+  setViewport(...viewportSize);
+ }
  vm.runInNewContext(fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8').replace(/^import .*\n/gm,''),context);
- return {el,timers,click:s=>el(s).handlers.click(),submit:()=>el('#command').handlers.submit({preventDefault(){}})};
+ return {el,timers,painted,setViewport,click:s=>el(s).handlers.click(),submit:()=>el('#command').handlers.submit({preventDefault(){}})};
 }
+
+test('viewport fitting starts the PTY at the measured size and resumes after a fixed override',async()=>{
+ const calls=[];
+ const h=harness(async(name,args)=>{
+  if(name==='open_shell'||name==='resize_shell')calls.push([name,{...args}]);
+  return name==='open_shell'?1:null;
+ },undefined,undefined,[70,16]);
+ await h.click('#open');
+ h.setViewport(74,18);h.setViewport(74,18);await tick();
+ h.el('#cols').value='60';h.el('#rows').value='12';await h.click('#resize');
+ assert.equal(h.el('#fit-size').checked,false);
+ h.setViewport(78,20);await tick();
+ h.el('#fit-size').checked=true;h.el('#fit-size').handlers.change();await tick();
+ assert.deepEqual(calls,[
+  ['open_shell',{cols:70,rows:16}],
+  ['resize_shell',{epoch:1,cols:74,rows:18}],
+  ['resize_shell',{epoch:1,cols:60,rows:12}],
+  ['resize_shell',{epoch:1,cols:78,rows:20}],
+ ]);
+});
+
+test('fitting follows geometry that changes during open and drops its queued resize when disabled',async()=>{
+ const opening=deferred(),resize=deferred(),calls=[];
+ const h=harness(async(name,args)=>{
+  if(name==='open_shell'){calls.push({...args});return opening.promise;}
+  if(name==='resize_shell'){calls.push({...args});return resize.promise;}
+  return null;
+ },undefined,undefined,[40,10]);
+ const opened=h.click('#open');
+ h.setViewport(45,11);
+ opening.resolve(1);await opened;
+ h.setViewport(50,12);
+ h.el('#fit-size').checked=false;h.el('#fit-size').handlers.change();
+ resize.resolve();await tick();
+ assert.deepEqual(calls,[{cols:40,rows:10},{epoch:1,cols:45,rows:11}]);
+});
+
+test('invalid fixed size leaves fitting enabled and a terminated shell ignores viewport changes',async()=>{
+ let exited=false;const resizes=[];
+ const h=harness(async(name,args)=>{
+  if(name==='resize_shell')resizes.push({...args});
+  return name==='open_shell'?1:null;
+ },args=>({epoch:args.epoch,exited,unsupported:'0'}),undefined,[70,16]);
+ await h.click('#open');
+ h.el('#cols').value='0';await h.click('#resize');
+ assert.match(h.el('#status').textContent,/Use integer rows/);
+ assert.equal(h.el('#fit-size').checked,true);
+ exited=true;await [...h.timers.values()][0]();
+ h.setViewport(74,18);await tick();
+ assert.deepEqual(resizes,[]);
+});
+test('PTY ACKs continue while dragging, then copy uses the frame the pointer saw',async()=>{
+ const first=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+ first.session='pty-demo';
+ const next=structuredClone(first);next.revision=2;
+ next.rows[0][0].text='X';
+ const pending=[first,next],acked=[];
+ const h=harness(async(name,args)=>{
+  if(name==='open_shell')return 1;
+  if(name==='poll_shell')return pending.shift()??null;
+  if(name==='ack_shell')acked.push(args.revision);
+ });
+ const canvas=h.el('canvas');
+ let captured=null;
+ canvas.setPointerCapture=id=>captured=id;
+ canvas.hasPointerCapture=id=>captured===id;
+ canvas.releasePointerCapture=()=>captured=null;
+ canvas.getBoundingClientRect=()=>({left:0,top:0,width:first.cols*10,height:first.rows.length*10});
+ const point=col=>({isPrimary:true,pointerType:'mouse',pointerId:1,button:0,clientX:col*10+5,clientY:5,preventDefault(){}});
+ await h.click('#open');
+ canvas.handlers.pointerdown(point(0));
+ await [...h.timers.values()][0]();
+ assert.deepEqual(acked,[1,2]);
+ assert.deepEqual(h.painted,[1]);
+ canvas.handlers.pointerup(point(4));
+ assert.deepEqual(h.painted,[1,2]);
+ await h.click('#copy-selection');
+ assert.equal(h.el('#history-output').value,'Tauri');
+ assert.equal(h.el('#history-output').selected,true);
+ assert.match(h.el('#history-label').textContent,/snapshot 1/);
+});
+test('application tracking owns the pointer while Shift keeps the same canvas selectable',async()=>{
+ const frame=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+ frame.session='pty-demo';
+ frame.mouse={tracking:'drag',generation:2};
+ let allowed=true;
+ const forwarded=[];
+ const h=harness(async(name,args)=>{
+  if(name==='open_shell')return 1;
+  if(name==='poll_shell'&&allowed){allowed=false;return frame;}
+  if(name==='mouse_shell')forwarded.push(args.report.kind);
+ });
+ const canvas=h.el('canvas');
+ let captured=null;
+ canvas.setPointerCapture=id=>captured=id;
+ canvas.hasPointerCapture=id=>captured===id;
+ canvas.releasePointerCapture=()=>captured=null;
+ canvas.getBoundingClientRect=()=>({left:0,top:0,width:frame.cols*10,height:frame.rows.length*10});
+ const point=(column,shiftKey)=>({isPrimary:true,pointerType:'mouse',pointerId:1,button:0,shiftKey,
+  clientX:column*10+5,clientY:5,preventDefault(){this.defaultPrevented=true;}});
+ await h.click('#open');
+ canvas.handlers.pointerdown(point(0,false));
+ canvas.handlers.pointermove(point(2,false));
+ canvas.handlers.pointerup(point(4,false));
+ await tick();
+ assert.deepEqual(forwarded,['press','motion','release']);
+ canvas.handlers.pointerdown(point(0,true));
+ canvas.handlers.pointerup(point(4,true));
+ await h.click('#copy-selection');
+ assert.equal(h.el('#history-output').value,'Tauri');
+ assert.deepEqual(forwarded,['press','motion','release']);
+});
 test('late failed poll from old epoch cannot stop new session',async()=>{
  let epoch=0;const old=deferred();const h=harness(async(name,args)=>{
  if(name==='open_shell')return ++epoch;if(name==='close_shell')return;if(name==='poll_shell')return args.epoch===1?old.promise:null;throw Error(name);
@@ -104,7 +248,10 @@ test('recovery never unlocks input after a partial command write failure',async(
 test('close distinguishes queued cleanup from confirmed direct-child reaping',async()=>{
  for(const pending of [true,false]) {
   const h=harness(async name=>{if(name==='open_shell')return 1;if(name==='close_shell')return {cleanup_pending:pending};return null;});
-  await h.click('#open');await h.click('#close');
+  await h.click('#open');
+  assert.match(h.el('#health').textContent,/Shell running/);
+  await h.click('#close');
+  assert.equal(h.el('#health').textContent,'');
   assert.match(h.el('#status').textContent,pending?/may still be pending/:/direct child reaped/);
   assert.match(h.el('#status').textContent,/Descendant containment is not provided/);
  }

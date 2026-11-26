@@ -23,8 +23,13 @@ sessions and retains uncertain ownership. App process exit can interrupt pending
 cleanup. No kernel cgroup delegation, namespace setup or system signal setting
 change was performed to conceal these remaining limits.
 
-Independent code review found no blocking issue in this batch. Required embedding
-contract: no other host code may reap these owned children via waitpid(-1) or change
-SIGCHLD disposition concurrently. The read-only default-disposition check cannot
-prove that contract for an arbitrary future host. Short mutex contention remains;
-“no blocking child wait” is not “zero waiting of any kind.”
+The adapter reads the host SIGCHLD disposition before each spawn and rejects
+SIG_IGN or SA_NOCLDWAIT, which make child exit status unavailable. GTK can install
+a handler for its own child watches. GLib waits for the specific children it
+registered, and the adapter waits for its own shell. The adapter leaves signal
+handling to the host. [GLib child watch contract](https://docs.gtk.org/glib/func.child_watch_source_new.html)
+
+Embedding hosts must keep PTY children waitable and reserve their waits for the
+adapter. A catch-all wait or a second watcher on the same PTY child violates that
+contract. If a child wait fails, the adapter discards signalling authority and
+keeps the slot under observation. Short mutex contention remains possible.

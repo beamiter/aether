@@ -15,6 +15,23 @@ test('root replacement is fail closed for traversal absolute remote ambiguous an
   const h=setup();h.select([file('old/ok.md','ok')]);assert.deepEqual(h.select(entries),[]);assert.equal(h.errors.length,1);
  }
 });
+test('common source names and extensions are admitted only by explicit snapshot selection', async () => {
+ const h = setup();
+ const names = ['README', 'LICENSE', 'Makefile', 'Dockerfile', 'Cargo.lock',
+  '.gitignore', '.editorconfig', 'src/guide.MDX', 'src/style.scss', 'src/app.mjs',
+  'src/tool.cjs', 'src/options.jsonc', 'src/types.hpp', 'src/main.go', 'src/Main.java', 'README:12'];
+ h.select(names.map(name => file('root/' + name, 'local')));
+ for (const name of names) {
+  await h.show(name);
+  assert.equal(h.shown.at(-1).path, name);
+  assert.equal(h.shown.at(-1).text, 'local');
+ }
+ assert.equal(selectedPathAtCell(frame('README:12'), 0, 3, ['README', 'README:12']), 'README:12');
+ h.select([file('root/secret.lock', 'excluded')]);
+ await h.show('secret.lock');
+ assert.equal(h.shown.at(-1), null);
+ assert.match(h.errors.at(-1), /Unsupported preview type/);
+});
 test('oversize and unsupported files are rejected before reads; UTF-8 and NUL checked',async()=>{
  for(const [path,size] of [['root/x.md',262145],['root/x.gif',12]]){
   const h=setup();h.select([{webkitRelativePath:path,size,arrayBuffer(){assert.fail('unbounded read');}}]);await h.show(path.slice(5));assert.equal(h.errors.length,1);
@@ -49,10 +66,10 @@ test('Ctrl-click candidate lookup matches selected exact tokens only',()=>{
  assert.equal(selectedPathAtCell(f,1,8,['src/App.tsx']),null);
 });
 import {installFilePreviewPanel} from '../web/file-preview-panel.js';
+import {previewDom} from './support/preview-dom.js';
 function panelHarness(){
- const elements=new Map();let epoch=1,current={...frame('src/App.tsx'),session:'pty-demo',epoch:1};
- const el=selector=>{if(!elements.has(selector))elements.set(selector,{value:'',textContent:'',hidden:false,handlers:{},addEventListener(n,fn){this.handlers[n]=fn;},replaceChildren(){this.children=[];},append(x){this.children.push(x);},focus(){this.focused=true;doc.activeElement=this;},contains(node){return ['#preview-close','#preview-confirm-local','#preview-source','#preview-raster'].some(id=>elements.get(id)===node);},getBoundingClientRect(){return {left:0,top:0,width:120,height:24};}});return elements.get(selector);};
- const doc={querySelector:el,createElement:()=>({})};
+ let epoch=1,current={...frame('src/App.tsx'),session:'pty-demo',epoch:1};
+ const {doc,el}=previewDom();
  const api=installFilePreviewPanel(doc,{getFrame:()=>current,getEpoch:()=>epoch});
  const click=(extra={})=>el('canvas').handlers.click({button:0,ctrlKey:true,currentTarget:el('canvas'),clientX:30,clientY:10,preventDefault(){},...extra});
  return {el,api,click,setEpoch:e=>epoch=e,setFrame:f=>current=f};
@@ -68,6 +85,48 @@ test('panel rejects wrong clicks and stale session confirmation without reading'
  let reads=0;const h=panelHarness();h.el('#preview-folder').files=[{webkitRelativePath:'root/src/App.tsx',size:1,arrayBuffer:async()=>{reads++;return bytes('x');}}];h.el('#preview-folder').handlers.change();
  for(const extra of [{button:1},{ctrlKey:false},{altKey:true},{shiftKey:true},{metaKey:true},{defaultPrevented:true},{clientX:-1}]){h.click(extra);assert.equal(h.el('#file-preview').hidden,true);}
  h.click();h.setEpoch(2);await h.el('#preview-confirm-local').handlers.click();assert.equal(reads,0);assert.equal(h.el('#file-preview').hidden,true);
+});
+test('alternate screen does not propose a local file preview', () => {
+ const h = panelHarness();
+ h.el('#preview-folder').files = [file('root/src/App.tsx', 'local')];
+ h.el('#preview-folder').handlers.change();
+ const reference = {...frame('src/App.tsx'), session:'pty-demo', epoch:1};
+ h.setFrame({...reference, screen:'alternate'});
+ h.click({preventDefault() { assert.fail('alternate screen owns the click'); }});
+ assert.equal(h.el('#file-preview').hidden, true);
+ h.setFrame({...reference, screen:'primary'});
+ h.click();
+ assert.equal(h.el('#file-preview').hidden, false);
+});
+test('Shift and Ctrl request an inert local preview while the primary screen tracks application mouse', async () => {
+ const h=panelHarness();
+ let reads=0;
+ const source=file('root/src/App.tsx','selected local source');
+ source.arrayBuffer=async()=>{reads++;return bytes('selected local source');};
+ h.el('#preview-folder').files=[source];
+ h.el('#preview-folder').handlers.change();
+ h.setFrame({...frame('src/App.tsx'),session:'pty-demo',epoch:1,screen:'primary',
+  mouse:{tracking:'button',generation:2}});
+ h.click();
+ assert.equal(h.el('#file-preview').hidden,true);
+ h.click({shiftKey:true});
+ assert.equal(h.el('#file-preview').hidden,false);
+ assert.equal(reads,0);
+ await h.el('#preview-confirm-local').handlers.click();
+ assert.equal(reads,1);
+});
+test('only complete references may touch frame row boundaries', () => {
+ const wrapped = {
+  cols:9,
+  rows:[frame('foo/bar/ ').rows[0], frame('README.md').rows[0], frame('  next.md').rows[0]],
+  row_wrapped:[true,true,false],
+ };
+ assert.equal(selectedPathAtCell(wrapped, 1, 2, ['README.md']), null);
+ assert.equal(selectedPathAtCell(wrapped, 2, 4, ['next.md']), 'next.md');
+ for (const row_wrapped of [[true,false,false], [false,true,false]]) {
+  assert.equal(selectedPathAtCell({...wrapped,row_wrapped}, 1, 2, ['README.md']), null);
+ }
+ assert.equal(selectedPathAtCell({...wrapped,row_wrapped:[false,false,false]}, 1, 2, ['README.md']), 'README.md');
 });
 test('valid read keeps confirmation panel visible while loading and clear cancels late result',async()=>{
  let resolve;const waiting=new Promise(r=>resolve=r),h=panelHarness();
@@ -269,4 +328,141 @@ test('Escape invalidates pending preview and late text cannot reopen sidebar',as
  h.el('#file-preview').handlers.keydown({key:'Escape',preventDefault(){},stopPropagation(){}});
  finish(bytes('text'));await reading;
  assert.equal(h.el('#file-preview').hidden,true);assert.equal(h.el('#preview-source').textContent,'');
+});
+
+test('confirmed source reference jumps within the selected file and exposes reported column', async () => {
+ const h = panelHarness();
+ h.el('#preview-folder').files = [file('root/src/App.tsx', 'one\r\ntwo\r\nthree\rfour')];
+ await h.el('#preview-folder').handlers.change();
+ h.setFrame({...frame('src/App.tsx:3:7'), session: 'pty-demo', epoch: 1});
+ h.click({clientX: 110});
+ assert.equal(h.el('#preview-details').textContent, 'Requested line 3 · reported column 7');
+ await h.el('#preview-confirm-local').handlers.click();
+ assert.equal(h.el('#preview-source').textContent, 'one\ntwo\nthree\\u{d}four');
+ assert.equal(h.el('#preview-line-status').textContent, 'Line 3 of 3 · reported column 7');
+ assert.equal(h.el('#preview-source').style['--preview-line-offset'], 2);
+ assert.ok(h.el('#preview-content').scrollTop > 0);
+ assert.equal(h.el('#preview-confirmation').hidden, true);
+
+ h.setFrame({...frame('src/App.tsx:30'), session: 'pty-demo', epoch: 1});
+ h.click();
+ await h.el('#preview-confirm-local').handlers.click();
+ assert.match(h.el('#preview-line-status').textContent, /Line 30 is outside/);
+ assert.equal(h.el('#preview-copy-line').disabled, true);
+ assert.equal(h.el('#preview-source').dataset.highlight, undefined);
+});
+
+test('literal occurrence navigation wraps within a line and across lines', async () => {
+ const copied = [];
+ const {doc, el} = previewDom({writeText(value) { copied.push(value); }});
+ installFilePreviewPanel(doc);
+ el('#preview-single').files = [{...file('', 'first [word] then [WORD] [word]\n雪 [Word]'), name:'source.md'}];
+ await el('#preview-single').handlers.change();
+ el('#preview-files').value = 'source.md';
+ await el('#preview-show').handlers.click();
+
+ const query = el('#preview-query'), source = el('#preview-source');
+ query.value = '[word]';
+ query.handlers.input();
+ assert.equal(el('#preview-matches').textContent, '2 matches');
+ assert.deepEqual(source.children.filter(node => node.tag === 'mark').map(mark => mark.textContent), ['[word]', '[word]']);
+ el('#preview-next').handlers.click();
+ assert.equal(el('#preview-matches').textContent, 'Match 1 of 2');
+ el('#preview-next').handlers.click();
+ assert.equal(el('#preview-matches').textContent, 'Match 2 of 2');
+ el('#preview-next').handlers.click();
+ assert.equal(el('#preview-matches').textContent, 'Match 1 of 2');
+
+ el('#preview-match-case').checked = false;
+ el('#preview-match-case').handlers.change();
+ assert.equal(el('#preview-matches').textContent, '4 matches');
+ el('#preview-prev').handlers.click();
+ assert.equal(el('#preview-matches').textContent, 'Match 3 of 4');
+ el('#preview-next').handlers.click();
+ assert.equal(el('#preview-line-status').textContent, 'Line 2 of 2');
+ assert.equal(source.children.find(mark => mark.classList?.contains('active')).textContent, '[Word]');
+ await el('#preview-copy-line').handlers.click();
+ await el('#preview-copy-text').handlers.click();
+ await el('#preview-copy-path').handlers.click();
+ assert.deepEqual(copied, ['雪 [Word]', source.textContent, 'source.md']);
+});
+
+test('find retains at most 4096 matches and a capped source remains navigable', async () => {
+ const h = panelHarness();
+ h.el('#preview-folder').files = [file('root/src/App.tsx', 'x'.repeat(4100) + '\n'.repeat(10000) + 'tail')];
+ await h.el('#preview-folder').handlers.change();
+ h.click();
+ await h.el('#preview-confirm-local').handlers.click();
+ const query = h.el('#preview-query');
+ query.value = 'x';
+ query.handlers.input();
+ assert.equal(h.el('#preview-matches').textContent, '4096+ matches');
+ assert.equal(h.el('#preview-source').children.filter(node => node.tag === 'mark').length, 4096);
+ h.el('#preview-line').value = '10001';
+ h.el('#preview-line-form').handlers.submit({preventDefault() {}});
+ assert.equal(h.el('#preview-line-status').textContent, 'Line 10001 of 10001');
+ assert.ok(h.el('#preview-content').scrollTop > 200000);
+ await h.el('#preview-copy-line').handlers.click();
+ assert.equal(h.el('#preview-copy-fallback').hidden, false);
+ assert.equal(h.el('#preview-copy-value').value, 'tail');
+ assert.equal(h.el('#preview-copy-value').selected, true);
+});
+
+test('reload reauthorizes the visible target and preserves navigation through success and failure', async () => {
+ const h = panelHarness();
+ const picker = h.el('#preview-folder'), reload = h.el('#preview-reload');
+ const source = h.el('#preview-source'), query = h.el('#preview-query');
+ picker.files = [file('root/src/App.tsx', 'hello hello\nold')];
+ await picker.handlers.change();
+ h.click();
+ await h.el('#preview-confirm-local').handlers.click();
+ query.value = 'hello';
+ query.handlers.input();
+ h.el('#preview-next').handlers.click();
+ h.el('#preview-next').handlers.click();
+ h.el('#preview-content').scrollLeft = 100;
+
+ reload.handlers.click();
+ assert.equal(picker.clicked, true);
+ let finish;
+ picker.files = [{...file('root/src/App.tsx', 'hello hello\nnew'), arrayBuffer: () => new Promise(resolve => { finish = resolve; })}];
+ const pending = picker.handlers.change();
+ assert.equal(source.textContent, 'hello hello\nold');
+ assert.equal(reload.disabled, true);
+ finish(bytes('hello hello\nnew'));
+ await pending;
+ assert.equal(source.textContent, 'hello hello\nnew');
+ assert.equal(query.value, 'hello');
+ assert.equal(h.el('#preview-matches').textContent, 'Match 2 of 2');
+ assert.equal(h.el('#preview-content').scrollLeft, 100);
+ assert.equal(reload.disabled, false);
+
+ reload.handlers.click();
+ picker.files = [{...file('root/src/App.tsx', ''), arrayBuffer: async () => { throw Error('Disk read failed.'); }}];
+ await picker.handlers.change();
+ assert.equal(source.textContent, 'hello hello\nnew');
+ assert.equal(h.el('#preview-matches').textContent, 'Match 2 of 2');
+ assert.match(h.el('#preview-panel-status').textContent, /Disk read failed.*previous snapshot/);
+
+ reload.handlers.click();
+ picker.files = [{...file('other/src/App.tsx', 'wrong'), arrayBuffer() { assert.fail('must not read a different folder'); }}];
+ await picker.handlers.change();
+ assert.equal(source.textContent, 'hello hello\nnew');
+ assert.match(h.el('#preview-panel-status').textContent, /Reselect.*src\/App\.tsx/);
+ h.el('#preview-clear').handlers.click();
+ assert.equal(source.textContent, '');
+});
+
+test('browser blob reads are sliced to the byte cap plus one before materializing data', async () => {
+ const h = setup();
+ const source = file('root/source.md', 'source');
+ source.arrayBuffer = () => assert.fail('unbounded arrayBuffer used directly');
+ source.slice = (start, end) => {
+  assert.equal(start, 0);
+  assert.equal(end, 256 * 1024 + 1);
+  return {arrayBuffer: async () => bytes('source')};
+ };
+ h.select([source]);
+ await h.show('source.md');
+ assert.equal(h.shown.at(-1).text, 'source');
 });

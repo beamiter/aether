@@ -39,18 +39,25 @@ test('mismatching decoder output is closed, rejected and not displayed',async()=
  let closed=0;const h=harness(async()=>({width:4097,height:1,close(){closed++;}}));h.select([file(png())]);await h.show('x.png');assert.equal(closed,1);assert.equal(h.shown.at(-1),null);assert.match(h.errors.at(-1),/dimensions/);
 });
 import {installFilePreviewPanel} from '../web/file-preview-panel.js';
+import {previewDom} from './support/preview-dom.js';
 test('panel image confirmation draws only admitted bitmap, clears canvas and rejects stale epoch',async()=>{
- const elements=new Map();let epoch=1,reads=0,closed=0,draws=0;
- const el=s=>{if(!elements.has(s))elements.set(s,{value:'',handlers:{},addEventListener(n,f){this.handlers[n]=f;},replaceChildren(){this.children=[];},append(x){this.children.push(x);},focus(){},getBoundingClientRect(){return {left:0,top:0,width:50,height:10};},getContext(){return {drawImage(){draws++;}};}});return elements.get(s);};
+ let epoch=1,reads=0,closed=0,draws=0;
+ const {doc,el}=previewDom({width:50,height:10,dpr:2,drawImage(){draws++;}});
  const old=globalThis.createImageBitmap;globalThis.createImageBitmap=async()=>({width:1,height:1,close(){closed++;}});
  try{
-  const h=installFilePreviewPanel({querySelector:el,createElement:()=>({})},{getEpoch:()=>epoch,getFrame:()=>({session:'pty-demo',epoch,cols:5,rows:[ [...'x.png'].map(text=>({text,width:1})) ]})});
+  const h=installFilePreviewPanel(doc,{getEpoch:()=>epoch,getFrame:()=>({session:'pty-demo',epoch,cols:5,rows:[ [...'x.png'].map(text=>({text,width:1})) ]})});
   const f=file(png());f.arrayBuffer=async()=>{reads++;return png();};
   el('#preview-folder').files=[f];el('#preview-folder').handlers.change();
   const click=()=>el('canvas').handlers.click({button:0,ctrlKey:true,currentTarget:el('canvas'),clientX:20,clientY:2,preventDefault(){}});
   click();assert.equal(reads,0);epoch=2;await el('#preview-confirm-local').handlers.click();assert.equal(reads,0);
   click();await el('#preview-confirm-local').handlers.click();assert.equal(reads,1);assert.equal(draws,1);assert.equal(closed,1);assert.equal(el('#preview-raster').hidden,false);
-  h.dismiss();assert.equal(el('#preview-raster').hidden,true);assert.equal(el('#preview-raster').width,1);
+  const raster=el('#preview-raster'),zoom=el('#preview-zoom');
+  assert.equal(zoom.value,'fit');assert.equal(raster.classList.contains('fit'),true);
+  assert.equal(el('#preview-details').textContent,'1 × 1 pixels');
+  zoom.value='400';zoom.handlers.change();
+  assert.equal(raster.classList.contains('fit'),false);assert.equal(raster.style.width,'2px');
+  assert.equal(raster.width,1);assert.equal(draws,1);
+  h.dismiss();assert.equal(raster.hidden,true);assert.equal(raster.width,1);
  }finally{globalThis.createImageBitmap=old;}
 });
 test('compressed PNG metadata and multi-picture JPEG APP2 never reach decode',()=>{

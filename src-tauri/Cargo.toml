@@ -5,6 +5,10 @@ edition = "2021"
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 [dependencies]
+dirs = "7.0"
+jterm_core = { git = "https://github.com/beamiter/jterm_core", rev = "f0107afaf631d29d06358abec3997f1b5712b627" }
+rusqlite = "=0.41.0"
+serde = { version = "1", features = ["derive"] }
 tauri = { version = "2", features = [] }
 tauri-terminal-frame-bridge = { path = "../bridge" }
 [workspace]

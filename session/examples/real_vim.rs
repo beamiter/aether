@@ -45,7 +45,11 @@ fn main() {
     std::fs::create_dir(&dir).unwrap();
     let file = dir.join("smoke.txt");
     let mut s = Session::spawn(24, 80).unwrap();
-    let cmd=format!("printf 'PRIMARY_SENTINEL\\n'; TERM=xterm {} -Nu NONE -n -i NONE {}; printf 'VIM_RETURNED\\n'\n",quote(vim.to_str().unwrap()),quote(file.to_str().unwrap()));
+    let cmd = format!(
+        "printf 'PRIMARY_SENTINEL\\n'; {} -Nu NONE -n -i NONE {}; printf 'VIM_RETURNED\\n'\n",
+        quote(vim.to_str().unwrap()),
+        quote(file.to_str().unwrap())
+    );
     send(&mut s, cmd.as_bytes());
     until(&mut s, "Vim alternate entry", |s| {
         s.terminal().frame().unwrap().stamp().screen == Screen::Alternate

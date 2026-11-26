@@ -25,11 +25,20 @@ pub struct WireFrame {
     pub layout: u32,
     pub cols: usize,
     pub rows: Vec<Vec<WireCell>>,
+    pub row_wrapped: Vec<bool>,
+    pub screen: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mouse: Option<WireMouse>,
     pub cursor_row: usize,
     pub cursor_col: usize,
     pub cursor_visible: bool,
     pub cursor_shape: &'static str,
     pub pending_wrap: bool,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct WireMouse {
+    pub tracking: &'static str,
+    pub generation: u32,
 }
 /// Resolve a host-owned immutable frame into paint-only values. No ANSI reaches JS.
 pub fn from_engine(frame: &CellFrame, session: &str, epoch: u32) -> Result<WireFrame, String> {
@@ -78,6 +87,12 @@ pub fn from_engine(frame: &CellFrame, session: &str, epoch: u32) -> Result<WireF
                     .collect()
             })
             .collect(),
+        row_wrapped: frame.rows().iter().map(|row| row.wrapped).collect(),
+        screen: match frame.stamp().screen {
+            Screen::Primary => "primary",
+            Screen::Alternate => "alternate",
+        },
+        mouse: None,
         cursor_row: frame.cursor().row,
         cursor_col: frame.cursor().col,
         cursor_visible: frame.cursor().visible,
@@ -214,6 +229,19 @@ impl DemoBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn row_wrapping_and_screen_identity_reach_the_wire() {
+        let mut terminal = jterm_headless_session_spike::Terminal::new(3, 4).unwrap();
+        terminal.feed(b"abcde").unwrap();
+        let frame = from_engine(&terminal.frame().unwrap(), "test", 1).unwrap();
+        assert_eq!(frame.screen, "primary");
+        assert_eq!(frame.row_wrapped, [true, false, false]);
+        terminal.feed(b"\x1b[?1049h").unwrap();
+        let alternate = from_engine(&terminal.frame().unwrap(), "test", 1).unwrap();
+        assert_eq!(alternate.screen, "alternate");
+        assert_eq!(alternate.row_wrapped, [false; 3]);
+    }
+
     #[test]
     fn cursor_shape_and_wrap_reach_wire_without_inference() {
         let mut terminal = jterm_headless_session_spike::Terminal::new(2, 4).unwrap();

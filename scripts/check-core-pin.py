@@ -19,10 +19,15 @@ assert re.fullmatch(r"[0-9a-f]{40}", revision), "core must use a full commit SHA
 for crate in ("session", "bridge"):
     dependency = read(f"{crate}/Cargo.toml")["dependencies"]["jterm_engine"]
     assert dependency["git"] == URL and dependency["rev"] == revision, crate
+workspace = read("src-tauri/Cargo.toml")["dependencies"]["jterm_core"]
+assert workspace["git"] == URL and workspace["rev"] == revision, "workspace core pin"
 for crate in ("session", "bridge", "src-tauri"):
-    engines = [p for p in read(f"{crate}/Cargo.lock")["package"] if p["name"] == "jterm_engine"]
-    assert len(engines) == 1, f"{crate}: expected one shared engine"
-    assert engines[0]["source"] == f"git+{URL}?rev={revision}#{revision}", crate
+    packages = read(f"{crate}/Cargo.lock")["package"]
+    names = ("jterm_engine", "jterm_core") if crate == "src-tauri" else ("jterm_engine",)
+    for name in names:
+        core = [p for p in packages if p["name"] == name]
+        assert len(core) == 1, f"{crate}: expected one {name}"
+        assert core[0]["source"] == f"git+{URL}?rev={revision}#{revision}", crate
 for crate, dependency, target in (
     ("bridge", "jterm-headless-session-spike", "session"),
     ("src-tauri", "tauri-terminal-frame-bridge", "bridge"),

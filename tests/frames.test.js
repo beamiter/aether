@@ -2,6 +2,17 @@ import test from 'node:test';import assert from 'node:assert/strict';import fs f
 import {acceptFull,paint} from '../web/frames.js';
 const demo=()=>JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
 test('accept actual Rust engine fixture and isolate external mutation',()=>{const raw=demo(),f=acceptFull(null,raw);raw.rows[0][0].text='X';assert.notEqual(f.rows[0][0].text,'X');assert.equal(f.cols,64);});
+test('mouse routing arrives as immutable frame metadata and rejects stale changes',()=>{
+ const before=acceptFull(null,demo());
+ assert.deepEqual(before.mouse,{tracking:'off',generation:1});
+ const raw={...demo(),revision:2,mouse:{tracking:'drag',generation:2}};
+ const after=acceptFull(before,raw);
+ raw.mouse.tracking='off';
+ assert.deepEqual(after.mouse,{tracking:'drag',generation:2});
+ for(const mouse of [null,{tracking:'invalid',generation:2},{tracking:'off',generation:0},{tracking:'off',generation:2}]){
+  assert.throws(()=>acceptFull(after,{...demo(),revision:3,mouse}),/mouse mode/);
+ }
+});
 test('reject foreign session/epoch, stale revisions and invalid sizes atomically',()=>{const old=acceptFull(null,demo());for(const change of [{session:'other'},{epoch:2},{revision:0},{revision:1},{revision:2,cols:0},{revision:2,cursor_col:999}]){assert.throws(()=>acceptFull(old,{...demo(),...change}));assert.equal(old.revision,1);}});
 test('reject malformed cells and non-advanced layout resize',()=>{for(const text of ['\x1b','xx','']){const f=demo();f.rows[0][0].text=text;assert.throws(()=>acceptFull(null,f));}const f=demo();f.revision=2;f.rows.pop();assert.throws(()=>acceptFull(acceptFull(null,demo()),f));});
 test('paint uses cell-local canvas operations, no terminal interpretation',()=>{let texts=0;const g={scale(){},fillRect(){},save(){},beginPath(){},rect(){},clip(){},fillText(){texts++},restore(){},strokeRect(){}};const canvas={style:{},getContext:()=>g};paint(canvas,acceptFull(null,demo()),2);assert.equal(texts,512);assert.equal(canvas.width,1536);});
@@ -26,6 +37,18 @@ test('actual Rust Unicode frame keeps two-column paint and styled colors',()=>{
  assert.ok(calls.some(c=>c[0]==='glyph'&&c[1]==='D'&&c[3]===0.5));
 });
 test('reject inconsistent wide-pair geometry atomically',()=>{for(const mutate of [f=>f.rows[0][0].width=0,f=>f.rows[0][0].width=2,f=>f.rows[0][63].width=2,f=>f.rows[0][0].style=32]){const f=demo();mutate(f);assert.throws(()=>acceptFull(null,f));}});
+test('selection metadata is validated, immutable, and compatible with legacy frames',()=>{
+ const legacy=acceptFull(null,demo());
+ assert.equal(legacy.screen,'primary');assert.ok(legacy.row_wrapped.every(value=>value===false));
+ const raw={...demo(),screen:'alternate',row_wrapped:Array(legacy.rows.length).fill(true)};
+ const frame=acceptFull(null,raw);
+ raw.row_wrapped[0]=false;
+ assert.equal(frame.screen,'alternate');assert.equal(frame.row_wrapped[0],true);
+ assert.throws(()=>acceptFull(null,{...raw,screen:'other'}),/screen/);
+ for(const rows of [[],new Array(legacy.rows.length),Array(legacy.rows.length).fill(1)]){
+  assert.throws(()=>acceptFull(null,{...raw,row_wrapped:rows}),/row wrapping/);
+ }
+});
 test('Rust cursor shapes paint at exact cell geometry and invalid shapes reject',()=>{const raw=demo();raw.cursor_row=2;raw.cursor_col=3;for(const shape of ['block','beam','underline']){const fills=[],strokes=[];const g={scale(){},fillRect(...x){fills.push(x)},save(){},beginPath(){},rect(){},clip(){},fillText(){},restore(){},strokeRect(...x){strokes.push(x)}};paint({style:{},getContext:()=>g},acceptFull(null,{...raw,cursor_shape:shape}));if(shape==='block')assert.deepEqual(strokes.at(-1),[36.5,48.5,11,23]);if(shape==='beam')assert.deepEqual(fills.at(-1),[36,48,2,24]);if(shape==='underline')assert.deepEqual(fills.at(-1),[36,70,12,2]);}assert.throws(()=>acceptFull(null,{...raw,cursor_shape:'invalid'}));assert.throws(()=>acceptFull(null,{...raw,pending_wrap:1}));});
 
 

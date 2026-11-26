@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {createFilePreview} from '../web/file-preview.js';
 import {installFilePreviewPanel} from '../web/file-preview-panel.js';
+import {previewDom} from './support/preview-dom.js';
 
 test('owned disk text fixtures verify byte caps and visible panel errors',async()=>{
  const dir=await fs.mkdtemp(path.join(os.tmpdir(),'aether-cap-owned-'));
@@ -31,9 +32,8 @@ test('owned disk text fixtures verify byte caps and visible panel errors',async(
   await loader.show('changed.md');assert.equal(reads.get('changed.md'),1);assert.equal(shown.at(-1),null);
   assert.equal(errors.at(-1),'Preview exceeds the 256 KiB text limit.');
   // Real installer, model DOM: this is not a WebKit/window acceptance test.
-  const nodes=new Map();
-  const el=s=>{if(!nodes.has(s))nodes.set(s,{value:'',textContent:'',handlers:{},addEventListener(n,f){this.handlers[n]=f;},replaceChildren(){this.children=[];},append(x){this.children.push(x);}});return nodes.get(s);};
-  installFilePreviewPanel({querySelector:el,createElement:()=>({})});
+  const {doc,el}=previewDom();
+  installFilePreviewPanel(doc);
   el('#preview-folder').files=[small,large];el('#preview-folder').handlers.change();
   el('#preview-files').value='100.md';await el('#preview-show').handlers.click();
   assert.equal(el('#preview-source').textContent.length,102400);

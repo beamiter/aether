@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   contracts:
-    name: Contracts, real PTY and Linux build
+    name: Contracts, PTY and WebKit smoke
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -34,7 +34,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
             build-essential pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev \
-            librsvg2-dev libxdo-dev libssl-dev vim
+            librsvg2-dev libxdo-dev libssl-dev ncurses-bin vim \
+            dbus-daemon xauth xvfb
       - name: Install pinned official Rust toolchain
         run: rustup toolchain install 1.100.0 --profile minimal --component clippy,rustfmt
       - name: Verify core and local dependency paths
@@ -50,7 +51,12 @@ jobs:
             cargo test --locked --manifest-path "$crate/Cargo.toml"
             cargo clippy --locked --manifest-path "$crate/Cargo.toml" --all-targets -- -D warnings
           done
-      - name: Real Vim PTY smoke (not GUI or IME)
+      - name: Real Vim with the default terminal profile
         run: cargo run --locked --manifest-path session/Cargo.toml --example real_vim -- /usr/bin/vim
-      - name: Compile Linux desktop executable (no window launch)
-        run: cargo build --locked --manifest-path src-tauri/Cargo.toml
+      - name: Compile Linux desktop executable
+        run: cargo build --locked --manifest-path src-tauri/Cargo.toml --bins --examples
+      - name: Smoke test the mapped Tauri window
+        timeout-minutes: 3
+        run: |
+          xvfb-run -a -s '-screen 0 1280x1024x24' dbus-run-session -- \
+            timeout 55s "$CARGO_TARGET_DIR/debug/examples/native_smoke"

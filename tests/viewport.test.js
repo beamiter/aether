@@ -1,11 +1,28 @@
 import test from 'node:test';import assert from 'node:assert/strict';
-import {dimensions,resizeQueue,cursorTarget} from '../web/viewport.js';
+import {dimensions,resizeQueue,cursorTarget,viewportDimensions} from '../web/viewport.js';
 const tick=()=>new Promise(r=>setImmediate(r));
 test('sizes reject zero/fraction/overflow and preserve exact legal endpoints',()=>{for(const [rows,cols] of [[0,1],[1,0],[129,1],[1,257],[2.5,2],[NaN,2],[1,Infinity]])assert.throws(()=>dimensions(rows,cols));assert.deepEqual(dimensions(1,1),{rows:1,cols:1});assert.deepEqual(dimensions(128,256),{rows:128,cols:256});});
 test('resize pressure retains at most active plus newest pending request',async()=>{let resolve;const calls=[],done=[];const queue=resizeQueue({getEpoch:()=>1,invoke:(_,a)=>{calls.push(a);return new Promise(r=>resolve=r);},onDone:s=>done.push(s),onError:assert.fail});const first=queue.request(2,3);for(let n=4;n<100;n++)queue.request(2,n);assert.equal(calls.length,1);resolve();await tick();assert.equal(calls.length,2);assert.equal(calls[1].cols,99);resolve();await first;assert.deepEqual(done,[{rows:2,cols:99}]);});
 test('old resize epoch cannot block or report into new session',async()=>{let epoch=1;const pending=[],done=[],errors=[];const queue=resizeQueue({getEpoch:()=>epoch,invoke:(_,a)=>new Promise((resolve,reject)=>pending.push({a,resolve,reject})),onDone:s=>done.push(s),onError:e=>errors.push(e)});const old=queue.request(2,3);epoch=2;const fresh=queue.request(4,5);pending[1].resolve();await fresh;pending[0].reject(Error('old'));await old;assert.deepEqual(done,[{rows:4,cols:5}]);assert.deepEqual(errors,[]);});
 test('resize failure without newer intent stops instead of retrying uncertain kernel operations',async()=>{let reject;let calls=0;const errors=[];const queue=resizeQueue({getEpoch:()=>1,invoke:()=>{calls++;return new Promise((_,r)=>reject=r)},onDone:assert.fail,onError:e=>errors.push(e)});const p=queue.request(2,3);reject(Error('ioctl'));await p;assert.equal(calls,1);assert.equal(errors.length,1);});
 test('show cursor target uses canvas offset inside positioned scroll viewport and clamps edges',()=>{assert.deepEqual(cursorTarget({cursor_col:0,cursor_row:0},{offsetLeft:12,offsetTop:40},{clientWidth:100,clientHeight:100,scrollWidth:400,scrollHeight:400}),{left:0,top:0});assert.deepEqual(cursorTarget({cursor_col:255,cursor_row:127},{offsetLeft:12,offsetTop:40},{clientWidth:100,clientHeight:100,scrollWidth:400,scrollHeight:400}),{left:300,top:300});});
+
+test('viewport fitting excludes borders, padding and its reserved vertical scrollbar',()=>{
+ const viewport={offsetWidth:1001,clientWidth:984,clientHeight:393,getBoundingClientRect:()=>({width:1001,height:410})};
+ const style={borderLeftWidth:'1px',borderRightWidth:'1px',borderTopWidth:'1px',borderBottomWidth:'1px',paddingLeft:'12px',paddingRight:'12px',paddingTop:'12px',paddingBottom:'12px'};
+ assert.deepEqual(viewportDimensions(viewport,style),{rows:16,cols:80});
+ // Transient horizontal overflow from the previous grid does not remove a row.
+ viewport.clientHeight=408;
+ assert.deepEqual(viewportDimensions(viewport,style),{rows:16,cols:80});
+});
+
+test('viewport fitting clamps narrow and large grids and skips hidden geometry',()=>{
+ const viewport=(width,height)=>({offsetWidth:width,clientWidth:width,getBoundingClientRect:()=>({width,height})});
+ assert.deepEqual(viewportDimensions(viewport(4,8),{}),{rows:1,cols:1});
+ assert.deepEqual(viewportDimensions(viewport(9000,9000),{}),{rows:128,cols:256});
+ assert.equal(viewportDimensions(viewport(0,0),{}),null);
+ assert.equal(viewportDimensions(viewport(120,240),undefined),null);
+});
 
 function deferred(){let resolve,reject;const promise=new Promise((a,b)=>{resolve=a;reject=b});return {promise,resolve,reject};}
 function fixture(){
