@@ -280,6 +280,23 @@ There are three independent Cargo manifests, not a root Cargo workspace.
 `../web`. Internal crate/package identifiers remain those of the imported lab;
 they are not additional terminal engines.
 
+### User install
+
+Install and launch Aether after setting up Rust and the system libraries above.
+
+```sh
+./scripts/install.sh
+~/.local/bin/aether
+```
+
+The installer builds the desktop and SSH helper with their locked Cargo
+dependencies and puts `aether` and `aether-terminal-host` in `~/.local/bin`.
+It registers an **Aether Terminal** desktop entry and icon. Use
+`--no-desktop` for a binary-only install, `--prefix` or `--bin-dir` for a
+custom location, or `--dry-run` to preview the commands. For a prebuilt
+pair, pass `--binary PATH` with `aether-terminal-host` beside that binary
+or specify the helper with `--host-binary PATH`.
+
 ### Debian candidate package
 
 On a Debian or Ubuntu build host with the same prerequisites, build the desktop
