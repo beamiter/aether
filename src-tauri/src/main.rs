@@ -48,7 +48,11 @@ async fn open_shell<R: tauri::Runtime>(
     require_terminal_window(&window)?;
     let format = SnapshotFormat::negotiate(frame_version)?;
     let integrated = integrated.unwrap_or(false);
-    let history = HistoryRequest::new(integrated, pane_history_id, window.path().app_data_dir().ok())?;
+    let history = HistoryRequest::new(
+        integrated,
+        pane_history_id,
+        window.path().app_data_dir().ok(),
+    )?;
     let shared = bridge.inner().clone();
     let weak = Arc::downgrade(&shared);
     run_bridge(shared, move |bridge| {
@@ -97,7 +101,11 @@ async fn activate_local_tab<R: tauri::Runtime>(
     require_terminal_window(&window)?;
     let format = SnapshotFormat::negotiate(frame_version)?;
     let integrated = integrated.unwrap_or(false);
-    let history = HistoryRequest::new(integrated, pane_history_id, window.path().app_data_dir().ok())?;
+    let history = HistoryRequest::new(
+        integrated,
+        pane_history_id,
+        window.path().app_data_dir().ok(),
+    )?;
     let shared = bridge.inner().clone();
     let weak = Arc::downgrade(&shared);
     run_bridge(shared, move |bridge| {

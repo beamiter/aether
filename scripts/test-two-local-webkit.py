@@ -1233,6 +1233,8 @@ def exercise_command_blocks(driver, owned, output_review=False, *, read_clipboar
               command: card.querySelector('code').textContent,
               body: card.textContent,
               output: card.querySelector('textarea')?.value ?? null,
+              output_surface: Boolean(card.querySelector('[aria-label="Command output"]')),
+              empty_output: Array.from(card.querySelectorAll('p')).some(p => p.textContent === 'No output.'),
               source: card.querySelector('.command-block-output-source')?.textContent ?? null,
               open: card.open,
             }));
@@ -1346,7 +1348,8 @@ def exercise_command_blocks(driver, owned, output_review=False, *, read_clipboar
     wait_for(ready_prompt, "Vim did not return to the live jsh prompt")
     driver.click("#command-block-toggle")
     fullscreen = refresh_for(editor)
-    assert fullscreen["output"] == "" and "AETHER_NATIVE_VIM" not in fullscreen["body"], fullscreen
+    assert fullscreen["empty_output"] and not fullscreen["output_surface"], fullscreen
+    assert "Exit 0" in fullscreen["body"] and "AETHER_NATIVE_VIM" not in fullscreen["body"], fullscreen
     driver.click("#command-block-return")
 
     driver.click("#new-local-tab")
