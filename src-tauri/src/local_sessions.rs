@@ -11,7 +11,7 @@ use std::{
     sync::{Mutex, Weak},
 };
 pub(crate) use stream::{Counter, ObserverTarget, StreamEvent};
-use stream::{Delivery, LocalStream, PeerUpdate, Receipt};
+use stream::{Delivery, LocalStream, PeerUpdate, Receipt, MAX_OBSERVERS};
 use tauri::ipc::Channel;
 use tauri_terminal_frame_bridge::{
     live::{CloseStatus, LiveBridge},
@@ -587,14 +587,14 @@ impl LocalSessions {
         if self.stream.is_some() || bridge.has_unacknowledged_frame() {
             return Err("recover the local view before subscribing again".into());
         }
-        self.validate_observer(&owner, observer)?;
+        self.validate_observers(&owner, observer.as_slice())?;
         self.ensure_worker(shared)?;
         self.registry
             .reader(&owner.session)?
             .bridge
             .enable_inline_graphics(format);
         let mut stream = LocalStream::new(owner, sink, format);
-        stream.set_observer(observer);
+        stream.set_observers(observer.as_slice());
         self.stream = Some(stream);
         self.worker.as_ref().unwrap().wake();
         Ok(())
@@ -623,21 +623,17 @@ impl LocalSessions {
 
     fn pump_terminals(&mut self) -> (bool, Option<Delivery>) {
         let detached = self.pump_detached();
-        let preview = self
-            .stream
-            .as_ref()
-            .and_then(|stream| {
-                stream
-                    .observe_next()
-                    .map(|observation| (observation, stream.format))
-            })
-            .and_then(|((target, revision), format)| {
+        let preview = self.stream.as_ref().and_then(|stream| {
+            stream.observations().find_map(|(target, revision)| {
                 self.retained_bridge(target.epoch)
-                    .and_then(|bridge| bridge.observe_channel_frame(target.epoch, revision, format))
+                    .and_then(|bridge| {
+                        bridge.observe_channel_frame(target.epoch, revision, stream.format)
+                    })
                     .ok()
                     .flatten()
                     .map(|(revision, frame)| {
                         (
+                            target,
                             revision,
                             PeerUpdate {
                                 layout: target.layout,
@@ -645,7 +641,8 @@ impl LocalSessions {
                             },
                         )
                     })
-            });
+            })
+        });
         let Some(stream) = self.stream.as_mut() else {
             let active = self
                 .registry
@@ -667,13 +664,21 @@ impl LocalSessions {
         (active || detached, delivery)
     }
 
-    fn validate_observer(
+    fn validate_observers(
         &self,
         owner: &Attachment,
-        observer: Option<ObserverTarget>,
+        targets: &[ObserverTarget],
     ) -> Result<(), String> {
-        if let Some(target) = observer {
-            if target.epoch == owner.epoch || target.layout == 0 {
+        if targets.len() > MAX_OBSERVERS {
+            return Err("too many split pane observations".into());
+        }
+        for (index, target) in targets.iter().enumerate() {
+            if target.epoch == owner.epoch
+                || target.layout == 0
+                || targets[..index].iter().any(|previous| {
+                    previous.epoch == target.epoch || previous.layout == target.layout
+                })
+            {
                 return Err("invalid split pane observation".into());
             }
             self.target_for_epoch(target.epoch)?;
@@ -681,23 +686,23 @@ impl LocalSessions {
         Ok(())
     }
 
-    pub(crate) fn set_observer(
+    pub(crate) fn set_observers(
         &mut self,
         owner: &Attachment,
         stream_id: u32,
-        target: Option<ObserverTarget>,
+        targets: &[ObserverTarget],
     ) -> Result<(), String> {
         self.registry
             .reader(&owner.session)?
             .bridge
             .validate_attachment(owner)?;
-        self.validate_observer(owner, target)?;
+        self.validate_observers(owner, targets)?;
         let stream = self
             .stream
             .as_mut()
             .filter(|stream| stream.owner == *owner && stream.id() == stream_id)
             .ok_or("stale local stream")?;
-        stream.set_observer(target);
+        stream.set_observers(targets);
         self.worker.as_ref().unwrap().wake();
         Ok(())
     }

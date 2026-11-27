@@ -18,6 +18,53 @@ use tauri_terminal_frame_bridge::{
 pub(crate) type StreamEvent = protocol_v4::StreamEvent<LocalShellStatus>;
 
 const HEARTBEAT: Duration = Duration::from_secs(2);
+pub(super) const MAX_OBSERVERS: usize = 2;
+
+type ObserverCursor = (ObserverTarget, Option<Counter>);
+pub(super) type Preview = (ObserverTarget, Counter, PeerUpdate);
+
+#[derive(Default)]
+struct Observers {
+    cursors: Vec<ObserverCursor>,
+    next: usize,
+}
+
+impl Observers {
+    fn set(&mut self, targets: &[ObserverTarget]) {
+        if self.cursors.iter().map(|(target, _)| target).eq(targets) {
+            return;
+        }
+        self.cursors = targets
+            .iter()
+            .map(|target| {
+                let revision = self
+                    .cursors
+                    .iter()
+                    .find(|(old, _)| old == target)
+                    .and_then(|(_, revision)| *revision);
+                (*target, revision)
+            })
+            .collect();
+        self.next = 0;
+    }
+
+    fn candidates(&self) -> impl Iterator<Item = ObserverCursor> + '_ {
+        let count = self.cursors.len();
+        (0..count).map(move |offset| self.cursors[(self.next + offset) % count])
+    }
+
+    fn published(&mut self, target: ObserverTarget, revision: Counter) {
+        if let Some((index, (_, cursor))) = self
+            .cursors
+            .iter_mut()
+            .enumerate()
+            .find(|(_, (old, _))| *old == target)
+        {
+            *cursor = Some(revision);
+            self.next = (index + 1) % self.cursors.len();
+        }
+    }
+}
 
 pub(super) struct Delivery {
     sink: Channel<StreamEvent>,
@@ -46,8 +93,7 @@ pub(super) struct LocalStream {
     last_sent: Instant,
     error: Option<String>,
     stopped: bool,
-    observer: Option<ObserverTarget>,
-    observer_revision: Option<Counter>,
+    observers: Observers,
 }
 
 impl LocalStream {
@@ -68,8 +114,7 @@ impl LocalStream {
             last_sent: Instant::now(),
             error: None,
             stopped: false,
-            observer: None,
-            observer_revision: None,
+            observers: Observers::default(),
         }
     }
 
@@ -77,22 +122,18 @@ impl LocalStream {
         self.sink.id()
     }
 
-    pub(super) fn set_observer(&mut self, target: Option<ObserverTarget>) {
-        if self.observer != target {
-            self.observer = target;
-            self.observer_revision = None;
-        }
+    pub(super) fn set_observers(&mut self, targets: &[ObserverTarget]) {
+        self.observers.set(targets);
     }
 
-    pub(super) fn observe_next(&self) -> Option<(ObserverTarget, Option<Counter>)> {
-        if self.stopped
-            || self.pending.is_some()
-            || self.error.is_some()
-            || self.failed.load(Ordering::Relaxed)
-        {
-            return None;
-        }
-        self.observer.map(|target| (target, self.observer_revision))
+    pub(super) fn observations(&self) -> impl Iterator<Item = ObserverCursor> + '_ {
+        let can_send = !self.stopped
+            && self.pending.is_none()
+            && self.error.is_none()
+            && !self.failed.load(Ordering::Relaxed);
+        self.observers
+            .candidates()
+            .take(if can_send { MAX_OBSERVERS } else { 0 })
     }
 
     pub(super) fn acknowledge(
@@ -117,7 +158,7 @@ impl LocalStream {
     pub(super) fn pump(
         &mut self,
         bridge: &mut LiveBridge,
-        preview: Option<(Counter, PeerUpdate)>,
+        preview: Option<Preview>,
     ) -> (bool, Option<Delivery>) {
         let epoch = self.owner.epoch;
         if self.stopped || self.failed.load(Ordering::Relaxed) {
@@ -148,7 +189,7 @@ impl LocalStream {
     fn poll(
         &mut self,
         bridge: &mut LiveBridge,
-        preview: Option<(Counter, PeerUpdate)>,
+        preview: Option<Preview>,
     ) -> Result<(bool, Option<Delivery>), String> {
         let frame = bridge.poll_channel_frame(self.owner.epoch, self.sequence == 0, self.format)?;
         // An initial publication can be deferred under encoder pressure. Do
@@ -178,8 +219,8 @@ impl LocalStream {
         });
         self.last_status = Some(status.clone());
         self.last_sent = now;
-        if let Some((revision, _)) = &preview {
-            self.observer_revision = Some(*revision);
+        if let Some((target, revision, _)) = &preview {
+            self.observers.published(*target, *revision);
         }
         Ok((
             ready,
@@ -187,7 +228,7 @@ impl LocalStream {
                 owner: self.owner.clone(),
                 sequence,
                 frame: frame.map(|(_, frame)| frame),
-                preview: preview.map(|(_, frame)| Box::new(frame)),
+                preview: preview.map(|(_, _, frame)| Box::new(frame)),
                 status,
             })),
         ))
@@ -216,10 +257,185 @@ impl LocalStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::local_sessions::LocalSessions;
+    use crate::local_sessions::{LocalSessions, TabActivation};
     use serde_json::Value;
     use std::sync::{mpsc, Mutex};
     use tauri::ipc::InvokeResponseBody;
+
+    #[test]
+    fn observers_rotate_fairly_and_keep_independent_publication_revisions() {
+        let first = ObserverTarget {
+            epoch: 1,
+            layout: 20,
+        };
+        let second = ObserverTarget {
+            epoch: 2,
+            layout: 21,
+        };
+        let new_surface = ObserverTarget {
+            epoch: 2,
+            layout: 22,
+        };
+        let high = Counter::new(999).unwrap();
+        let low = Counter::new(3).unwrap();
+        let order = |set: &Observers| {
+            set.candidates()
+                .map(|(target, revision)| (target.epoch, target.layout, revision))
+                .collect::<Vec<_>>()
+        };
+        let mut set = Observers::default();
+        assert!(order(&set).is_empty());
+        set.set(&[first, second]);
+        assert_eq!(order(&set), [(1, 20, None), (2, 21, None)]);
+        set.published(first, high);
+        assert_eq!(order(&set), [(2, 21, None), (1, 20, Some(high))]);
+        set.published(second, low);
+        assert_eq!(order(&set), [(1, 20, Some(high)), (2, 21, Some(low))]);
+        set.published(first, high);
+        set.set(&[first, second]);
+        assert_eq!(order(&set)[0], (2, 21, Some(low)));
+        set.set(&[new_surface, first]);
+        assert_eq!(order(&set), [(2, 22, None), (1, 20, Some(high))]);
+    }
+
+    #[test]
+    fn two_retained_ptys_share_one_delivery_credit_and_never_gain_input() {
+        let local = Arc::new(Mutex::new(LocalSessions::default()));
+        let shared = Arc::downgrade(&local);
+        let mut sessions = local.lock().unwrap();
+        let first = sessions
+            .open(false, SnapshotFormat::Channel, None, shared.clone())
+            .unwrap()
+            .owner;
+        let mut add_tab = |owner: &Attachment| {
+            let attached = sessions
+                .activate_tab(
+                    Some(owner),
+                    None,
+                    TabActivation {
+                        preserve_input: true,
+                        integrated: false,
+                        format: SnapshotFormat::Channel,
+                        history: None,
+                    },
+                    shared.clone(),
+                )
+                .unwrap()
+                .view;
+            let tauri_terminal_frame_bridge::LocalSnapshot::Channel(frame) = attached.frame else {
+                panic!("v4 tab activation did not return a snapshot");
+            };
+            let frame: protocol_v4::Update = serde_json::from_str(&frame).unwrap();
+            sessions
+                .acknowledge_frame(&attached.owner, frame.revision().get())
+                .unwrap();
+            attached.owner
+        };
+        let second = add_tab(&first);
+        let active = add_tab(&second);
+        let first_target = ObserverTarget {
+            epoch: first.epoch,
+            layout: 71,
+        };
+        let second_target = ObserverTarget {
+            epoch: second.epoch,
+            layout: 72,
+        };
+        let (send, receive) = mpsc::channel();
+        let channel = Channel::new(move |body| {
+            if let InvokeResponseBody::Json(json) = body {
+                send.send(serde_json::from_str::<Value>(&json).unwrap())
+                    .unwrap();
+            }
+            Ok(())
+        });
+        let id = channel.id();
+        sessions
+            .subscribe(
+                active.clone(),
+                channel,
+                None,
+                SnapshotFormat::Channel,
+                shared,
+            )
+            .unwrap();
+        sessions
+            .set_observers(&active, id, &[first_target, second_target])
+            .unwrap();
+        assert!(sessions
+            .set_observers(&active, id, &[first_target, first_target])
+            .is_err());
+        assert!(sessions
+            .set_observers(&active, id, &[first_target, second_target, first_target])
+            .is_err());
+        assert!(sessions
+            .set_observers(
+                &active,
+                id,
+                &[ObserverTarget {
+                    epoch: active.epoch,
+                    layout: 73
+                }]
+            )
+            .is_err());
+        assert!(sessions
+            .set_observers(&first, id, &[second_target])
+            .is_err());
+        assert!(sessions.input(&first, |_, _| Ok(())).is_err());
+        assert!(sessions.input(&second, |_, _| Ok(())).is_err());
+        assert!(sessions.input(&active, |_, _| Ok(())).is_ok());
+        drop(sessions);
+
+        let mut seen = Vec::new();
+        for sequence in 1..=6 {
+            let event = receive.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(event["owner"]["epoch"], active.epoch);
+            assert_eq!(event["sequence"], sequence.to_string());
+            if let Some(preview) = event["preview"].as_object() {
+                let layout = preview["layout"].as_u64().unwrap();
+                let frame: Value =
+                    serde_json::from_str(preview["frame"].as_str().unwrap()).unwrap();
+                let expected = if layout == 71 {
+                    &first
+                } else {
+                    assert_eq!(layout, 72);
+                    &second
+                };
+                assert_eq!(frame["stamp"]["epoch"], expected.epoch.to_string());
+                assert_eq!(frame["stamp"]["session"], expected.session);
+                if !seen.contains(&layout) {
+                    seen.push(layout);
+                }
+            }
+            assert!(
+                receive.recv_timeout(Duration::from_millis(35)).is_err(),
+                "second envelope before acknowledgement"
+            );
+            let revision = event["frame"].as_str().map(|raw| {
+                serde_json::from_str::<protocol_v4::Update>(raw)
+                    .unwrap()
+                    .revision()
+            });
+            local
+                .lock()
+                .unwrap()
+                .acknowledge_stream(&active, id, Counter::new(sequence).unwrap(), revision)
+                .unwrap();
+            if seen.len() == 2 {
+                break;
+            }
+        }
+
+        let mut sessions = local.lock().unwrap();
+        for owner in [&first, &second, &active] {
+            sessions.close(owner).unwrap();
+        }
+        assert_eq!(
+            seen,
+            [71, 72],
+            "both retained PTYs must publish a preview in order"
+        );
+    }
 
     #[test]
     fn a_slow_channel_holds_one_issued_frame_while_a_real_pty_drains() {

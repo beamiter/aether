@@ -222,7 +222,23 @@ async fn set_local_observer<R: tauri::Runtime>(
 ) -> Result<(), String> {
     require_terminal_window(&window)?;
     run_bridge(bridge.inner().clone(), move |bridge| {
-        bridge.set_observer(&owner, stream_id, observer)
+        bridge.set_observers(&owner, stream_id, observer.as_slice())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn set_local_observers<R: tauri::Runtime>(
+    window: tauri::WebviewWindow<R>,
+    owner: Attachment,
+    stream_id: u32,
+    observers: [Option<local_sessions::ObserverTarget>; 2],
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
+) -> Result<(), String> {
+    require_terminal_window(&window)?;
+    run_bridge(bridge.inner().clone(), move |bridge| {
+        let observers = observers.into_iter().flatten().collect::<Vec<_>>();
+        bridge.set_observers(&owner, stream_id, &observers)
     })
     .await
 }
@@ -639,6 +655,7 @@ fn application<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<
             subscribe_local_shell,
             observe_local_shell,
             set_local_observer,
+            set_local_observers,
             ack_local_stream,
             open_terminal_hyperlink,
             copy_terminal_text,
