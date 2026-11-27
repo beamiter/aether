@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {acceptChannelFrame, acceptHistoryProjection, CHANNEL_FRAME_VERSION, CHANNEL_PACKED_VERSION} from '../web/frames-v4.js';
+import {paint} from '../web/frames.js';
 import {packedRow} from './fixtures/packed-channel.js';
 
 const owner = {session: 'packed', epoch: 1, generation: 1};
@@ -33,6 +34,31 @@ test('packed rows expand to the same glyphs, widths, colors and resources as v6 
   assert.equal(moved.rows[1],compact.rows[0]);
   assert.equal(moved.hyperlinks[23],linked.target);
   assert.equal(moved.images[image.id],compact.images[image.id]);
+});
+
+test('changing a packed continuation background restores its complete wide glyph and cursor',()=>{
+  const wideRow = {wrapped:false,cells:[cell,cell,cell,wide,half]};
+  const initial = accept(null,{...snapshot,rows:[packedRow(wideRow)],images:[],hyperlinks:[]});
+  const changed = {...wideRow,cells:[...wideRow.cells.slice(0,-1),{...half,background:'#445566'}]};
+  const update = (base, revision, row) => accept(base,{kind:'delta',base_revision:base.revision,
+    stamp:{...snapshot.stamp,revision},rows:[{index:0,row:packedRow(row)}]});
+  const next = update(initial,'2',changed);
+  const clears = [], glyphs = [], fills = [];
+  const context = {setTransform(){},save(){},beginPath(){},rect(){},clip(){},restore(){},
+    clearRect(...rect){clears.push(rect);},fillText(...glyph){glyphs.push(glyph);},
+    fillRect(...rect){fills.push([this.fillStyle,...rect]);}};
+  const canvas = {style:{},getContext:()=>context};
+  paint(canvas,initial,1);
+  clears.length = glyphs.length = fills.length = 0;
+  paint(canvas,next,1);
+  assert.deepEqual(clears,[[36,0,24,24]]);
+  assert.deepEqual(glyphs,[['界',36,2]]);
+  assert.deepEqual(fills,[['#222222',36,0,12,24],['#445566',48,0,12,24],['#9ac6ff',48,0,2,24]]);
+  clears.length = glyphs.length = fills.length = 0;
+  const rewrapped = update(next,'3',{...changed,wrapped:true});
+  assert.equal(rewrapped.rows[0].wrapped,true);
+  paint(canvas,rewrapped,1);
+  assert.deepEqual([clears,glyphs,fills],[[],[],[]]);
 });
 
 test('packed rows enforce width, style references, grapheme bytes and scalar validity',()=>{

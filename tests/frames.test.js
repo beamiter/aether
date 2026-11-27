@@ -217,7 +217,7 @@ function deltaFrom(base, fields={}) {
   revision:base.revision+1,rows:[],...fields}});
 }
 
-test('validated row deltas repaint only changed rows and the rows affected by the cursor',()=>{
+test('validated row deltas repaint changed cells and the old and new cursor footprints',()=>{
  const {canvas,g,writes}=observedCanvas();
  const initial=smallPaintFrame({cols:2,rows:4});
  paint(canvas,initial,1.25);
@@ -235,17 +235,38 @@ test('validated row deltas repaint only changed rows and the rows affected by th
 
  const moved=deltaFrom(next,{cursor_row:3});
  paint(canvas,moved,1.25);
- assert.deepEqual(clears.splice(0),[[0,0,30,30],[0,90,30,30]]);
- assert.deepEqual(texts.splice(0),[[0,2],[12,2],[0,74],[12,74]]);
+ assert.deepEqual(clears.splice(0),[[0,0,15,30],[0,90,15,30]]);
+ assert.deepEqual(texts.splice(0),[[0,2],[0,74]]);
  assert.deepEqual(cursors.splice(0),[[.5,72.5,11,23]]);
 
  const hidden=deltaFrom(moved,{cursor_visible:false});
  paint(canvas,hidden,1.25);
- assert.deepEqual(clears.splice(0),[[0,90,30,30]]);
- assert.deepEqual(texts.splice(0),[[0,74],[12,74]]);
+ assert.deepEqual(clears.splice(0),[[0,90,15,30]]);
+ assert.deepEqual(texts.splice(0),[[0,74]]);
  paint(canvas,deltaFrom(hidden,{pending_wrap:true,cursor_row:1}),1.25);
  assert.deepEqual([clears,texts,cursors],[[],[],[]]);
  assert.deepEqual(writes,[['width',30],['height',120]]);
+});
+
+test('horizontal cell damage requires aligned backing pixels',()=>{
+ const initial=smallPaintFrame({cols:4,rows:2});
+ const changed=initial.rows[0].map((c,x)=>x===2?{...c,text:'Y'}:c);
+ const next=deltaFrom(initial,{rows:[{index:0,cells:changed}]});
+ for (const [scale,area,draws,cursor] of [
+  [1.25,[30,0,15,30],['Y'],0],
+  [1.125,[0,0,54,27],['X','X','Y','X'],1],
+ ]) {
+  const {canvas,g}=observedCanvas();
+  paint(canvas,initial,scale);
+  const clears=[],texts=[],cursors=[];
+  g.clearRect=(...rect)=>clears.push(rect);
+  g.fillText=text=>texts.push(text);
+  g.strokeRect=(...rect)=>cursors.push(rect);
+  paint(canvas,next,scale);
+  assert.deepEqual(clears,[area]);
+  assert.deepEqual(texts,draws);
+  assert.equal(cursors.length,cursor);
+ }
 });
 
 test('reset, fractional row edges and interrupted deltas fall back to a full repaint',()=>{
@@ -258,7 +279,7 @@ test('reset, fractional row edges and interrupted deltas fall back to a full rep
  const fill=g.fillText;
  g.fillText=()=>{throw new Error('interrupted');};
  assert.throws(()=>paint(canvas,next,1),/interrupted/);
- assert.deepEqual(clears.splice(0),[[0,0,24,24],[0,48,24,24]]);
+ assert.deepEqual(clears.splice(0),[[0,0,12,24],[0,48,12,24]]);
  g.fillText=fill;
  paint(canvas,next,1);
  assert.deepEqual(clears.splice(0),[[0,0,24,96]]);

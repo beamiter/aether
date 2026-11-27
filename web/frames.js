@@ -76,8 +76,8 @@ export function acceptUpdate(previous, update, expected = {session:'frame-demo',
 const painted = new WeakMap();
 const rasterCanvas = createRasterCanvasCache(32 * 1024 * 1024);
 
-function paintImages(canvas, g, frame, dirty, cw, ch) {
-  for (const y of dirty) for (const {id,column,slice} of frame.rows[y].imageSlices ?? []) {
+function paintImages(canvas, g, frame, damage, cw, ch) {
+  for (const {y} of damage) for (const {id,column,slice} of frame.rows[y].imageSlices ?? []) {
     const image = frame.images[id];
     const source = rasterCanvas(canvas.ownerDocument,image);
     const x = column * cw, width = image.columns * cw;
@@ -118,6 +118,44 @@ function paintUnderline(g, cell, x, y, width) {
   }
 }
 
+function sameCellPaint(before, after) {
+  return before === after || (before.text === after.text && before.width === after.width &&
+    before.background === after.background && before.foreground === after.foreground &&
+    before.style === after.style && before.underline === after.underline &&
+    before.underline_color === after.underline_color && before.hyperlink_id === after.hyperlink_id);
+}
+
+function cursorWidth(frame) {
+  return frame.rows[frame.cursor_row][frame.cursor_col].width === 2 ? 2 : 1;
+}
+
+function cellDamage(previous, frame, y, oldCursorRow, newCursorRow) {
+  const before = previous.rows[y], after = frame.rows[y], cols = frame.cols;
+  let first = cols, last = 0;
+  if (before !== after) {
+    first = 0;
+    while (first < cols && sameCellPaint(before[first], after[first])) first++;
+    if (first < cols) {
+      last = cols;
+      while (last > first && sameCellPaint(before[last-1], after[last-1])) last--;
+    }
+  }
+  if (y === oldCursorRow) {
+    first = Math.min(first, previous.cursor_col);
+    last = Math.max(last, previous.cursor_col + cursorWidth(previous));
+  }
+  if (y === newCursorRow) {
+    first = Math.min(first, frame.cursor_col);
+    last = Math.max(last, frame.cursor_col + cursorWidth(frame));
+  }
+  if (first >= last) return;
+  // A continuation can have its own background. Restore the complete
+  // clipped glyph if either frame has a wide cell crossing a damage edge.
+  while (first > 0 && (before[first].width === 0 || after[first].width === 0)) first--;
+  while (last < cols && (before[last].width === 0 || after[last].width === 0)) last++;
+  return {y, first, last};
+}
+
 export function paint(canvas, frame, scale = globalThis.devicePixelRatio || 1) {
   if (!Number.isFinite(scale) || scale <= 0 || scale > 4) scale = 1;
   const cw = CELL_WIDTH, ch = CELL_HEIGHT;
@@ -133,6 +171,7 @@ export function paint(canvas, frame, scale = globalThis.devicePixelRatio || 1) {
   const last = painted.get(canvas);
   const previous = last?.frame;
   const rowPixels = ch * scale;
+  const cellPixels = cw * scale;
   // Fractional row edges can blend with the next row in Canvas2D. Only
   // clear individual rows when their boundaries align to backing pixels.
   const full = !last || last.scale !== scale || !Number.isInteger(rowPixels) ||
@@ -145,15 +184,37 @@ export function paint(canvas, frame, scale = globalThis.devicePixelRatio || 1) {
     previous.cursor_visible !== frame.cursor_visible || previous.cursor_color !== frame.cursor_color);
   const oldCursorRow = cursorMoved && previous.cursor_visible ? previous.cursor_row : -1;
   const newCursorRow = cursorMoved && frame.cursor_visible ? frame.cursor_row : -1;
-  let dirty = [];
+  const canPaintCells = !full && !frame.selection && Number.isInteger(cellPixels);
+  const move = !full && mergeBackgrounds && !frame.selection
+    ? rowMoveForBase(frame,previous.revision) : undefined;
+  // Only an already-sized backing can have a matching row-copy base.
+  const moveContext = move ? canvas.getContext('2d') : null;
+  const canCopyRows = typeof moveContext?.drawImage === 'function';
+  let copy = false;
+  const damage = [];
   for (let y = 0; y < frame.rows.length; y++) {
-    // Accepted deltas retain the validated row references from their base.
-    // Cursor changes also invalidate both its old and new visible rows.
-    if (full || previous.rows[y] !== frame.rows[y] || y === oldCursorRow || y === newCursorRow) {
-      dirty.push(y);
+    const before = previous?.rows[y], after = frame.rows[y];
+    const changed = full || before !== after || y === oldCursorRow || y === newCursorRow;
+    const inMove = canCopyRows && y >= move.to && y < move.to + move.count;
+    if (inMove) {
+      const from = move.from + y - move.to;
+      if (after === previous.rows[from] && !after.imageSlices?.length &&
+          !(previous.cursor_visible && previous.cursor_row === from) &&
+          !(frame.cursor_visible && frame.cursor_row === y)) {
+        copy ||= changed;
+        continue;
+      }
+      // The copy can cover this row with source images or an old cursor.
+    } else if (!changed) continue;
+    if (canPaintCells && !inMove && before.length === frame.cols && after.length === frame.cols &&
+        !before.imageSlices?.length && !after.imageSlices?.length) {
+      const span = cellDamage(previous, frame, y, oldCursorRow, newCursorRow);
+      if (span) damage.push(span);
+    } else {
+      damage.push({y, first: 0, last: frame.cols});
     }
   }
-  if (!dirty.length) {
+  if (!damage.length && !copy) {
     painted.set(canvas, {frame, scale});
     return;
   }
@@ -165,73 +226,66 @@ export function paint(canvas, frame, scale = globalThis.devicePixelRatio || 1) {
   if (canvas.height !== height) canvas.height = height;
   if (canvas.style.width !== `${cssWidth}px`) canvas.style.width = `${cssWidth}px`;
   if (canvas.style.height !== `${cssHeight}px`) canvas.style.height = `${cssHeight}px`;
-  const g = canvas.getContext('2d');
+  const g = moveContext ?? canvas.getContext('2d');
   g.setTransform(1, 0, 0, 1, 0, 0);
-  const move = !full && mergeBackgrounds && !frame.selection
-    ? rowMoveForBase(frame,previous.revision) : undefined;
-  if (move && typeof g.drawImage === 'function') {
-    const repaint = new Set(dirty);
-    let copied = 0;
-    for (let offset = 0; offset < move.count; offset++) {
-      const from = move.from + offset, to = move.to + offset;
-      const row = frame.rows[to];
-      if (row === previous.rows[from] && !row.imageSlices?.length &&
-          !(previous.cursor_visible && previous.cursor_row === from) &&
-          !(frame.cursor_visible && frame.cursor_row === to)) {
-        repaint.delete(to);
-        copied++;
-      } else {
-        repaint.add(to);
-      }
-    }
-    if (copied) {
-      // A single draw reads its source before writing the overlapping destination.
-      // Cursor and image rows are redrawn below at their current positions.
-      g.drawImage(canvas,0,move.from*rowPixels,width,move.count*rowPixels,
-        0,move.to*rowPixels,width,move.count*rowPixels);
-      dirty = [...repaint].sort((a,b)=>a-b);
-    }
+  if (copy) {
+    // A single draw reads its source before writing the overlapping destination.
+    g.drawImage(canvas,0,move.from*rowPixels,width,move.count*rowPixels,
+      0,move.to*rowPixels,width,move.count*rowPixels);
   }
-  if (dirty.length === frame.rows.length) g.clearRect(0, 0, width, height);
-  else for (const y of dirty) g.clearRect(0, y * rowPixels, width, rowPixels);
+  if (damage.length === frame.rows.length && damage.every(span => span.first === 0 && span.last === frame.cols)) {
+    g.clearRect(0, 0, width, height);
+  } else for (const {y,first,last} of damage) {
+    const left = first * cellPixels, right = last === frame.cols ? width : last * cellPixels;
+    g.clearRect(left, y * rowPixels, right - left, rowPixels);
+  }
   g.setTransform(scale, 0, 0, scale, 0, 0);
   g.font = '18px monospace'; g.textBaseline = 'top';
   // All backgrounds first: a wide glyph must not be erased by its trailing cell.
-  for (const y of dirty) {
+  for (const {y,first,last} of damage) {
     const row = frame.rows[y];
+    const limit = Math.min(last, row.length);
     if (!mergeBackgrounds) {
-      row.forEach((cell, x) => { g.fillStyle = cell.background; g.fillRect(x*cw, y*ch, cw, ch); });
+      for (let x = first; x < limit; x++) {
+        g.fillStyle = row[x].background;
+        g.fillRect(x*cw, y*ch, cw, ch);
+      }
       continue;
     }
-    for (let start = 0; start < row.length;) {
+    for (let start = first; start < limit;) {
       const background = row[start].background;
       let end = start + 1;
-      while (end < row.length && row[end].background === background) end++;
+      while (end < limit && row[end].background === background) end++;
       g.fillStyle = background;
       g.fillRect(start*cw, y*ch, (end-start)*cw, ch);
       start = end;
     }
   }
-  for (const y of dirty) frame.rows[y].forEach((c,x)=>{
-    if(c.width===0)return;
-    g.save();
-    try {
-      g.beginPath();g.rect(x*cw,y*ch,cw*c.width,ch);g.clip();
-      g.font=`${c.style&2?'italic ':''}${c.style&1?'bold ':''}18px monospace`;
-      g.globalAlpha=c.style&16?0.5:1;g.fillStyle=c.foreground;g.fillText(c.text,x*cw,y*ch+2);
-      if(c.style&8)g.fillRect(x*cw,y*ch+ch/2,cw*c.width,1);
-      paintUnderline(g,c,x*cw,y*ch+ch-3,cw*c.width);
-    } finally {
-      g.restore();
+  for (const {y,first,last} of damage) {
+    const row = frame.rows[y];
+    for (let x = first, limit = Math.min(last, row.length); x < limit; x++) {
+      const c = row[x];
+      if (c.width === 0) continue;
+      g.save();
+      try {
+        g.beginPath();g.rect(x*cw,y*ch,cw*c.width,ch);g.clip();
+        g.font=`${c.style&2?'italic ':''}${c.style&1?'bold ':''}18px monospace`;
+        g.globalAlpha=c.style&16?0.5:1;g.fillStyle=c.foreground;g.fillText(c.text,x*cw,y*ch+2);
+        if(c.style&8)g.fillRect(x*cw,y*ch+ch/2,cw*c.width,1);
+        paintUnderline(g,c,x*cw,y*ch+ch-3,cw*c.width);
+      } finally {
+        g.restore();
+      }
     }
-  });
-  paintImages(canvas,g,frame,dirty,cw,ch);
+  }
+  paintImages(canvas,g,frame,damage,cw,ch);
   if (frame.selection) {
     g.fillStyle = '#78a8f46b';
     for (const {row,first,last} of frame.selection) g.fillRect(first*cw,row*ch,(last-first)*cw,ch);
   }
-  if(frame.cursor_visible && dirty.includes(frame.cursor_row)){
-    const x=frame.cursor_col*cw,y=frame.cursor_row*ch,width=cw*(frame.rows[frame.cursor_row][frame.cursor_col].width===2?2:1);g.fillStyle=g.strokeStyle=frame.cursor_color ?? '#9ac6ff';
+  if(frame.cursor_visible && damage.some(({y,first,last}) =>
+      y===frame.cursor_row && frame.cursor_col>=first && frame.cursor_col<last)){
+    const x=frame.cursor_col*cw,y=frame.cursor_row*ch,width=cw*cursorWidth(frame);g.fillStyle=g.strokeStyle=frame.cursor_color ?? '#9ac6ff';
     if(frame.cursor_shape==='beam')g.fillRect(x,y,2,ch);
     else if(frame.cursor_shape==='underline')g.fillRect(x,y+ch-2,width,2);
     else g.strokeRect(x+.5,y+.5,width-1,ch-1);
