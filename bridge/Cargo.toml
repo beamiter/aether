@@ -6,8 +6,8 @@ default-run = "tauri-terminal-frame-bridge"
 
 [dependencies]
 base64 = "0.22"
-jterm_engine = { git = "https://github.com/beamiter/jterm_core", rev = "52d35314db9b89421da02b34f36a17a779390302" }
-jterm_protocol = { git = "https://github.com/beamiter/jterm_core", rev = "52d35314db9b89421da02b34f36a17a779390302", features = ["engine-projection"] }
+jterm_engine = { git = "https://github.com/beamiter/jterm_core", rev = "bb425815ae730d41363a4203c6d512ee565c659f" }
+jterm_protocol = { git = "https://github.com/beamiter/jterm_core", rev = "bb425815ae730d41363a4203c6d512ee565c659f", features = ["engine-projection"] }
 getrandom = "0.4"
 libc = "0.2"
 png = "0.18.1"
