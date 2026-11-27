@@ -150,6 +150,15 @@ jobs:
             "$CARGO_TARGET_DIR/debug/tauri-terminal-lab" --output "$fixture_dir/evidence" \
             --ime-client "$fixture_dir/clients/native-ime-client" \
             --jsh "$RUNNER_TEMP/aether-shell-fixture/bin/jsh"
+      - name: Opt-in three local PTYs and passive canvases on Wayland
+        if: ${{ !cancelled() && steps.wayland-fixtures.outcome == 'success' }}
+        timeout-minutes: 3
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          fixture_dir="${AETHER_WAYLAND_FIXTURES:?}"
+          dbus-run-session -- timeout --kill-after=10s 140s /usr/bin/python3 -B scripts/test-wayland-ime.py \
+            "$CARGO_TARGET_DIR/debug/tauri-terminal-lab" --output "$fixture_dir/three-shells-evidence" \
+            --ime-client "$fixture_dir/clients/native-ime-client" --three-shells-preview
       - name: Frozen command output review and export on Wayland
         id: wayland-output-review
         if: ${{ !cancelled() && steps.wayland-fixtures.outcome == 'success' }}

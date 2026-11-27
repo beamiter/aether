@@ -378,6 +378,9 @@ def run(args):
         driver.open(binary)
         cleanup.callback(driver.close)
         wait_for(lambda: fixtures["opened_page"](driver), "embedded Aether page did not load")
+        if args.three_shells_preview:
+            fixtures["exercise_three_shells"](driver, root, "wayland")
+            return
         swaymsg = Path(args.sway).with_name("swaymsg")
         if args.companion_daemon:
             compositor_ipc = wait_for(lambda: next(runtime.glob("sway-ipc.*.sock"), None), "no private compositor IPC")
@@ -620,6 +623,7 @@ if __name__ == "__main__":
     journey.add_argument("--companion-daemon", type=Path, help="run the private native Eva journey")
     journey.add_argument("--vim9", action="store_true", help="run the real Vim9 Wayland composition and bridge-loss journey")
     journey.add_argument("--output-review", action="store_true", help="verify the frozen output review and downloaded source")
+    journey.add_argument("--three-shells-preview", action="store_true", help="run the opt-in local three-pane journey")
     parser.add_argument("--sway", default="sway")
     parser.add_argument("--wtype", default="wtype")
     parser.add_argument("--compositor-libraries", type=Path)

@@ -396,6 +396,47 @@ function testChannel(){
  return class {constructor(){this.id=++number;}};
 }
 
+test('OSC8 hover remains current across a new frame without synthesizing a click',async()=>{
+ const owner={session:'a'.repeat(32),epoch:1,generation:1};
+ const raw=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+ const target='https://aether-hyperlink.test/docs';
+ let outgoing,opened=0;
+ const h=harness(async(name,args)=>{
+  switch(name){
+   case 'open_shell':return owner;
+   case 'subscribe_local_shell':outgoing=args.stream.onmessage;return null;
+   case 'ack_local_stream':return null;
+   case 'open_terminal_hyperlink':opened++;return null;
+   default:throw Error(name);
+  }
+ },undefined,undefined,undefined,{},testChannel(),{mouseCanvas:true});
+ const canvas=h.el('canvas');
+ canvas.getBoundingClientRect=()=>({left:0,top:0,width:raw.cols*12,height:raw.rows.length*24});
+ const frame=(sequence,linked)=> {
+  const payload=JSON.parse(channelSnapshot({...raw,session:owner.session,epoch:1,revision:sequence}));
+  if(linked){
+   payload.rows[0].cells[0]={...payload.rows[0].cells[0],hyperlink_id:17};
+   payload.hyperlinks=[{id:17,target}];
+  }
+  return outgoing({owner,kind:'update',sequence:String(sequence),frame:JSON.stringify(payload),status:channelHealth(1)});
+ };
+ await h.click('#open');await frame(1,true);
+ canvas.handlers.pointermove({clientX:2,clientY:2,ctrlKey:true});
+ assert.equal(canvas.title,`Ctrl-click to open ${target}`);
+ assert.equal(canvas.style.cursor,'pointer');
+ await frame(2,true);
+ assert.equal(canvas.title,`Ctrl-click to open ${target}`);
+ assert.equal(canvas.style.cursor,'pointer');
+ await frame(3,false);
+ assert.equal(canvas.title,'');
+ await frame(4,true);
+ assert.equal(canvas.title,`Ctrl-click to open ${target}`);
+ canvas.handlers.pointerleave({});
+ await frame(5,true);
+ assert.equal(canvas.title,'');
+ assert.equal(opened,0);
+});
+
 test('a block snapshot from an old attachment cannot populate the reconnected panel',async()=>{
  const first={session:'a'.repeat(32),epoch:1,generation:1},next={...first,generation:3};
  const raw=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));

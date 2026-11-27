@@ -46,7 +46,7 @@ const localShellKinds=new Map();
 const localPaneIds=new Map();
 const localTabGeometry=new Map();
 let changingTab=null,restoringLocalLayout=false;
-let mouseView=null;
+let mouseView=null,hoveredLinkPoint=null;
 let state=null,epoch=null,owner=null,timer=null,polling=null,generation=0,transport=0,recovery=null;
 let sshSession=null,sshInputSuspended=false,detachedLocal=null,sshReloadNeeded=false,retainedLayoutBlocked=false;
 let sshFocusOwner=null,sshMouseOwner=null;
@@ -1232,7 +1232,7 @@ resize.addEventListener('click', async () => {
   }
 });
 function describeCursor(frame=visibleLiveFrame()){
-  canvas.title='';canvas.style.cursor='';
+  refreshHyperlinkHint(frame);
   if(!frame)return;
   const surface=selectionOverlay?.parentElement ?? canvas;
   const left=`${(surface.offsetLeft||0)+frame.cursor_col*12}px`;
@@ -1245,8 +1245,7 @@ function describeCursor(frame=visibleLiveFrame()){
   if(terminalSize.textContent!==size)terminalSize.textContent=size;
   document.querySelector('#cursor-status').textContent=`${frame.cols} × ${frame.rows.length} cells · cursor row ${frame.cursor_row+1}, column ${frame.cursor_col+1} · ${frame.cursor_shape}${frame.cursor_visible?'':' (hidden)'}${frame.pending_wrap?' · wrap pending':''}`;
 }
-function hyperlinkAt(event){
-  const frame=visibleLiveFrame();
+function hyperlinkAt(event,frame=visibleLiveFrame()){
   if(!owner||frame?.version!==CHANNEL_FRAME_VERSION||frame.session!==owner.session||frame.epoch!==owner.epoch)return null;
   const point=terminalCellAt(frame,canvas,event.clientX,event.clientY);
   if(!point)return null;
@@ -1255,12 +1254,19 @@ function hyperlinkAt(event){
   const target=frame.hyperlinks[cell.hyperlink_id];
   return target?{...point,target,revision:frame.revision}:null;
 }
+function refreshHyperlinkHint(frame=visibleLiveFrame()){
+  const pointer=hoveredLinkPoint;
+  if(!owner||owner!==pointer?.attachment||!frame)hoveredLinkPoint=null;
+  const link=hoveredLinkPoint?hyperlinkAt(pointer,frame):null;
+  const visible=link&&(!document.elementFromPoint||document.elementFromPoint(pointer.clientX,pointer.clientY)===canvas);
+  canvas.title=visible?`Ctrl-click to open ${link.target}`:'';
+  canvas.style.cursor=visible&&pointer.ctrlKey?'pointer':'';
+}
 canvas.addEventListener('pointermove',event=>{
-  const link=hyperlinkAt(event);
-  canvas.title=link?`Ctrl-click to open ${link.target}`:'';
-  canvas.style.cursor=link&&event.ctrlKey?'pointer':'';
+  hoveredLinkPoint={attachment:owner,clientX:event.clientX,clientY:event.clientY,ctrlKey:event.ctrlKey};
+  refreshHyperlinkHint();
 });
-canvas.addEventListener('pointerleave',()=>{canvas.title='';canvas.style.cursor='';});
+canvas.addEventListener('pointerleave',()=>{hoveredLinkPoint=null;refreshHyperlinkHint();});
 canvas.addEventListener('click',event=>{
   if(!event.isTrusted||event.defaultPrevented||event.button!==0||!event.ctrlKey||event.altKey||event.shiftKey||event.metaKey)return;
   const link=hyperlinkAt(event);
