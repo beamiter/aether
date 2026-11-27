@@ -19,7 +19,7 @@ export function installTerminalShell(document, {actions, isComposing, keyboardSc
     const words = query.value.toLowerCase().trim().split(/\s+/);
     const matches = actions.filter(action => {
       const label = [action.label, action.hint].join(' ').toLowerCase();
-      return (!action.enabled || action.enabled()) && words.every(word => label.includes(word));
+      return words.every(word => label.includes(word));
     });
     list.replaceChildren(...matches.map(action => {
       const item = document.createElement('li');
@@ -28,12 +28,20 @@ export function installTerminalShell(document, {actions, isComposing, keyboardSc
       label.textContent = action.label;
       button.type = 'button';
       button.append(label);
+      if (action.enabled && !action.enabled()) {
+        button.setAttribute('aria-disabled', 'true');
+        const reason = document.createElement('small');
+        reason.textContent = action.unavailableReason?.() ?? 'Not available in this view.';
+        label.append(reason);
+      }
       if (action.hint) {
         const hint = document.createElement('kbd');
         hint.textContent = action.hint;
         button.append(hint);
       }
-      button.addEventListener('click', () => run(action));
+      button.addEventListener('click', () => {
+        if (button.getAttribute('aria-disabled') !== 'true') run(action);
+      });
       item.append(button);
       return item;
     }));
@@ -57,14 +65,16 @@ export function installTerminalShell(document, {actions, isComposing, keyboardSc
   query.addEventListener('focus', () => list.setAttribute('data-query-focus', ''));
   query.addEventListener('blur', () => list.removeAttribute('data-query-focus'));
   dialog.addEventListener('keydown', event => {
-    if (event.isComposing || event.keyCode === 229 || event.key === 'Process') return;
+    if (event.isComposing || event.keyCode === 229 || event.key === 'Process' || isComposing()) return;
     const buttons = [...list.querySelectorAll('button')];
     if (!buttons.length) return;
     if (event.key === 'Enter') {
       event.preventDefault();
       if (!event.repeat) {
         paletteEnter = true;
-        (buttons.find(button => button === event.target) ?? buttons[0]).click();
+        const target = buttons.find(button => button === event.target) ??
+          buttons.find(button => button.getAttribute('aria-disabled') !== 'true');
+        target?.click();
       }
     }
     if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {

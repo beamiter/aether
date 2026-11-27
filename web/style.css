@@ -375,6 +375,8 @@ kbd {color: var(--muted); font: 11px monospace; white-space: nowrap;}
 }
 #command-palette-results[data-query-focus] li:first-child button,
 #command-palette-results button:hover {background: #2b3b48; border-color: #52687c;}
+#command-palette-results button[aria-disabled="true"] {color: #a8b6c4; cursor: default;}
+#command-palette-results small {display: block; margin-top: 3px; color: #a8b6c4;}
 #command-palette-empty {margin: 8px 0 0;}
 
 @media (max-width: 620px) {

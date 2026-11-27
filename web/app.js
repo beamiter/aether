@@ -1486,9 +1486,9 @@ function cycleTabs(step){
 const canCycleTabs=()=>!tabs.hidden&&!changingTab&&!recovery&&!restoringLocalLayout&&
   localTabEpochs.size>(owner?1:0);
 const canUseHistory=()=>!!owner&&!changingTab;
-function clickAction(label,id,hint,keys){
+function clickAction(label,id,hint,keys,unavailableReason){
   const target=document.querySelector(id);
-  return {label,hint,keys,enabled:()=>!target.hidden&&!target.disabled,run:()=>target.click()};
+  return {label,hint,keys,unavailableReason,enabled:()=>!target.hidden&&!target.disabled,run:()=>target.click()};
 }
 async function copyTerminalSelection(){
   const attachment=owner, selection=liveSelection?.snapshot();
@@ -1509,18 +1509,18 @@ const actions=[
   clickAction('Restore shell tabs','#restore-local-layout'),
   clickAction('Reconnect view','#attach'),
   clickAction('Close shell','#close','Ctrl+Shift+W',['Shift+w']),
-  {label:'Next tab',hint:'Ctrl+Tab',keys:['tab','pagedown'],enabled:canCycleTabs,run:()=>cycleTabs(1)},
-  {label:'Previous tab',hint:'Ctrl+Shift+Tab',keys:['Shift+tab','pageup'],enabled:canCycleTabs,run:()=>cycleTabs(-1)},
-  {label:'Split left and right',hint:'Ctrl+Shift+E',keys:['Shift+e'],enabled:()=>!splitToggle.disabled,run:()=>setSplit('horizontal')},
-  {label:'Split top and bottom',hint:'Ctrl+Shift+D',keys:['Shift+d'],enabled:()=>!splitToggle.disabled,run:()=>setSplit('vertical')},
+  {label:'Next tab',hint:'Ctrl+Tab',keys:['tab','pagedown'],enabled:canCycleTabs,unavailableReason:()=> 'Requires at least two local shell tabs.',run:()=>cycleTabs(1)},
+  {label:'Previous tab',hint:'Ctrl+Shift+Tab',keys:['Shift+tab','pageup'],enabled:canCycleTabs,unavailableReason:()=> 'Requires at least two local shell tabs.',run:()=>cycleTabs(-1)},
+  {label:'Split left and right',hint:'Ctrl+Shift+E',keys:['Shift+e'],enabled:()=>!splitToggle.disabled,unavailableReason:()=> 'Requires two available local shell tabs.',run:()=>setSplit('horizontal')},
+  {label:'Split top and bottom',hint:'Ctrl+Shift+D',keys:['Shift+d'],enabled:()=>!splitToggle.disabled,unavailableReason:()=> 'Requires two available local shell tabs.',run:()=>setSplit('vertical')},
   {label:'Return to one pane',enabled:()=>splitEnabled&&!splitToggle.disabled,run:()=>setSplit(null)},
-  {label:'Search terminal history',hint:'Ctrl+Shift+F',keys:['Shift+f'],enabled:canUseHistory,run:()=>showHistory(true)},
+  {label:'Search terminal history',hint:'Ctrl+Shift+F',keys:['Shift+f'],enabled:canUseHistory,unavailableReason:()=> 'Requires an attached terminal view.',run:()=>showHistory(true)},
   {label:'Copy terminal selection',hint:'Ctrl+Shift+C',keys:['Shift+c'],
-    enabled:()=>!!owner&&!copySelection.disabled,run:copyTerminalSelection},
+    enabled:()=>!!owner&&!copySelection.disabled,unavailableReason:()=> 'Select text in the attached terminal first.',run:copyTerminalSelection},
   clickAction('Detach terminal view','#detach'),
   clickAction('Recover output snapshot','#recover'),
   clickAction('Terminal Chat','#terminal-chat-toggle'),
-  clickAction('Workflows','#workflows'),
+  clickAction('Workflows','#workflows',undefined,undefined,()=> 'Requires an active writable jsh prompt.'),
   {label:'Session controls',run:()=>revealPanel(sessionTools)},
   {label:'Workspace tools',run:()=>revealPanel(workspaceTools)},
 ];
@@ -1531,7 +1531,10 @@ for(const [label,id] of [
   actions.push({label,enabled:()=>!document.querySelector(id).hidden,run:()=>showTool(id)});
 }
 if(invoke)actions.push(clickAction('Remote Desktop','#remote-tab'));
-const availableActions=actions.map(action=>({...action,enabled:()=>!terminalPanel.hidden&&(!action.enabled||action.enabled())}));
+const availableActions=actions.map(action=>({...action,
+  enabled:()=>!terminalPanel.hidden&&(!action.enabled||action.enabled()),
+  unavailableReason:()=>terminalPanel.hidden?'Switch to Terminal first.':action.unavailableReason?.(),
+}));
 if(invoke)availableActions.push({
   label:'Terminal',enabled:()=>terminalPanel.hidden,run:()=>document.querySelector('#terminal-tab').click(),
 });
