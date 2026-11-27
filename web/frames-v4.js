@@ -1,4 +1,5 @@
-export const CHANNEL_FRAME_VERSION = 5;
+export const CHANNEL_IMAGE_VERSION = 5;
+export const CHANNEL_FRAME_VERSION = 6;
 const textChannelVersion = 4;
 const maxImages = 32;
 const maxImageBytes = 2 * 1024 * 1024;
@@ -14,6 +15,13 @@ const maxHyperlinkBytes = 1024 * 1024;
 const maxHyperlinkTargetBytes = 2048;
 const underlines = new Set(['single','double','curly','dotted','dashed']);
 const colors = /^#[a-fA-F0-9]{6}$/;
+const supportsChannelImages = version => version === CHANNEL_IMAGE_VERSION || version === CHANNEL_FRAME_VERSION;
+const frameMoves = new WeakMap();
+
+export function rowMoveForBase(frame, revision) {
+  const move = frameMoves.get(frame);
+  return move?.base === revision ? move : undefined;
+}
 
 export function channelCounter(value) {
   if (typeof value !== 'string' || !/^[1-9][0-9]{0,19}$/.test(value)) throw new Error('invalid Channel counter');
@@ -158,13 +166,13 @@ function validateRow(row, cols, links, referenced, supportsImages) {
 
 export function acceptChannelFrame(previous, encoded, expected, snapshotOnly = false) {
   const expectedVersion = expected.frameVersion ?? previous?.version;
-  const limit = maxEncodedBytes + (expectedVersion === CHANNEL_FRAME_VERSION ? maxEncodedImageBytes : 0);
+  const limit = maxEncodedBytes + (supportsChannelImages(expectedVersion) ? maxEncodedImageBytes : 0);
   if (typeof encoded !== 'string' || encoded.length > limit) throw new Error('Channel frame byte limit');
   const wireBytes = utf8Bytes(encoded);
   if (wireBytes > limit) throw new Error('Channel frame byte limit');
   const update = JSON.parse(encoded);
   const stamp = update?.stamp;
-  if (!stamp || ![textChannelVersion,CHANNEL_FRAME_VERSION].includes(stamp.version) ||
+  if (!stamp || (stamp.version !== textChannelVersion && !supportsChannelImages(stamp.version)) ||
       (expectedVersion !== undefined && stamp.version !== expectedVersion) || stamp.session !== expected.session ||
       stamp.epoch !== String(expected.epoch) || stamp.resource_generation !== stamp.epoch ||
       !['primary','alternate'].includes(stamp.screen))
@@ -175,7 +183,10 @@ export function acceptChannelFrame(previous, encoded, expected, snapshotOnly = f
       revision <= channelCounter(previous.revision) || layout < channelCounter(previous.layout)))
     throw new Error('stale Channel frame');
   if (!Array.isArray(update.rows) || update.rows.length > 128) throw new Error('Channel row bounds');
-  const supportsImages = stamp.version === CHANNEL_FRAME_VERSION;
+  const moves = update.moves === undefined ? [] : update.moves;
+  if (update.moves !== undefined && (stamp.version !== CHANNEL_FRAME_VERSION || update.kind !== 'delta' ||
+      !Array.isArray(moves) || moves.length > 128)) throw new Error('invalid Channel row moves');
+  const supportsImages = supportsChannelImages(stamp.version);
   const imageBase = update.kind === 'delta' ? previous : null;
   const {images: newImages, encodedBytes} = validatedImages(update.images, supportsImages && stamp.screen === 'primary', imageBase, previous);
   if (wireBytes > maxEncodedBytes + encodedBytes) throw new Error('Channel frame byte limit');
@@ -193,10 +204,21 @@ export function acceptChannelFrame(previous, encoded, expected, snapshotOnly = f
   } else {
     if (snapshotOnly || update.kind !== 'delta' || !previous ||
         update.base_revision !== previous.revision || stamp.layout !== previous.layout || stamp.screen !== previous.screen ||
-        update.rows.length > previous.rows.length) throw new Error('invalid Channel delta base');
+        stamp.version !== previous.version || update.rows.length > previous.rows.length) throw new Error('invalid Channel delta base');
     cols = previous.cols;
     rows = previous.rows.slice();
     const seen = new Set();
+    for (const move of moves) {
+      const {from, to, count} = move ?? {};
+      if (![from,to,count].every(Number.isInteger) || from < 0 || to < 0 || count < 1 || from === to ||
+          from + count > rows.length || to + count > rows.length) throw new Error('invalid Channel row move');
+      for (let offset = 0; offset < count; offset++) {
+        const index = to + offset;
+        if (seen.has(index)) throw new Error('overlapping Channel row moves');
+        rows[index] = previous.rows[from + offset];
+        seen.add(index);
+      }
+    }
     for (const edit of update.rows) {
       const index = edit?.index;
       if (!Number.isInteger(index) || index < 0 || index >= rows.length || seen.has(index))
@@ -226,9 +248,14 @@ export function acceptChannelFrame(previous, encoded, expected, snapshotOnly = f
       !['block','underline','beam'].includes(cursor_shape) || typeof cursor_visible !== 'boolean' || typeof pending_wrap !== 'boolean')
     throw new Error('invalid Channel cursor');
   const images = resolveImages(rows, cols, newImages, imageBase);
-  return Object.freeze({version: stamp.version, session: stamp.session, epoch: expected.epoch,
+  const frame = Object.freeze({version: stamp.version, session: stamp.session, epoch: expected.epoch,
     revision: stamp.revision, layout: stamp.layout, screen: stamp.screen, cols, rows: Object.freeze(rows),
     hyperlinks:Object.freeze(hyperlinks), images, cursor_row, cursor_col, cursor_shape, cursor_visible, pending_wrap, cursor_color});
+  if (moves.length === 1) {
+    const {from,to,count} = moves[0];
+    frameMoves.set(frame,Object.freeze({base:update.base_revision,from,to,count}));
+  }
+  return frame;
 }
 
 export const MAX_PROJECTED_HISTORY_ROWS = 65536;
@@ -243,7 +270,7 @@ export function acceptHistoryProjection(encoded, owner, search = false) {
   const wireBytes = utf8Bytes(encoded);
   if (wireBytes > limit) throw new Error('history projection byte limit');
   const view = JSON.parse(encoded);
-  if (!view || view.version !== CHANNEL_FRAME_VERSION || view.owner?.session !== owner.session ||
+  if (!view || view.version !== CHANNEL_IMAGE_VERSION || view.owner?.session !== owner.session ||
       view.owner.epoch !== owner.epoch || view.owner.generation !== owner.generation)
     throw new Error('foreign history projection');
   const {cols,text,offset,total_rows,revision,default_background} = view;

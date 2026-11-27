@@ -31,7 +31,9 @@ pub fn snapshot_encoder(
         SnapshotFormat::Compatibility => {
             from_engine(frame, session, epoch).map(LocalSnapshot::Compatibility)
         }
-        SnapshotFormat::Channel | SnapshotFormat::ChannelImages => {
+        SnapshotFormat::Channel
+        | SnapshotFormat::ChannelImages
+        | SnapshotFormat::ChannelRowMoves => {
             let version = format.channel_version().expect("Channel format");
             semantic_v4::encode(None, frame, session, version)
                 .map(|(_, data)| LocalSnapshot::Channel(data))

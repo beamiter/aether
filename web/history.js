@@ -1,4 +1,4 @@
-import {acceptHistoryProjection,CHANNEL_FRAME_VERSION,MAX_PROJECTED_HISTORY_ROWS,channelCounter} from './frames-v4.js';
+import {acceptHistoryProjection,CHANNEL_IMAGE_VERSION,MAX_PROJECTED_HISTORY_ROWS,channelCounter} from './frames-v4.js';
 import {CELL_WIDTH,CELL_HEIGHT,clearPaint,paint} from './frames.js';
 import {terminalCellAt} from './viewport.js';
 
@@ -128,7 +128,7 @@ function historyGrid({viewport,spacer,canvas},output) {
 export function installHistory({older,newer,refresh,output,label,invoke,getOwner,searchControls,copyControls,visual,enableProjection}) {
   let group=null,activeSearch=null,searchId=0,retained=null;
   const grid=visual?historyGrid(visual,output):null;
-  const format=owner=>grid&&enableProjection?.(owner)?{frameVersion:CHANNEL_FRAME_VERSION}:{};
+  const format=owner=>grid&&enableProjection?.(owner)?{frameVersion:CHANNEL_IMAGE_VERSION}:{};
   const sameSource=(a,b)=>a?.row===b?.row&&a?.column===b?.column;
   const sameShell=(a,b)=>a?.session===b?.session&&a?.epoch===b?.epoch;
   const expired='History source expired. Refresh to view retained rows.';

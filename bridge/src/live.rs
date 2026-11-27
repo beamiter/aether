@@ -115,7 +115,7 @@ impl LiveBridge {
     }
 
     pub fn enable_inline_graphics(&mut self, format: SnapshotFormat) {
-        if !self.local_desktop || format != SnapshotFormat::ChannelImages || self.inline_graphics {
+        if !self.local_desktop || !format.supports_images() || self.inline_graphics {
             return;
         }
         self.inline_graphics = true;
@@ -886,7 +886,8 @@ impl LiveBridge {
     ) -> Result<HistorySearchResponse, String> {
         self.check(epoch)?;
         request.validate()?;
-        let owner = (format == SnapshotFormat::ChannelImages)
+        let owner = format
+            .supports_images()
             .then(|| self.attachment(epoch))
             .transpose()?;
         if request.restart {

@@ -469,7 +469,7 @@ async fn history_shell<R: tauri::Runtime>(
 ) -> Result<tauri_terminal_frame_bridge::protocol_v4::LocalHistorySnapshot, String> {
     use tauri_terminal_frame_bridge::protocol_v4::LocalHistorySnapshot;
     let format = SnapshotFormat::negotiate(frame_version)?;
-    if format == SnapshotFormat::ChannelImages {
+    if format.supports_images() {
         require_terminal_window(&window)?;
         return run_attached(bridge.inner().clone(), owner, move |bridge, epoch| {
             bridge

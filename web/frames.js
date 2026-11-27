@@ -1,4 +1,5 @@
 import {createRasterCanvasCache} from './raster-canvas-cache.js';
+import {rowMoveForBase} from './frames-v4.js';
 
 export const CELL_WIDTH = 12, CELL_HEIGHT = 24;
 
@@ -144,7 +145,7 @@ export function paint(canvas, frame, scale = globalThis.devicePixelRatio || 1) {
     previous.cursor_visible !== frame.cursor_visible || previous.cursor_color !== frame.cursor_color);
   const oldCursorRow = cursorMoved && previous.cursor_visible ? previous.cursor_row : -1;
   const newCursorRow = cursorMoved && frame.cursor_visible ? frame.cursor_row : -1;
-  const dirty = [];
+  let dirty = [];
   for (let y = 0; y < frame.rows.length; y++) {
     // Accepted deltas retain the validated row references from their base.
     // Cursor changes also invalidate both its old and new visible rows.
@@ -166,6 +167,31 @@ export function paint(canvas, frame, scale = globalThis.devicePixelRatio || 1) {
   if (canvas.style.height !== `${cssHeight}px`) canvas.style.height = `${cssHeight}px`;
   const g = canvas.getContext('2d');
   g.setTransform(1, 0, 0, 1, 0, 0);
+  const move = !full && mergeBackgrounds && !frame.selection
+    ? rowMoveForBase(frame,previous.revision) : undefined;
+  if (move && typeof g.drawImage === 'function') {
+    const repaint = new Set(dirty);
+    let copied = 0;
+    for (let offset = 0; offset < move.count; offset++) {
+      const from = move.from + offset, to = move.to + offset;
+      const row = frame.rows[to];
+      if (row === previous.rows[from] && !row.imageSlices?.length &&
+          !(previous.cursor_visible && previous.cursor_row === from) &&
+          !(frame.cursor_visible && frame.cursor_row === to)) {
+        repaint.delete(to);
+        copied++;
+      } else {
+        repaint.add(to);
+      }
+    }
+    if (copied) {
+      // A single draw reads its source before writing the overlapping destination.
+      // Cursor and image rows are redrawn below at their current positions.
+      g.drawImage(canvas,0,move.from*rowPixels,width,move.count*rowPixels,
+        0,move.to*rowPixels,width,move.count*rowPixels);
+      dirty = [...repaint].sort((a,b)=>a-b);
+    }
+  }
   if (dirty.length === frame.rows.length) g.clearRect(0, 0, width, height);
   else for (const y of dirty) g.clearRect(0, y * rowPixels, width, rowPixels);
   g.setTransform(scale, 0, 0, scale, 0, 0);

@@ -198,44 +198,53 @@ fn update(
         pending_wrap: cursor.pending_wrap,
     };
     let mut projection = Projection {
-        images_enabled: version == wire::IMAGE_VERSION,
+        images_enabled: matches!(version, wire::IMAGE_VERSION | wire::ROW_MOVE_VERSION),
         colors,
         ..Projection::default()
     };
-    if let Some((base, delta)) = previous
+    if let Some((base, changed)) = previous
         .filter(|base| same_cell_colors(base.paint_colors(), colors))
-        .and_then(|base| base.delta_to(frame).ok().map(|delta| (base, delta)))
-        .filter(|(_, delta)| delta.rows.len() < frame.rows().len())
+        .and_then(|base| {
+            base.changed_row_indices(frame)
+                .ok()
+                .map(|changed| (base, changed))
+        })
     {
-        if projection.images_enabled
-            && delta
-                .rows
-                .iter()
-                .any(|(index, _)| row_images(frame, *index).next().is_some())
-        {
-            projection.base_images = (0..base.rows().len())
-                .flat_map(|index| row_images(base, index))
-                .map(|(_, image, _)| image.id().get())
-                .collect();
-        }
-        let rows = delta
-            .rows
-            .iter()
-            .map(|(index, _)| {
-                Ok(wire::ChangedRow {
-                    index: *index as u16,
-                    row: wire_row(frame, *index, &mut projection)?,
+        let (rows, moves) = if version == wire::ROW_MOVE_VERSION && changed.len() > 1 {
+            split_row_moves(base, frame, changed)
+        } else {
+            (changed, Vec::new())
+        };
+        if rows.len() < frame.rows().len() {
+            if projection.images_enabled
+                && rows
+                    .iter()
+                    .any(|&index| row_images(frame, index).next().is_some())
+            {
+                projection.base_images = (0..base.rows().len())
+                    .flat_map(|index| row_images(base, index))
+                    .map(|(_, image, _)| image.id().get())
+                    .collect();
+            }
+            let rows = rows
+                .into_iter()
+                .map(|index| {
+                    Ok(wire::ChangedRow {
+                        index: index as u16,
+                        row: wire_row(frame, index, &mut projection)?,
+                    })
                 })
-            })
-            .collect::<Result<_, String>>()?;
-        let (hyperlinks, images) = projection.into_resources();
-        return Ok(wire::Update::Delta {
-            stamp,
-            base_revision: counter(delta.base.revision)?,
-            rows,
-            hyperlinks,
-            images,
-        });
+                .collect::<Result<_, String>>()?;
+            let (hyperlinks, images) = projection.into_resources();
+            return Ok(wire::Update::Delta {
+                stamp,
+                base_revision: counter(base.stamp().revision)?,
+                rows,
+                moves,
+                hyperlinks,
+                images,
+            });
+        }
     }
     let rows = (0..frame.rows().len())
         .map(|index| wire_row(frame, index, &mut projection))
@@ -248,6 +257,44 @@ fn update(
         hyperlinks,
         images,
     })
+}
+
+fn split_row_moves(
+    base: &CellFrame,
+    frame: &CellFrame,
+    mut rows: Vec<usize>,
+) -> (Vec<usize>, Vec<wire::RowMove>) {
+    let mut sources: Vec<_> = base
+        .rows()
+        .iter()
+        .enumerate()
+        .map(|(index, row)| (row.cells.as_ptr(), index))
+        .collect();
+    sources.sort_unstable_by_key(|&(address, _)| address);
+    let mut moves: Vec<wire::RowMove> = Vec::new();
+    rows.retain(|&to| {
+        let address = frame.rows()[to].cells.as_ptr();
+        let start = sources.partition_point(|&(candidate, _)| candidate < address);
+        let from = sources[start..]
+            .iter()
+            .take_while(|&&(candidate, _)| candidate == address)
+            .map(|&(_, index)| index)
+            .find(|&from| from != to && base.shares_row_paint_with(from, frame, to));
+        let Some(from) = from else {
+            return true;
+        };
+        let (from, to) = (from as u16, to as u16);
+        if let Some(last) = moves
+            .last_mut()
+            .filter(|last| last.from + last.count == from && last.to + last.count == to)
+        {
+            last.count += 1;
+        } else {
+            moves.push(wire::RowMove { from, to, count: 1 });
+        }
+        false
+    });
+    (rows, moves)
 }
 
 #[derive(Default)]
@@ -577,10 +624,90 @@ mod tests {
         assert!(rows
             .iter()
             .any(|row| row.index == 1 && row.row.image_slices.len() == 1));
+        let wire::Update::Delta {
+            moves,
+            rows,
+            images,
+            ..
+        } = update(Some(&displayed), &moved, "test", wire::ROW_MOVE_VERSION).unwrap()
+        else {
+            panic!("the image should move from the acknowledged frame");
+        };
+        assert!(moves.iter().any(|part| part.to == 1 && part.from == 2));
+        assert!(rows.iter().all(|row| row.row.image_slices.is_empty()));
+        assert!(images.is_empty());
         let (_, data) = scratch.encode(None, &moved, "test", wire::VERSION).unwrap();
         let text_frame: serde_json::Value = serde_json::from_str(&data).unwrap();
         assert!(text_frame.get("images").is_none());
         assert!(text_frame["rows"][1].get("image_slices").is_none());
+    }
+
+    #[test]
+    fn v6_scroll_moves_preserve_full_paint_and_leave_legacy_frames_compatible() {
+        let mut terminal = jterm_engine::terminal::Terminal::new(6, 12).unwrap();
+        terminal.enable_hyperlinks(|_, _| true);
+        terminal.enable_underline_colors();
+        terminal.enable_grapheme_clusters();
+        terminal
+            .feed(
+                concat!(
+                    "A\r\n\x1b]8;;https://example.test/link\x07\x1b[4;58;5;33mBe\u{301}",
+                    "\x1b[0m\x1b]8;;\x07\r\nC\r\nD\r\nE\r\nF",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let before = terminal.frame().unwrap();
+        terminal.feed(b"\x1b[S\x1b[6;1Hnew").unwrap();
+        let after = terminal.frame().unwrap();
+        let snapshot = |frame| update(None, frame, "test", wire::ROW_MOVE_VERSION).unwrap();
+        let wire::Update::Snapshot {
+            rows: base,
+            hyperlinks: base_links,
+            ..
+        } = snapshot(&before)
+        else {
+            unreachable!()
+        };
+        let wire::Update::Snapshot {
+            rows: full,
+            hyperlinks: full_links,
+            ..
+        } = snapshot(&after)
+        else {
+            unreachable!()
+        };
+        let wire::Update::Delta {
+            base_revision,
+            rows,
+            moves,
+            hyperlinks,
+            ..
+        } = update(Some(&before), &after, "test", wire::ROW_MOVE_VERSION).unwrap()
+        else {
+            panic!("full-screen scrolling should use a row move")
+        };
+        assert_eq!(base_revision.get(), before.stamp().revision);
+        assert_eq!(
+            moves,
+            [wire::RowMove {
+                from: 1,
+                to: 0,
+                count: 5
+            }]
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].index, 5);
+        assert_eq!(&base[1..], &full[..5]);
+        assert_eq!(rows[0].row, full[5]);
+        assert_eq!(base_links, full_links);
+        assert!(hyperlinks.is_empty());
+
+        for version in [wire::VERSION, wire::IMAGE_VERSION] {
+            let legacy = update(Some(&before), &after, "test", version).unwrap();
+            assert!(matches!(legacy, wire::Update::Snapshot { .. }));
+            assert!(serde_json::to_value(legacy).unwrap().get("moves").is_none());
+        }
     }
 
     #[test]
@@ -614,6 +741,7 @@ mod tests {
             rows: edits,
             hyperlinks,
             images,
+            moves,
         } = serde_json::from_str(&delta).unwrap()
         else {
             panic!("expected partial delta");
@@ -623,6 +751,7 @@ mod tests {
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].index, 0);
         assert_eq!(edits[0].row, rows[0]);
+        assert!(moves.is_empty());
         assert!(hyperlinks.is_empty());
         assert!(images.is_empty());
         let alternate = sample(revision + 2, Screen::Alternate, false);
