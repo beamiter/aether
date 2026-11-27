@@ -11,6 +11,7 @@ use jterm_engine::{
     frame::CellFrame,
     frame_retention::{process_frame_budget, RetainedCellFrame},
     history_reflow::HistoryAnchor,
+    native_window_ops::NativeWindowPixels,
     terminal::{HistoryPage, Terminal},
 };
 use jterm_headless_session_spike::{Session, WakeSink};
@@ -27,6 +28,22 @@ pub use command_blocks::{
 };
 pub use mouse::{AlternateScrollView, MouseReport, MouseView};
 use raw_suffix::RawSuffix;
+
+#[derive(Clone, Copy, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewportPixels {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl ViewportPixels {
+    fn native(self) -> NativeWindowPixels {
+        NativeWindowPixels::Viewport {
+            width: self.width,
+            height: self.height,
+        }
+    }
+}
 
 const HISTORY_PAGE_ROWS: usize = 128;
 const MIN_HISTORY_PAGE_ROWS: usize = 32;
@@ -136,15 +153,32 @@ impl LiveBridge {
     }
 
     pub fn open(&mut self, rows: usize, cols: usize) -> Result<u32, String> {
-        self.open_shell(rows, cols, false)
+        self.open_with_window_pixels(rows, cols, false, None)
     }
 
     pub fn open_integrated(&mut self, rows: usize, cols: usize) -> Result<u32, String> {
-        self.open_shell(rows, cols, true)
+        self.open_with_window_pixels(rows, cols, true, None)
     }
 
-    fn open_shell(&mut self, rows: usize, cols: usize, integrated: bool) -> Result<u32, String> {
-        self.open_session(|epoch| Session::spawn_family_with_epoch(rows, cols, epoch, integrated))
+    pub fn open_with_window_pixels(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        integrated: bool,
+        pixels: Option<ViewportPixels>,
+    ) -> Result<u32, String> {
+        let pixels = pixels.map(ViewportPixels::native);
+        if let Some(pixels) = pixels {
+            pixels.validate()?;
+        }
+        self.open_session(|epoch| {
+            let mut session = Session::spawn_family_with_epoch(rows, cols, epoch, integrated)?;
+            if let Some(pixels) = pixels {
+                // Install the geometry before the local output worker can drive the PTY.
+                session.set_window_pixels(rows, cols, pixels)?;
+            }
+            Ok(session)
+        })
     }
 
     /// Launch a dedicated local editor from a host-authorized argv and cwd.
@@ -1144,7 +1178,33 @@ impl LiveBridge {
     fn write(&mut self, epoch: u32, text: &[u8]) -> Result<usize, String> {
         self.write_owned_raw(self.attachment(epoch)?, text.to_vec())
     }
+    pub fn set_window_pixels(
+        &mut self,
+        epoch: u32,
+        layout: u64,
+        rows: usize,
+        cols: usize,
+        pixels: ViewportPixels,
+    ) -> Result<(), String> {
+        self.check(epoch)?;
+        let session = self.session.as_mut().unwrap();
+        if session.terminal().frame()?.stamp().layout != layout {
+            return Err("pixel measurement is for an earlier terminal layout".into());
+        }
+        session.set_window_pixels(rows, cols, pixels.native())
+    }
+
     pub fn resize(&mut self, epoch: u32, rows: usize, cols: usize) -> Result<(), String> {
+        self.resize_with_window_pixels(epoch, rows, cols, None)
+    }
+
+    pub fn resize_with_window_pixels(
+        &mut self,
+        epoch: u32,
+        rows: usize,
+        cols: usize,
+        pixels: Option<ViewportPixels>,
+    ) -> Result<(), String> {
         self.check(epoch)?;
         let session = self.session.as_mut().unwrap();
         let changed = if self.local_desktop {
@@ -1153,7 +1213,9 @@ impl LiveBridge {
         } else {
             false
         };
-        session.resize(rows, cols)?;
+        // Same-grid pixel changes are ordered by the renderer's measurement updates.
+        let pixels = pixels.filter(|_| changed).map(ViewportPixels::native);
+        session.resize_with_window_pixels(rows, cols, pixels)?;
         if changed {
             self.mouse.retire();
             let now = Instant::now();

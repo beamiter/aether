@@ -163,18 +163,24 @@ function cellDamage(previous, frame, y, oldCursorRow, newCursorRow) {
   return {y, first, last};
 }
 
-export function paint(canvas, frame, scale = globalThis.devicePixelRatio || 1) {
+export function backingGeometry(rows, cols, scale = globalThis.devicePixelRatio || 1) {
   if (!Number.isFinite(scale) || scale <= 0 || scale > 4) scale = 1;
-  const cw = CELL_WIDTH, ch = CELL_HEIGHT;
+  const cssWidth = cols * CELL_WIDTH, cssHeight = rows * CELL_HEIGHT;
   // Cap backing allocation independently of viewport dimensions and device DPR.
-  const limit = Math.sqrt(16777216 / (frame.cols * cw * frame.rows.length * ch));
+  const limit = Math.sqrt(16777216 / (cssWidth * cssHeight));
   // Merge only on an unclamped integer DPR: all opaque cell edges then
   // land on physical pixels, without changing fractional-edge rasterization.
   const mergeBackgrounds = Number.isInteger(scale) && scale <= limit;
   scale = Math.min(scale, limit);
-  const cssWidth = frame.cols * cw, cssHeight = frame.rows.length * ch;
   const width = Math.max(1, Math.floor(cssWidth * scale));
   const height = Math.max(1, Math.floor(cssHeight * scale));
+  return {width, height, cssWidth, cssHeight, scale, mergeBackgrounds};
+}
+
+export function paint(canvas, frame, deviceScale = globalThis.devicePixelRatio || 1) {
+  const cw = CELL_WIDTH, ch = CELL_HEIGHT;
+  const {width, height, cssWidth, cssHeight, scale, mergeBackgrounds} =
+    backingGeometry(frame.rows.length, frame.cols, deviceScale);
   const last = painted.get(canvas);
   const previous = last?.frame;
   const rowPixels = ch * scale;

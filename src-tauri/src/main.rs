@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use tauri::{ipc::Channel, webview::PageLoadEvent, Manager};
 use tauri_terminal_frame_bridge::{
     history_search::{HistorySearchRequest, HistorySearchResponse},
-    live::LiveBridge,
+    live::{LiveBridge, ViewportPixels},
     semantic::{Attachment, Resume, SessionSelector, Update},
     DemoBridge, LocalSnapshot, SnapshotFormat, SnapshotRevision, WireFrame,
 };
@@ -43,6 +43,7 @@ async fn open_shell<R: tauri::Runtime>(
     integrated: Option<bool>,
     pane_history_id: Option<String>,
     frame_version: Option<u8>,
+    window_pixels: Option<ViewportPixels>,
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<local_sessions::OpenedShell, String> {
     require_terminal_window(&window)?;
@@ -56,7 +57,7 @@ async fn open_shell<R: tauri::Runtime>(
     let shared = bridge.inner().clone();
     let weak = Arc::downgrade(&shared);
     run_bridge(shared, move |bridge| {
-        bridge.open(integrated, format, history, weak)
+        bridge.open(integrated, format, history, window_pixels, weak)
     })
     .await
 }
@@ -66,6 +67,7 @@ async fn open_second_local_shell<R: tauri::Runtime>(
     window: tauri::WebviewWindow<R>,
     epoch: u32,
     frame_version: Option<u8>,
+    window_pixels: Option<ViewportPixels>,
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<Attachment, String> {
     require_terminal_window(&window)?;
@@ -73,7 +75,7 @@ async fn open_second_local_shell<R: tauri::Runtime>(
     let shared = bridge.inner().clone();
     let weak = Arc::downgrade(&shared);
     run_bridge(shared, move |bridge| {
-        bridge.open_second(epoch, format, weak)
+        bridge.open_second(epoch, format, window_pixels, weak)
     })
     .await
 }
@@ -96,6 +98,7 @@ async fn activate_local_tab<R: tauri::Runtime>(
     integrated: Option<bool>,
     pane_history_id: Option<String>,
     frame_version: Option<u8>,
+    window_pixels: Option<ViewportPixels>,
 ) -> Result<Result<local_sessions::AttachedView, String>, String> {
     require_terminal_window(&window)?;
     let format = SnapshotFormat::negotiate(frame_version)?;
@@ -120,6 +123,7 @@ async fn activate_local_tab<R: tauri::Runtime>(
                 integrated,
                 format,
                 history,
+                window_pixels,
             },
             weak,
         ))
@@ -368,10 +372,28 @@ async fn resize_shell(
     owner: Attachment,
     rows: usize,
     cols: usize,
+    window_pixels: Option<ViewportPixels>,
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<(), String> {
     run_input(bridge.inner().clone(), owner, move |bridge, epoch| {
-        bridge.resize(epoch, rows, cols)
+        bridge.resize_with_window_pixels(epoch, rows, cols, window_pixels)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn set_shell_window_pixels<R: tauri::Runtime>(
+    window: tauri::WebviewWindow<R>,
+    owner: Attachment,
+    layout: local_sessions::Counter,
+    rows: usize,
+    cols: usize,
+    pixels: ViewportPixels,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
+) -> Result<(), String> {
+    require_terminal_window(&window)?;
+    run_input(bridge.inner().clone(), owner, move |bridge, epoch| {
+        bridge.set_window_pixels(epoch, layout.get(), rows, cols, pixels)
     })
     .await
 }
@@ -676,6 +698,7 @@ fn application<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<
             recover_shell,
             write_shell,
             resize_shell,
+            set_shell_window_pixels,
             key_shell,
             mouse_shell,
             focus_shell,

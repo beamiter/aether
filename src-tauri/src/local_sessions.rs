@@ -14,7 +14,7 @@ pub(crate) use stream::{Counter, ObserverTarget, StreamEvent};
 use stream::{Delivery, LocalStream, PeerUpdate, Receipt, MAX_OBSERVERS};
 use tauri::ipc::Channel;
 use tauri_terminal_frame_bridge::{
-    live::{CloseStatus, LiveBridge},
+    live::{CloseStatus, LiveBridge, ViewportPixels},
     semantic::{Attachment, Resume, SessionSelector, Update},
     snapshot_encoder, LocalSnapshot, SnapshotFormat, WireFrame,
 };
@@ -150,6 +150,7 @@ pub(crate) struct TabActivation {
     pub(crate) integrated: bool,
     pub(crate) format: SnapshotFormat,
     pub(crate) history: Option<HistoryRequest>,
+    pub(crate) window_pixels: Option<ViewportPixels>,
 }
 
 #[derive(serde::Serialize)]
@@ -213,13 +214,14 @@ impl LocalSessions {
         integrated: bool,
         format: SnapshotFormat,
         history: Option<HistoryRequest>,
+        window_pixels: Option<ViewportPixels>,
         shared: Weak<Mutex<Self>>,
     ) -> Result<OpenedShell, String> {
         // Keep the ordinary opener fail-closed if *any* PTY remains.
         if !self.registry.sessions.is_empty() {
             return Err("close the existing session first".into());
         }
-        let owner = self.open_fresh(integrated, format, history, shared)?;
+        let owner = self.open_fresh(integrated, format, history, window_pixels, shared)?;
         let pane_history_id = self
             .retained_bridge(owner.epoch)?
             .completed_pane_id()
@@ -234,13 +236,14 @@ impl LocalSessions {
         &mut self,
         retained_epoch: u32,
         format: SnapshotFormat,
+        window_pixels: Option<ViewportPixels>,
         shared: Weak<Mutex<Self>>,
     ) -> Result<Attachment, String> {
         if self.registry.sessions.len() != 1 || self.registry.reader.is_some() {
             return Err("detach the single existing local shell before opening a second".into());
         }
         self.target_for_epoch(retained_epoch)?;
-        self.open_fresh(false, format, None, shared)
+        self.open_fresh(false, format, None, window_pixels, shared)
     }
 
     pub(crate) fn list_epochs(&self) -> Vec<u32> {
@@ -279,6 +282,7 @@ impl LocalSessions {
         integrated: bool,
         format: SnapshotFormat,
         history: Option<HistoryRequest>,
+        window_pixels: Option<ViewportPixels>,
         shared: Weak<Mutex<Self>>,
     ) -> Result<Attachment, String> {
         self.ensure_worker(shared)?;
@@ -286,7 +290,14 @@ impl LocalSessions {
         let worker = self.worker.as_ref().unwrap();
         let prev_epoch = self.last_epoch;
         let owner = self.registry.open(|| {
-            let (owned, owner) = Self::spawn(prev_epoch, integrated, format, history, worker)?;
+            let (owned, owner) = Self::spawn(
+                prev_epoch,
+                integrated,
+                format,
+                history,
+                window_pixels,
+                worker,
+            )?;
             Ok((owner.session.clone(), owned, owner))
         })?;
         self.last_epoch = owner.epoch;
@@ -299,6 +310,7 @@ impl LocalSessions {
         integrated: bool,
         format: SnapshotFormat,
         history: Option<HistoryRequest>,
+        window_pixels: Option<ViewportPixels>,
         worker: &LocalWorker,
     ) -> Result<(OwnedLocalPty, Attachment), String> {
         let history = match history {
@@ -318,11 +330,7 @@ impl LocalSessions {
         let mut bridge = LiveBridge::local_desktop_after(prev_epoch);
         bridge.enable_inline_graphics(format);
         bridge.set_hyperlink_policy(jterm_core::link::is_openable_osc8);
-        let epoch = if integrated {
-            bridge.open_integrated(24, 80)?
-        } else {
-            bridge.open(24, 80)?
-        };
+        let epoch = bridge.open_with_window_pixels(24, 80, integrated, window_pixels)?;
         let history = if let Some((history, checkpoint)) = history {
             history.restore(&mut bridge, epoch, checkpoint)?;
             Some(history)
@@ -356,6 +364,7 @@ impl LocalSessions {
             integrated,
             format,
             history,
+            window_pixels,
         } = options;
         if integrated && target_epoch.is_some() {
             return Err("Choose the shell type when opening a new tab.".into());
@@ -422,6 +431,7 @@ impl LocalSessions {
                 integrated,
                 format,
                 history,
+                window_pixels,
                 self.worker.as_ref().unwrap(),
             )?;
             let Entry::Vacant(entry) = self.registry.sessions.entry(original.session) else {

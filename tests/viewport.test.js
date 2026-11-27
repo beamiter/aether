@@ -1,5 +1,6 @@
+import {backingGeometry} from '../web/frames.js';
 import test from 'node:test';import assert from 'node:assert/strict';
-import {dimensions,resizeQueue,cursorTarget,viewportDimensions} from '../web/viewport.js';
+import {dimensions,resizeQueue,cursorTarget,viewportDimensions,windowPixelQueue} from '../web/viewport.js';
 const tick=()=>new Promise(r=>setImmediate(r));
 test('sizes reject zero/fraction/overflow and preserve exact legal endpoints',()=>{for(const [rows,cols] of [[0,1],[1,0],[129,1],[1,257],[2.5,2],[NaN,2],[1,Infinity]])assert.throws(()=>dimensions(rows,cols));assert.deepEqual(dimensions(1,1),{rows:1,cols:1});assert.deepEqual(dimensions(128,256),{rows:128,cols:256});});
 test('resize pressure retains at most active plus newest pending request',async()=>{let resolve;const calls=[],done=[];const queue=resizeQueue({getEpoch:()=>1,invoke:(_,a)=>{calls.push(a);return new Promise(r=>resolve=r);},onDone:s=>done.push(s),onError:assert.fail});const first=queue.request(2,3);for(let n=4;n<100;n++)queue.request(2,n);assert.equal(calls.length,1);resolve();await tick();assert.equal(calls.length,2);assert.equal(calls[1].cols,99);resolve();await first;assert.deepEqual(done,[{rows:2,cols:99}]);});
@@ -63,3 +64,44 @@ for(const stage of ['IPC','onDone']){
   h.calls[2].resolve();await tick();h.reports.at(-1).resolve();await fresh;
  });
 }
+
+test('window pixel calculations follow physical scaling and the canvas backing cap',()=>{
+  const pixels=(rows,cols,scale)=>{
+    const {width,height}=backingGeometry(rows,cols,scale);
+    return [width,height];
+  };
+  assert.deepEqual(pixels(24,80,1),[960,576]);
+  assert.deepEqual(pixels(12,84,2),[2016,576]);
+  assert.deepEqual(pixels(12,84,1.25),[1260,360]);
+  const [width,height]=pixels(128,256,4);
+  assert.ok(width*height <= 16777216);
+  assert.ok(width < 256*12*4);
+});
+
+test('window pixel updates coalesce per owner and a retired request cannot block the next owner',async()=>{
+  const firstOwner={}, secondOwner={};
+  let owner=firstOwner;
+  const requests=[];
+  const report=windowPixelQueue({getOwner:()=>owner,update:(attachment,geometry)=>{
+    const next=deferred();
+    requests.push({attachment,geometry,...next});
+    return next.promise;
+  }});
+  const first=report(owner,1,24,80,960,576);
+  report(owner,1,24,80,960,576);
+  report(owner,1,24,80,1440,864);
+  report(owner,1,24,80,1920,1152);
+  assert.equal(requests.length,1);
+  requests[0].resolve();
+  await tick();
+  assert.deepEqual(requests[1].geometry,{layout:1,rows:24,cols:80,pixels:{width:1920,height:1152}});
+  report(owner,2,12,84,1008,288);
+  owner=secondOwner;
+  const second=report(owner,2,12,84,2016,576);
+  assert.equal(requests[2].attachment,secondOwner);
+  requests[2].resolve();
+  await second;
+  requests[1].reject(new Error('previous owner left'));
+  await first;
+  assert.equal(requests.length,3);
+});

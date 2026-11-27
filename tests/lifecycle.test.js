@@ -5,7 +5,7 @@ import {installTerminalFocus} from '../web/terminal-focus.js';
 import {installTerminalMouse} from '../web/terminal-mouse.js';
 import {installTerminalSelection} from '../web/terminal-selection.js';
 import {installTerminalShell} from '../web/terminal-shell.js';
-import {dimensions,resizeQueue,cursorTarget,terminalCellAt,viewportDimensions} from '../web/viewport.js';
+import {dimensions,resizeQueue,cursorTarget,terminalCellAt,viewportDimensions,windowPixelQueue} from '../web/viewport.js';
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import vm from 'node:vm';
 import {installHistory} from '../web/history.js';
 import {installInlineHistory} from '../web/inline-history.js';
@@ -13,13 +13,14 @@ import {installCommandBlocks} from '../web/command-blocks.js';
 import {installTerminalChat,validateChatStatus} from '../web/terminal-chat.js';
 import {installWorkflows} from '../web/workflows.js';
 import {plainLocalTab,readLocalShellLayout,saveLocalShellLayout,readThreePaneLayout,saveThreePaneLayout,MAX_LOCAL_SHELLS,validLocalGeometry,localSplitPair} from '../web/local-layout.js';
-import {acceptFull,acceptUpdate,clearPaint,paint as paintFrame} from '../web/frames.js'; import {installIme} from '../web/ime.js';
+import {acceptFull,acceptUpdate,backingGeometry,clearPaint,paint as paintFrame} from '../web/frames.js'; import {installIme} from '../web/ime.js';
 import {acceptChannelFrame,channelCounter,CHANNEL_RENDITION_VERSION} from '../web/frames-v4.js';
 import {packedRow} from './fixtures/packed-channel.js';
 const tick=()=>new Promise(r=>setImmediate(r));
 const deferred=()=>{let resolve,reject;const promise=new Promise((a,b)=>{resolve=a;reject=b});return {promise,resolve,reject};};
 function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsupported:"0"}), Encoder=TextEncoder, paint=()=>{},storage={},Channel,animation={}){
  const invoke=async(name,args)=>{
+  if(name==='set_shell_window_pixels')return animation.applyWindowPixels?.(args)??null;
   if(name==='ssh_terminal'&&args?.action?.operation==='recover_reload_layout')return animation.recoverReloadLayout?.()??null;
   const {owner,...parameters}=args??{};
   const keepsOwner=['activate_local_tab','subscribe_local_shell','ack_local_stream','set_local_observer','set_local_observers','observe_local_shell','local_command_blocks','focus_shell'].includes(name);
@@ -56,7 +57,7 @@ function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsuppo
  const listen=events=>(name,fn)=>events.set(name,[...(events.get(name)??[]),fn]);
  const fire=(events,name)=>{for(const fn of events.get(name)??[])fn({target:document.activeElement});};
  const document={querySelector:el,querySelectorAll:()=>[],createElement:element,body:element(),activeElement:null,hidden:false,hasFocus:()=>true,addEventListener:listen(pageEvents)};
- const context={makePassiveSurfaces,validateReloadView,retainedReloadView,saveReloadTicket,takeReloadTicket,installFilePreviewPanel:()=>({dismiss(){}}),document,addEventListener:listen(windowEvents),__TAURI__:{core:{invoke,Channel}},acceptFull,acceptUpdate,clearPaint,acceptChannelFrame,channelCounter,CHANNEL_RENDITION_VERSION,installIme,installHistory,installCommandBlocks,installTerminalChat,installTerminalShell,installWorkflows,validateChatStatus,installPasteReview,installTerminalFocus,installTerminalMouse,installTerminalSelection,dimensions,resizeQueue,cursorTarget,terminalCellAt,viewportDimensions,paint,TextEncoder:Encoder,TextDecoder,
+ const context={makePassiveSurfaces,validateReloadView,retainedReloadView,saveReloadTicket,takeReloadTicket,installFilePreviewPanel:()=>({dismiss(){}}),document,addEventListener:listen(windowEvents),__TAURI__:{core:{invoke,Channel}},acceptFull,acceptUpdate,backingGeometry,clearPaint,acceptChannelFrame,channelCounter,CHANNEL_RENDITION_VERSION,installIme,installHistory,installCommandBlocks,installTerminalChat,installTerminalShell,installWorkflows,validateChatStatus,installPasteReview,installTerminalFocus,installTerminalMouse,installTerminalSelection,dimensions,resizeQueue,cursorTarget,terminalCellAt,viewportDimensions,windowPixelQueue,paint,TextEncoder:Encoder,TextDecoder,
  installInlineHistory,
  plainLocalTab,MAX_LOCAL_SHELLS,validLocalGeometry,localSplitPair,readLocalShellLayout:()=>readLocalShellLayout(storage),saveLocalShellLayout:value=>saveLocalShellLayout(value,storage),readThreePaneLayout:()=>readThreePaneLayout(storage),saveThreePaneLayout:value=>saveThreePaneLayout(value,storage),
  setInterval(fn){timers.set(++id,fn);return id},clearInterval(i){timers.delete(i)},setTimeout,...animation};

@@ -203,6 +203,7 @@ fn local_tab_activation_rotates_the_lease_after_an_ack_and_retries_exactly() {
                     integrated: false,
                     format: super::SnapshotFormat::Compatibility,
                     history: None,
+                    window_pixels: None,
                 },
                 Arc::downgrade(local.inner()),
             )
@@ -1042,11 +1043,34 @@ fn three_local_tabs_keep_physical_geometry_and_observers_cannot_resize() {
         "ack_shell",
         json!({"owner":third,"revision":third_view["Ok"]["frame"]["revision"]}),
     );
+    let earlier_layout = third_view["Ok"]["frame"]["layout"]
+        .as_u64()
+        .unwrap()
+        .to_string();
+    invoke(
+        &window,
+        "set_shell_window_pixels",
+        json!({"owner":third,"layout":earlier_layout,"rows":24,"cols":80,
+               "pixels":{"width":1920,"height":1152}}),
+    );
     invoke(
         &window,
         "resize_shell",
-        json!({"owner":third,"rows":19,"cols":95}),
+        json!({"owner":third,"rows":19,"cols":95,
+               "windowPixels":{"width":1140,"height":456}}),
     );
+    let stale_pixels = tauri::test::get_ipc_response(
+        &window,
+        request(
+            "set_shell_window_pixels",
+            json!({
+                "owner":third,"layout":earlier_layout,"rows":19,"cols":95,
+                "pixels":{"width":2280,"height":912}
+            }),
+        ),
+    )
+    .unwrap_err();
+    assert!(stale_pixels.to_string().contains("earlier terminal layout"));
     assert_eq!(
         invoke(&window, "list_local_shells", json!({})),
         json!([first["epoch"], second["epoch"], third["epoch"]])
@@ -1077,6 +1101,19 @@ fn three_local_tabs_keep_physical_geometry_and_observers_cannot_resize() {
     )
     .unwrap_err();
     assert!(denied.to_string().contains("read-only"));
+    let denied_pixels = tauri::test::get_ipc_response(
+        &window,
+        request(
+            "set_shell_window_pixels",
+            json!({
+                "owner":readonly,"layout":reader["frame"]["layout"].as_u64().unwrap().to_string(),
+            "rows":17,"cols":71,
+                "pixels":{"width":852,"height":408}
+            }),
+        ),
+    )
+    .unwrap_err();
+    assert!(denied_pixels.to_string().contains("read-only"));
     let peer = invoke(
         &window,
         "observe_local_shell",

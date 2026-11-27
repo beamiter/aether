@@ -304,7 +304,7 @@ mod tests {
         let shared = Arc::downgrade(&local);
         let mut sessions = local.lock().unwrap();
         let first = sessions
-            .open(false, SnapshotFormat::Channel, None, shared.clone())
+            .open(false, SnapshotFormat::Channel, None, None, shared.clone())
             .unwrap()
             .owner;
         let mut add_tab = |owner: &Attachment| {
@@ -317,6 +317,7 @@ mod tests {
                         integrated: false,
                         format: SnapshotFormat::Channel,
                         history: None,
+                        window_pixels: None,
                     },
                     shared.clone(),
                 )
@@ -443,7 +444,13 @@ mod tests {
         let owner = local
             .lock()
             .unwrap()
-            .open(false, SnapshotFormat::Channel, None, Arc::downgrade(&local))
+            .open(
+                false,
+                SnapshotFormat::Channel,
+                None,
+                None,
+                Arc::downgrade(&local),
+            )
             .unwrap()
             .owner;
         let (send, receive) = mpsc::channel();

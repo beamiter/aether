@@ -7,14 +7,14 @@ import {validateReloadView,retainedReloadView,saveReloadTicket,takeReloadTicket}
 import {installFilePreviewPanel} from './file-preview-panel.js';
 import {openVim9Snapshot} from './vim9-workbench.js';
 import {installPasteReview} from './paste.js';
-import {dimensions,resizeQueue,cursorTarget,terminalCellAt,viewportDimensions} from './viewport.js';
+import {dimensions,resizeQueue,cursorTarget,terminalCellAt,viewportDimensions,windowPixelQueue} from './viewport.js';
 import {installHistory} from './history.js';
 import {installInlineHistory} from './inline-history.js';
 import {installCommandBlocks} from './command-blocks.js';
 import {installTerminalChat,validateChatStatus} from './terminal-chat.js';
 import {installWorkflows} from './workflows.js';
 import {plainLocalTab,readLocalShellLayout,saveLocalShellLayout,readThreePaneLayout,saveThreePaneLayout,validPaneId,MAX_LOCAL_SHELLS,validLocalGeometry,localSplitPair} from './local-layout.js';
-import {acceptFull,acceptUpdate,clearPaint,paint} from './frames.js'; import {installIme} from './ime.js';
+import {backingGeometry,acceptFull,acceptUpdate,clearPaint,paint} from './frames.js'; import {installIme} from './ime.js';
 import {acceptChannelFrame,channelCounter,CHANNEL_RENDITION_VERSION} from './frames-v4.js';
 const canvas=document.querySelector('canvas'),status=document.querySelector('#status'),button=document.querySelector('#demo');
 const open=document.querySelector('#open'),attach=document.querySelector('#attach'),detach=document.querySelector('#detach'),close=document.querySelector('#close'),input=document.querySelector('#input'),send=document.querySelector('#send');
@@ -85,7 +85,7 @@ const liveSelection = selectionOverlay && typeof canvas.setPointerCapture === 'f
   ? installTerminalSelection({
     canvas, overlay: selectionOverlay, document,
     onFrame(frame) {
-      if (frame) paint(canvas, frame);
+      if (frame) paintTerminalFrame(frame);
       else clearPaint(canvas);
       describeCursor(frame);
     },
@@ -94,7 +94,7 @@ const liveSelection = selectionOverlay && typeof canvas.setPointerCapture === 'f
   : null;
 function paintLiveFrame(frame) {
   if (liveSelection) liveSelection.present(frame);
-  else paint(canvas, frame);
+  else paintTerminalFrame(frame);
 }
 const visibleLiveFrame = () => liveSelection?.visibleFrame() ?? state;
 const filePreview=installFilePreviewPanel(document,{getFrame:visibleLiveFrame,getEpoch:()=>changingTab?null:epoch,getSession:()=>changingTab?null:owner?.session,
@@ -159,6 +159,35 @@ canvas.addEventListener('click',event=>{if(!event.defaultPrevented&&!event.ctrlK
 const resize=document.querySelector('#resize');
 const invoke=globalThis.__TAURI__?.core?.invoke;
 const Channel=globalThis.__TAURI__?.core?.Channel;
+function windowPixelOwner() {
+  return sshSession === null && !changingTab && !recovery && !keyQueue.locked ? owner : null;
+}
+const reportWindowPixels = windowPixelQueue({
+  getOwner: windowPixelOwner,
+  update: (attachment, geometry) => invoke('set_shell_window_pixels', {owner:attachment, ...geometry}),
+});
+let lastPaintScale = null;
+function reportPaintedWindowPixels(frame) {
+  const active = windowPixelOwner();
+  if (!invoke || !frame || !active ||
+      frame.session !== active.session || frame.epoch !== active.epoch) return;
+  if (canvas.width > 0 && canvas.height > 0) {
+    reportWindowPixels(active, String(frame.layout), frame.rows.length, frame.cols, canvas.width, canvas.height);
+  }
+}
+function paintTerminalFrame(frame) {
+  lastPaintScale = globalThis.devicePixelRatio || 1;
+  paint(canvas, frame, lastPaintScale);
+  reportPaintedWindowPixels(frame);
+}
+function windowPixels(rows, cols) {
+  const {width, height} = backingGeometry(rows, cols);
+  return {width, height};
+}
+// The local owner opens a 24 by 80 grid before any viewport fitting.
+function initialWindowPixels() { return windowPixels(24, 80); }
+
+
 const channelSnapshots=()=>typeof Channel==='function'?{frameVersion:CHANNEL_RENDITION_VERSION}:{};
 const acceptAttachedSnapshot=(frame,attachment,options)=>options.frameVersion===CHANNEL_RENDITION_VERSION
   ?acceptChannelFrame(null,frame,{...attachment,frameVersion:options.frameVersion},true):acceptFull(null,frame,attachment);
@@ -555,6 +584,7 @@ function invokeAttached(command,{epoch:target,...args},attachment=owner) {
     if(!kind)return Promise.reject(new Error('Unknown SSH terminal command'));
     return invoke('ssh_terminal',{action:{operation:'request',command:{kind,owner:attachment,...args}}});
   }
+  if(command==='resize_shell') args.windowPixels=windowPixels(args.rows,args.cols);
   return invoke(command,{owner:attachment,...args});
 }
 function acceptOwner(attachment) {
@@ -896,7 +926,8 @@ async function attemptLocalTab(){
       const launch=change.targetEpoch===null&&change.configuration.shell==='jsh'?{integrated:true}:{};
       if(launch.integrated&&change.configuration.paneId)launch.paneHistoryId=change.configuration.paneId;
       const response=await invoke('activate_local_tab',{owner:change.source,targetEpoch:change.targetEpoch,
-        preserveInput:change.preserveInput,...options,...launch});
+        preserveInput:change.preserveInput,...options,...launch,
+        ...(change.targetEpoch===null?{windowPixels:initialWindowPixels()}:{})});
       if(typeof response?.Err==='string'){
         const previous=change.previousFrame;
         if(previous){paintLiveFrame(previous);state=previous;describeCursor();}
@@ -937,7 +968,7 @@ async function attemptLocalTab(){
     localTransport='channel';localInputSuspended=false;
     setActiveControls(next.writable);setLocalTools(true);
     status.textContent=`Local shell ${epoch} active${next.writable?'.':' in view-only mode.'}`;
-    changingTab=null;recordLocalLayout();renderLocalTabs(!change.focusTerminal);
+    changingTab=null;reportPaintedWindowPixels(state);recordLocalLayout();renderLocalTabs(!change.focusTerminal);
     if(change.focusTerminal)focusTerminal();
     await startTransport();
     if(owner===next.owner&&change.splitOnActivate)await setSplit(change.splitOnActivate);
@@ -1050,7 +1081,8 @@ async function openShell({destination=null,retained=null,fromRestore=false,confi
     const options=channelSnapshots();
     const launch=configuration.paneId?{integrated,paneHistoryId:configuration.paneId}:{integrated};
     const result=destination!==null?await invoke('ssh_terminal',{action:{operation:'open',destination}})
-      :retained?await invoke('open_second_local_shell',{epoch:retained,...options}):await invoke('open_shell',{...launch,...options});
+      :retained?await invoke('open_second_local_shell',{epoch:retained,...options,windowPixels:initialWindowPixels()})
+      :await invoke('open_shell',{...launch,...options,windowPixels:initialWindowPixels()});
     if(generation!==attempt)return;
     const paneId=destination===null?acceptLocalPane(result):undefined;
     const opened=destination===null&&paneId!==undefined?acceptOwner({
@@ -1331,6 +1363,21 @@ if (fitSize && fitViewport) {
   fitViewport.classList.toggle('fit-terminal', fitSize.checked);
   fitSize.addEventListener('change',()=>setFit(fitSize.checked));
   if (invoke && typeof ResizeObserver === 'function') new ResizeObserver(requestFit).observe(fitViewport);
+}
+function refreshTerminalScale() {
+  const frame = visibleLiveFrame();
+  if (frame && lastPaintScale !== (globalThis.devicePixelRatio || 1)) paintTerminalFrame(frame);
+}
+function watchTerminalScale() {
+  const match = globalThis.matchMedia?.(`(resolution: ${globalThis.devicePixelRatio || 1}dppx)`);
+  match?.addEventListener?.('change', () => {
+    refreshTerminalScale();
+    watchTerminalScale();
+  }, {once:true});
+}
+if (invoke) {
+  globalThis.addEventListener?.('resize', refreshTerminalScale);
+  watchTerminalScale();
 }
 resize.addEventListener('click', async () => {
   if (epoch === null || input.disabled) return;

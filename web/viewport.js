@@ -51,6 +51,33 @@ export function resizeQueue({getEpoch,invoke,onDone,onError}) {
     return current.promise;
   }};
 }
+// Keep one update in flight and only the latest measurement for a local owner.
+export function windowPixelQueue({getOwner, update}) {
+  let group = null;
+  return function report(owner, layout, rows, cols, width, height) {
+    if (!owner || owner !== getOwner()) return;
+    if (group?.owner !== owner) group = {owner, latest:null, pending:null, promise:null};
+    const current = group, previous = current.latest;
+    if (!previous || previous.layout !== layout || previous.rows !== rows || previous.cols !== cols ||
+        previous.pixels.width !== width || previous.pixels.height !== height) {
+      current.pending = current.latest = {layout, rows, cols, pixels:{width, height}};
+    }
+    if (!current.pending || current.promise) return current.promise;
+    current.promise = (async () => {
+      while (current.pending && owner === getOwner()) {
+        const next = current.pending;
+        current.pending = null;
+        try {
+          await update(owner, next);
+        } catch {
+          // A resize or attachment switch may have superseded the measurement.
+        }
+      }
+    })().finally(() => { current.promise = null; });
+    return current.promise;
+  };
+}
+
 export function cursorTarget(frame,canvas,viewport) {
   const left=(canvas.offsetLeft||0)+frame.cursor_col*CELL_WIDTH;
   const top=(canvas.offsetTop||0)+frame.cursor_row*CELL_HEIGHT;
