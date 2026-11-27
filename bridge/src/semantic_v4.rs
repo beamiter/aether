@@ -541,13 +541,18 @@ mod tests {
 
     #[test]
     fn v5_deltas_reuse_the_visible_resource_and_v4_omits_rasters() {
+        // Encoding assertions own their workspace independently of parallel PTY publishers.
+        let budget = Arc::new(RetainedBytesBudget::new(JSON_WORKSPACE_BYTES));
+        let scratch = FrameScratch::reserve_from(&budget).unwrap();
         let mut terminal = jterm_engine::terminal::Terminal::new(5, 8).unwrap();
         terminal.enable_inline_graphics((12, 24), |_, _, _| None);
         let before = terminal.frame().unwrap();
         let command = b"\x1b[3;2H\x1b_Ga=T,i=3,s=1,v=1,c=2,r=1,f=24,C=1;/wAA\x1b\\";
         assert_eq!(terminal.feed(command).unwrap(), b"\x1b_Gi=3;OK\x1b\\");
         let displayed = terminal.frame().unwrap();
-        let (_, data) = encode(Some(&before), &displayed, "test", wire::IMAGE_VERSION).unwrap();
+        let (_, data) = scratch
+            .encode(Some(&before), &displayed, "test", wire::IMAGE_VERSION)
+            .unwrap();
         let wire::Update::Delta {
             stamp,
             rows,
@@ -572,7 +577,7 @@ mod tests {
         assert!(rows
             .iter()
             .any(|row| row.index == 1 && row.row.image_slices.len() == 1));
-        let (_, data) = encode(None, &moved, "test", wire::VERSION).unwrap();
+        let (_, data) = scratch.encode(None, &moved, "test", wire::VERSION).unwrap();
         let text_frame: serde_json::Value = serde_json::from_str(&data).unwrap();
         assert!(text_frame.get("images").is_none());
         assert!(text_frame["rows"][1].get("image_slices").is_none());
@@ -580,11 +585,16 @@ mod tests {
 
     #[test]
     fn snapshot_and_exact_delta_preserve_the_same_paint_data_at_u64_width() {
+        // Encoding assertions own their workspace independently of parallel PTY publishers.
+        let budget = Arc::new(RetainedBytesBudget::new(JSON_WORKSPACE_BYTES));
+        let scratch = FrameScratch::reserve_from(&budget).unwrap();
         let revision = 9_007_199_254_740_992;
         let base = sample(revision, Screen::Primary, false);
         let next = sample(revision + 1, Screen::Primary, true);
-        let (_, snapshot) = encode(None, &next, "test", wire::VERSION).unwrap();
-        let (_, delta) = encode(Some(&base), &next, "test", wire::VERSION).unwrap();
+        let (_, snapshot) = scratch.encode(None, &next, "test", wire::VERSION).unwrap();
+        let (_, delta) = scratch
+            .encode(Some(&base), &next, "test", wire::VERSION)
+            .unwrap();
         let wire::Update::Snapshot { stamp, rows, .. } = serde_json::from_str(&snapshot).unwrap()
         else {
             panic!("expected snapshot");

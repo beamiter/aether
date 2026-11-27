@@ -565,6 +565,29 @@ pub fn stdio(socket: &Path, mut reader: impl BufRead, mut writer: impl Write) ->
 mod tests {
     use super::*;
 
+    fn run_with_private_pty_capacity() -> bool {
+        let thread = std::thread::current();
+        let test_name = thread.name().expect("named Rust test thread");
+        const CHILD_TEST: &str = "AETHER_PTY_CAPACITY_TEST";
+        if std::env::var(CHILD_TEST).as_deref() == Ok(test_name) {
+            return false;
+        }
+        // Each runtime owns a process-wide deferred-reaper budget. A full host
+        // must exercise its own limit without competing with unrelated PTYs.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD_TEST, test_name)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated capacity test failed\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        true
+    }
+
     #[test]
     fn releasing_owner_unlocks_even_if_a_fork_inherited_the_descriptor() {
         let file = std::env::temp_dir().join(format!(
@@ -1056,6 +1079,9 @@ os.write(1,b'RETIRED')
 
     #[test]
     fn host_limits_live_ptys_and_expires_abandoned_sessions() {
+        if run_with_private_pty_capacity() {
+            return;
+        }
         let mut host = Host::new().unwrap();
         assert!(host.execute(Command::Open { rows: 0, cols: 80 }).is_err());
         for _ in 0..MAX_SESSIONS {
@@ -1072,6 +1098,9 @@ os.write(1,b'RETIRED')
 
     #[test]
     fn stale_close_at_capacity_cannot_release_another_session_or_its_replacement() {
+        if run_with_private_pty_capacity() {
+            return;
+        }
         fn open(host: &mut Host) -> Result<Attachment, String> {
             let result = host.execute(Command::Open { rows: 16, cols: 80 })?;
             Ok(serde_json::from_value(result).unwrap())
