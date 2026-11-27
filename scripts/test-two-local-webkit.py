@@ -3941,7 +3941,10 @@ def exercise_three_shells(driver, owned, backend, binary):
     assert tty_size(owned / "three-2-resized") == "12 84"
     wait_for(lambda: state()["draft"] == "", "resize receipt still pending")
     for position in (0, 1):
-        driver.click("#focus-preview-pane-1")
+        # The input and resize controls above can vertically scroll the page.
+        # Bring the terminal back into view for the real click, as for tabs.
+        driver.execute("document.body.scrollTop = 0;")
+        driver.click("#focus-preview-pane-1", trace_hit=True)
         wait_for(lambda: state()["current_tab"] == tabs[position] and
                          state()["focused"] == "ime-input" and state()["writable"],
                  f"preview {position} did not return focus to its own input")

@@ -905,10 +905,13 @@ function setActiveControls(writable){
   close.disabled=detach.disabled=restoringLocalLayout;
   if (writable && fitSize?.checked) void Promise.resolve().then(requestFit);
 }
+function localTabInputPending(){
+  return !!owner&&(keyQueue.pending>0||(!keyQueue.locked&&input.disabled));
+}
 function startLocalTab(targetEpoch,{fromRestore=false,focusTerminal=false,configuration=plainLocalTab,splitOnActivate=null}={}) {
   if(sshSession!==null||changingTab||recovery||restoringLocalLayout&&!fromRestore||
       (!owner&&(showLocal.disabled||targetEpoch===null)))return;
-  if(owner&&!fromRestore&&(keyQueue.pending||(!keyQueue.locked&&input.disabled))){
+  if(!fromRestore&&localTabInputPending()){
     status.textContent='Wait for the current input request to finish before switching shells.';
     return;
   }
@@ -1836,8 +1839,9 @@ function directionalPane(direction){
 }
 const directionalPaneActions=['left','right','up','down'].map(direction=>({
   label:`Focus pane ${direction}`,
-  enabled:()=>directionalPane(direction)!==null,
-  unavailableReason:()=> 'No visible local pane in this direction.',
+  enabled:()=>directionalPane(direction)!==null&&!localTabInputPending(),
+  unavailableReason:()=>directionalPane(direction)!==null&&localTabInputPending()
+    ? 'Wait for the current terminal input to finish.' : 'No visible local pane in this direction.',
   run:()=>{
     const target=directionalPane(direction);
     if(target!==null)return startLocalTab(target,{focusTerminal:true});

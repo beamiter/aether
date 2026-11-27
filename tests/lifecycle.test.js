@@ -658,7 +658,8 @@ test('three visible shells rotate a single writer and ACK a retired preview on t
 test('directional palette actions move the single writer by visible layout, not the tab roster',async()=>{
  const own=(epoch,generation)=>({session:String(epoch).repeat(32),epoch,generation});
  const raw=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
- const activations=[],writes=[];
+ const activations=[],writes=[],pending=deferred();
+ let blockWrite=true;
  let opened=1,generation=1;
  const h=harness(async(name,args)=>{
   switch(name){
@@ -668,14 +669,17 @@ test('directional palette actions move the single writer by visible layout, not 
     activations.push(next);
     return {Ok:{owner,frame:channelSnapshot({...raw,session:owner.session,epoch:next}),input_allowed:true}};
    }
-   case 'write_shell':writes.push(args.epoch);return args.bytes.length;
+   case 'write_shell':
+    writes.push(args.epoch);
+    if(blockWrite)await pending.promise;
+    return args.bytes.length;
    default:return null;
   }
  },undefined,undefined,undefined,{},testChannel(),
  {localStorage:{getItem:key=>key==='aether.preview-three-panes'?'1':null}});
  let focused=0;
  h.el('#ime-input').focus=()=>focused++;
- const choose=async(direction,active)=>{
+ const choose=async(direction,active,reason)=>{
   h.click('#command-palette-open');
   const query=h.el('#command-palette-query'), dialog=h.el('#command-palette');
   query.value='focus pane '+direction;query.handlers.input();
@@ -683,6 +687,7 @@ test('directional palette actions move the single writer by visible layout, not 
   assert.equal(results.length,1);
   const button=results[0].children[0];
   assert.equal(button.getAttribute('aria-disabled'),active?null:'true');
+  if(reason)assert.equal(button.children[0].children[0].textContent,reason);
   const count=activations.length, previous=focused;
   await button.click();await tick();
   assert.equal(activations.length,count+(active?1:0));
@@ -693,13 +698,23 @@ test('directional palette actions move the single writer by visible layout, not 
  await h.click('#open');
  for(let i=0;i<3;i++)await h.click('#new-local-tab');
  await h.click('#split-three-local'); // Shell 4 is lower-right; shell 3 is parked.
+ const input=h.el('#input');
+ input.value='write before switching from Shell 4';
+ const receipt=h.submit();
+ await tick();
+ await choose('up',false,'Wait for the current terminal input to finish.');
+ assert.equal(input.value,'write before switching from Shell 4');
+ assert.equal(h.el('#active-pane').dataset.slot,'2');
+ assert.deepEqual(writes,[4]);
+ blockWrite=false;pending.resolve();await receipt;
+ assert.equal(input.value,'');
  await choose('right',false);
  await choose('up',true);assert.equal(activations.at(-1),2);
  await choose('left',true);assert.equal(activations.at(-1),1);
  await choose('down',false);
  await choose('right',true);assert.equal(activations.at(-1),2);
  h.el('#input').value='write only to the selected pane';await h.submit();
- assert.deepEqual(writes,[2]);
+ assert.deepEqual(writes,[4,2]);
  assert.equal(h.el('#terminal-panes').dataset.triple,'true');
  await h.click('#split-three-local'); // A non-split tab roster offers no directions.
  await choose('left',false);
