@@ -3682,9 +3682,109 @@ def private_accessibility_address():
     return address.unpack()[0]
 
 
+def exercise_three_shells(driver, owned, backend):
+    """Three real PTYs, two independently updated passive canvases and one writer."""
+    assert driver.execute("return document.querySelector('#split-three-local').hidden;")
+    origin = driver.execute("return performance.timeOrigin;")
+    driver.execute("localStorage.setItem('aether.preview-three-panes', '1'); location.reload();")
+    wait_for(lambda: opened_page(driver) and driver.execute("return performance.timeOrigin;") != origin,
+             "private three-pane preview did not reload")
+    def state():
+        return driver.execute(READ)
+
+    def pane_pixels():
+        return driver.execute("""
+          const panes = document.querySelector('#terminal-panes');
+          if (panes.dataset.triple !== 'true') return null;
+          return Array.from(panes.querySelectorAll('[data-slot]:not([hidden])'))
+            .sort((a,b)=>Number(a.dataset.slot)-Number(b.dataset.slot))
+            .map(pane => Array.from(pane.querySelector('canvas').getContext('2d')
+              .getImageData(2,2,1,1).data));
+        """)
+
+    def tty_size(path):
+        driver.type("#input", f"stty size > {shlex.quote(str(path))}")
+        driver.click("#send")
+        return wait_for(lambda: path.read_text().strip() if path.is_file() else None,
+                        "active PTY did not report its size")
+
+    colors = [[202, 22, 42, 255], [26, 62, 215, 255], [33, 180, 53, 255]]
+    updates = [[112, 20, 181, 255], [12, 171, 153, 255]]
+    gate = owned / "preview-output-gate"
+    identities, tabs, tty_sizes = [], [], []
+    for number, color in enumerate(colors):
+        driver.click("#open" if number == 0 else "#new-local-tab")
+        wait_for(lambda: state()["writable"] and len(state()["tabs"]) == number + 1,
+                 f"shell {number} did not acquire its attachment")
+        tabs.append(state()["current_tab"])
+        identities.append(write_from_current_tab(driver, owned / f"three-{number}.pid", color))
+        wait_for(lambda: state()["draft"] == "" and state()["pixel"] == color,
+                 f"shell {number} did not paint its own color")
+        if number < 2:
+            r, g, b, _ = updates[number]
+            # No busy producer, fixed wait bound, no stdin access.
+            cmd = (f"(for i in $(seq 1 450); do "
+                   f"if test -e {shlex.quote(str(gate))}; then "
+                   f"printf '\\033[H\\033[48;2;{r};{g};{b}m%20s\\033[0m' ''; "
+                   f"break; fi; sleep 0.1; done) </dev/null &")
+            ready = owned / f"three-{number}-armed"
+            cmd += f" : > {shlex.quote(str(ready))}"
+            driver.type("#input", cmd)
+            driver.click("#send")
+            wait_for(lambda: ready.is_file() and state()["draft"] == "",
+                     f"shell {number} did not arm passive output")
+            # Intermediate process text may move the cursor; redraw the marker at row one.
+            assert write_from_current_tab(driver, owned / f"three-{number}-redraw.pid",
+                                          color) == identities[number]
+            wait_for(lambda: state()["draft"] == "" and state()["pixel"] == color,
+                     "producer altered the baseline marker")
+        tty_sizes.append(tty_size(owned / f"three-{number}-size"))
+        assert re.fullmatch(r"[1-9][0-9]* [1-9][0-9]*", tty_sizes[-1])
+        wait_for(lambda: state()["draft"] == "", "initial size receipt still pending")
+    assert len({pid for pid, _ in identities}) == 3
+    assert all(stamp is not None for _, stamp in identities)
+    driver.click("#split-three-local")
+    wait_for(lambda: pane_pixels() == colors,
+             "three visible native panes did not show their separate PTY pixels")
+    boxes = driver.execute("""
+      return Array.from(document.querySelectorAll('#terminal-panes > [data-slot]:not([hidden])'))
+        .sort((a,b)=>Number(a.dataset.slot)-Number(b.dataset.slot))
+        .map(node=>{const r=node.getBoundingClientRect(); return [r.left,r.top,r.right,r.bottom];});
+    """)
+    assert len(boxes) == 3 and all(left < right and top < bottom for left, top, right, bottom in boxes)
+    assert boxes[0][2] < boxes[1][0] == boxes[2][0] and boxes[1][3] < boxes[2][1]
+    gate.touch()
+    wait_for(lambda: pane_pixels() == [*updates, colors[2]],
+             "two passive PTYs did not update independently under the active shell")
+    assert state()["current_tab"] == tabs[2]
+    assert tty_sizes[2] != "12 84"
+    for selector, value in [("#cols", "84"), ("#rows", "12")]:
+        driver.clear(selector)
+        driver.type(selector, value)
+    driver.click("#resize")
+    wait_for(lambda: state()["cursor"].startswith("84 × 12"), "resize did not reach the third owned PTY")
+    assert tty_size(owned / "three-2-resized") == "12 84"
+    wait_for(lambda: state()["draft"] == "", "resize receipt still pending")
+    for position in (0, 1):
+        driver.click("#focus-preview-pane-1")
+        wait_for(lambda: state()["current_tab"] == tabs[position] and
+                         state()["focused"] == "ime-input" and state()["writable"],
+                 f"preview {position} did not return focus to its own input")
+        assert write_from_current_tab(driver, owned / f"three-{position}-return.pid") == identities[position]
+        wait_for(lambda: state()["draft"] == "", "active input still pending")
+        assert tty_size(owned / f"three-{position}-retained-size") == tty_sizes[position]
+        wait_for(lambda: state()["draft"] == "", "retained size receipt still pending")
+    click_tab(driver, tabs[2])
+    assert write_from_current_tab(driver, owned / "three-2-return.pid") == identities[2]
+    print(json.dumps({"case": "AETHER.THREE_PANES.CANVAS_AND_INPUT", "backend": backend,
+                      "three_distinct_live_ptys": True, "two_passive_canvases_update": True,
+                      "preview_focus_and_exact_pty_identity": True,
+                      "active_resize_leaves_passive_ptys_unchanged": True}), flush=True)
+
+
 def run(binary, jsh, workspace, api, native, notebook=False, output_review=False, vim9=False,
         inline_graphics_only=False, history_graphics_only=False, workspace_only=False, backend="x11",
-        vim_binary=None, workflow_only=False, shell_chrome_only=False):
+        vim_binary=None, workflow_only=False, shell_chrome_only=False, three_shells_only=False):
     executable = shutil.which("WebKitWebDriver")
     if not executable:
         raise RuntimeError("run with official WebKitWebDriver")
@@ -3757,6 +3857,9 @@ def run(binary, jsh, workspace, api, native, notebook=False, output_review=False
                 wait_for(ready, "loopback WebKitWebDriver not ready")
                 driver.open(binary, fit=shell_chrome_only)
                 wait_for(lambda: opened_page(driver), "embedded Aether tauri: page did not load")
+                if three_shells_only:
+                    exercise_three_shells(driver, owned, backend)
+                    return
                 if shell_chrome_only:
                     exercise_terminal_shell(driver, owned)
                     return
@@ -3827,6 +3930,7 @@ if __name__ == "__main__":
     parser.add_argument("--inline-graphics-only", action="store_true", help="exercise real PTY image rendering and reconnect")
     parser.add_argument("--history-graphics-only", action="store_true", help="exercise projected history rendering and selection")
     parser.add_argument("--shell-chrome-only", action="store_true", help="exercise the native terminal controls and shortcuts")
+    parser.add_argument("--three-shells-only", action="store_true", help="verify three native PTYs and two passive canvases")
     args = parser.parse_args()
     if not args.binary.is_absolute() or args.binary.is_symlink() or not args.binary.is_file() or not os.access(args.binary, os.X_OK):
         parser.error("an absolute regular executable is required")
@@ -3843,11 +3947,11 @@ if __name__ == "__main__":
     if args.vim9 and (not (args.vim_binary or shutil.which("vim"))
                       or any(not shutil.which(tool) for tool in ("rg", "xdotool"))):
         parser.error("--vim9 requires Vim 9, ripgrep and xdotool")
-    if args.backend == "wayland" and not (args.workspace_only or args.workflow_only):
+    if args.backend == "wayland" and not (args.workspace_only or args.workflow_only or args.three_shells_only):
         parser.error("--backend wayland requires a standalone journey")
     signal.signal(signal.SIGTERM, interrupted)
     run(args.binary, args.jsh, args.workspace, args.api_chat, args.native_task, args.notebook,
         args.output_review, args.vim9, args.inline_graphics_only, args.history_graphics_only,
         workspace_only=args.workspace_only, backend=args.backend,
         vim_binary=args.vim_binary.resolve() if args.vim_binary else None, workflow_only=args.workflow_only,
-        shell_chrome_only=args.shell_chrome_only)
+        shell_chrome_only=args.shell_chrome_only, three_shells_only=args.three_shells_only)

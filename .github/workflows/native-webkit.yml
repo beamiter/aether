@@ -88,6 +88,18 @@ jobs:
               /usr/bin/python3 -B scripts/test-two-local-webkit.py "$app" \
                 --jsh "$RUNNER_TEMP/aether-shell-fixture/bin/jsh" \
                 --workspace --api-chat --native-task --notebook --output-review --vim9
+      - name: Opt-in three local PTYs and passive canvases on X11
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 3
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          app="${CARGO_TARGET_DIR:?}/debug/tauri-terminal-lab"
+          test -x "$app"
+          test ! -L "$app"
+          sha256sum "$app"
+          xvfb-run --auto-servernum --server-args="-screen 0 1600x1100x24 -nolisten tcp" \
+            dbus-run-session -- timeout --kill-after=10s 140s \
+              /usr/bin/python3 -B scripts/test-two-local-webkit.py "$app" --three-shells-only
       - name: Real PTY Kitty graphics and Canvas pixels on X11
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 2

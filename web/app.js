@@ -1,3 +1,4 @@
+import {makePassiveSurfaces} from './passive-surfaces.js';
 import {installTerminalMouse} from './terminal-mouse.js';
 import {installTerminalFocus} from './terminal-focus.js';
 import {installTerminalSelection} from './terminal-selection.js';
@@ -23,6 +24,12 @@ const localTools=document.querySelector('#local-shells'),showLocal=document.quer
 const tabs=document.querySelector('#local-tabs'),tabList=document.querySelector('#local-tab-list'),newTab=document.querySelector('#new-local-tab'),retryTab=document.querySelector('#retry-local-tab');
 const newJshTab=document.querySelector('#new-jsh-tab');
 const splitToggle=document.querySelector('#split-local'),panes=document.querySelector('#terminal-panes'),peerPane=document.querySelector('#peer-pane'),peerCanvas=document.querySelector('#peer-canvas'),focusPeer=document.querySelector('#focus-peer-pane');
+const tripleToggle=document.querySelector('#split-three-local'),activePane=document.querySelector('#active-pane');
+const passivePanes=[1,2].map(index=>({
+  section:document.querySelector(`#preview-pane-${index}`),
+  canvas:document.querySelector(`#preview-canvas-${index}`),
+  focus:document.querySelector(`#focus-preview-pane-${index}`),
+}));
 const restoreLayout=document.querySelector('#restore-local-layout');
 const terminalPanel=document.querySelector('#terminal-panel');
 const emptyTerminal=document.querySelector('#terminal-empty');
@@ -47,13 +54,30 @@ const showSavedSsh=document.querySelector('#show-saved-ssh'),savedSshPanel=docum
 const savedSshSelect=document.querySelector('#saved-ssh-shell'),resumeSavedSsh=document.querySelector('#resume-saved-ssh'),forgetSavedSsh=document.querySelector('#forget-saved-ssh');
 let savedSshShells=[],savedSshRequest=0;
 let localStream=null,localTransport='channel',localInputSuspended=false,localFrameRecovery=false;
-let splitEnabled=false,splitEpochs=[],splitLayout=1,settingSplit=false,peerState=null;
+let splitEnabled=false,splitEpochs=[],splitLayout=1,layoutSerial=1,settingSplit=false,peerState=null;
+let tripleEpochs=[],passiveTargets=[null,null];
+function allocateLayoutToken(){
+  if(layoutSerial===0xffffffff)throw new Error('Terminal layout tokens exhausted');
+  return ++layoutSerial;
+}
+const passiveSurfaces=makePassiveSurfaces({
+  allocate:allocateLayoutToken,
+  clear(surface){clearPaint(surface);delete surface.dataset.geometry;},
+  paint(surface,frame){
+    paint(surface,frame);
+    surface.dataset.geometry=`${frame.cols}x${frame.rows.length}`;
+    rememberLocalGeometry(frame);
+  },
+});
 function readPreference(key){
   try{return globalThis.localStorage?.getItem(key)??null;}catch{return null;}
 }
 function writePreference(key,value){
   try{globalThis.localStorage?.setItem(key,value);}catch{/* A preference must not interrupt the terminal. */}
 }
+// Keep the initial three-surface journey opt-in until the desktop checks
+// prove isolation and the saved recursive layout is ready.
+const threePanePreview=readPreference('aether.preview-three-panes')==='1';
 let splitAxis=readPreference('aether.split-axis')==='vertical'?'vertical':'horizontal';
 const selectionOverlay = document.querySelector('#terminal-selection');
 const copySelection = document.querySelector('#copy-selection');
@@ -189,6 +213,14 @@ function rememberLocalGeometry(frame){
   localTabGeometry.set(frame.epoch,geometry);recordLocalLayout();
 }
 function updateSplitPair(previous=null){
+  if(tripleEpochs.length){
+    if(!tripleEpochs.every(value=>localTabEpochs.has(value)))tripleEpochs=[];
+    else if(localTabEpochs.has(epoch)&&!tripleEpochs.includes(epoch)){
+      const slot=tripleEpochs.indexOf(previous);
+      if(slot<0)tripleEpochs=[];
+      else tripleEpochs=tripleEpochs.map((value,index)=>index===slot?epoch:value);
+    }
+  }
   if(splitEnabled)splitEpochs=localSplitPair([...localTabEpochs].sort((a,b)=>a-b),epoch,splitEpochs,previous);
 }
 function recordLocalLayout(){
@@ -213,15 +245,43 @@ function recordLocalLayout(){
   saveLocalShellLayout(savedLayout);renderSavedLayout();
 }
 function observerTarget(){
-  if(!splitEnabled||!owner||sshSession!==null||localTabEpochs.size<2||!splitEpochs.includes(epoch))return null;
+  if(tripleIsVisible()||!splitEnabled||!owner||sshSession!==null||localTabEpochs.size<2||!splitEpochs.includes(epoch))return null;
   const other=splitEpochs.find(number=>number!==epoch&&localTabEpochs.has(number));
   return other===undefined?null:{epoch:other,layout:splitLayout};
+}
+function tripleIsVisible(){
+  return threePanePreview&&!!owner&&sshSession===null&&localTransport==='channel'&&tripleEpochs.length===3&&
+    tripleEpochs.includes(epoch)&&tripleEpochs.every(value=>localTabOwners.has(value));
+}
+function knownLocalEpochs(){
+  return [...localTabEpochs].filter(value=>localTabOwners.has(value)).sort((a,b)=>a-b);
+}
+function renderTriple(disabled){
+  const visible=tripleIsVisible();
+  tripleToggle.hidden=!threePanePreview||sshSession!==null||knownLocalEpochs().length<3;
+  tripleToggle.disabled=disabled||tripleToggle.hidden||!localStream?.ready;
+  tripleToggle.setAttribute('aria-pressed',String(visible));
+  tripleToggle.textContent=visible?'Leave three panes':'Three panes';
+  panes.dataset.triple=visible?'true':'';
+  activePane.dataset.slot=visible?String(tripleEpochs.indexOf(epoch)):'';
+  const peers=visible?tripleEpochs.flatMap((value,slot)=>value===epoch?[]:[{value,slot}]):[];
+  passiveTargets=passiveSurfaces.reconcile(peers.map(({value,slot},index)=>({
+    leaf:`live-slot-${slot}`,epoch:value,session:localTabOwners.get(value).session,canvas:passivePanes[index].canvas,
+  })));
+  passivePanes.forEach(({section,focus},index)=>{
+    const peer=peers[index];
+    section.hidden=!peer;
+    section.dataset.slot=peer?String(peer.slot):'';
+    focus.disabled=disabled||!peer;
+    if(peer)focus.textContent=`Focus Shell ${peer.value}`;
+  });
 }
 function renderSplit(){
   const target=observerTarget();
   splitToggle.disabled=!owner||sshSession!==null||!!changingTab||!!recovery||restoringLocalLayout||settingSplit;
-  splitToggle.setAttribute('aria-pressed',String(!!target));
-  splitToggle.textContent=target?'Single pane':'Split';
+  renderTriple(splitToggle.disabled);
+  splitToggle.setAttribute('aria-pressed',String(!!target||tripleIsVisible()));
+  splitToggle.textContent=(target||tripleIsVisible())?'Single pane':'Split';
   const first=splitEpochs[0]===epoch;
   panes.dataset.split=target?(splitAxis==='vertical'?(first?'top':'bottom'):(first?'left':'right')):'';
   peerPane.hidden=!target;
@@ -282,32 +342,70 @@ function paintPeer(frame){
 function sameObservation(left,right){
   return left?.epoch===right?.epoch&&left?.layout===right?.layout;
 }
+function desiredObservers(){
+  return tripleIsVisible()?{multi:true,targets:passiveTargets}:{multi:false,targets:[observerTarget(),null]};
+}
+function sameObservers(left,right){
+  return left.multi===right.multi&&left.targets.every((target,index)=>sameObservation(target,right.targets[index]));
+}
 async function syncObserver(stream){
   if(localStream!==stream||!stream.ready)return;
   if(stream.adjusting)return stream.adjusting;
   stream.adjusting=(async()=>{
-    let target=observerTarget();
-    while(localStream===stream&&!sameObservation(stream.observer,target)){
-      await invoke('set_local_observer',{owner:stream.owner,streamId:stream.channel.id,observer:target});
-      stream.observer=target;target=observerTarget();
+    let wanted=desiredObservers();
+    while(localStream===stream&&!sameObservers(stream.observers,wanted)){
+      const authority={owner:stream.owner,streamId:stream.channel.id};
+      if(wanted.multi)await invoke('set_local_observers',{...authority,observers:wanted.targets});
+      else await invoke('set_local_observer',{...authority,observer:wanted.targets[0]});
+      stream.observers=wanted;wanted=desiredObservers();
     }
   })();
   try{await stream.adjusting;}finally{stream.adjusting=null;}
 }
+async function toggleTriple(){
+  if(tripleToggle.disabled)return;
+  const attachment=owner,stream=localStream;
+  const known=knownLocalEpochs();
+  if(!stream?.ready||!known.includes(epoch)||known.length<3)return;
+  const old=tripleEpochs;
+  splitLayout=allocateLayoutToken();
+  tripleEpochs=old.length?[]:known.slice(0,3);
+  if(tripleEpochs.length&&!tripleEpochs.includes(epoch))tripleEpochs[2]=epoch;
+  settingSplit=true;renderSplit();
+  try{await syncObserver(stream);}
+  catch(error){
+    if(owner===attachment&&localStream===stream){
+      tripleEpochs=old;splitLayout=allocateLayoutToken();renderSplit();
+      stream.observers={multi:!desiredObservers().multi,targets:[null,null]};
+      try{await syncObserver(stream);}catch{ /* Output authority is unchanged. */ }
+      if(owner===attachment)status.textContent=`Three panes unavailable: ${String(error?.message??error)}`;
+    }
+  }finally{settingSplit=false;renderSplit();}
+}
+tripleToggle.addEventListener('click',toggleTriple);
+passivePanes.forEach(({focus,canvas:surface},index)=>{
+  const select=()=>{
+    const target=passiveTargets[index];
+    if(target&&!focus.disabled)return startLocalTab(target.epoch,{focusTerminal:true});
+  };
+  focus.addEventListener('click',select);
+  surface.addEventListener('click',select);
+});
 async function setSplit(axis){
   if(splitToggle.disabled)return;
   if(axis&&localTabEpochs.size<2){
     const configuration=localShellKinds.get(owner.session)==='jsh'?jshLocalTab:plainLocalTab;
     return startLocalTab(null,{configuration,focusTerminal:true,splitOnActivate:axis});
   }
-  if(axis&&splitEnabled&&splitAxis===axis)return;
+  if(axis&&splitEnabled&&splitAxis===axis&&!tripleIsVisible())return;
+  tripleEpochs=[];
   if(axis){
     splitAxis=axis;
     writePreference('aether.split-axis',axis);
   }
   if(axis&&!splitEnabled)splitEpochs=localSplitPair([...localTabEpochs].sort((a,b)=>a-b),epoch);
   if(!axis)splitEpochs=[];
-  splitEnabled=!!axis;splitLayout++;
+  splitEnabled=!!axis;splitLayout=allocateLayoutToken();
   settingSplit=true;renderSplit();
   const attachment=owner;
   try{
@@ -319,7 +417,7 @@ async function setSplit(axis){
   catch(error){if(owner===attachment)status.textContent=`Split pane unavailable: ${String(error?.message??error)}`;}
   finally{settingSplit=false;renderSplit();recordLocalLayout();}
 }
-splitToggle.addEventListener('click',()=>setSplit(splitEnabled?null:'horizontal'));
+splitToggle.addEventListener('click',()=>setSplit(splitEnabled||tripleIsVisible()?null:'horizontal'));
 function selectPeer(){
   const target=observerTarget();
   if(target&&!focusPeer.disabled)return startLocalTab(target.epoch,{focusTerminal:true});
@@ -597,6 +695,7 @@ function suspendLocalOutput(error,recoverFrame=false){
   pasteReview.reset();ime.reset();keyQueue.locked=true;
   input.disabled=send.disabled=resize.disabled=true;
   renderTerminalStage();
+  renderSplit();
   refreshTerminalControls();
   status.textContent=`Local output stream paused: ${String(error?.message??error)}. Recover the output snapshot to continue.`;
 }
@@ -615,12 +714,14 @@ async function receiveLocalStream(stream,event){
     const target=observerTarget();
     recoverFrame=true;
     const peer=target&&event.preview?.layout===target.layout?validateChannelPeer(event.preview.frame,target):null;
+    const commitPassive=tripleIsVisible()?passiveSurfaces.prepare(event.preview):null;
     let revision=null;
     if(event.frame!==null){
       const next=acceptChannelFrame(stream.frame,event.frame,{...attachment,frameVersion:CHANNEL_FRAME_VERSION});
       paintLiveFrame(next);state=next;stream.frame=next;revision=next.revision;describeCursor();
     }
     paintPeer(peer);
+    commitPassive?.();
     recoverFrame=false;
     showShellStatus(event.status,'channel');
     stream.sequence=sequence;stream.lastSeen=Date.now();
@@ -652,23 +753,24 @@ async function startTransport(){
     try{channel=new Channel();}catch{/* No subscription was sent. */}
   }
   if(!channel){
+    if(tripleEpochs.length&&owner.session!==sshSession){tripleEpochs=[];renderSplit();}
     if(owner.session!==sshSession&&state?.version===CHANNEL_FRAME_VERSION){
       suspendLocalOutput(new Error('local output Channel unavailable'));
       return;
     }
     timer=setInterval(poll,50);await poll();return;
   }
-  const stream={owner,channel,sequence:0n,frame:null,lastSeen:Date.now(),animation:null,observer:observerTarget(),ready:false,adjusting:null};
+  const stream={owner,channel,sequence:0n,frame:null,lastSeen:Date.now(),animation:null,observers:{multi:false,targets:[observerTarget(),null]},ready:false,adjusting:null};
   localStream=stream;
   stream.channel.onmessage=event=>queueLocalStream(stream,event);
   timer=setInterval(()=>{
     if(localStream===stream&&!document.hidden&&Date.now()-stream.lastSeen>10000)
       failLocalStream(stream,new Error('no local output heartbeat'));
   },1000);
-  try{await invoke('subscribe_local_shell',{owner:stream.owner,stream:stream.channel,observer:stream.observer,frameVersion:CHANNEL_FRAME_VERSION});}
+  try{await invoke('subscribe_local_shell',{owner:stream.owner,stream:stream.channel,observer:stream.observers.targets[0],frameVersion:CHANNEL_FRAME_VERSION});}
   catch(error){failLocalStream(stream,error);}
   if(localStream===stream){
-    stream.ready=true;
+    stream.ready=true;renderSplit();
     try{await syncObserver(stream);}
     catch(error){if(localStream===stream)status.textContent=`Split pane unavailable: ${String(error?.message??error)}`;}
   }
@@ -824,7 +926,7 @@ async function restoreLocalGeometry(configuration){
 restoreLayout.addEventListener('click',async()=>{
   if(retainedLayoutBlocked||restoreLayout.disabled||!savedLayout||owner||localTabEpochs.size||restoringLocalLayout)return;
   const layout=savedLayout;
-  splitEnabled=layout.split;splitLayout++;
+  splitEnabled=layout.split;splitLayout=allocateLayoutToken();
   restoringLocalLayout=true;
   setOpenDisabled(true);attach.disabled=button.disabled=true;
   status.textContent='Restoring shell tabs…';
@@ -854,7 +956,7 @@ restoreLayout.addEventListener('click',async()=>{
       created.push(owner.epoch);
       await restoreLocalGeometry(configuration);
     }
-    splitEpochs=layout.split?(layout.panes??[0,1]).map(index=>created[index]):[];splitLayout++;
+    splitEpochs=layout.split?(layout.panes??[0,1]).map(index=>created[index]):[];splitLayout=allocateLayoutToken();
     if(owner.epoch!==created[layout.active]){
       await startLocalTab(created[layout.active],{fromRestore:true});
       if(changingTab)return;
@@ -1436,7 +1538,6 @@ async function recoverSshReloadLayout(reason=null){
 
 const historyPanel=document.querySelector('#terminal-history');
 const historyDock=document.querySelector('#terminal-history-dock');
-const activePane=document.querySelector('#active-pane');
 const sessionTools=document.querySelector('#session-tools');
 const workspaceTools=document.querySelector('#terminal-tools');
 const historyQuery=document.querySelector('#history-find-query');
@@ -1553,7 +1654,8 @@ const actions=[
   {label:'Previous tab',hint:'Ctrl+Shift+Tab',keys:['Shift+tab','pageup'],enabled:canCycleTabs,unavailableReason:()=> 'Requires at least two local shell tabs.',run:()=>cycleTabs(-1)},
   {label:'Split left and right',hint:'Ctrl+Shift+E',keys:['Shift+e'],enabled:()=>!splitToggle.disabled,unavailableReason:()=> 'Requires two available local shell tabs.',run:()=>setSplit('horizontal')},
   {label:'Split top and bottom',hint:'Ctrl+Shift+D',keys:['Shift+d'],enabled:()=>!splitToggle.disabled,unavailableReason:()=> 'Requires two available local shell tabs.',run:()=>setSplit('vertical')},
-  {label:'Return to one pane',enabled:()=>splitEnabled&&!splitToggle.disabled,run:()=>setSplit(null)},
+  clickAction('Toggle three panes','#split-three-local'),
+  {label:'Return to one pane',enabled:()=>(splitEnabled||tripleIsVisible())&&!splitToggle.disabled,run:()=>setSplit(null)},
   {label:'Search terminal history',hint:'Ctrl+Shift+F',keys:['Shift+f'],enabled:canUseHistory,unavailableReason:()=> 'Requires a local terminal with searchable history.',run:()=>showHistory(true)},
   {label:'Copy terminal selection',hint:'Ctrl+Shift+C',keys:['Shift+c'],
     enabled:()=>!!owner&&!copySelection.disabled,unavailableReason:()=> 'Select text in the attached terminal first.',run:copyTerminalSelection},

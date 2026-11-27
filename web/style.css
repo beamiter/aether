@@ -286,6 +286,14 @@ kbd {color: var(--muted); font: 11px monospace; white-space: nowrap;}
 #active-pane .fit-terminal {scrollbar-gutter: stable;}
 #terminal-chat-transcript {min-height: 0; overflow: auto;}
 #focus-peer-pane {align-self: flex-start; margin: 5px 8px 0;}
+#terminal-panes[data-triple="true"] {
+  grid-template: repeat(2, minmax(0, 1fr)) / repeat(2, minmax(0, 1fr));
+}
+#terminal-panes[data-triple="true"] > [data-slot="0"] {grid-area: 1 / 1 / 3 / 2;}
+#terminal-panes[data-triple="true"] > [data-slot="1"] {grid-area: 1 / 2 / 2 / 3;}
+#terminal-panes[data-triple="true"] > [data-slot="2"] {grid-area: 2 / 2 / 3 / 3;}
+#terminal-panes[data-triple="true"] #active-pane {border-color: #55786d;}
+.focus-preview-pane {align-self: flex-start; margin: 5px 8px 0;}
 #terminal-empty {
   position: absolute;
   inset: 0;

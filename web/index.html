@@ -21,6 +21,7 @@
   <div class="terminal-actions">
     <button id="new-jsh-tab" type="button" disabled hidden>New jsh tab</button>
     <button id="split-local" type="button" aria-pressed="false" aria-keyshortcuts="Control+Shift+E" disabled>Split</button>
+    <button id="split-three-local" type="button" aria-pressed="false" hidden disabled>Three panes</button>
     <button id="terminal-chat-toggle" type="button" aria-pressed="false" disabled>Chat</button>
     <button id="workflows" type="button" aria-controls="workflow-picker" aria-expanded="false" disabled>Workflows</button>
     <button id="retry-local-tab" type="button" hidden>Retry tab switch</button>
@@ -72,6 +73,14 @@
   <section id="peer-pane" hidden aria-label="Inactive terminal pane">
     <button id="focus-peer-pane" type="button">Focus other shell</button>
     <div class="viewport"><canvas id="peer-canvas" aria-label="Inactive terminal output"></canvas></div>
+  </section>
+  <section id="preview-pane-1" hidden aria-label="Inactive terminal pane 1">
+    <button id="focus-preview-pane-1" class="focus-preview-pane" type="button">Focus shell</button>
+    <div class="viewport"><canvas id="preview-canvas-1" aria-label="Inactive terminal output"></canvas></div>
+  </section>
+  <section id="preview-pane-2" hidden aria-label="Inactive terminal pane 2">
+    <button id="focus-preview-pane-2" class="focus-preview-pane" type="button">Focus shell</button>
+    <div class="viewport"><canvas id="preview-canvas-2" aria-label="Inactive terminal output"></canvas></div>
   </section>
 </div>
 <footer class="terminal-status">

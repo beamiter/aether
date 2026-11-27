@@ -1,3 +1,4 @@
+import {makePassiveSurfaces} from '../web/passive-surfaces.js';
 import {validateReloadView,retainedReloadView,saveReloadTicket,takeReloadTicket} from '../web/ssh-reload.js';
 import {installPasteReview} from '../web/paste.js';
 import {installTerminalFocus} from '../web/terminal-focus.js';
@@ -20,7 +21,7 @@ function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsuppo
  const invoke=async(name,args)=>{
   if(name==='ssh_terminal'&&args?.action?.operation==='recover_reload_layout')return animation.recoverReloadLayout?.()??null;
   const {owner,...parameters}=args??{};
-  const keepsOwner=['activate_local_tab','subscribe_local_shell','ack_local_stream','set_local_observer','observe_local_shell','local_command_blocks','focus_shell'].includes(name);
+  const keepsOwner=['activate_local_tab','subscribe_local_shell','ack_local_stream','set_local_observer','set_local_observers','observe_local_shell','local_command_blocks','focus_shell'].includes(name);
   const legacy=owner&&!keepsOwner?{epoch:owner.epoch,...parameters}:args;
   if(name==='shell_status')return {drained:false,write_error:null,dropped_reply_bytes:'0',...await health(legacy)};
   const result=await rawInvoke(name,legacy);
@@ -54,7 +55,7 @@ function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsuppo
  const listen=events=>(name,fn)=>events.set(name,[...(events.get(name)??[]),fn]);
  const fire=(events,name)=>{for(const fn of events.get(name)??[])fn({target:document.activeElement});};
  const document={querySelector:el,querySelectorAll:()=>[],createElement:element,body:element(),activeElement:null,hidden:false,hasFocus:()=>true,addEventListener:listen(pageEvents)};
- const context={validateReloadView,retainedReloadView,saveReloadTicket,takeReloadTicket,installFilePreviewPanel:()=>({dismiss(){}}),document,addEventListener:listen(windowEvents),__TAURI__:{core:{invoke,Channel}},acceptFull,acceptUpdate,clearPaint,acceptChannelFrame,channelCounter,CHANNEL_FRAME_VERSION,installIme,installHistory,installCommandBlocks,installTerminalChat,installTerminalShell,installWorkflows,validateChatStatus,installPasteReview,installTerminalFocus,installTerminalMouse,installTerminalSelection,dimensions,resizeQueue,cursorTarget,terminalCellAt,viewportDimensions,paint,TextEncoder:Encoder,TextDecoder,
+ const context={makePassiveSurfaces,validateReloadView,retainedReloadView,saveReloadTicket,takeReloadTicket,installFilePreviewPanel:()=>({dismiss(){}}),document,addEventListener:listen(windowEvents),__TAURI__:{core:{invoke,Channel}},acceptFull,acceptUpdate,clearPaint,acceptChannelFrame,channelCounter,CHANNEL_FRAME_VERSION,installIme,installHistory,installCommandBlocks,installTerminalChat,installTerminalShell,installWorkflows,validateChatStatus,installPasteReview,installTerminalFocus,installTerminalMouse,installTerminalSelection,dimensions,resizeQueue,cursorTarget,terminalCellAt,viewportDimensions,paint,TextEncoder:Encoder,TextDecoder,
  installInlineHistory,
  plainLocalTab,MAX_LOCAL_SHELLS,validLocalGeometry,localSplitPair,readLocalShellLayout:()=>readLocalShellLayout(storage),saveLocalShellLayout:value=>saveLocalShellLayout(value,storage),
  setInterval(fn){timers.set(++id,fn);return id},clearInterval(i){timers.delete(i)},setTimeout,...animation};
@@ -546,6 +547,69 @@ test('split observations paint the inactive shell and cannot claim live input',a
  assert.equal(painted.at(-1).canvas,h.el('#peer-canvas'));assert.equal(painted.at(-1).epoch,2);
  h.el('#input').value='send A';await h.submit();
  assert.deepEqual(adopted,[2,1]);assert.deepEqual(writes,[2,1]);
+});
+
+test('three visible shells rotate a single writer and ACK a retired preview on the same stream',async()=>{
+ const own=(epoch,generation)=>({session:String(epoch).repeat(32),epoch,generation});
+ const a=own(1,1),b=own(2,2),c=own(3,3),aAgain=own(1,4),d=own(4,5);
+ const raw=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+ const frame=(owner,revision=raw.revision)=>channelSnapshot({...raw,session:owner.session,epoch:owner.epoch,revision});
+ const events=[],layouts=[],painted=[],acks=[],writes=[];
+ const opening=[b,c,d];
+ const h=harness(async(name,args)=>{
+  switch(name){
+   case 'open_shell':return a;
+   case 'subscribe_local_shell':events.push({handle:args.stream.onmessage,epoch:args.owner.epoch});return null;
+   case 'set_local_observers':
+    assert.equal(args.observers.length,2);
+    assert.ok(args.observers.every(target=>target.epoch!==args.owner.epoch));
+    layouts.push({epoch:args.owner.epoch,targets:args.observers});return null;
+   case 'set_local_observer':return null;
+   case 'ack_shell':return null;
+   case 'ack_local_stream':acks.push([args.owner.epoch,args.sequence,args.revision]);return null;
+   case 'write_shell':writes.push(args.epoch);return args.bytes.length;
+   case 'activate_local_tab':{
+    assert.ok(args.targetEpoch===null||args.targetEpoch===1);
+    const next=args.targetEpoch===1?aAgain:opening.shift();
+    return {Ok:{owner:next,frame:frame(next),input_allowed:true}};
+   }
+   default:throw Error('unexpected local IPC '+name);
+  }
+ },undefined,undefined,(canvas,next)=>painted.push({canvas,epoch:next.epoch,rev:next.revision}),{},testChannel(),{localStorage:{getItem:key=>key==='aether.preview-three-panes'?'1':null}});
+ const event=(owner,seq,preview,active=null)=>({owner,kind:'update',sequence:String(seq),frame:active,preview,status:channelHealth(owner.epoch)});
+ await h.click('#open');await h.click('#new-local-tab');await h.click('#new-local-tab');
+ assert.equal(h.el('#split-three-local').disabled,false);
+ await h.click('#split-three-local');
+ assert.equal(h.el('#terminal-panes').dataset.triple,'true');
+ assert.equal(h.el('#active-pane').dataset.slot,'2');
+ const [slotA,slotB]=layouts.at(-1).targets;
+ assert.deepEqual([slotA.epoch,slotB.epoch],[1,2]);
+ const sendC=events.at(-1).handle;
+ await sendC(event(c,1,{layout:slotA.layout,frame:frame(a,17)},frame(c)));
+ await sendC(event(c,2,{layout:slotB.layout,frame:frame(b,2)}));
+ assert.deepEqual(painted.slice(-2).map(item=>[item.canvas===h.el('#preview-canvas-1')?1:2,item.epoch,item.rev]),[[1,1,'17'],[2,2,'2']]);
+ h.el('#input').value='write only C';await h.submit();
+ await h.click('#split-three-local');await h.click('#split-three-local');
+ const newerA=layouts.at(-1).targets[0];
+ assert.notEqual(newerA.layout,slotA.layout);
+ const count=painted.length;
+ await sendC(event(c,3,{layout:slotA.layout,frame:'obsolete wrong frame'}));
+ assert.equal(painted.length,count);
+ assert.equal(h.el('#input').disabled,false);
+ assert.deepEqual(acks,[[3,'1',String(raw.revision)],[3,'2',null],[3,'3',null]]);
+ await h.click('#focus-preview-pane-1');
+ assert.equal(events.at(-1).epoch,1);
+ assert.equal(h.el('#active-pane').dataset.slot,'0');
+ assert.deepEqual(Array.from(layouts.at(-1).targets,target=>target.epoch),[2,3]);
+ h.el('#input').value='write only A';await h.submit();
+ await h.click('#new-local-tab');
+ assert.equal(events.at(-1).epoch,4);
+ assert.equal(h.el('#active-pane').dataset.slot,'0');
+ assert.deepEqual(Array.from(layouts.at(-1).targets,target=>target.epoch),[2,3]);
+ assert.equal(h.el('#local-tab-list').options.length,4);
+ assert.equal(h.el('#preview-pane-1').hidden,false);
+ assert.equal(h.el('#preview-pane-2').hidden,false);
+ assert.deepEqual(writes,[3,1]);
 });
 
 test('SSH terminal recovers the same grid on a new generation and reattaches read-only',async()=>{
