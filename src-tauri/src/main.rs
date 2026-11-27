@@ -90,6 +90,7 @@ async fn list_local_shells<R: tauri::Runtime>(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri binds the top-level IPC fields to separate arguments.
 async fn activate_local_tab<R: tauri::Runtime>(
     window: tauri::WebviewWindow<R>,
     owner: Option<Attachment>,
