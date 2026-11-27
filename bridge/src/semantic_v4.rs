@@ -5,10 +5,11 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use jterm_engine::{
     colors::ColorState,
     frame::{CellFrame, Row, Screen},
+    grid::UnderlineColorRun,
     history_reflow::HistoryAnchor,
     retained_bytes::{RetainedBytes, RetainedBytesBudget},
     terminal::{HistoryPage, InlineImage},
-    Color, HyperlinkId, UnderlineStyle,
+    HyperlinkId, UnderlineStyle,
 };
 use jterm_protocol::{
     engine_projection::{paint_rgb, same_cell_colors},
@@ -185,7 +186,7 @@ fn encode_history_rows<'a, R: serde::Serialize>(
                 row,
                 |column| page.cluster_text(index, column),
                 |id| page.hyperlink_target(id),
-                |column| page.underline_color(index, column),
+                page.underline_color_runs(index),
             )?;
             let image_slices = projection.image_slices(
                 page.inline_images(index)
@@ -321,39 +322,74 @@ fn project_update<'a, R>(
     })
 }
 
+#[inline(never)]
 fn split_row_moves(
     base: &CellFrame,
     frame: &CellFrame,
     mut rows: Vec<usize>,
 ) -> (Vec<usize>, Vec<wire::RowMove>) {
-    let mut sources: Vec<_> = base
-        .rows()
-        .iter()
-        .enumerate()
-        .map(|(index, row)| (row.cells.as_ptr(), index))
-        .collect();
-    sources.sort_unstable_by_key(|&(address, _)| address);
+    let mut sources = None;
+    let mut linear_probes = 2;
     let mut moves: Vec<wire::RowMove> = Vec::new();
     rows.retain(|&to| {
+        let matches = |from: usize| from != to && base.shares_row_paint_with(from, frame, to);
+        // A region can contain unchanged rows between two moved runs.
+        // Try the last displacement even across one of those gaps.
+        if let Some(last) = moves.last_mut() {
+            if let Some(offset) = to.checked_sub(usize::from(last.to)) {
+                let from = usize::from(last.from) + offset;
+                if matches(from) {
+                    if offset == usize::from(last.count) {
+                        last.count += 1;
+                    } else {
+                        moves.push(wire::RowMove {
+                            from: from as u16,
+                            to: to as u16,
+                            count: 1,
+                        });
+                    }
+                    return false;
+                }
+            }
+        }
+
         let address = frame.rows()[to].cells.as_ptr();
-        let start = sources.partition_point(|&(candidate, _)| candidate < address);
-        let from = sources[start..]
-            .iter()
-            .take_while(|&&(candidate, _)| candidate == address)
-            .map(|&(_, index)| index)
-            .find(|&from| from != to && base.shares_row_paint_with(from, frame, to));
+        // A scroll usually needs one lookup to start its run and one miss
+        // at the newly exposed row. Small deltas also avoid sorting the base.
+        let from = if linear_probes > 0 {
+            linear_probes -= 1;
+            base.rows()
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.cells.as_ptr() == address)
+                .map(|(index, _)| index)
+                .find(|&from| matches(from))
+        } else {
+            let sources = sources.get_or_insert_with(|| {
+                let mut entries: Vec<_> = base
+                    .rows()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, row)| (row.cells.as_ptr(), index))
+                    .collect();
+                entries.sort_unstable_by_key(|&(address, _)| address);
+                entries
+            });
+            let start = sources.partition_point(|&(candidate, _)| candidate < address);
+            sources[start..]
+                .iter()
+                .take_while(|&&(candidate, _)| candidate == address)
+                .map(|&(_, index)| index)
+                .find(|&from| matches(from))
+        };
         let Some(from) = from else {
             return true;
         };
-        let (from, to) = (from as u16, to as u16);
-        if let Some(last) = moves
-            .last_mut()
-            .filter(|last| last.from + last.count == from && last.to + last.count == to)
-        {
-            last.count += 1;
-        } else {
-            moves.push(wire::RowMove { from, to, count: 1 });
-        }
+        moves.push(wire::RowMove {
+            from: from as u16,
+            to: to as u16,
+            count: 1,
+        });
         false
     });
     (rows, moves)
@@ -552,12 +588,24 @@ impl<'a> Projection<'a> {
         row: &Row,
         cluster: impl Fn(usize) -> Option<&'a str>,
         hyperlink: impl Fn(HyperlinkId) -> Option<&'a str>,
-        underline: impl Fn(usize) -> Option<Color>,
+        mut underline_runs: &[UnderlineColorRun],
     ) -> Result<Vec<EncodedCell<'a>>, String> {
         row.cells
             .iter()
             .enumerate()
             .map(|(column, cell)| {
+                // Columns are visited in order, so each color run only
+                // needs to be found once per row.
+                while underline_runs
+                    .first()
+                    .is_some_and(|run| usize::from(run.end) <= column)
+                {
+                    underline_runs = &underline_runs[1..];
+                }
+                let underline_color = underline_runs
+                    .first()
+                    .filter(|run| usize::from(run.start) <= column)
+                    .map(|run| paint_rgb(run.color, true, self.colors));
                 let flags = cell.flags;
                 let width = cell_width(flags, column, row.cells.len());
                 let text = if width == 0 {
@@ -624,8 +672,7 @@ impl<'a> Projection<'a> {
                         UnderlineStyle::Dotted => Some(wire::Underline::Dotted),
                         UnderlineStyle::Dashed => Some(wire::Underline::Dashed),
                     },
-                    underline_color: underline(column)
-                        .map(|color_value| paint_rgb(color_value, true, self.colors)),
+                    underline_color,
                     hyperlink_id,
                 })
             })
@@ -651,7 +698,7 @@ fn wire_row<'a>(
             row,
             |column| frame.cluster_text(index, column),
             |id| frame.hyperlink_target(id),
-            |column| frame.underline_color(index, column),
+            frame.underline_color_runs(index),
         )?,
         image_slices: projection.image_slices(row_images(frame, index))?,
     })
@@ -1009,6 +1056,108 @@ mod tests {
             assert!(matches!(legacy, wire::Update::Snapshot { .. }));
             assert!(serde_json::to_value(legacy).unwrap().get("moves").is_none());
         }
+    }
+
+    #[test]
+    fn separated_move_runs_and_aliased_sources_replay_to_the_full_frame() {
+        let mut rows: Vec<_> = ('a'..='p')
+            .map(|character| Row {
+                cells: Arc::from([TerminalCell {
+                    character,
+                    ..TerminalCell::default()
+                }]),
+                wrapped: false,
+            })
+            .collect();
+        rows[6] = rows[2].clone();
+        rows[10] = rows[2].clone();
+        rows[10].wrapped = true;
+        let updated_rows: Vec<_> = [1, 2, 3, 0, 4, 6, 7, 8, 9, 10, 12, 13, 14, 15, 11, 5]
+            .iter()
+            .map(|&i| rows[i].clone())
+            .collect();
+        let frame = |revision, rows: Vec<Row>| {
+            CellFrame::new(
+                Stamp {
+                    epoch: 1,
+                    revision,
+                    layout: 1,
+                    screen: Screen::Primary,
+                },
+                1,
+                rows.into(),
+                Cursor {
+                    row: 0,
+                    col: 0,
+                    pending_wrap: false,
+                    visible: true,
+                    shape: CursorShape::Block,
+                },
+                Limits {
+                    max_rows: 16,
+                    max_cols: 1,
+                    max_cells: 16,
+                },
+            )
+            .unwrap()
+        };
+        let base = frame(1, rows);
+        let next = frame(2, updated_rows);
+        let snapshot = |frame| match update(None, frame, "test", wire::ROW_MOVE_VERSION).unwrap() {
+            wire::Update::Snapshot { rows, .. } => rows,
+            _ => unreachable!(),
+        };
+        let wire::Update::Delta { rows, moves, .. } =
+            update(Some(&base), &next, "test", wire::ROW_MOVE_VERSION).unwrap()
+        else {
+            panic!("separated runs should still produce a delta");
+        };
+        assert!(moves.len() > 2);
+        let original = snapshot(&base);
+        let mut replayed = original.clone();
+        for movement in moves {
+            let from = movement.from as usize;
+            let to = movement.to as usize;
+            let count = movement.count as usize;
+            replayed[to..to + count].clone_from_slice(&original[from..from + count]);
+        }
+        for patch in rows {
+            replayed[patch.index as usize] = patch.row;
+        }
+        assert_eq!(replayed, snapshot(&next));
+    }
+
+    #[test]
+    fn projected_underline_colors_cover_runs_and_the_gaps_between_them() {
+        let mut terminal = jterm_engine::terminal::Terminal::new(2, 8).unwrap();
+        terminal.enable_underline_colors();
+        terminal
+            .feed(b"\x1b[4;58;2;1;2;3mAB\x1b[mCD\x1b[4;58;2;4;5;6mE\x1b[58;2;7;8;9mFG\x1b[m")
+            .unwrap();
+        let frame = terminal.frame().unwrap();
+        let wire::Update::Snapshot { rows, .. } =
+            update(None, &frame, "test", wire::VERSION).unwrap()
+        else {
+            unreachable!();
+        };
+        let colors: Vec<_> = rows[0]
+            .cells
+            .iter()
+            .map(|cell| cell.underline_color.as_deref())
+            .collect();
+        assert_eq!(
+            colors,
+            [
+                Some("#010203"),
+                Some("#010203"),
+                None,
+                None,
+                Some("#040506"),
+                Some("#070809"),
+                Some("#070809"),
+                None,
+            ]
+        );
     }
 
     #[test]
