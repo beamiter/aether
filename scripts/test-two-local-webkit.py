@@ -749,7 +749,7 @@ def geometry_receipt(driver, selector, point=None):
             const box = node => node ? Array.from(
                 ['left','top','width','height'], k => Math.round(node.getBoundingClientRect()[k])
             ) : null;
-            const viewport = canvas?.closest('.viewport, #history-viewport');
+            const viewport = canvas?.closest('.viewport, #history-viewport, #peer-pane');
             const rect = canvas?.getBoundingClientRect(), clip = viewport?.getBoundingClientRect();
             let point = {json.dumps(point)};
             if (!point && canvas?.id === 'history-canvas') {{
@@ -766,8 +766,8 @@ def geometry_receipt(driver, selector, point=None):
             }}
             const hit = point && document.elementFromPoint(...point);
             const control = id => document.getElementById(id);
-            const role = node => !node ? null : node === canvas ? 'canvas' :
-              node === control('ime-input') ? 'ime' : node === control('app-header') ? 'header' :
+            const role = node => !node ? null : node === canvas ? (canvas.tagName === 'CANVAS' ? 'canvas' : 'target') :
+              node === control('ime-input') ? 'ime' : node.closest('#app-header') ? 'header' :
               node.closest('#terminal-stage') ? 'terminal-stage' :
               node.closest('#terminal-history') ? 'history' : node.tagName;
             const chat = control('active-pane')?.dataset.chatSurface;
@@ -3980,7 +3980,19 @@ def exercise_three_shells(driver, owned, backend, binary):
              "closing the bottom leaf did not retain the horizontal split and parked tab")
     assert write_from_current_tab(driver, owned / "three-closed-focus.pid") == identities[1]
     wait_for(lambda: state()["draft"] == "", "close fallback shell receipt still pending")
-    driver.click("#focus-peer-pane")
+    # Close is in Session controls below the terminal, which click() opens
+    # and scrolls to. Reveal the upper pane controls before sending a real
+    # WebDriver click. On the compact window, centering alone can leave the
+    # peer button underneath the sticky app header.
+    driver.execute("document.body.scrollTop = 0;")
+    try:
+        driver.click("#focus-peer-pane")
+    except ProtocolError as error:
+        if error.error == "element click intercepted":
+            print(json.dumps({"case": "AETHER.THREE_PANES.CLOSE_FOCUS_CLICK_INTERCEPTED",
+                              "backend": backend,
+                              "receipt": geometry_receipt(driver, "#focus-peer-pane")}), flush=True)
+        raise
     wait_for(lambda: state()["current_tab"] == tabs[0] and state()["writable"] and state()["split"] == "left",
              "surviving peer did not remain focusable")
     assert write_from_current_tab(driver, owned / "three-closed-peer.pid") == identities[0]
