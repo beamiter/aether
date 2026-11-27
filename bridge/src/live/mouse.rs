@@ -1,7 +1,8 @@
+use super::ViewportPixels;
 use crate::protocol_v4::Counter;
 use jterm_engine::{
     frame::Stamp,
-    mouse::{MouseInput, MouseTracking},
+    mouse::{MouseEncoding, MouseInput, MouseTracking},
     terminal::Terminal,
 };
 
@@ -20,6 +21,8 @@ pub struct MouseView {
     revision: Counter,
     generation: u32,
     tracking: Tracking,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pixels: Option<ViewportPixels>,
 }
 
 /// Wheel-only alternate-screen scrolling; separate from negotiated mouse tracking.
@@ -60,12 +63,21 @@ enum Action {
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
+struct PointerPixels {
+    x: u32,
+    y: u32,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct MouseReport {
     layout: Counter,
     revision: Counter,
     generation: u32,
     row: usize,
     col: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pixels: Option<PointerPixels>,
     kind: Action,
     button: Option<Button>,
     alt: bool,
@@ -90,7 +102,8 @@ impl Mouse {
     }
 
     pub(super) fn view(&self, terminal: &Terminal, presented: Stamp) -> Option<MouseView> {
-        let tracking = match terminal.mouse_report_profile()?.tracking {
+        let profile = terminal.mouse_report_profile()?;
+        let tracking = match profile.tracking {
             MouseTracking::PressOnly => Tracking::PressOnly,
             MouseTracking::Button => Tracking::Button,
             MouseTracking::Drag => Tracking::Drag,
@@ -100,11 +113,18 @@ impl Mouse {
         if presented != current || terminal.publication_held() {
             return None;
         }
+        let pixels = if profile.encoding == MouseEncoding::SgrPixels {
+            let (width, height) = terminal.mouse_pixel_extent()?;
+            Some(ViewportPixels { width, height })
+        } else {
+            None
+        };
         Some(MouseView {
             layout: Counter::new(presented.layout)?,
             revision: Counter::new(presented.revision)?,
             generation: generation(terminal)?,
             tracking,
+            pixels,
         })
     }
 
@@ -188,7 +208,10 @@ impl Mouse {
             return Ok(false);
         }
         let modifiers = (u8::from(report.alt) << 3) | (u8::from(report.ctrl) << 4);
-        let Some(bytes) = terminal.encode_mouse(input, report.col, report.row, modifiers) else {
+        let pixels = report.pixels.map(|point| (point.x, point.y));
+        let Some(bytes) =
+            terminal.encode_mouse_with_pixels(input, report.col, report.row, modifiers, pixels)
+        else {
             return Ok(false);
         };
         session.submit_input(bytes)?;

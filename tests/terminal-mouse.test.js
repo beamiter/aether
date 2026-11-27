@@ -62,6 +62,47 @@ test('application drag maps physical cells and releases the captured button outs
   assert.ok(h.sent.every(report => report.layout === '7' && report.revision === '11' && report.generation === 8));
 });
 
+test('pixel motion distinguishes points in one cell and clamps the release to the measured surface', async () => {
+  const h = harness();
+  h.setFrame({mouse:{tracking:'drag', generation:8, pixels:{width:240, height:320}}});
+  h.event('pointerdown');
+  h.event('pointermove', {clientX:48, buttons:1});
+  await Promise.resolve();
+  h.event('pointermove', {clientX:48.25, buttons:1});
+  h.event('pointermove', {clientX:49, buttons:1});
+  await Promise.resolve();
+  h.event('wheel', {deltaY:-1});
+  await Promise.resolve();
+  h.event('pointerup', {clientX:400, clientY:-4});
+  assert.deepEqual(h.sent.map(({kind, row, col, pixels}) => [kind, row, col, pixels]), [
+    ['press', 2, 1, {x:78, y:82}],
+    ['motion', 2, 1, {x:76, y:82}],
+    ['motion', 2, 1, {x:78, y:82}],
+    ['wheel_up', 2, 1, {x:78, y:82}],
+    ['release', 0, 5, {x:239, y:0}],
+  ]);
+});
+
+test('a pixel-only resize retires captured and queued events from the prior scale', async () => {
+  let finishMotion;
+  const inFlight = new Promise(resolve => {finishMotion = resolve;});
+  const h = harness('drag', report => report.kind === 'motion' ? inFlight : undefined);
+  h.setFrame({mouse:{tracking:'drag', generation:8, pixels:{width:240, height:320}}});
+  h.event('pointerdown');
+  h.event('pointermove', {clientX:48, buttons:1});
+  h.event('pointermove', {clientX:49, buttons:1});
+  h.setFrame({mouse:{tracking:'drag', generation:9, pixels:{width:120, height:160}}});
+  finishMotion();
+  await inFlight;
+  h.event('pointerup');
+  h.event('pointerdown');
+  assert.deepEqual(h.sent.map(({kind, generation, pixels}) => [kind, generation, pixels]), [
+    ['press', 8, {x:78, y:82}],
+    ['motion', 8, {x:76, y:82}],
+    ['press', 9, {x:39, y:41}],
+  ]);
+});
+
 test('release follows the current revision when the application repaints during a drag', () => {
   const h = harness();
   h.event('pointerdown');

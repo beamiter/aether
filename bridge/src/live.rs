@@ -29,7 +29,7 @@ pub use command_blocks::{
 pub use mouse::{AlternateScrollView, MouseReport, MouseView};
 use raw_suffix::RawSuffix;
 
-#[derive(Clone, Copy, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ViewportPixels {
     pub width: u32,
@@ -206,6 +206,7 @@ impl LiveBridge {
             session.set_color_defaults(jterm_protocol::engine_projection::WIRE_COLOR_DEFAULTS);
             session.enable_underline_colors();
             session.enable_grapheme_clusters();
+            session.enable_pixel_mouse();
             session.enable_keyboard_disambiguation();
             session.enable_history_preserving_resize();
         }
@@ -1900,6 +1901,120 @@ expect(b'.')
         assert!(!bridge
             .mouse(epoch, report("press", &view["layout"], generation))
             .unwrap());
+        bridge.close(epoch).unwrap();
+    }
+
+    #[test]
+    fn pixel_mouse_validates_positions_and_retires_a_held_button_on_pixel_resize() {
+        let mut bridge = LiveBridge::local_desktop();
+        let epoch = bridge
+            .open_with_window_pixels(
+                6,
+                128,
+                false,
+                Some(ViewportPixels {
+                    width: 1536,
+                    height: 144,
+                }),
+            )
+            .unwrap();
+        let expected_bytes = b"\x1b[<0;1;1M\x1b[<0;3072;288M\x1b[<0;3072;288m";
+        let command = format!(
+            "stty -echo -icanon min 1 time 0; printf '\\033[?1002;1016h'; od -An -v -w{0} -tx1 -N{0}\n",
+            expected_bytes.len()
+        );
+        write_owned_line(&mut bridge, epoch, command.as_bytes());
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let poll_view = |bridge: &mut LiveBridge| loop {
+            if let Some(frame) = bridge.poll(epoch).unwrap() {
+                bridge.acknowledge(epoch, frame.revision).unwrap();
+            }
+            if let Some(view) = bridge.mouse_view(epoch).unwrap() {
+                break serde_json::to_value(view).unwrap();
+            }
+            assert!(Instant::now() < deadline, "missing pixel mouse view");
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        let before = poll_view(&mut bridge);
+        assert_eq!(
+            before["pixels"],
+            serde_json::json!({"width":1536,"height":144})
+        );
+        let report = |view: &serde_json::Value, kind: &str, position: serde_json::Value| {
+            serde_json::from_value::<MouseReport>(serde_json::json!({
+                "layout": view["layout"], "revision": view["revision"], "generation": view["generation"],
+                "row": 0, "col": 0, "kind": kind, "button": "left", "alt": false, "ctrl": false,
+                "pixels": position,
+            }))
+            .unwrap()
+        };
+        let origin = serde_json::json!({"x":0,"y":0});
+        assert!(!bridge
+            .mouse(epoch, report(&before, "press", serde_json::Value::Null))
+            .unwrap());
+        assert!(!bridge
+            .mouse(
+                epoch,
+                report(&before, "press", serde_json::json!({"x":1536,"y":0}))
+            )
+            .unwrap());
+        assert!(bridge
+            .mouse(epoch, report(&before, "press", origin.clone()))
+            .unwrap());
+        bridge
+            .set_window_pixels(
+                epoch,
+                before["layout"].as_str().unwrap().parse().unwrap(),
+                6,
+                128,
+                ViewportPixels {
+                    width: 3072,
+                    height: 288,
+                },
+            )
+            .unwrap();
+        let after = poll_view(&mut bridge);
+        assert_eq!(after["layout"], before["layout"]);
+        assert_ne!(after["generation"], before["generation"]);
+        assert_eq!(
+            after["pixels"],
+            serde_json::json!({"width":3072,"height":288})
+        );
+        assert!(!bridge
+            .mouse(epoch, report(&before, "release", origin))
+            .unwrap());
+        let corner = serde_json::json!({"x":3071,"y":287});
+        assert!(bridge
+            .mouse(epoch, report(&after, "press", corner.clone()))
+            .unwrap());
+        assert!(bridge
+            .mouse(epoch, report(&after, "release", corner))
+            .unwrap());
+        let expected = expected_bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "missing pointer reports from the PTY"
+            );
+            if let Some(frame) = bridge.poll(epoch).unwrap() {
+                bridge.acknowledge(epoch, frame.revision).unwrap();
+            }
+            if bridge
+                .session
+                .as_ref()
+                .unwrap()
+                .terminal()
+                .visible_text()
+                .contains(&expected)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
         bridge.close(epoch).unwrap();
     }
 

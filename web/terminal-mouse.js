@@ -6,18 +6,31 @@ function sameOwner(left, right) {
     left.mouse.tracking === right.mouse.tracking;
 }
 
-function cellAt(canvas, frame, event, clamp = false) {
-  const {left, top, width, height} = canvas.getBoundingClientRect();
+function pointAt({left, top, width, height}, frame, event, clamp = false) {
   if (!(width > 0 && height > 0) || !Number.isFinite(event.clientX) || !Number.isFinite(event.clientY)) {
     return null;
   }
-  const col = Math.floor((event.clientX - left) * frame.cols / width);
-  const row = Math.floor((event.clientY - top) * frame.rows.length / height);
+  const x = event.clientX - left, y = event.clientY - top;
+  let col = Math.floor(x * frame.cols / width), row = Math.floor(y * frame.rows.length / height);
   if (clamp) {
-    return {col: Math.max(0, Math.min(frame.cols - 1, col)),
-      row: Math.max(0, Math.min(frame.rows.length - 1, row))};
+    col = Math.max(0, Math.min(frame.cols - 1, col));
+    row = Math.max(0, Math.min(frame.rows.length - 1, row));
+  } else if (!(row >= 0 && row < frame.rows.length && col >= 0 && col < frame.cols)) {
+    return null;
   }
-  return row >= 0 && row < frame.rows.length && col >= 0 && col < frame.cols ? {row, col} : null;
+  const size = frame.mouse.pixels;
+  if (!size) return {row, col};
+  return {row, col, pixels: {
+    x: Math.max(0, Math.min(size.width - 1, Math.floor(x * size.width / width))),
+    y: Math.max(0, Math.min(size.height - 1, Math.floor(y * size.height / height))),
+  }};
+}
+
+function sameMotion(left, right) {
+  const samePosition = right.pixels
+    ? left.pixels?.x === right.pixels.x && left.pixels?.y === right.pixels.y
+    : left.row === right.row && left.col === right.col;
+  return samePosition && left.button === right.button && left.alt === right.alt && left.ctrl === right.ctrl;
 }
 
 export function installTerminalMouse({canvas, getFrame, send, focus, canRelease = () => false}) {
@@ -125,7 +138,7 @@ export function installTerminalMouse({canvas, getFrame, send, focus, canRelease 
     const releaseFrame = sameOwner(frame, current) ? current
       : !current && canRelease(frame) ? frame : null;
     if (shouldRelease && releaseFrame) {
-      const last = event && cellAt(canvas, releaseFrame, event, true) || point;
+      const last = event && pointAt(canvas.getBoundingClientRect(), releaseFrame, event, true) || point;
       void send(report(releaseFrame, 'release', last, button, event));
     }
   }
@@ -140,7 +153,7 @@ export function installTerminalMouse({canvas, getFrame, send, focus, canRelease 
     if (event.defaultPrevented || event.pointerType !== 'mouse' || !event.isPrimary || localOverride(event)) return;
     const frame = pointerOwner(), button = BUTTONS[event.button];
     if (!frame || !button) return;
-    const point = cellAt(canvas, frame, event);
+    const point = pointAt(canvas.getBoundingClientRect(), frame, event);
     if (!point) return;
     event.preventDefault();
     suppressClick = true;
@@ -164,13 +177,12 @@ export function installTerminalMouse({canvas, getFrame, send, focus, canRelease 
     const frame = pointerOwner();
     if (!frame || (drag && (!sameOwner(drag.frame, frame) || drag.pointerId !== event.pointerId))) return;
     if (!drag && (event.buttons || localOverride(event))) return;
-    const point = cellAt(canvas, frame, event, Boolean(drag));
+    const point = pointAt(canvas.getBoundingClientRect(), frame, event, Boolean(drag));
     if (!point) return;
     if (drag) drag.point = point;
     if (frame.mouse.tracking !== 'any' && (frame.mouse.tracking !== 'drag' || !drag)) return;
     const payload = report(frame, 'motion', point, drag?.button ?? null, event);
-    if (recentMotion && sameOwner(recentMotion.frame, frame) &&
-        ['row', 'col', 'button', 'alt', 'ctrl'].every(key => recentMotion.payload[key] === payload[key])) return;
+    if (recentMotion && sameOwner(recentMotion.frame, frame) && sameMotion(recentMotion.payload, payload)) return;
     recentMotion = {frame, payload};
     enqueueFast(frame, payload);
   }, {capture: true});
@@ -203,7 +215,9 @@ export function installTerminalMouse({canvas, getFrame, send, focus, canRelease 
       resetWheelFraction();
       return;
     }
-    const point = frame && geometry && cellAt(canvas, frame, event);
+    const point = geometry && pointAt(
+      {left:geometry[0], top:geometry[1], width:geometry[2], height:geometry[3]}, frame, event,
+    );
     if (!point) { resetWheelFraction(); return; }
     event.preventDefault();
     const alt = Boolean(event.altKey), ctrl = Boolean(event.ctrlKey);

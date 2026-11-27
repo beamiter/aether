@@ -112,12 +112,15 @@ const inlineHistory=installInlineHistory({
   fetchHistory:(attachment,options)=>invokeAttached('history_shell',{epoch:attachment.epoch,...options},attachment),
   focus:()=>imeInput.focus(),
 });
+function matchesMouseCanvas(mouse) {
+  return !mouse.pixels || (canvas.width === mouse.pixels.width && canvas.height === mouse.pixels.height);
+}
 const terminalMouse = typeof canvas.setPointerCapture === 'function'
   ? installTerminalMouse({
     canvas,
     getFrame() {
       if (input.disabled || changingTab || recovery || inlineHistory.active() || !canReportMouse(owner) ||
-          mouseView?.owner !== owner) return null;
+          mouseView?.owner !== owner || !matchesMouseCanvas(mouseView.mouse)) return null;
       const frame = visibleLiveFrame();
       if (!frame || frame.session !== owner.session || frame.epoch !== owner.epoch ||
           String(frame.revision) !== mouseView.mouse.revision ||
@@ -126,10 +129,10 @@ const terminalMouse = typeof canvas.setPointerCapture === 'function'
     },
     canRelease(frame) {
       return !input.disabled && !changingTab && !recovery &&
-        canReportMouse(owner) && frame.attachment === owner;
+        canReportMouse(owner) && frame.attachment === owner && matchesMouseCanvas(frame.mouse);
     },
     send: report => enqueueLogical('mouse_shell', {report}),
-    focus: () => imeInput.focus(),
+    focus: () => imeInput.focus({preventScroll:true}),
   })
   : null;
 const terminalChatSend=document.querySelector('#terminal-chat-send');
@@ -713,6 +716,12 @@ function validateShellStatus(info,expectedEpoch){
       validateStampedMouseView(info.mouse);
       if (!['press_only', 'button', 'drag', 'any'].includes(info.mouse.tracking)) {
         throw new Error('invalid terminal mouse tracking');
+      }
+      if (info.mouse.pixels !== undefined) {
+        const {width, height} = info.mouse.pixels ?? {};
+        if (![width, height].every(size => Number.isInteger(size) && size > 0 && size <= 0xffffffff)) {
+          throw new Error('invalid terminal mouse pixel extent');
+        }
       }
     }
     if (info.alternate_scroll !== undefined) validateStampedMouseView(info.alternate_scroll);
