@@ -168,16 +168,8 @@ impl LiveBridge {
         pixels: Option<ViewportPixels>,
     ) -> Result<u32, String> {
         let pixels = pixels.map(ViewportPixels::native);
-        if let Some(pixels) = pixels {
-            pixels.validate()?;
-        }
         self.open_session(|epoch| {
-            let mut session = Session::spawn_family_with_epoch(rows, cols, epoch, integrated)?;
-            if let Some(pixels) = pixels {
-                // Install the geometry before the local output worker can drive the PTY.
-                session.set_window_pixels(rows, cols, pixels)?;
-            }
-            Ok(session)
+            Session::spawn_family_with_window_pixels(rows, cols, epoch, integrated, pixels)
         })
     }
 
