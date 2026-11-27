@@ -115,8 +115,8 @@ class Driver:
         assert self.session is not None
         return self.request(method, f"/session/{self.session}{path}", data)
 
-    def execute(self, read_only_script):
-        return self.command("POST", "/execute/sync", {"script": read_only_script, "args": []})
+    def execute(self, read_only_script, args=()):
+        return self.command("POST", "/execute/sync", {"script": read_only_script, "args": list(args)})
 
     def find_element_path(self, selector):
         item = self.command("POST", "/element", {"using": "css selector", "value": selector})[ELEMENT]
@@ -138,16 +138,49 @@ class Driver:
             self.command("POST", self.find_element_path(f"#{panel} > summary") + "/click", {})
         return self.find_element_path(selector)
 
-    def click(self, selector):
+    def click_hit_receipt(self, selector, phase):
+        """Sample the WebDriver in-view center without reading page content."""
+        try:
+            receipt = self.execute("""
+                const target = document.querySelector(arguments[0]);
+                const rect = target?.getClientRects()[0];
+                if (!rect) return {present: !!target, rect: null};
+                const left = Math.max(0, rect.left), right = Math.min(innerWidth, rect.right);
+                const top = Math.max(0, rect.top), bottom = Math.min(innerHeight, rect.bottom);
+                const point = left < right && top < bottom ?
+                    [Math.floor((left + right) / 2), Math.floor((top + bottom) / 2)] : null;
+                const hit = point && document.elementFromPoint(...point);
+                const hitRole = !hit ? null : target.contains(hit) ? 'target' :
+                    hit.closest('#app-header') ? 'app-header' :
+                    hit.closest('.terminal-toolbar') ? 'terminal-toolbar' :
+                    hit.closest('#terminal-panes') ? 'terminal-panes' :
+                    hit.closest('#session-tools') ? 'session-tools' : 'other';
+                return {present: true, rect: [rect.left, rect.top, rect.width, rect.height].map(Math.round),
+                        point, hit: hitRole, viewport: [innerWidth, innerHeight],
+                        disabled: target.disabled === true, bodyScroll: Math.round(document.body.scrollTop)};
+            """, [selector])
+        except (OSError, ProtocolError):
+            receipt = None
+        print(json.dumps({"case": "AETHER.THREE_PANES.CLICK_INTERCEPTED",
+                          "control": selector, "phase": phase, "receipt": receipt}), flush=True)
+
+    def click(self, selector, *, trace_hit=False):
         path = self.element_path(selector)
         try:
             self.command("POST", path + "/click", {})
         except ProtocolError as error:
             if error.error != "element click intercepted":
                 raise
+            if trace_hit:
+                self.click_hit_receipt(selector, "initial")
             # A prior panel can leave a toolbar control under the sticky header.
             self.execute(f"document.querySelector({json.dumps(selector)}).scrollIntoView({{block:'center'}});")
-            self.command("POST", path + "/click", {})
+            try:
+                self.command("POST", path + "/click", {})
+            except ProtocolError as retry:
+                if trace_hit and retry.error == "element click intercepted":
+                    self.click_hit_receipt(selector, "centered-retry")
+                raise
 
     def type(self, selector, text):
         self.command("POST", self.element_path(selector) + "/value", {"text": text})
@@ -3921,7 +3954,10 @@ def exercise_three_shells(driver, owned, backend, binary):
     # Opening a fourth shell temporarily replaces the active leaf. Selecting
     # C again parks D outside the three-pane layout before the close.
     wait_for(lambda: state()["draft"] == "", "third input receipt still pending")
-    driver.click("#new-local-tab")
+    # The resize and input form live below the terminal. Return the body
+    # scroll to the visible tab toolbar before clicking its actual button.
+    driver.execute("document.body.scrollTop = 0;")
+    driver.click("#new-local-tab", trace_hit=True)
     parked = wait_for(lambda: state()["current_tab"] if state()["writable"] and
                       len(state()["tabs"]) == 4 else None, "fourth shell did not open")
     assert parked not in tabs
@@ -3985,14 +4021,7 @@ def exercise_three_shells(driver, owned, backend, binary):
     # WebDriver click. On the compact window, centering alone can leave the
     # peer button underneath the sticky app header.
     driver.execute("document.body.scrollTop = 0;")
-    try:
-        driver.click("#focus-peer-pane")
-    except ProtocolError as error:
-        if error.error == "element click intercepted":
-            print(json.dumps({"case": "AETHER.THREE_PANES.CLOSE_FOCUS_CLICK_INTERCEPTED",
-                              "backend": backend,
-                              "receipt": geometry_receipt(driver, "#focus-peer-pane")}), flush=True)
-        raise
+    driver.click("#focus-peer-pane", trace_hit=True)
     wait_for(lambda: state()["current_tab"] == tabs[0] and state()["writable"] and state()["split"] == "left",
              "surviving peer did not remain focusable")
     assert write_from_current_tab(driver, owned / "three-closed-peer.pid") == identities[0]
