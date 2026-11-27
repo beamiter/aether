@@ -405,7 +405,13 @@ fn row_styles_repeat(cells: &[EncodedCell<'_>]) -> bool {
         }
         sample[index] = style;
     }
-    false
+    // Striding can hit a different style in each long, uniform span. Probe
+    // one neighbor per sample before rejecting that kind of row.
+    let mut adjacent = 0;
+    for (column, style) in (1..cells.len()).step_by(stride).zip(sample) {
+        adjacent += usize::from(style == Some(packed_style(&cells[column])));
+    }
+    adjacent != 0 && 2 * adjacent >= cells.len().div_ceil(stride)
 }
 
 fn pack_row(row: wire::RowData<EncodedCell<'_>>) -> EncodedRow<'_> {
@@ -414,7 +420,7 @@ fn pack_row(row: wire::RowData<EncodedCell<'_>>) -> EncodedRow<'_> {
     }
     let columns = row.cells.len() as u16;
     // Dense true-color rows benefit less from a palette. Stop collecting
-    // early and send the ordinary cell shape for such rows in version 7.
+    // early and send the ordinary cell shape for such rows.
     let max_styles = (row.cells.len() / 4).clamp(1, 32);
     let mut styles = Vec::new();
     let mut style_indices = HashMap::new();
@@ -764,6 +770,44 @@ mod tests {
             .unwrap();
         let old: serde_json::Value = serde_json::from_str(&old).unwrap();
         assert_eq!(packed["rows"][1], old["rows"][1]);
+    }
+
+    #[test]
+    fn packed_rows_admit_uniform_spans_with_distinct_sampled_styles() {
+        let budget = Arc::new(RetainedBytesBudget::new(JSON_WORKSPACE_BYTES));
+        let scratch = FrameScratch::reserve_from(&budget).unwrap();
+        let mut terminal = jterm_engine::terminal::Terminal::new(2, 128).unwrap();
+        for green in 0..16 {
+            terminal
+                .feed(format!("\x1b[38;2;75;{green};123mABCDEFGH").as_bytes())
+                .unwrap();
+        }
+        let frame = terminal.frame().unwrap();
+        let (_, encoded) = scratch
+            .encode(None, &frame, "bands", wire::RENDITION_VERSION)
+            .unwrap();
+        let packed: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        let row = &packed["rows"][0];
+        assert_eq!(row["styles"].as_array().unwrap().len(), 16);
+        assert_eq!(row["runs"].as_array().unwrap().len(), 16);
+        assert_eq!(row["runs"][0], serde_json::json!([0, "ABCDEFGH"]));
+
+        terminal.feed(b"\x1b[H").unwrap();
+        for green in 0..128 {
+            terminal
+                .feed(format!("\x1b[38;2;75;{green};123mA").as_bytes())
+                .unwrap();
+        }
+        let (_, encoded) = scratch
+            .encode(
+                None,
+                &terminal.frame().unwrap(),
+                "pixels",
+                wire::RENDITION_VERSION,
+            )
+            .unwrap();
+        let ordinary: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(ordinary["rows"][0]["cells"].as_array().unwrap().len(), 128);
     }
 
     #[test]

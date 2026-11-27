@@ -386,7 +386,9 @@ impl LiveBridge {
 
     pub fn detach(&mut self, owner: &Attachment) -> Result<(), String> {
         let generation = self.next_detached_generation(owner)?;
-        self.session.as_mut().unwrap().retire_pending_input();
+        let session = self.session.as_mut().unwrap();
+        session.retire_pending_input();
+        session.terminal().release_history_viewport();
         self.retire_focus();
         self.generation = generation;
         self.raw.retire_view();
@@ -436,6 +438,7 @@ impl LiveBridge {
         } else if session.retire_partial_input() {
             self.input_attached = false;
         }
+        session.terminal().release_history_viewport();
         self.retire_focus();
         self.generation = generation;
         self.raw.retire_view();
@@ -1203,8 +1206,7 @@ fn projected_history_page(
     {
         return Err("history page out of bounds".into());
     }
-    let layout = terminal.history_layout()?;
-    let start = anchor
+    let anchor = anchor
         .map(|source| {
             let anchor = HistoryAnchor {
                 row: source.row.get() - 1,
@@ -1213,14 +1215,16 @@ fn projected_history_page(
             if !terminal.retains_history_anchor(anchor) {
                 return Err("History source expired. Refresh to view retained rows.");
             }
-            Ok(layout.row_at(anchor).saturating_add_signed(shift as isize))
+            Ok(anchor)
         })
         .transpose()?;
+    let layout = terminal.history_layout_for_viewport()?;
+    let start = anchor.map(|anchor| layout.row_at(anchor).saturating_add_signed(shift as isize));
     let mut limit = HISTORY_PAGE_ROWS;
     loop {
         let latest = layout.len().saturating_sub(limit);
         let first = start.map_or_else(|| latest.saturating_sub(offset), |start| start.min(latest));
-        let page = terminal.projected_history_page(&layout, first, limit)?;
+        let page = terminal.projected_history_viewport_page(&layout, first, limit)?;
         if page.text.len() <= MAX_HISTORY_SNAPSHOT_BYTES {
             return Ok((layout, first, page));
         }
@@ -1253,6 +1257,50 @@ fn bounded_history_page(terminal: &Terminal, offset: usize) -> Result<HistoryPag
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn projected_history_reuses_viewport_rows_until_the_archive_changes() {
+        use std::sync::Arc;
+
+        let mut terminal = Terminal::new(2, 20).unwrap();
+        for row in 0..150 {
+            terminal
+                .feed(format!("{row:03} 界\r\n").as_bytes())
+                .unwrap();
+        }
+        let (layout, first, page) = projected_history_page(&terminal, 0, None, 0).unwrap();
+        let weak = Arc::downgrade(&layout);
+        drop(layout);
+        let (older, earlier, overlap) = projected_history_page(&terminal, 1, None, 0).unwrap();
+        assert_eq!(earlier + 1, first);
+        assert!(Arc::ptr_eq(&weak.upgrade().unwrap(), &older));
+        assert!(Arc::ptr_eq(
+            &page.row(0).unwrap().cells,
+            &overlap.row(1).unwrap().cells
+        ));
+        let source = older.anchor_at(first).unwrap();
+        let anchor = HistorySource {
+            row: crate::protocol_v4::Counter::new(source.row + 1).unwrap(),
+            column: source.column,
+        };
+
+        drop(older);
+        terminal.feed(b"new row\r\n").unwrap();
+        assert!(
+            weak.upgrade().is_none(),
+            "append must release the old index"
+        );
+        let (updated, position, updated_page) =
+            projected_history_page(&terminal, 0, Some(anchor), 0).unwrap();
+        assert_eq!(updated.anchor_at(position), Some(source));
+        assert_eq!(updated_page.total_rows, page.total_rows + 1);
+        assert_eq!(updated_page.text, page.text);
+
+        terminal.release_history_viewport();
+        let released = Arc::downgrade(&updated);
+        drop(updated);
+        assert!(released.upgrade().is_none());
+    }
 
     #[test]
     fn projected_history_moves_raster_coordinates_and_rejects_evicted_anchors() {
