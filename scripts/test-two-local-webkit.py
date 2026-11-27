@@ -3714,6 +3714,107 @@ def private_accessibility_address():
     return address.unpack()[0]
 
 
+def exercise_three_restore_fit_x11(driver, owned, binary, tabs, parked, identities, parked_id):
+    """Restart while fitted; read PTY sizes without changing pane focus."""
+    def state():
+        return driver.execute(READ)
+
+    def pty_size(identity):
+        pid, stamp = identity
+        assert birth(pid) == stamp, "fit fixture lost the owned shell"
+        fd = os.open(f"/proc/{pid}/fd/0", os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)
+        try:
+            rows, cols, _, _ = struct.unpack("HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, bytes(8)))
+            return rows, cols
+        finally:
+            os.close(fd)
+
+    def fitted(previous=None):
+        sizes = driver.execute("""
+            const pane = document.querySelector('#active-pane .viewport');
+            const style = getComputedStyle(pane), box = pane.getBoundingClientRect();
+            const px = prop => parseFloat(style[prop]) || 0;
+            const horizontal = px('borderLeftWidth') + px('borderRightWidth');
+            const vertical = px('borderTopWidth') + px('borderBottomWidth');
+            const usableWidth = box.width - horizontal - px('paddingLeft') - px('paddingRight')
+                - Math.max(0, pane.offsetWidth - pane.clientWidth - horizontal);
+            const usableHeight = box.height - vertical - px('paddingTop') - px('paddingBottom');
+            if (!document.querySelector('#fit-size').checked || usableWidth <= 0 || usableHeight <= 0) return null;
+            return {
+                requested: [Number(document.querySelector('#rows').value), Number(document.querySelector('#cols').value)],
+                measured: [Math.max(1, Math.min(128, Math.floor(usableHeight / 24))),
+                           Math.max(1, Math.min(256, Math.floor(usableWidth / 12)))],
+            };
+        """)
+        match = re.match(r"(\d+) × (\d+) cells", state()["cursor"])
+        if sizes and match and sizes["requested"] == sizes["measured"]:
+            measured = tuple(sizes["measured"])
+            if (int(match[2]), int(match[1])) == measured and measured != previous:
+                return measured
+        return None
+
+    # Retain a non-default real viewport on the old process and another on
+    # the new process. Do not simulate ResizeObserver or change canvas CSS.
+    driver.command("POST", "/window/rect", {"width": 1200, "height": 850})
+    driver.click("#fit-size")
+    before_size = wait_for(lambda: (size if (size := fitted()) == pty_size(identities[2]) else None),
+                           "old active pane did not settle before fitted restart")
+    before_window = geometry_receipt(driver, "#active-pane canvas")["inner"]
+    prior = [*identities, parked_id]
+    passive_sizes = [pty_size(identity) for identity in (identities[0], identities[1], parked_id)]
+    driver.close()
+    for pid, stamp in prior:
+        wait_for(lambda: birth(pid) != stamp, "an old fitted shell survived desktop shutdown")
+    driver.open(binary, fit=True)
+    assert driver.execute("return document.querySelector('#fit-size').checked;")
+    driver.command("POST", "/window/rect", {"width": 900, "height": 690})
+    wait_for(lambda: all(a < b for a, b in zip(
+        geometry_receipt(driver, "#active-pane canvas").get("inner", before_window), before_window)),
+        "new desktop did not use the smaller window")
+    wait_for(lambda: state()["restore_layout"], "fitted restart could not find the saved preview")
+    driver.click("#restore-local-layout")
+    wait_for(lambda: state()["status"] == "Opened 4 fresh shells in the saved layout.",
+             "fitted restart did not restore all tabs")
+    *tabs, parked = state()["tabs"]
+    assert state()["current_tab"] == tabs[2] and state()["writable"]
+    settled = wait_for(lambda: fitted(before_size), "new active pane did not adapt to its viewport")
+    active_id = write_from_current_tab(driver, owned / "three-fit-active.pid")
+    assert pty_size(active_id) == settled == fitted(before_size)
+    wait_for(lambda: state()["draft"] == "", "fitted active shell write still pending")
+
+    # The passive frames report their native geometry before either shell
+    # receives focus. Kernel PTY sizes are read after assigning each a PID.
+    passive_geometries = [f"{cols}x{rows}" for rows, cols in passive_sizes[:2]]
+    wait_for(lambda: driver.execute("""
+        return Array.from(document.querySelectorAll('#terminal-panes [data-slot]:not([hidden]) canvas'))
+            .filter(node=>node.id.startsWith('preview-canvas-')).map(node=>node.dataset.geometry ?? '');
+    """) == passive_geometries, "active Fit changed a passive preview's saved grid")
+    driver.click("#focus-preview-pane-1")
+    wait_for(lambda: state()["current_tab"] == tabs[0] and state()["writable"],
+             "fitted preview could not activate its first peer")
+    first_size = wait_for(lambda: fitted(passive_sizes[0]), "new active peer did not fit its own viewport")
+    first_id = write_from_current_tab(driver, owned / "three-fit-first.pid")
+    assert pty_size(first_id) == first_size == fitted(passive_sizes[0])
+    assert pty_size(active_id) == settled, "fitting first peer resized the previously active PTY"
+    wait_for(lambda: state()["draft"] == "", "fitted peer write still pending")
+    # Pause Fit before inspecting B and parked D so their activation does not
+    # alter the sizes whose preservation is under test.
+    driver.click("#fit-size")
+    fresh = [first_id]
+    for name, tab, expected in zip(("peer", "parked"), (tabs[1], parked), passive_sizes[1:]):
+        click_tab(driver, tab)
+        identity = write_from_current_tab(driver, owned / f"three-fit-{name}.pid")
+        assert pty_size(identity) == expected
+        fresh.append(identity)
+        wait_for(lambda: state()["draft"] == "", "fitted restart identity receipt still pending")
+    assert len(set([*prior, active_id, *fresh])) == 8
+    click_tab(driver, tabs[2])
+    print(json.dumps({"case": "AETHER.THREE_PANES.RESTART_WITH_FIT", "backend": "x11",
+                      "active_grid_tracks_smaller_native_window": True, "passive_and_parked_sizes_retained": True,
+                      "newly_focused_peer_only_refits_itself": True}), flush=True)
+    return tabs, parked, [fresh[0], fresh[1], active_id], fresh[2]
+
+
 def exercise_three_shells(driver, owned, backend, binary):
     """Three real PTYs, two independently updated passive canvases and one writer."""
     assert driver.execute("return document.querySelector('#split-three-local').hidden;")
@@ -3864,6 +3965,10 @@ def exercise_three_shells(driver, owned, backend, binary):
     print(json.dumps({"case": "AETHER.THREE_PANES.RESTART_LAYOUT", "backend": backend,
                       "fresh_shells_after_explicit_restore": True, "visible_order_and_parked_tab_preserved": True,
                       "saved_active_size_and_draft_boundary_preserved": True}), flush=True)
+
+    if backend == "x11":
+        tabs, parked, identities, parked_id = exercise_three_restore_fit_x11(
+            driver, owned, binary, tabs, parked, identities, parked_id)
 
     driver.click("#close")
     wait_for(lambda: state()["current_tab"] == tabs[1] and state()["writable"] and
