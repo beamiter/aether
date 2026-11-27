@@ -1,4 +1,4 @@
-import {acceptHistoryProjection,CHANNEL_IMAGE_VERSION,MAX_PROJECTED_HISTORY_ROWS,channelCounter} from './frames-v4.js';
+import {acceptHistoryProjection,CHANNEL_PACKED_VERSION,MAX_PROJECTED_HISTORY_ROWS,channelCounter} from './frames-v4.js';
 import {CELL_WIDTH,CELL_HEIGHT,clearPaint,paint} from './frames.js';
 import {terminalCellAt} from './viewport.js';
 
@@ -128,7 +128,7 @@ function historyGrid({viewport,spacer,canvas},output) {
 export function installHistory({older,newer,refresh,output,label,invoke,getOwner,searchControls,copyControls,visual,enableProjection}) {
   let group=null,activeSearch=null,searchId=0,retained=null;
   const grid=visual?historyGrid(visual,output):null;
-  const format=owner=>grid&&enableProjection?.(owner)?{frameVersion:CHANNEL_IMAGE_VERSION}:{};
+  const format=owner=>grid&&enableProjection?.(owner)?{frameVersion:CHANNEL_PACKED_VERSION}:{};
   const sameSource=(a,b)=>a?.row===b?.row&&a?.column===b?.column;
   const sameShell=(a,b)=>a?.session===b?.session&&a?.epoch===b?.epoch;
   const expired='History source expired. Refresh to view retained rows.';
@@ -215,7 +215,7 @@ export function installHistory({older,newer,refresh,output,label,invoke,getOwner
         }
         if(result.kind!=='match')throw new Error('invalid history search response');
         const snapshot=acceptHistory(result.snapshot,owner.epoch);
-        const projection=options.frameVersion?acceptHistoryProjection(result.projection,owner,true):null;
+        const projection=options.frameVersion?acceptHistoryProjection(result.projection,owner,true,options.frameVersion):null;
         if(projection&&(projection.text!==snapshot.text||projection.revision!==snapshot.revision||
             projection.offset!==snapshot.offset||projection.total_rows!==snapshot.total_rows||projection.rows.length!==snapshot.row_count))
           throw new Error('history search projection changed its source');
@@ -282,7 +282,7 @@ export function installHistory({older,newer,refresh,output,label,invoke,getOwner
           // A newer request already owns the output. Do not validate or encode
           // the abandoned reply, and do not disturb selected text.
           if(current.pending!==null)continue;
-          const projection=options.frameVersion?acceptHistoryProjection(value,owner):null;
+          const projection=options.frameVersion?acceptHistoryProjection(value,owner,false,options.frameVersion):null;
           if(isExpired(projection,owner)){dropPage(expired);return;}
           const snapshot=projection??acceptHistory(value,owner.epoch);
           const rows=projection?.rows.length??snapshot.row_count??HISTORY_PAGE_ROWS;

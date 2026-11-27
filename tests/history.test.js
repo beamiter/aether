@@ -1,5 +1,7 @@
 import test from 'node:test';import assert from 'node:assert/strict';
 import {acceptHistory,installHistory} from '../web/history.js';
+import {CHANNEL_PACKED_VERSION} from '../web/frames-v4.js';
+import {packedRow} from './fixtures/packed-channel.js';
 const page=(epoch=1,text='hello\nworld',offset=0,total_rows=3)=>({epoch,revision:'12',offset,total_rows,text});
 const tick=()=>new Promise(r=>setImmediate(r));
 function setup(){
@@ -360,11 +362,11 @@ test('a removed projected source discards both its displayed selection and super
  const ui=installHistory({older:element(),newer:element(),refresh,output,label,getOwner:()=>owner,
   visual:{viewport,spacer:element(),canvas},enableProjection:()=>true,
   invoke:(_,args)=>new Promise(resolve=>requests.push({args,resolve}))});
- const projection=(row,text)=>JSON.stringify({owner,version:5,revision:'19',cols:1,offset:0,total_rows:1,text,
-  rows:[{source:{row,column:0},text_offsets:[0,1],paint:{wrapped:false,cells:[
-   {text,foreground:'#ffffff',background:'#000000',width:1,style:0}]}}]});
+ const projection=(row,text)=>JSON.stringify({owner,version:CHANNEL_PACKED_VERSION,revision:'19',cols:1,offset:0,total_rows:1,text,
+  rows:[{source:{row,column:0},text_offsets:[0,1],paint:packedRow({wrapped:false,cells:[
+   {text,foreground:'#ffffff',background:'#000000',width:1,style:0}]})}]});
  const first=refresh.handlers.click();
- assert.equal(requests[0].args.frameVersion,5);
+ assert.equal(requests[0].args.frameVersion,CHANNEL_PACKED_VERSION);
  requests[0].resolve(projection('10','Z'));await first;
  assert.equal(output.value,'Z');assert.equal(viewport.hidden,false);
  output.setSelectionRange(0,1);
@@ -401,9 +403,9 @@ test('projected history preserves exact backward selection while reflowing overl
     return [cell,{...cell,text:' ',width:0}];
    });
    if(!wrapped)text+='\n';
-   return {source:{row:String(row),column},text_offsets,paint:{wrapped,cells}};
+   return {source:{row:String(row),column},text_offsets,paint:packedRow({wrapped,cells})};
   });
-  return JSON.stringify({owner,version:5,revision:'19',cols:8,offset,total_rows:100,rows,text:text.slice(0,-1)});
+  return JSON.stringify({owner,version:CHANNEL_PACKED_VERSION,revision:'19',cols:8,offset,total_rows:100,rows,text:text.slice(0,-1)});
  }
  const first=refresh.handlers.click();
  requests[0].resolve(projection([[20,0,['A','中','B'],true],[20,4,['C']],[21,0,['D']]],0));

@@ -1,4 +1,4 @@
-import {acceptHistoryProjection, CHANNEL_IMAGE_VERSION} from './frames-v4.js';
+import {acceptHistoryProjection, CHANNEL_PACKED_VERSION} from './frames-v4.js';
 import {CELL_HEIGHT, clearPaint, paint} from './frames.js';
 
 // Keep the PTY frame live underneath the reader. History requests neither
@@ -57,10 +57,10 @@ export function installInlineHistory({canvas, viewport, getOwner, getFrame, fetc
         const first = page ? page.total_rows - page.offset - page.rows.length : 0;
         const position = anchor ? {anchor, shift: current.requestedTop - first} : {};
         const value = await fetchHistory(current.owner, {
-          frameVersion: CHANNEL_IMAGE_VERSION, offset: 0, ...position,
+          frameVersion: CHANNEL_PACKED_VERSION, offset: 0, ...position,
         });
         if (!isCurrent()) return;
-        const next = acceptHistoryProjection(value, current.owner);
+        const next = acceptHistoryProjection(value, current.owner, false, CHANNEL_PACKED_VERSION);
         if (!next.rows.length) {
           reset();
           return;

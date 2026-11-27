@@ -1,5 +1,6 @@
 export const CHANNEL_IMAGE_VERSION = 5;
 export const CHANNEL_FRAME_VERSION = 6;
+export const CHANNEL_PACKED_VERSION = 7;
 const textChannelVersion = 4;
 const maxImages = 32;
 const maxImageBytes = 2 * 1024 * 1024;
@@ -15,7 +16,9 @@ const maxHyperlinkBytes = 1024 * 1024;
 const maxHyperlinkTargetBytes = 2048;
 const underlines = new Set(['single','double','curly','dotted','dashed']);
 const colors = /^#[a-fA-F0-9]{6}$/;
-const supportsChannelImages = version => version === CHANNEL_IMAGE_VERSION || version === CHANNEL_FRAME_VERSION;
+const invalidCellText = /[\x00-\x1f\x7f-\x9f\ud800-\udfff]/u;
+const supportsRowMoves = version => version === CHANNEL_FRAME_VERSION || version === CHANNEL_PACKED_VERSION;
+const supportsChannelImages = version => version === CHANNEL_IMAGE_VERSION || supportsRowMoves(version);
 const frameMoves = new WeakMap();
 
 export function rowMoveForBase(frame, revision) {
@@ -131,21 +134,70 @@ function resolveImages(rows, cols, newImages, base, clipImages = false) {
   return Object.freeze(images);
 }
 
-function validateRow(row, cols, links, referenced, supportsImages) {
+function validStyle(cell, links) {
+  return cell && Number.isInteger(cell.style) && cell.style >= 0 && cell.style <= 123 && (cell.style & 4) === 0 &&
+    typeof cell.foreground === 'string' && colors.test(cell.foreground) &&
+    typeof cell.background === 'string' && colors.test(cell.background) &&
+    (cell.underline === undefined || underlines.has(cell.underline)) &&
+    (cell.underline_color === undefined || (typeof cell.underline_color === 'string' && colors.test(cell.underline_color))) &&
+    (cell.hyperlink_id === undefined || links.has(cell.hyperlink_id));
+}
+
+function validatePackedRow(row, cols, links, referenced, supportsImages) {
+  if (!row || typeof row.wrapped !== 'boolean' || row.columns !== cols || row.cells !== undefined ||
+      !Array.isArray(row.styles) || row.styles.length > cols || !Array.isArray(row.runs) || row.runs.length > cols)
+    throw new Error('invalid packed Channel row');
+  const styles = row.styles.map(paint => {
+    if (!validStyle(paint, links)) throw new Error('invalid packed Channel style');
+    const {foreground,background,style,underline,underline_color,hyperlink_id} = paint;
+    return {foreground,background,style,underline,underline_color,hyperlink_id};
+  });
+  const cells = [], usedStyles = new Set(), rowLinks = new Set();
+  let textBytes = 0, lead = false;
+  const append = (text, width, paint) => {
+    if (cells.length >= cols) throw new Error('packed Channel row width');
+    if (lead !== (width === 0) || (width === 0 && text !== ' '))
+      throw new Error('invalid Channel wide span');
+    lead = width === 2;
+    const {foreground,background,style,underline,underline_color,hyperlink_id} = paint;
+    cells.push(Object.freeze({text,foreground,background,width,style,underline,underline_color,hyperlink_id}));
+  };
+  for (const run of row.runs) {
+    if (!Array.isArray(run) || (run.length !== 2 && run.length !== 3)) throw new Error('invalid packed Channel run');
+    const [index, text, width] = run, explicit = run.length === 3;
+    if (!Number.isInteger(index) || index < 0 || index >= styles.length ||
+        typeof text !== 'string' || !text.length ||
+        text.length > (explicit ? maxClusterBytes : (cols - cells.length) * 2) || invalidCellText.test(text) ||
+        (explicit && (!Number.isInteger(width) || width < 0 || width > 2)))
+      throw new Error('invalid packed Channel run');
+    const paint = styles[index], size = utf8Bytes(text);
+    if (explicit && size > maxClusterBytes) throw new Error('Channel cluster byte limit');
+    textBytes += size;
+    if (explicit) append(text, width, paint);
+    else for (const scalar of text) append(scalar, 1, paint);
+    usedStyles.add(index);
+    if (paint.hyperlink_id !== undefined) {
+      rowLinks.add(paint.hyperlink_id);
+      referenced.add(paint.hyperlink_id);
+    }
+  }
+  if (lead) throw new Error('invalid Channel wide span');
+  if (cells.length !== cols || usedStyles.size !== styles.length) throw new Error('invalid packed Channel row width or styles');
+  const imageSlices = validateSlices(row.image_slices, cols, supportsImages);
+  return Object.freeze(Object.assign(cells, {wrapped: row.wrapped, textBytes, links:Object.freeze([...rowLinks]), imageSlices}));
+}
+
+function validateRow(row, cols, links, referenced, supportsImages, packed = false) {
+  if (packed && row?.cells === undefined) return validatePackedRow(row, cols, links, referenced, supportsImages);
+  if (packed && (row.styles !== undefined || row.runs !== undefined || row.columns !== undefined))
+    throw new Error('mixed Channel row encodings');
   if (!row || typeof row.wrapped !== 'boolean' || !Array.isArray(row.cells) || row.cells.length !== cols)
     throw new Error('invalid Channel row');
   let textBytes = 0;
   const rowLinks = new Set();
   const cells = row.cells.map((cell, i) => {
-    if (!cell || !Number.isInteger(cell.width) || cell.width < 0 || cell.width > 2 ||
-        !Number.isInteger(cell.style) || cell.style < 0 || cell.style > 123 || (cell.style & 4) !== 0 ||
-        typeof cell.text !== 'string' || cell.text.length === 0 || cell.text.length > maxClusterBytes ||
-        /[\x00-\x1f\x7f-\x9f\ud800-\udfff]/u.test(cell.text) ||
-        typeof cell.foreground !== 'string' || !colors.test(cell.foreground) ||
-        typeof cell.background !== 'string' || !colors.test(cell.background) ||
-        (cell.underline !== undefined && !underlines.has(cell.underline)) ||
-        (cell.underline_color !== undefined && (typeof cell.underline_color !== 'string' || !colors.test(cell.underline_color))) ||
-        (cell.hyperlink_id !== undefined && !links.has(cell.hyperlink_id)))
+    if (!validStyle(cell, links) || !Number.isInteger(cell.width) || cell.width < 0 || cell.width > 2 ||
+        typeof cell.text !== 'string' || !cell.text.length || cell.text.length > maxClusterBytes || invalidCellText.test(cell.text))
       throw new Error('invalid Channel cell');
     const size = utf8Bytes(cell.text);
     if (size > maxClusterBytes) throw new Error('Channel cluster byte limit');
@@ -184,7 +236,7 @@ export function acceptChannelFrame(previous, encoded, expected, snapshotOnly = f
     throw new Error('stale Channel frame');
   if (!Array.isArray(update.rows) || update.rows.length > 128) throw new Error('Channel row bounds');
   const moves = update.moves === undefined ? [] : update.moves;
-  if (update.moves !== undefined && (stamp.version !== CHANNEL_FRAME_VERSION || update.kind !== 'delta' ||
+  if (update.moves !== undefined && (!supportsRowMoves(stamp.version) || update.kind !== 'delta' ||
       !Array.isArray(moves) || moves.length > 128)) throw new Error('invalid Channel row moves');
   const supportsImages = supportsChannelImages(stamp.version);
   const imageBase = update.kind === 'delta' ? previous : null;
@@ -193,6 +245,7 @@ export function acceptChannelFrame(previous, encoded, expected, snapshotOnly = f
   const links = validatedHyperlinks(update.hyperlinks, previous), referenced = new Set();
 
   const allowSlices = supportsImages && stamp.screen === 'primary';
+  const packed = stamp.version === CHANNEL_PACKED_VERSION;
   let cols, rows;
   if (update.kind === 'snapshot') {
     cols = update.cols;
@@ -200,7 +253,7 @@ export function acceptChannelFrame(previous, encoded, expected, snapshotOnly = f
       throw new Error('Channel dimension limit');
     if (previous && previous.layout === stamp.layout && (cols !== previous.cols || update.rows.length !== previous.rows.length))
       throw new Error('Channel geometry requires new layout');
-    rows = update.rows.map(row => validateRow(row, cols, links, referenced, allowSlices));
+    rows = update.rows.map(row => validateRow(row, cols, links, referenced, allowSlices, packed));
   } else {
     if (snapshotOnly || update.kind !== 'delta' || !previous ||
         update.base_revision !== previous.revision || stamp.layout !== previous.layout || stamp.screen !== previous.screen ||
@@ -223,7 +276,7 @@ export function acceptChannelFrame(previous, encoded, expected, snapshotOnly = f
       const index = edit?.index;
       if (!Number.isInteger(index) || index < 0 || index >= rows.length || seen.has(index))
         throw new Error('invalid Channel row index');
-      rows[index] = validateRow(edit.row, cols, links, referenced, allowSlices);
+      rows[index] = validateRow(edit.row, cols, links, referenced, allowSlices, packed);
       seen.add(index);
     }
   }
@@ -264,13 +317,15 @@ const historyBlank = Object.freeze({text:' ',foreground:'#d9e5ef',background:'#1
 
 // The browser selects from the same immutable text that supplied these paint
 // rows. A search window can also carry a short prefix of the following window.
-export function acceptHistoryProjection(encoded, owner, search = false) {
+export function acceptHistoryProjection(encoded, owner, search = false, expectedVersion) {
   const limit = maxEncodedBytes + maxEncodedImageBytes;
   if (typeof encoded !== 'string' || encoded.length > limit) throw new Error('history projection byte limit');
   const wireBytes = utf8Bytes(encoded);
   if (wireBytes > limit) throw new Error('history projection byte limit');
   const view = JSON.parse(encoded);
-  if (!view || view.version !== CHANNEL_IMAGE_VERSION || view.owner?.session !== owner.session ||
+  const packed = view?.version === CHANNEL_PACKED_VERSION;
+  if (!view || (!packed && view.version !== CHANNEL_IMAGE_VERSION) ||
+      (expectedVersion !== undefined && view.version !== expectedVersion) || view.owner?.session !== owner.session ||
       view.owner.epoch !== owner.epoch || view.owner.generation !== owner.generation)
     throw new Error('foreign history projection');
   const {cols,text,offset,total_rows,revision,default_background} = view;
@@ -300,9 +355,9 @@ export function acceptHistoryProjection(encoded, owner, search = false) {
       throw new Error('invalid history row source');
     previousRow = rowId;previousColumn = source.column;
     sources.push(Object.freeze({row:source.row,column:source.column}));
-    const width = entry.paint?.cells?.length;
-    if (!Number.isInteger(width) || width > cols) throw new Error('invalid history row width');
-    const row = validateRow(entry.paint,width,links,referenced,true);
+    const width = packed && entry.paint?.cells === undefined ? entry.paint?.columns : entry.paint?.cells?.length;
+    if (!Number.isInteger(width) || width < 0 || width > cols) throw new Error('invalid history row width');
+    const row = validateRow(entry.paint,width,links,referenced,true,packed);
     paintBytes += row.textBytes;
     const bounds = entry.text_offsets;
     if (!Array.isArray(bounds) || bounds.length !== width + 1 || bounds[0] !== end + Number(!wraps) ||

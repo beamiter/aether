@@ -66,13 +66,13 @@ impl HistorySearch {
         &mut self,
         terminal: &Terminal,
         epoch: u32,
-        owner: Option<Attachment>,
+        projection: Option<(Attachment, u8)>,
     ) -> Result<HistorySearchResponse, String> {
         let id = self.id;
         Ok(match self.search.step(terminal)? {
             HistorySearchProgress::Match(found) => {
-                let projection = owner
-                    .map(|owner| {
+                let projection = projection
+                    .map(|(owner, version)| {
                         // The search cursor already checked that its original raw
                         // extent survived. Read the same owned rows at their
                         // original widths so a resize cannot shift match offsets.
@@ -92,6 +92,7 @@ impl HistorySearch {
                                     column: 0,
                                 })
                             },
+                            version,
                         )
                     })
                     .transpose()?;
@@ -153,7 +154,13 @@ mod tests {
             start,
             end,
             ..
-        } = search.step(&terminal, 1, Some(owner.clone())).unwrap()
+        } = search
+            .step(
+                &terminal,
+                1,
+                Some((owner.clone(), crate::protocol_v4::IMAGE_VERSION)),
+            )
+            .unwrap()
         else {
             panic!("history match missing");
         };

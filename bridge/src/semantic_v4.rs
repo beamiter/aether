@@ -15,7 +15,7 @@ use jterm_protocol::{
     terminal::RgbColor,
 };
 use std::{
-    collections::{btree_map::Entry, BTreeMap, BTreeSet},
+    collections::{btree_map::Entry, BTreeMap, BTreeSet, HashMap},
     io::{self, Write},
     sync::{Arc, OnceLock},
 };
@@ -49,14 +49,29 @@ impl FrameScratch {
         session: &str,
         version: u8,
     ) -> Result<(wire::Counter, String), String> {
-        let update = project_update(previous, frame, session, version)?;
-        let images = match &update {
-            wire::UpdateData::Snapshot { images, .. } | wire::UpdateData::Delta { images, .. } => {
-                images
-            }
-        };
-        Ok((update.revision(), encode_json(&update, images)?))
+        if version == wire::PACKED_VERSION {
+            encode_update(project_update(previous, frame, session, version, pack_row)?)
+        } else {
+            encode_update(project_update(
+                previous,
+                frame,
+                session,
+                version,
+                std::convert::identity,
+            )?)
+        }
     }
+}
+
+fn encode_update<R: serde::Serialize>(
+    update: wire::UpdateRows<R>,
+) -> Result<(wire::Counter, String), String> {
+    let images = match &update {
+        wire::UpdateRows::Snapshot { images, .. } | wire::UpdateRows::Delta { images, .. } => {
+            images
+        }
+    };
+    Ok((update.revision(), encode_json(&update, images)?))
 }
 
 pub(crate) fn encode(
@@ -101,8 +116,10 @@ pub(crate) fn encode_history(
     revision: u64,
     text: &str,
     source_at: impl Fn(usize) -> Option<HistoryAnchor>,
+    version: u8,
 ) -> Result<String, String> {
-    if !(1..=wire::MAX_COLUMNS).contains(&cols)
+    if !matches!(version, wire::IMAGE_VERSION | wire::PACKED_VERSION)
+        || !(1..=wire::MAX_COLUMNS).contains(&cols)
         || page.row_count > wire::MAX_ROWS
         || page.total_rows > wire::MAX_PROJECTED_HISTORY_ROWS
         || page.offset + page.row_count > page.total_rows
@@ -112,6 +129,43 @@ pub(crate) fn encode_history(
         return Err("invalid history projection bounds".into());
     }
     let _scratch = FrameScratch::acquire().ok_or(ENCODERS_BUSY)?;
+    let history = HistoryEncoding {
+        owner,
+        page,
+        cols,
+        revision,
+        text,
+        version,
+    };
+    if version == wire::PACKED_VERSION {
+        encode_history_rows(history, source_at, pack_row)
+    } else {
+        encode_history_rows(history, source_at, std::convert::identity)
+    }
+}
+
+struct HistoryEncoding<'a> {
+    owner: crate::semantic::Attachment,
+    page: &'a HistoryPage,
+    cols: usize,
+    revision: u64,
+    text: &'a str,
+    version: u8,
+}
+
+fn encode_history_rows<'a, R: serde::Serialize>(
+    history: HistoryEncoding<'a>,
+    source_at: impl Fn(usize) -> Option<HistoryAnchor>,
+    mut encode_row: impl FnMut(wire::RowData<EncodedCell<'a>>) -> R,
+) -> Result<String, String> {
+    let HistoryEncoding {
+        owner,
+        page,
+        cols,
+        revision,
+        text,
+        version,
+    } = history;
     let mut projection = Projection {
         images_enabled: true,
         colors: page.paint_colors(),
@@ -141,25 +195,25 @@ pub(crate) fn encode_history(
                 .row
                 .checked_add(1)
                 .ok_or("history source exhausted")?;
-            Ok(wire::HistoryRowData {
+            Ok(wire::HistoryRowWith {
                 source: wire::HistorySource {
                     row: counter(row_id)?,
                     column: source.column,
                 },
-                paint: wire::RowData {
+                paint: encode_row(wire::RowData {
                     wrapped: row.wrapped,
                     cells,
                     image_slices,
-                },
+                }),
                 text_offsets,
             })
         })
         .collect::<Result<_, String>>()?;
     let (hyperlinks, images) = projection.into_resources();
-    let view = wire::HistoryViewData {
+    let view = wire::HistoryViewRows {
         owner,
         revision: counter(revision)?,
-        version: wire::IMAGE_VERSION,
+        version,
         cols: cols as u16,
         offset: page.offset as u32,
         total_rows: page.total_rows as u32,
@@ -174,12 +228,13 @@ pub(crate) fn encode_history(
     encode_json(&view, &view.images)
 }
 
-fn project_update<'a>(
+fn project_update<'a, R>(
     previous: Option<&CellFrame>,
     frame: &'a CellFrame,
     session: &str,
     version: u8,
-) -> Result<wire::UpdateData<EncodedCell<'a>>, String> {
+    mut encode_row: impl FnMut(wire::RowData<EncodedCell<'a>>) -> R,
+) -> Result<wire::UpdateRows<R>, String> {
     validate_grid(frame)?;
     let engine_stamp = frame.stamp();
     let cursor = frame.cursor();
@@ -203,7 +258,10 @@ fn project_update<'a>(
         pending_wrap: cursor.pending_wrap,
     };
     let mut projection = Projection {
-        images_enabled: matches!(version, wire::IMAGE_VERSION | wire::ROW_MOVE_VERSION),
+        images_enabled: matches!(
+            version,
+            wire::IMAGE_VERSION | wire::ROW_MOVE_VERSION | wire::PACKED_VERSION
+        ),
         colors,
         ..Projection::default()
     };
@@ -215,7 +273,9 @@ fn project_update<'a>(
                 .map(|changed| (base, changed))
         })
     {
-        let (rows, moves) = if version == wire::ROW_MOVE_VERSION && changed.len() > 1 {
+        let (rows, moves) = if matches!(version, wire::ROW_MOVE_VERSION | wire::PACKED_VERSION)
+            && changed.len() > 1
+        {
             split_row_moves(base, frame, changed)
         } else {
             (changed, Vec::new())
@@ -234,14 +294,14 @@ fn project_update<'a>(
             let rows = rows
                 .into_iter()
                 .map(|index| {
-                    Ok(wire::ChangedRowData {
+                    Ok(wire::ChangedRowWith {
                         index: index as u16,
-                        row: wire_row(frame, index, &mut projection)?,
+                        row: encode_row(wire_row(frame, index, &mut projection)?),
                     })
                 })
                 .collect::<Result<_, String>>()?;
             let (hyperlinks, images) = projection.into_resources();
-            return Ok(wire::UpdateData::Delta {
+            return Ok(wire::UpdateRows::Delta {
                 stamp,
                 base_revision: counter(base.stamp().revision)?,
                 rows,
@@ -252,10 +312,10 @@ fn project_update<'a>(
         }
     }
     let rows = (0..frame.rows().len())
-        .map(|index| wire_row(frame, index, &mut projection))
+        .map(|index| wire_row(frame, index, &mut projection).map(&mut encode_row))
         .collect::<Result<_, _>>()?;
     let (hyperlinks, images) = projection.into_resources();
-    Ok(wire::UpdateData::Snapshot {
+    Ok(wire::UpdateRows::Snapshot {
         stamp,
         cols: frame.cols() as u16,
         rows,
@@ -319,6 +379,102 @@ impl EncodedText<'_> {
 }
 
 type EncodedCell<'a> = wire::CellData<EncodedText<'a>, RgbColor>;
+
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum EncodedRow<'a> {
+    Packed(wire::PackedRow<EncodedText<'a>, RgbColor>),
+    Cells(wire::RowData<EncodedCell<'a>>),
+}
+
+fn packed_style(cell: &EncodedCell<'_>) -> wire::PackedStyle<RgbColor> {
+    wire::PackedStyle {
+        foreground: cell.foreground,
+        background: cell.background,
+        style: cell.style,
+        underline: cell.underline,
+        underline_color: cell.underline_color,
+        hyperlink_id: cell.hyperlink_id,
+    }
+}
+
+fn row_styles_repeat(cells: &[EncodedCell<'_>]) -> bool {
+    let mut sample = [None; 8];
+    let stride = cells.len().div_ceil(sample.len()).max(1);
+    for (index, cell) in cells.iter().step_by(stride).enumerate() {
+        let style = Some(packed_style(cell));
+        if sample[..index].contains(&style) {
+            return true;
+        }
+        sample[index] = style;
+    }
+    false
+}
+
+fn pack_row(row: wire::RowData<EncodedCell<'_>>) -> EncodedRow<'_> {
+    if !row_styles_repeat(&row.cells) {
+        return EncodedRow::Cells(row);
+    }
+    let columns = row.cells.len() as u16;
+    // Dense true-color rows benefit less from a palette. Stop collecting
+    // early and send the ordinary cell shape for such rows in version 7.
+    let max_styles = (row.cells.len() / 4).clamp(1, 32);
+    let mut styles = Vec::new();
+    let mut style_indices = HashMap::new();
+    let mut last = None;
+    let mut indices = Vec::with_capacity(row.cells.len());
+    for cell in &row.cells {
+        let paint = packed_style(cell);
+        let index = match last {
+            Some((previous, index)) if previous == paint => index,
+            _ => {
+                let index = if let Some(&index) = style_indices.get(&paint) {
+                    index
+                } else {
+                    if styles.len() == max_styles {
+                        return EncodedRow::Cells(row);
+                    }
+                    let index = styles.len() as u16;
+                    style_indices.insert(paint, index);
+                    styles.push(paint);
+                    index
+                };
+                last = Some((paint, index));
+                index
+            }
+        };
+        indices.push(index);
+    }
+    let mut runs = Vec::new();
+    for (cell, index) in row.cells.into_iter().zip(indices) {
+        if let (1, EncodedText::Scalar(character), Some(last)) =
+            (cell.width, &cell.text, runs.last_mut())
+        {
+            match last {
+                wire::PackedRun::Scalars(style, text) if *style == index => {
+                    text.push(*character);
+                    continue;
+                }
+                wire::PackedRun::Cell(style, EncodedText::Scalar(first), 1) if *style == index => {
+                    let mut text = String::with_capacity(8);
+                    text.push(*first);
+                    text.push(*character);
+                    *last = wire::PackedRun::Scalars(index, text);
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        runs.push(wire::PackedRun::Cell(index, cell.text, cell.width));
+    }
+    EncodedRow::Packed(wire::PackedRow {
+        wrapped: row.wrapped,
+        columns,
+        styles,
+        runs,
+        image_slices: row.image_slices,
+    })
+}
 
 #[derive(Default)]
 struct Projection<'a> {
@@ -543,7 +699,7 @@ mod tests {
         session: &str,
         version: u8,
     ) -> Result<wire::Update, String> {
-        let projected = project_update(previous, frame, session, version)?;
+        let projected = project_update(previous, frame, session, version, std::convert::identity)?;
         let data = serde_json::to_vec(&projected).map_err(|error| error.to_string())?;
         serde_json::from_slice(&data).map_err(|error| error.to_string())
     }
@@ -578,6 +734,31 @@ mod tests {
         assert_eq!(writer.bytes.capacity(), 19);
         assert!(writer.write_all(b"x").is_err());
         assert_eq!(writer.bytes.len(), 19);
+    }
+
+    #[test]
+    fn packed_snapshots_group_scalar_runs_and_fall_back_for_dense_colors() {
+        let budget = Arc::new(RetainedBytesBudget::new(JSON_WORKSPACE_BYTES));
+        let scratch = FrameScratch::reserve_from(&budget).unwrap();
+        let mut terminal = jterm_engine::terminal::Terminal::new(2, 8).unwrap();
+        terminal
+            .feed(b"ABCDEFGH\x1b[2;1H\x1b[31mR\x1b[32mG\x1b[33mY\x1b[0m")
+            .unwrap();
+        let frame = terminal.frame().unwrap();
+        let (_, packed) = scratch
+            .encode(None, &frame, "packed", wire::PACKED_VERSION)
+            .unwrap();
+        let packed: serde_json::Value = serde_json::from_str(&packed).unwrap();
+        assert_eq!(
+            packed["rows"][0]["runs"],
+            serde_json::json!([[0, "ABCDEFGH"]])
+        );
+        assert_eq!(packed["rows"][0]["styles"].as_array().unwrap().len(), 1);
+        let (_, old) = scratch
+            .encode(None, &frame, "packed", wire::ROW_MOVE_VERSION)
+            .unwrap();
+        let old: serde_json::Value = serde_json::from_str(&old).unwrap();
+        assert_eq!(packed["rows"][1], old["rows"][1]);
     }
 
     fn sample(revision: u64, screen: Screen, wrapped: bool) -> CellFrame {

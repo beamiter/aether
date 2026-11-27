@@ -838,6 +838,23 @@ impl LiveBridge {
         anchor: Option<HistorySource>,
         shift: i32,
     ) -> Result<String, String> {
+        self.history_projection_at_version(
+            epoch,
+            offset,
+            anchor,
+            shift,
+            crate::protocol_v4::IMAGE_VERSION,
+        )
+    }
+
+    pub fn history_projection_at_version(
+        &self,
+        epoch: u32,
+        offset: usize,
+        anchor: Option<HistorySource>,
+        shift: i32,
+        version: u8,
+    ) -> Result<String, String> {
         let owner = self.attachment(epoch)?;
         let terminal = self.session.as_ref().unwrap().terminal();
         let (layout, first, page) = projected_history_page(terminal, offset, anchor, shift)?;
@@ -848,6 +865,7 @@ impl LiveBridge {
             page.revision,
             &page.text,
             |row| layout.anchor_at(first + row),
+            version,
         )
     }
 
@@ -886,9 +904,9 @@ impl LiveBridge {
     ) -> Result<HistorySearchResponse, String> {
         self.check(epoch)?;
         request.validate()?;
-        let owner = format
-            .supports_images()
-            .then(|| self.attachment(epoch))
+        let projection = format
+            .history_version()
+            .map(|version| self.attachment(epoch).map(|owner| (owner, version)))
             .transpose()?;
         if request.restart {
             if self
@@ -905,7 +923,7 @@ impl LiveBridge {
             .as_mut()
             .filter(|search| search.id == request.id && search.query() == request.query)
             .ok_or("start a new history search")?;
-        search.step(self.session.as_ref().unwrap().terminal(), epoch, owner)
+        search.step(self.session.as_ref().unwrap().terminal(), epoch, projection)
     }
     pub fn status(&self, epoch: u32) -> Result<SessionStatus, String> {
         self.check(epoch)?;

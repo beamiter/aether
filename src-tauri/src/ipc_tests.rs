@@ -65,6 +65,13 @@ fn local_v6_snapshot_recovery_and_attach_keep_exact_lease_and_receipt() {
     assert_snapshot_recovery_and_attach_keep_exact_lease_and_receipt(6);
 }
 
+#[test]
+fn local_v7_snapshot_recovery_and_attach_keep_exact_lease_and_receipt() {
+    assert_snapshot_recovery_and_attach_keep_exact_lease_and_receipt(
+        tauri_terminal_frame_bridge::protocol_v4::PACKED_VERSION,
+    );
+}
+
 fn assert_snapshot_recovery_and_attach_keep_exact_lease_and_receipt(frame_version: u8) {
     let app = super::application(tauri::test::mock_builder())
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
@@ -85,6 +92,11 @@ fn assert_snapshot_recovery_and_attach_keep_exact_lease_and_receipt(frame_versio
     let current = &recovered["owner"];
     assert_eq!(frame["kind"], "snapshot");
     assert_eq!(frame["stamp"]["version"], frame_version);
+    if frame_version == tauri_terminal_frame_bridge::protocol_v4::PACKED_VERSION {
+        assert_eq!(frame["rows"][0]["columns"], frame["cols"]);
+        assert!(frame["rows"][0]["styles"].is_array());
+        assert!(frame["rows"][0]["runs"].is_array());
+    }
     assert_eq!(frame["stamp"]["session"], owner["session"]);
     assert_eq!(current["generation"], 2);
     let revision = &frame["stamp"]["revision"];

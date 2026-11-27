@@ -469,11 +469,17 @@ async fn history_shell<R: tauri::Runtime>(
 ) -> Result<tauri_terminal_frame_bridge::protocol_v4::LocalHistorySnapshot, String> {
     use tauri_terminal_frame_bridge::protocol_v4::LocalHistorySnapshot;
     let format = SnapshotFormat::negotiate(frame_version)?;
-    if format.supports_images() {
+    if let Some(version) = format.history_version() {
         require_terminal_window(&window)?;
         return run_attached(bridge.inner().clone(), owner, move |bridge, epoch| {
             bridge
-                .history_projection(epoch, offset, anchor, shift.unwrap_or_default())
+                .history_projection_at_version(
+                    epoch,
+                    offset,
+                    anchor,
+                    shift.unwrap_or_default(),
+                    version,
+                )
                 .map(LocalHistorySnapshot::Projection)
         })
         .await;
