@@ -16,6 +16,7 @@ pub(crate) struct LocalShellStatus {
     alternate_scroll: Option<AlternateScrollView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     history_oldest_row: Option<Counter>,
+    inline_codex_history: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pane_history_id: Option<String>,
 }
@@ -55,6 +56,7 @@ impl LocalShellStatus {
             mouse: bridge.mouse_view(epoch)?,
             alternate_scroll: bridge.alternate_scroll_view(epoch)?,
             history_oldest_row: bridge.history_oldest_row(epoch)?,
+            inline_codex_history: bridge.inline_codex_history(epoch)?,
             pane_history_id: bridge.completed_pane_id().map(str::to_owned),
             chat: TerminalChatStatus {
                 surface,

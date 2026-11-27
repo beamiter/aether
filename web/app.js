@@ -7,6 +7,7 @@ import {openVim9Snapshot} from './vim9-workbench.js';
 import {installPasteReview} from './paste.js';
 import {dimensions,resizeQueue,cursorTarget,terminalCellAt,viewportDimensions} from './viewport.js';
 import {installHistory} from './history.js';
+import {installInlineHistory} from './inline-history.js';
 import {installCommandBlocks} from './command-blocks.js';
 import {installTerminalChat,validateChatStatus} from './terminal-chat.js';
 import {installWorkflows} from './workflows.js';
@@ -62,11 +63,21 @@ const filePreview=installFilePreviewPanel(document,{getFrame:visibleLiveFrame,ge
   openInVim:typeof openVim9Snapshot==='function'?openVim9Snapshot:null});
 const imeInput=document.querySelector('#ime-input');
 const terminalPreedit=document.querySelector('#terminal-preedit');
+const historyCanvas=document.createElement('canvas');
+historyCanvas.setAttribute('aria-label','Codex terminal history');
+Object.assign(historyCanvas.style,{position:'absolute',top:'0',left:'0',zIndex:'1'});
+canvas.parentElement?.append(historyCanvas);
+const inlineHistory=installInlineHistory({
+  canvas:historyCanvas,viewport:document.querySelector('#active-pane .viewport'),
+  getOwner:()=>changingTab||recovery?null:owner,getFrame:visibleLiveFrame,
+  fetchHistory:(attachment,options)=>invokeAttached('history_shell',{epoch:attachment.epoch,...options},attachment),
+  focus:()=>imeInput.focus(),
+});
 const terminalMouse = typeof canvas.setPointerCapture === 'function'
   ? installTerminalMouse({
     canvas,
     getFrame() {
-      if (input.disabled || changingTab || recovery || !canReportMouse(owner) ||
+      if (input.disabled || changingTab || recovery || inlineHistory.active() || !canReportMouse(owner) ||
           mouseView?.owner !== owner) return null;
       const frame = visibleLiveFrame();
       if (!frame || frame.session !== owner.session || frame.epoch !== owner.epoch ||
@@ -458,6 +469,8 @@ function validateShellStatus(info,expectedEpoch){
     validateChatStatus(info.chat);
     acceptLocalPane(info);
     if(info.history_oldest_row!==undefined)channelCounter(info.history_oldest_row);
+    if(info.inline_codex_history!==undefined&&typeof info.inline_codex_history!=='boolean')
+      throw new Error('invalid inline history state');
   }
   if (local || info.mouse_reporting === true) {
     if (info.mouse !== undefined) {
@@ -496,6 +509,7 @@ function showShellStatus(info,mode){
   if(owner&&owner.session!==sshSession){
     terminalChat.showStatus(info,owner);
     if(info.history_oldest_row!==undefined)history.updateRetained(owner,info.history_oldest_row);
+    inlineHistory.update(owner,typeof Channel==='function'&&info.inline_codex_history===true,info.history_oldest_row);
   }
   const mouse = info.mouse ?? (info.alternate_scroll
     ? {...info.alternate_scroll, tracking: 'alternate_scroll'} : null);
@@ -505,6 +519,7 @@ function showShellStatus(info,mode){
   if(document.activeElement===imeInput||document.activeElement===canvas)terminalChat.followCursor();
 }
 function stopTransport(){
+  inlineHistory.update(null,false);
   mouseView = null;
   terminalMouse?.frameChanged();
   clearInterval(timer);
@@ -1084,6 +1099,7 @@ canvas.addEventListener('click',event=>{
   });
 },true);
 function revealLiveCursor(){
+  inlineHistory.reset();
   const frame=visibleLiveFrame();
   if(!frame)return;
   const viewport=document.querySelector('#active-pane .viewport');
@@ -1133,6 +1149,7 @@ function enqueueLogical(command,payload,onReceipt){
   if(epoch===null||input.disabled)return;
   const queue=keyQueue;
   const mouse=command==='mouse_shell';
+  if(!mouse)inlineHistory.reset();
   if (mouse && (!canReportMouse(owner) || queue.pending >= (payload.report.kind === 'release' ? 128 : 126))) return;
   if(queue.pending>=128){pasteReview.reset();queue.locked=true;status.textContent='Keyboard queue full; input locked. Close/reopen before retrying.';input.disabled=send.disabled=true;return;}
   const current=epoch,attachment=owner;queue.pending++;
@@ -1155,6 +1172,7 @@ function keydown(event){
   if(epoch===null||input.disabled||ime.isComposing()||event.isComposing||event.keyCode===229||event.getModifierState?.('AltGraph')||event.metaKey||event.key==='Dead'||event.key==='Process')return;
   if(pasteReview.dismissFromOrigin(event))return;
   if(workflows.consumeEnterRepeat(event)){event.preventDefault();return;}
+  if(inlineHistory.page(event)){event.preventDefault();return;}
   if(localView()&&event.ctrlKey&&event.shiftKey&&!event.altKey&&event.key.toLowerCase()==='m'){
     event.preventDefault();
     if(!event.repeat)workflows.toggle();

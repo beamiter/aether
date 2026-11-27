@@ -872,6 +872,12 @@ impl LiveBridge {
             .and_then(crate::protocol_v4::Counter::new))
     }
 
+    pub fn inline_codex_history(&self, epoch: u32) -> Result<bool, String> {
+        self.check(epoch)?;
+        let session = self.session.as_ref().unwrap();
+        Ok(session.terminal().history_rows() != 0 && session.foreground_is_codex())
+    }
+
     pub fn search_history(
         &mut self,
         epoch: u32,
