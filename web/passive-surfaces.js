@@ -1,4 +1,4 @@
-import {acceptChannelFrame, channelCounter, CHANNEL_PACKED_VERSION} from './frames-v4.js';
+import {acceptChannelFrame, channelCounter, CHANNEL_RENDITION_VERSION} from './frames-v4.js';
 
 const U32_MAX = 0xffffffff;
 const wireId = value => Number.isInteger(value) && value > 0 && value <= U32_MAX;
@@ -40,7 +40,7 @@ export function makePassiveSurfaces({paint, clear, allocate}) {
     if (!current) return null;
     const {canvas, epoch, session, frame:previous} = current;
     const frame = acceptChannelFrame(null, preview.frame,
-      {session, epoch, frameVersion:CHANNEL_PACKED_VERSION}, true);
+      {session, epoch, frameVersion:CHANNEL_RENDITION_VERSION}, true);
     if (previous && channelCounter(previous.revision) >= channelCounter(frame.revision)) return null;
     return () => {
       if (!slots.includes(current) || current.frame !== previous) return false;

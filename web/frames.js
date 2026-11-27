@@ -1,5 +1,5 @@
 import {createRasterCanvasCache} from './raster-canvas-cache.js';
-import {rowMoveForBase} from './frames-v4.js';
+import {CELL_CONCEALED, CELL_OVERLINE, rowMoveForBase} from './frames-v4.js';
 
 export const CELL_WIDTH = 12, CELL_HEIGHT = 24;
 
@@ -24,7 +24,14 @@ function validateRow(row, cols) {
     if (!c || !Number.isInteger(c.width) || c.width<0 || c.width>2 || !Number.isInteger(c.style) ||
         c.style<0 || c.style>31 || !singleScalar(c.text) || /[\x00-\x1f\x7f-\x9f\ud800-\udfff]/u.test(c.text) ||
         !/^#[a-f0-9]{6}$/i.test(c.foreground) || !/^#[a-f0-9]{6}$/i.test(c.background)) throw new Error('cell');
-    return Object.freeze({text:c.text,foreground:c.foreground,background:c.background,width:c.width,style:c.style});
+    let style = c.style;
+    if (c.rendition !== undefined) {
+      const rendition = c.rendition;
+      if (!Number.isInteger(rendition) || rendition < 0 || rendition > 3) throw new Error('cell rendition');
+      if (rendition & 1) style |= CELL_CONCEALED;
+      if (rendition & 2) style |= CELL_OVERLINE;
+    }
+    return Object.freeze({text:c.text,foreground:c.foreground,background:c.background,width:c.width,style});
   });
   for (let i=0;i<cells.length;i++) {
     if(cells[i].width===2 && (i+1===cells.length || cells[i+1].width!==0)) throw new Error('wide lead without continuation');
@@ -265,12 +272,13 @@ export function paint(canvas, frame, scale = globalThis.devicePixelRatio || 1) {
     const row = frame.rows[y];
     for (let x = first, limit = Math.min(last, row.length); x < limit; x++) {
       const c = row[x];
-      if (c.width === 0) continue;
+      if (c.width === 0 || (c.style & CELL_CONCEALED)) continue;
       g.save();
       try {
         g.beginPath();g.rect(x*cw,y*ch,cw*c.width,ch);g.clip();
         g.font=`${c.style&2?'italic ':''}${c.style&1?'bold ':''}18px monospace`;
         g.globalAlpha=c.style&16?0.5:1;g.fillStyle=c.foreground;g.fillText(c.text,x*cw,y*ch+2);
+        if(c.style&CELL_OVERLINE)g.fillRect(x*cw,y*ch+1,cw*c.width,1);
         if(c.style&8)g.fillRect(x*cw,y*ch+ch/2,cw*c.width,1);
         paintUnderline(g,c,x*cw,y*ch+ch-3,cw*c.width);
       } finally {

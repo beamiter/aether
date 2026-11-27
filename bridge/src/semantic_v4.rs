@@ -49,7 +49,7 @@ impl FrameScratch {
         session: &str,
         version: u8,
     ) -> Result<(wire::Counter, String), String> {
-        if version == wire::PACKED_VERSION {
+        if wire::supports_packed_rows(version) {
             encode_update(project_update(previous, frame, session, version, pack_row)?)
         } else {
             encode_update(project_update(
@@ -118,7 +118,7 @@ pub(crate) fn encode_history(
     source_at: impl Fn(usize) -> Option<HistoryAnchor>,
     version: u8,
 ) -> Result<String, String> {
-    if !matches!(version, wire::IMAGE_VERSION | wire::PACKED_VERSION)
+    if (version != wire::IMAGE_VERSION && !wire::supports_packed_rows(version))
         || !(1..=wire::MAX_COLUMNS).contains(&cols)
         || page.row_count > wire::MAX_ROWS
         || page.total_rows > wire::MAX_PROJECTED_HISTORY_ROWS
@@ -137,7 +137,7 @@ pub(crate) fn encode_history(
         text,
         version,
     };
-    if version == wire::PACKED_VERSION {
+    if wire::supports_packed_rows(version) {
         encode_history_rows(history, source_at, pack_row)
     } else {
         encode_history_rows(history, source_at, std::convert::identity)
@@ -169,6 +169,7 @@ fn encode_history_rows<'a, R: serde::Serialize>(
     let mut projection = Projection {
         images_enabled: true,
         colors: page.paint_colors(),
+        extended_rendition: version == wire::RENDITION_VERSION,
         ..Projection::default()
     };
     let rows = page
@@ -258,11 +259,9 @@ fn project_update<'a, R>(
         pending_wrap: cursor.pending_wrap,
     };
     let mut projection = Projection {
-        images_enabled: matches!(
-            version,
-            wire::IMAGE_VERSION | wire::ROW_MOVE_VERSION | wire::PACKED_VERSION
-        ),
+        images_enabled: version == wire::IMAGE_VERSION || wire::supports_row_moves(version),
         colors,
+        extended_rendition: version == wire::RENDITION_VERSION,
         ..Projection::default()
     };
     if let Some((base, changed)) = previous
@@ -273,9 +272,7 @@ fn project_update<'a, R>(
                 .map(|changed| (base, changed))
         })
     {
-        let (rows, moves) = if matches!(version, wire::ROW_MOVE_VERSION | wire::PACKED_VERSION)
-            && changed.len() > 1
-        {
+        let (rows, moves) = if wire::supports_row_moves(version) && changed.len() > 1 {
             split_row_moves(base, frame, changed)
         } else {
             (changed, Vec::new())
@@ -484,6 +481,7 @@ struct Projection<'a> {
     last_hyperlink: Option<u16>,
     hyperlinks: BTreeMap<u16, &'a str>,
     images_enabled: bool,
+    extended_rendition: bool,
     image_bytes: usize,
     base_images: BTreeSet<u64>,
     images: BTreeMap<u64, wire::ImageResource>,
@@ -594,6 +592,12 @@ impl<'a> Projection<'a> {
                 if flags.inverse() {
                     std::mem::swap(&mut foreground, &mut background);
                 }
+                let rendition = if self.extended_rendition {
+                    (u8::from(flags.concealed()) * wire::STYLE_CONCEALED)
+                        | (u8::from(flags.overline()) * wire::STYLE_OVERLINE)
+                } else {
+                    0
+                };
                 Ok(wire::CellData {
                     text,
                     foreground,
@@ -604,7 +608,8 @@ impl<'a> Projection<'a> {
                         | (u8::from(flags.strikethrough()) << 3)
                         | (u8::from(flags.dim()) << 4)
                         | (u8::from(flags.blink()) << 5)
-                        | (u8::from(flags.protected()) << 6),
+                        | (u8::from(flags.protected()) << 6)
+                        | rendition,
                     underline: match flags.underline() {
                         UnderlineStyle::None => None,
                         UnderlineStyle::Single => Some(wire::Underline::Single),
@@ -759,6 +764,39 @@ mod tests {
             .unwrap();
         let old: serde_json::Value = serde_json::from_str(&old).unwrap();
         assert_eq!(packed["rows"][1], old["rows"][1]);
+    }
+
+    #[test]
+    fn rendition_bits_are_negotiated_for_channel_and_optional_for_compatibility() {
+        let budget = Arc::new(RetainedBytesBudget::new(JSON_WORKSPACE_BYTES));
+        let scratch = FrameScratch::reserve_from(&budget).unwrap();
+        let mut terminal = jterm_engine::terminal::Terminal::new(2, 16).unwrap();
+        terminal.feed(b"\x1b[8;53mX\x1b[28mY\x1b[55mZ").unwrap();
+        let frame = terminal.frame().unwrap();
+        let versioned = |version| {
+            let (_, packed) = scratch.encode(None, &frame, "rendition", version).unwrap();
+            let packed: serde_json::Value = serde_json::from_str(&packed).unwrap();
+            let styles = packed["rows"][0]["styles"].as_array().unwrap();
+            styles
+                .iter()
+                .map(|paint| paint["style"].as_u64().unwrap() as u8)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(versioned(wire::PACKED_VERSION), [0]);
+        assert_eq!(
+            versioned(wire::RENDITION_VERSION),
+            [
+                wire::STYLE_CONCEALED | wire::STYLE_OVERLINE,
+                wire::STYLE_OVERLINE,
+                0
+            ]
+        );
+        let legacy =
+            jterm_protocol::engine_projection::from_engine(&frame, "rendition", 1).unwrap();
+        let legacy = serde_json::to_value(legacy).unwrap();
+        assert_eq!(legacy["rows"][0][0]["rendition"], 3);
+        assert_eq!(legacy["rows"][0][1]["rendition"], 2);
+        assert!(legacy["rows"][0][2].get("rendition").is_none());
     }
 
     fn sample(revision: u64, screen: Screen, wrapped: bool) -> CellFrame {

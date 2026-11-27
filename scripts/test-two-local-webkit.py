@@ -980,7 +980,16 @@ try:
         received += os.read(0, 128)
     if received != expected:
         raise RuntimeError(repr(received))
-    os.write(1, b'\x1b[2;9H' + '🐍hist-image'.encode() + b'\x1b[24S')
+    os.write(1, b'\x1b[2;9H' + '🐍hist-image'.encode() +
+        b'\x1b[3;13H\x1b[38;2;252;210;9;48;2;17;36;59;8;4;9;53mW' +
+        '🧪'.encode() + b'\x1b[28;24;29m.\x1b[55mY\x1b[0m')
+    (root / 'history-rendition-ready').touch()
+    until = time.monotonic() + 45
+    while not (root / 'history-rendition-archive').exists():
+        if time.monotonic() >= until:
+            raise RuntimeError('waiting to archive rendition fixture')
+        time.sleep(.03)
+    os.write(1, b'\x1b[24S')
     (root / 'history-raster-ready').write_text(str(os.getpid()))
     until = time.monotonic() + 45
     while not (root / 'history-raster-clear').exists():
@@ -1009,6 +1018,27 @@ finally:
             raise AssertionError("graphics PTY: " + error.read_text())
         return ready.is_file() and ready.stat().st_size
 
+    def rendition_painted(selector):
+        return driver.execute(f"""
+            const canvas = document.querySelector({json.dumps(selector)});
+            if (!canvas.style.width || !canvas.width) return false;
+            const scale = canvas.width / parseFloat(canvas.style.width);
+            const row = 2 - Number(canvas.dataset.firstRow ?? 0);
+            if (row < 0 || (row+1)*24*scale > canvas.height + 0.001) return false;
+            const ctx = canvas.getContext('2d'), background = [17,36,59,255], line = [252,210,9,255];
+            const left = Math.ceil(144*scale), right = Math.floor(180*scale);
+            const top = Math.ceil(row*24*scale), bottom = Math.floor((row+1)*24*scale);
+            const hidden = ctx.getImageData(left,top,right-left,bottom-top).data;
+            const pixel = col => ctx.getImageData(Math.floor((col*12+6)*scale),
+                Math.floor((row*24+1.5)*scale),1,1).data;
+            return hidden.every((value,i) => value === background[i%4]) &&
+                pixel(15).every((value,i) => value === line[i]) &&
+                pixel(16).every((value,i) => value === background[i]);
+        """)
+
+    wait_for(lambda: (owned / "history-rendition-ready").is_file() and rendition_painted("main canvas"),
+             "live conceal and overline did not paint at their cell boundaries")
+    (owned / "history-rendition-archive").touch()
     wait_for(archived_ready, "graphics did not reach the retained archive")
 
     def read(first_column):
@@ -1031,6 +1061,7 @@ finally:
     first = wait_for(lambda: (page := read(2)) and page["red"] == red and page["green"] == green and page,
                      "the ordinary history projection did not paint both archived image slices")
     assert first["text"].startswith("x" * 80 + "XY") and "🐍hist-image" in first["text"]
+    assert "W🧪.Y" in first["text"] and rendition_painted("#history-canvas")
     assert first["width"] == 80 * 12 and first["tile"] < first["page"]
     # Pixels can exist in a virtualized tile outside the window. Bring the
     # viewport into view, then still perform the real pointer click below.
@@ -1075,6 +1106,7 @@ finally:
     driver.click("#close")
     wait_for(lambda: driver.execute(READ)["status"].startswith("Terminal closed"), "retained graphics fixture did not close")
     print(json.dumps({"native_history_retained_image_pixels": True,
+                      "native_live_and_history_conceal_and_overline": True,
                       "native_history_virtualized_canvas": True,
                       "native_history_projected_reflow_and_selection": True,
                       "native_history_search_uses_original_image_rows": True,

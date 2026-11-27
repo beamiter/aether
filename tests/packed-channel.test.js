@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {acceptChannelFrame, acceptHistoryProjection, CHANNEL_FRAME_VERSION, CHANNEL_PACKED_VERSION} from '../web/frames-v4.js';
-import {paint} from '../web/frames.js';
+import {acceptChannelFrame, acceptHistoryProjection, CELL_CONCEALED, CELL_OVERLINE,
+  CHANNEL_FRAME_VERSION, CHANNEL_PACKED_VERSION, CHANNEL_RENDITION_VERSION} from '../web/frames-v4.js';
+import {acceptFull, paint} from '../web/frames.js';
 import {packedRow} from './fixtures/packed-channel.js';
 
 const owner = {session: 'packed', epoch: 1, generation: 1};
@@ -59,6 +60,46 @@ test('changing a packed continuation background restores its complete wide glyph
   assert.equal(rewrapped.rows[0].wrapped,true);
   paint(canvas,rewrapped,1);
   assert.deepEqual([clears,glyphs,fills],[[],[],[]]);
+});
+
+test('version 8 suppresses concealed glyphs and decorations and extends an overline across a wide cell',()=>{
+  const rendition = {wrapped:false,cells:[
+    {...wide,text:'🧪',style:4|8|128,underline:'double',hyperlink_id:23},
+    half, {...wide,style:128}, half, cell,
+  ]};
+  const current = {...snapshot,images:[],stamp:{...stamp,version:CHANNEL_RENDITION_VERSION,cursor_visible:false}};
+  const frame = accept(null,{...current,rows:[packedRow(rendition)]});
+  assert.deepEqual(frame.rows,accept(null,{...current,rows:[rendition]}).rows);
+  assert.equal(frame.rows[0][0].style,CELL_CONCEALED|CELL_OVERLINE|8);
+  assert.equal(frame.rows[0][0].text,'🧪');
+  const glyphs = [], fills = [];
+  const context = {setTransform(){},save(){},beginPath(){},rect(){},clip(){},restore(){},clearRect(){},
+    fillText(...glyph){glyphs.push(glyph);},fillRect(...fill){fills.push(fill);}};
+  paint({style:{},getContext:()=>context},frame,1);
+  assert.deepEqual(glyphs,[['界',24,2],['X',48,2]]);
+  assert.deepEqual(fills.filter(fill=>fill[3]===1),[[24,1,24,1]]);
+  const legacy = {...current,stamp:{...current.stamp,version:CHANNEL_PACKED_VERSION},rows:[packedRow(rendition)]};
+  assert.throws(()=>accept(null,legacy),/style/);
+
+  const history = acceptHistoryProjection(JSON.stringify({
+    version:CHANNEL_RENDITION_VERSION,owner,revision:'2',total_rows:1,offset:0,cols:5,text:'🧪界X',
+    rows:[{source:{row:'12',column:0},paint:packedRow(rendition),text_offsets:[0,2,2,3,3,4]}],
+    hyperlinks:[linked],
+  }),owner,false,CHANNEL_RENDITION_VERSION);
+  assert.equal(history.text,'🧪界X');
+  assert.deepEqual(history.offsets[0],[0,2,2,3,3,4]);
+  assert.equal(history.rows[0][0].style,CELL_CONCEALED|CELL_OVERLINE|8);
+});
+
+test('compatibility rendition is optional and keeps the legacy underline flag distinct',()=>{
+  const legacy = {version:3,session:owner.session,epoch:owner.epoch,revision:1,layout:1,cols:2,
+    cursor_row:0,cursor_col:0,cursor_visible:false,cursor_shape:'block',pending_wrap:false,
+    rows:[[{...cell,style:4},{...cell,rendition:3}]]};
+  const frame = acceptFull(null,legacy,owner);
+  assert.deepEqual(frame.rows[0].map(c=>c.style),[4,CELL_CONCEALED|CELL_OVERLINE]);
+  for (const rendition of [-1,4,null,'1']) {
+    assert.throws(()=>acceptFull(null,{...legacy,rows:[[cell,{...cell,rendition}]]},owner),/rendition/);
+  }
 });
 
 test('packed rows enforce width, style references, grapheme bytes and scalar validity',()=>{

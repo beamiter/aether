@@ -15,7 +15,7 @@ import {installTerminalChat,validateChatStatus} from './terminal-chat.js';
 import {installWorkflows} from './workflows.js';
 import {plainLocalTab,readLocalShellLayout,saveLocalShellLayout,validPaneId,MAX_LOCAL_SHELLS,validLocalGeometry,localSplitPair} from './local-layout.js';
 import {acceptFull,acceptUpdate,clearPaint,paint} from './frames.js'; import {installIme} from './ime.js';
-import {acceptChannelFrame,channelCounter,CHANNEL_PACKED_VERSION} from './frames-v4.js';
+import {acceptChannelFrame,channelCounter,CHANNEL_RENDITION_VERSION} from './frames-v4.js';
 const canvas=document.querySelector('canvas'),status=document.querySelector('#status'),button=document.querySelector('#demo');
 const open=document.querySelector('#open'),attach=document.querySelector('#attach'),detach=document.querySelector('#detach'),close=document.querySelector('#close'),input=document.querySelector('#input'),send=document.querySelector('#send');
 const openIntegrated=document.querySelector('#open-integrated');
@@ -159,8 +159,8 @@ canvas.addEventListener('click',event=>{if(!event.defaultPrevented&&!event.ctrlK
 const resize=document.querySelector('#resize');
 const invoke=globalThis.__TAURI__?.core?.invoke;
 const Channel=globalThis.__TAURI__?.core?.Channel;
-const channelSnapshots=()=>typeof Channel==='function'?{frameVersion:CHANNEL_PACKED_VERSION}:{};
-const acceptAttachedSnapshot=(frame,attachment,options)=>options.frameVersion===CHANNEL_PACKED_VERSION
+const channelSnapshots=()=>typeof Channel==='function'?{frameVersion:CHANNEL_RENDITION_VERSION}:{};
+const acceptAttachedSnapshot=(frame,attachment,options)=>options.frameVersion===CHANNEL_RENDITION_VERSION
   ?acceptChannelFrame(null,frame,{...attachment,frameVersion:options.frameVersion},true):acceptFull(null,frame,attachment);
 let savedLayout=invoke?readLocalShellLayout():null,protectSavedLayout=false;
 const sshCommands={poll_shell:'poll',ack_shell:'ack',shell_status:'status',history_shell:'history',recover_shell:'recover',detach_shell:'detach',close_shell:'close',write_shell:'write',key_shell:'key',text_shell:'text',paste_shell:'paste',resize_shell:'resize',focus_shell:'focus',mouse_shell:'mouse'};
@@ -350,7 +350,7 @@ function validatePeerFrame(frame,target){
 function validateChannelPeer(frame,target){
   const session=localTabOwners.get(target.epoch)?.session;
   if(typeof session!=='string'||!/^[a-f0-9]{32}$/.test(session))throw new Error('invalid inactive shell');
-  const next=acceptChannelFrame(null,frame,{session,epoch:target.epoch,frameVersion:CHANNEL_PACKED_VERSION},true);
+  const next=acceptChannelFrame(null,frame,{session,epoch:target.epoch,frameVersion:CHANNEL_RENDITION_VERSION},true);
   return peerState?.epoch===next.epoch&&BigInt(peerState.revision)>=BigInt(next.revision)?null:next;
 }
 function paintPeer(frame){
@@ -737,7 +737,7 @@ async function receiveLocalStream(stream,event){
     const commitPassive=tripleIsVisible()?passiveSurfaces.prepare(event.preview):null;
     let revision=null;
     if(event.frame!==null){
-      const next=acceptChannelFrame(stream.frame,event.frame,{...attachment,frameVersion:CHANNEL_PACKED_VERSION});
+      const next=acceptChannelFrame(stream.frame,event.frame,{...attachment,frameVersion:CHANNEL_RENDITION_VERSION});
       paintLiveFrame(next);state=next;stream.frame=next;revision=next.revision;describeCursor();
     }
     paintPeer(peer);
@@ -774,7 +774,7 @@ async function startTransport(){
   }
   if(!channel){
     if(tripleEpochs.length&&owner.session!==sshSession){tripleEpochs=[];renderSplit();}
-    if(owner.session!==sshSession&&state?.version===CHANNEL_PACKED_VERSION){
+    if(owner.session!==sshSession&&state?.version===CHANNEL_RENDITION_VERSION){
       suspendLocalOutput(new Error('local output Channel unavailable'));
       return;
     }
@@ -787,7 +787,7 @@ async function startTransport(){
     if(localStream===stream&&!document.hidden&&Date.now()-stream.lastSeen>10000)
       failLocalStream(stream,new Error('no local output heartbeat'));
   },1000);
-  try{await invoke('subscribe_local_shell',{owner:stream.owner,stream:stream.channel,observer:stream.observers.targets[0],frameVersion:CHANNEL_PACKED_VERSION});}
+  try{await invoke('subscribe_local_shell',{owner:stream.owner,stream:stream.channel,observer:stream.observers.targets[0],frameVersion:CHANNEL_RENDITION_VERSION});}
   catch(error){failLocalStream(stream,error);}
   if(localStream===stream){
     stream.ready=true;renderSplit();
@@ -1314,7 +1314,7 @@ function describeCursor(frame=visibleLiveFrame()){
   document.querySelector('#cursor-status').textContent=`${frame.cols} × ${frame.rows.length} cells · cursor row ${frame.cursor_row+1}, column ${frame.cursor_col+1} · ${frame.cursor_shape}${frame.cursor_visible?'':' (hidden)'}${frame.pending_wrap?' · wrap pending':''}`;
 }
 function hyperlinkAt(event,frame=visibleLiveFrame()){
-  if(!owner||frame?.version!==CHANNEL_PACKED_VERSION||frame.session!==owner.session||frame.epoch!==owner.epoch)return null;
+  if(!owner||frame?.version!==CHANNEL_RENDITION_VERSION||frame.session!==owner.session||frame.epoch!==owner.epoch)return null;
   const point=terminalCellAt(frame,canvas,event.clientX,event.clientY);
   if(!point)return null;
   const cells=frame.rows[point.row];
@@ -1514,7 +1514,7 @@ async function recoverOutput(previousStatus=null){
       sshInputSuspended=false;
       status.textContent=result.input_allowed===true?'SSH output snapshot recovered.':'SSH output snapshot recovered. Input remains disabled.';
     }else if(localTransport==='recovery'){
-      localTransport=options.frameVersion===CHANNEL_PACKED_VERSION?'channel':'poll';
+      localTransport=options.frameVersion===CHANNEL_RENDITION_VERSION?'channel':'poll';
       localFrameRecovery=false;
       if(localInputSuspended&&result.input_allowed===true&&!keyQueue.pending){
         keyQueue.locked=false;input.disabled=send.disabled=resize.disabled=restoringLocalLayout;

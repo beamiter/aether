@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {installInlineHistory} from '../web/inline-history.js';
-import {CHANNEL_PACKED_VERSION} from '../web/frames-v4.js';
+import {CHANNEL_RENDITION_VERSION} from '../web/frames-v4.js';
 import {packedRow} from './fixtures/packed-channel.js';
 
 const settle = () => new Promise(resolve => setImmediate(resolve));
@@ -31,7 +31,7 @@ test('inline paging and wheel share a retained viewport and return to the live f
         : history.length - size;
       const characters = [...history.slice(start, start + size)];
       return JSON.stringify({
-        owner, version: CHANNEL_PACKED_VERSION, revision: '1', cols: 1, total_rows: history.length,
+        owner, version: CHANNEL_RENDITION_VERSION, revision: '1', cols: 1, total_rows: history.length,
         offset: history.length - (start + size), text: characters.join('\n'),
         rows: characters.map((ch, index) => ({
           source: {row: String(start + index + 1), column: 0},

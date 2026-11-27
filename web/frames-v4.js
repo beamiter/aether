@@ -1,6 +1,10 @@
 export const CHANNEL_IMAGE_VERSION = 5;
 export const CHANNEL_FRAME_VERSION = 6;
 export const CHANNEL_PACKED_VERSION = 7;
+export const CHANNEL_RENDITION_VERSION = 8;
+// Decoded cells keep bit 2 available for the version-3 underline flag.
+export const CELL_CONCEALED = 256;
+export const CELL_OVERLINE = 128;
 const textChannelVersion = 4;
 const maxImages = 32;
 const maxImageBytes = 2 * 1024 * 1024;
@@ -17,7 +21,8 @@ const maxHyperlinkTargetBytes = 2048;
 const underlines = new Set(['single','double','curly','dotted','dashed']);
 const colors = /^#[a-fA-F0-9]{6}$/;
 const invalidCellText = /[\x00-\x1f\x7f-\x9f\ud800-\udfff]/u;
-const supportsRowMoves = version => version === CHANNEL_FRAME_VERSION || version === CHANNEL_PACKED_VERSION;
+const supportsPackedRows = version => version === CHANNEL_PACKED_VERSION || version === CHANNEL_RENDITION_VERSION;
+const supportsRowMoves = version => version === CHANNEL_FRAME_VERSION || supportsPackedRows(version);
 const supportsChannelImages = version => version === CHANNEL_IMAGE_VERSION || supportsRowMoves(version);
 const frameMoves = new WeakMap();
 
@@ -134,8 +139,9 @@ function resolveImages(rows, cols, newImages, base, clipImages = false) {
   return Object.freeze(images);
 }
 
-function validStyle(cell, links) {
-  return cell && Number.isInteger(cell.style) && cell.style >= 0 && cell.style <= 123 && (cell.style & 4) === 0 &&
+function validStyle(cell, links, extended) {
+  return cell && Number.isInteger(cell.style) && cell.style >= 0 &&
+    (extended ? cell.style <= 255 : cell.style <= 123 && (cell.style & 4) === 0) &&
     typeof cell.foreground === 'string' && colors.test(cell.foreground) &&
     typeof cell.background === 'string' && colors.test(cell.background) &&
     (cell.underline === undefined || underlines.has(cell.underline)) &&
@@ -143,14 +149,18 @@ function validStyle(cell, links) {
     (cell.hyperlink_id === undefined || links.has(cell.hyperlink_id));
 }
 
-function validatePackedRow(row, cols, links, referenced, supportsImages) {
+function decodedStyle(style, extended) {
+  return extended && (style & 4) ? (style & ~4) | CELL_CONCEALED : style;
+}
+
+function validatePackedRow(row, cols, links, referenced, supportsImages, extended) {
   if (!row || typeof row.wrapped !== 'boolean' || row.columns !== cols || row.cells !== undefined ||
       !Array.isArray(row.styles) || row.styles.length > cols || !Array.isArray(row.runs) || row.runs.length > cols)
     throw new Error('invalid packed Channel row');
   const styles = row.styles.map(paint => {
-    if (!validStyle(paint, links)) throw new Error('invalid packed Channel style');
+    if (!validStyle(paint, links, extended)) throw new Error('invalid packed Channel style');
     const {foreground,background,style,underline,underline_color,hyperlink_id} = paint;
-    return {foreground,background,style,underline,underline_color,hyperlink_id};
+    return {foreground,background,style:decodedStyle(style,extended),underline,underline_color,hyperlink_id};
   });
   const cells = [], usedStyles = new Set(), rowLinks = new Set();
   let textBytes = 0, lead = false;
@@ -187,8 +197,9 @@ function validatePackedRow(row, cols, links, referenced, supportsImages) {
   return Object.freeze(Object.assign(cells, {wrapped: row.wrapped, textBytes, links:Object.freeze([...rowLinks]), imageSlices}));
 }
 
-function validateRow(row, cols, links, referenced, supportsImages, packed = false) {
-  if (packed && row?.cells === undefined) return validatePackedRow(row, cols, links, referenced, supportsImages);
+function validateRow(row, cols, links, referenced, supportsImages, version) {
+  const packed = supportsPackedRows(version), extended = version === CHANNEL_RENDITION_VERSION;
+  if (packed && row?.cells === undefined) return validatePackedRow(row, cols, links, referenced, supportsImages, extended);
   if (packed && (row.styles !== undefined || row.runs !== undefined || row.columns !== undefined))
     throw new Error('mixed Channel row encodings');
   if (!row || typeof row.wrapped !== 'boolean' || !Array.isArray(row.cells) || row.cells.length !== cols)
@@ -196,7 +207,7 @@ function validateRow(row, cols, links, referenced, supportsImages, packed = fals
   let textBytes = 0;
   const rowLinks = new Set();
   const cells = row.cells.map((cell, i) => {
-    if (!validStyle(cell, links) || !Number.isInteger(cell.width) || cell.width < 0 || cell.width > 2 ||
+    if (!validStyle(cell, links, extended) || !Number.isInteger(cell.width) || cell.width < 0 || cell.width > 2 ||
         typeof cell.text !== 'string' || !cell.text.length || cell.text.length > maxClusterBytes || invalidCellText.test(cell.text))
       throw new Error('invalid Channel cell');
     const size = utf8Bytes(cell.text);
@@ -210,7 +221,7 @@ function validateRow(row, cols, links, referenced, supportsImages, packed = fals
       rowLinks.add(hyperlink_id);
       referenced.add(hyperlink_id);
     }
-    return Object.freeze({text, foreground, background, width, style, underline, underline_color, hyperlink_id});
+    return Object.freeze({text, foreground, background, width, style:decodedStyle(style,extended), underline, underline_color, hyperlink_id});
   });
   const imageSlices = validateSlices(row.image_slices, cols, supportsImages);
   return Object.freeze(Object.assign(cells, {wrapped: row.wrapped, textBytes, links:Object.freeze([...rowLinks]), imageSlices}));
@@ -245,7 +256,6 @@ export function acceptChannelFrame(previous, encoded, expected, snapshotOnly = f
   const links = validatedHyperlinks(update.hyperlinks, previous), referenced = new Set();
 
   const allowSlices = supportsImages && stamp.screen === 'primary';
-  const packed = stamp.version === CHANNEL_PACKED_VERSION;
   let cols, rows;
   if (update.kind === 'snapshot') {
     cols = update.cols;
@@ -253,7 +263,7 @@ export function acceptChannelFrame(previous, encoded, expected, snapshotOnly = f
       throw new Error('Channel dimension limit');
     if (previous && previous.layout === stamp.layout && (cols !== previous.cols || update.rows.length !== previous.rows.length))
       throw new Error('Channel geometry requires new layout');
-    rows = update.rows.map(row => validateRow(row, cols, links, referenced, allowSlices, packed));
+    rows = update.rows.map(row => validateRow(row, cols, links, referenced, allowSlices, stamp.version));
   } else {
     if (snapshotOnly || update.kind !== 'delta' || !previous ||
         update.base_revision !== previous.revision || stamp.layout !== previous.layout || stamp.screen !== previous.screen ||
@@ -276,7 +286,7 @@ export function acceptChannelFrame(previous, encoded, expected, snapshotOnly = f
       const index = edit?.index;
       if (!Number.isInteger(index) || index < 0 || index >= rows.length || seen.has(index))
         throw new Error('invalid Channel row index');
-      rows[index] = validateRow(edit.row, cols, links, referenced, allowSlices, packed);
+      rows[index] = validateRow(edit.row, cols, links, referenced, allowSlices, stamp.version);
       seen.add(index);
     }
   }
@@ -323,7 +333,7 @@ export function acceptHistoryProjection(encoded, owner, search = false, expected
   const wireBytes = utf8Bytes(encoded);
   if (wireBytes > limit) throw new Error('history projection byte limit');
   const view = JSON.parse(encoded);
-  const packed = view?.version === CHANNEL_PACKED_VERSION;
+  const packed = supportsPackedRows(view?.version);
   if (!view || (!packed && view.version !== CHANNEL_IMAGE_VERSION) ||
       (expectedVersion !== undefined && view.version !== expectedVersion) || view.owner?.session !== owner.session ||
       view.owner.epoch !== owner.epoch || view.owner.generation !== owner.generation)
@@ -357,7 +367,7 @@ export function acceptHistoryProjection(encoded, owner, search = false, expected
     sources.push(Object.freeze({row:source.row,column:source.column}));
     const width = packed && entry.paint?.cells === undefined ? entry.paint?.columns : entry.paint?.cells?.length;
     if (!Number.isInteger(width) || width < 0 || width > cols) throw new Error('invalid history row width');
-    const row = validateRow(entry.paint,width,links,referenced,true,packed);
+    const row = validateRow(entry.paint,width,links,referenced,true,view.version);
     paintBytes += row.textBytes;
     const bounds = entry.text_offsets;
     if (!Array.isArray(bounds) || bounds.length !== width + 1 || bounds[0] !== end + Number(!wraps) ||
