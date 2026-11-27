@@ -654,6 +654,48 @@ test('three visible shells rotate a single writer and ACK a retired preview on t
  assert.deepEqual(writes,[3,1]);
 });
 
+for(const [closed,expectedSplit,expectedPeer] of [[3,'right',1],[1,'top',3]]){
+ test(`closing visible shell ${closed} preserves the other two panes and never selects parked shell 4`,async()=>{
+  const own=(epoch,generation)=>({session:String(epoch).repeat(32),epoch,generation});
+  const a=own(1,1),b=own(2,2),c=own(3,3),d=own(4,4);
+  const raw=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+  const frame=owner=>channelSnapshot({...raw,session:owner.session,epoch:owner.epoch});
+  const opening=[b,c,d], seen=[], previews=[],writes=[];
+  let generation=4;
+  const h=harness(async(name,args)=>{
+   switch(name){
+    case 'open_shell':return a;
+    case 'subscribe_local_shell':if(args.observer)previews.push(args.observer.epoch);return null;
+    case 'ack_shell':return null;
+    case 'set_local_observers':return null;
+    case 'set_local_observer':if(args.observer)previews.push(args.observer.epoch);return null;
+    case 'close_shell':seen.push(['close',args.epoch]);return {cleanup_pending:false};
+    case 'write_shell':writes.push(args.epoch);return args.bytes.length;
+    case 'activate_local_tab':{
+     const next=args.targetEpoch===null?opening.shift():own(args.targetEpoch,++generation);
+     seen.push(['activate',args.owner?.epoch??null,next.epoch]);
+     return {Ok:{owner:next,frame:frame(next),input_allowed:true}};
+    }
+    default:throw Error('unexpected local IPC '+name);
+   }
+  },undefined,undefined,undefined,{},testChannel(),{localStorage:{getItem:key=>key==='aether.preview-three-panes'?'1':null}});
+  await h.click('#open');
+  for(let i=0;i<3;i++)await h.click('#new-local-tab');
+  await h.el('#local-tab-list').options.find(tab=>tab.dataset.epoch===String(closed)).handlers.click();
+  await tick();await tick();
+  await h.click('#split-three-local');
+  assert.equal(h.el('#terminal-panes').dataset.triple,'true');
+  await h.click('#close');
+  assert.deepEqual(seen.slice(-2),[['close',closed],['activate',null,2]]);
+  assert.equal(h.el('#terminal-panes').dataset.triple,'');
+  assert.equal(h.el('#terminal-panes').dataset.split,expectedSplit);
+  assert.equal(previews.at(-1),expectedPeer);
+  assert.equal(h.el('#input').disabled,false);
+  h.el('#input').value='surviving shell only';await h.submit();
+  assert.deepEqual(writes,[2]);
+ });
+}
+
 test('SSH terminal recovers the same grid on a new generation and reattaches read-only',async()=>{
  const old={session:'a'.repeat(32),epoch:1,generation:1},next={...old,generation:2},readonly={...old,generation:4};
  const frame={...JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8')),session:old.session,epoch:1};

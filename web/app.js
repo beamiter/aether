@@ -1180,13 +1180,60 @@ async function detachView(){
   }
 }
 detach.addEventListener('click',detachView);
+// The opt-in L layout is A | (B above C). Collapse the closed leaf's
+// immediate split only; the parked roster never participates in the choice.
+function previewCloseSurvivors(attachment){
+  if(!tripleIsVisible()||!tripleEpochs.includes(attachment.epoch))return null;
+  const [left,top,bottom]=tripleEpochs;
+  const closed=attachment.epoch;
+  const peers=tripleEpochs.filter(value=>value!==closed).map(value=>localTabOwners.get(value));
+  if(peers.length!==2||peers.some(peer=>!peer))return null;
+  return {axis:closed===left?'vertical':'horizontal',peers,target:closed===top?bottom:top};
+}
 close.addEventListener('click',async()=>{
   // SSH and local shells can have the same numeric epoch. Retire the poll
   // before Close can give up that view, even if the close response is lost.
   if(changingTab||!owner||close.disabled)return;
-  generation++;transport++;polling=null;setLocalTools(false);filePreview.dismiss();pasteReview.reset();ime.reset();history.reset();stopTransport();const old=epoch,oldOwner=owner;epoch=null;owner=null;renderLocalTabs();resize.disabled=close.disabled=detach.disabled=input.disabled=send.disabled=true;
-  try{const result=await invokeAttached('close_shell',{epoch:old},oldOwner);if(oldOwner.session!==sshSession){input.value='';localDrafts.delete(oldOwner.session);localTabEpochs.delete(oldOwner.epoch);localTabOwners.delete(oldOwner.epoch);localShellKinds.delete(oldOwner.session);localPaneIds.delete(oldOwner.session);localTabGeometry.delete(oldOwner.epoch);terminalChat.forget(oldOwner.session);if(localTabEpochs.size<2){splitEnabled=false;splitEpochs=[];}else updateSplitPair();recordLocalLayout();}status.textContent=result?.cleanup_pending===false?'Terminal closed; direct child reaped. Descendant containment is not provided.':'Terminal closed; direct-child cleanup handed to bounded supervisor and may still be pending. Descendant containment is not provided.';if(typeof result?.save_warning==='string')status.textContent+=' '+result.save_warning;state=null;clearTerminalPaint();sshSession=null;sshInputSuspended=false;setOpenDisabled(false);attach.disabled=button.disabled=false;renderLocalTabs();}
-  catch(e){epoch=old;owner=oldOwner;blocks.updateOwner();terminalChat.updateOwner();close.disabled=detach.disabled=false;status.textContent=`Close error: ${String(e?.message??e)}. Retry Close to finish cleanup.`;}
+  const old=epoch,oldOwner=owner,survivors=previewCloseSurvivors(oldOwner);
+  generation++;transport++;polling=null;setLocalTools(false);filePreview.dismiss();pasteReview.reset();
+  ime.reset();history.reset();stopTransport();epoch=null;owner=null;renderLocalTabs();
+  resize.disabled=close.disabled=detach.disabled=input.disabled=send.disabled=true;
+  let result;
+  try{result=await invokeAttached('close_shell',{epoch:old},oldOwner);}
+  catch(e){
+    epoch=old;owner=oldOwner;blocks.updateOwner();terminalChat.updateOwner();close.disabled=detach.disabled=false;
+    status.textContent=`Close error: ${String(e?.message??e)}. Retry Close to finish cleanup.`;
+    return;
+  }
+  let resume=null;
+  if(oldOwner.session!==sshSession){
+    input.value='';localDrafts.delete(oldOwner.session);localTabEpochs.delete(oldOwner.epoch);
+    localTabOwners.delete(oldOwner.epoch);localShellKinds.delete(oldOwner.session);localPaneIds.delete(oldOwner.session);
+    localTabGeometry.delete(oldOwner.epoch);terminalChat.forget(oldOwner.session);
+    if(survivors&&survivors.peers.every(peer=>localTabEpochs.has(peer.epoch)&&
+        localTabOwners.get(peer.epoch)?.session===peer.session)){
+      tripleEpochs=[];
+      splitEnabled=true;
+      splitEpochs=survivors.peers.map(peer=>peer.epoch);
+      splitAxis=survivors.axis;
+      writePreference('aether.split-axis',splitAxis);
+      splitLayout=allocateLayoutToken();
+      resume=survivors.target;
+    }else if(localTabEpochs.size<2){
+      splitEnabled=false;splitEpochs=[];tripleEpochs=[];
+    }else updateSplitPair();
+    if(resume===null)recordLocalLayout();
+  }
+  const warning=typeof result?.save_warning==='string'?result.save_warning:'';
+  status.textContent=result?.cleanup_pending===false?'Terminal closed; direct child reaped. Descendant containment is not provided.':
+    'Terminal closed; direct-child cleanup handed to bounded supervisor and may still be pending. Descendant containment is not provided.';
+  if(warning)status.textContent+=' '+warning;
+  state=null;clearTerminalPaint();sshSession=null;sshInputSuspended=false;
+  setOpenDisabled(false);attach.disabled=button.disabled=false;renderLocalTabs();
+  if(resume!==null){
+    await startLocalTab(resume,{focusTerminal:true});
+    if(epoch===resume&&warning)status.textContent+=' '+warning;
+  }
 });
 document.querySelector('#command').addEventListener('submit',async event=>{
   event.preventDefault();if(epoch===null||input.disabled)return;

@@ -3781,6 +3781,37 @@ def exercise_three_shells(driver, owned, backend):
                       "preview_focus_and_exact_pty_identity": True,
                       "active_resize_leaves_passive_ptys_unchanged": True}), flush=True)
 
+    # Opening a fourth shell temporarily replaces the active leaf. Selecting
+    # C again parks D outside the three-pane layout before the close.
+    wait_for(lambda: state()["draft"] == "", "third input receipt still pending")
+    driver.click("#new-local-tab")
+    parked = wait_for(lambda: state()["current_tab"] if state()["writable"] and
+                      len(state()["tabs"]) == 4 else None, "fourth shell did not open")
+    assert parked not in tabs
+    parked_id = write_from_current_tab(driver, owned / "three-parked.pid")
+    wait_for(lambda: state()["draft"] == "", "parked shell receipt still pending")
+    click_tab(driver, tabs[2])
+    wait_for(lambda: state()["current_tab"] == tabs[2] and state()["writable"] and
+             driver.execute("return document.querySelector('#terminal-panes').dataset.triple;") == "true",
+             "third shell did not return to its preview slot")
+    driver.click("#close")
+    wait_for(lambda: state()["current_tab"] == tabs[1] and state()["writable"] and
+             state()["split"] == "right" and set(state()["tabs"]) == {tabs[0], tabs[1], parked},
+             "closing the bottom leaf did not retain the horizontal split and parked tab")
+    assert write_from_current_tab(driver, owned / "three-closed-focus.pid") == identities[1]
+    wait_for(lambda: state()["draft"] == "", "close fallback shell receipt still pending")
+    driver.click("#focus-peer-pane")
+    wait_for(lambda: state()["current_tab"] == tabs[0] and state()["writable"] and state()["split"] == "left",
+             "surviving peer did not remain focusable")
+    assert write_from_current_tab(driver, owned / "three-closed-peer.pid") == identities[0]
+    wait_for(lambda: state()["draft"] == "", "close peer receipt still pending")
+    click_tab(driver, parked)
+    assert write_from_current_tab(driver, owned / "three-closed-parked.pid") == parked_id
+    print(json.dumps({"case": "AETHER.THREE_PANES.CLOSE_SURVIVORS", "backend": backend,
+                      "horizontal_split_preserved": True,
+                      "survivors_and_parked_pty_identity_preserved": True,
+                      "focus_after_close_stays_in_split": True}), flush=True)
+
 
 def run(binary, jsh, workspace, api, native, notebook=False, output_review=False, vim9=False,
         inline_graphics_only=False, history_graphics_only=False, workspace_only=False, backend="x11",
