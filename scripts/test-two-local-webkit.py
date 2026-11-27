@@ -239,7 +239,7 @@ def write_from_current_tab(driver, pid_file, color=None):
     return shell_identity(pid_file)
 
 
-def click_tab(driver, number):
+def click_tab(driver, number, *, three_pane=False):
     assert re.fullmatch(r"[1-9][0-9]{0,9}", number)
     selector = f'#local-tab-list [data-epoch="{number}"]'
     wait_messages = {
@@ -258,7 +258,12 @@ def click_tab(driver, number):
         if (number in state["available_tabs"] and state["current_tab"] != number
                 and (last_click is None or retry_requested)):
             try:
-                driver.click(selector)
+                if three_pane:
+                    # The previous shell write may have scrolled the Session
+                    # panel below the stage. Reveal the full toolbar before
+                    # letting WebDriver target the tab's center.
+                    driver.execute("document.body.scrollTop = 0;")
+                driver.click(selector, trace_hit=three_pane)
                 last_click = time.monotonic()
                 attempted_status = state["status"]
             except ProtocolError as error:
@@ -3838,14 +3843,14 @@ def exercise_three_restore_fit_x11(driver, owned, binary, tabs, parked, identiti
         if tab == parked:
             # Use the bottom slot to inspect the parked shell. Returning to
             # that bottom shell restores the layout for the close check.
-            click_tab(driver, tabs[2])
-        click_tab(driver, tab)
+            click_tab(driver, tabs[2], three_pane=True)
+        click_tab(driver, tab, three_pane=True)
         identity = write_from_current_tab(driver, owned / f"three-fit-{name}.pid")
         assert pty_size(identity) == expected
         fresh.append(identity)
         wait_for(lambda: state()["draft"] == "", "fitted restart identity receipt still pending")
     assert len(set([*prior, active_id, *fresh])) == 8
-    click_tab(driver, tabs[2])
+    click_tab(driver, tabs[2], three_pane=True)
     print(json.dumps({"case": "AETHER.THREE_PANES.RESTART_WITH_FIT", "backend": "x11",
                       "active_grid_tracks_smaller_native_window": True, "passive_and_parked_sizes_retained": True,
                       "newly_focused_peer_only_refits_itself": True}), flush=True)
@@ -3944,7 +3949,7 @@ def exercise_three_shells(driver, owned, backend, binary):
         wait_for(lambda: state()["draft"] == "", "active input still pending")
         assert tty_size(owned / f"three-{position}-retained-size") == tty_sizes[position]
         wait_for(lambda: state()["draft"] == "", "retained size receipt still pending")
-    click_tab(driver, tabs[2])
+    click_tab(driver, tabs[2], three_pane=True)
     assert write_from_current_tab(driver, owned / "three-2-return.pid") == identities[2]
     print(json.dumps({"case": "AETHER.THREE_PANES.CANVAS_AND_INPUT", "backend": backend,
                       "three_distinct_live_ptys": True, "two_passive_canvases_update": True,
@@ -3963,7 +3968,7 @@ def exercise_three_shells(driver, owned, backend, binary):
     assert parked not in tabs
     parked_id = write_from_current_tab(driver, owned / "three-parked.pid")
     wait_for(lambda: state()["draft"] == "", "parked shell receipt still pending")
-    click_tab(driver, tabs[2])
+    click_tab(driver, tabs[2], three_pane=True)
     wait_for(lambda: state()["current_tab"] == tabs[2] and state()["writable"] and
              driver.execute("return document.querySelector('#terminal-panes').dataset.triple;") == "true",
              "third shell did not return to its preview slot")
@@ -3995,13 +4000,13 @@ def exercise_three_shells(driver, owned, backend, binary):
     assert visible == [f"Focus Shell {tab}" for tab in tabs], "restored slots included the parked tab"
     fresh = []
     for number, tab in enumerate([*tabs, parked]):
-        click_tab(driver, tab)
+        click_tab(driver, tab, three_pane=True)
         assert state()["draft"] == ""
         fresh.append(write_from_current_tab(driver, owned / f"three-restored-{number}.pid"))
         wait_for(lambda: state()["draft"] == "", "restored shell command still pending")
     assert len(set([*prior, *fresh])) == 8 and not forbidden.exists()
     identities, parked_id = fresh[:3], fresh[3]
-    click_tab(driver, tabs[2])
+    click_tab(driver, tabs[2], three_pane=True)
     print(json.dumps({"case": "AETHER.THREE_PANES.RESTART_LAYOUT", "backend": backend,
                       "fresh_shells_after_explicit_restore": True, "visible_order_and_parked_tab_preserved": True,
                       "saved_active_size_and_draft_boundary_preserved": True}), flush=True)
@@ -4026,7 +4031,7 @@ def exercise_three_shells(driver, owned, backend, binary):
              "surviving peer did not remain focusable")
     assert write_from_current_tab(driver, owned / "three-closed-peer.pid") == identities[0]
     wait_for(lambda: state()["draft"] == "", "close peer receipt still pending")
-    click_tab(driver, parked)
+    click_tab(driver, parked, three_pane=True)
     assert write_from_current_tab(driver, owned / "three-closed-parked.pid") == parked_id
     print(json.dumps({"case": "AETHER.THREE_PANES.CLOSE_SURVIVORS", "backend": backend,
                       "horizontal_split_preserved": True,
