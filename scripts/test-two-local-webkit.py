@@ -58,7 +58,7 @@ return {
   active_x: document.querySelector('#active-pane').getBoundingClientRect().left,
   peer_x: document.querySelector('#peer-pane').getBoundingClientRect().left,
   focused: document.activeElement?.id,
-  restore_layout: !document.querySelector('#saved-local-layout').hidden &&
+  restore_layout: !document.querySelector('#restore-local-layout').hidden &&
                   !document.querySelector('#restore-local-layout').disabled,
   dump: history.value,
   find_status: document.querySelector('#history-find-status').textContent,
@@ -94,7 +94,7 @@ class Driver:
                 raise ProtocolError(f"{method} {path}", code)
             return value
 
-    def open(self, binary):
+    def open(self, binary, *, fit=False):
         result = self.request("POST", "/session", {
             "capabilities": {
                 "alwaysMatch": {"webkitgtk:browserOptions": {"binary": str(binary)}},
@@ -105,6 +105,11 @@ class Driver:
         if not isinstance(session, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,128}", session):
             raise ValueError("unusable WebKit WebDriver session identifier")
         self.session = session
+        wait_for(lambda: opened_page(self), "embedded Aether tauri: page did not load")
+        if not fit and self.execute("return document.querySelector('#fit-size')?.checked ?? false"):
+            self.click("#fit-size")
+            if self.execute("return document.querySelector('#session-tools')?.open"):
+                self.type("#show-session-tools", "\ue007")
 
     def command(self, method, path, data=None):
         assert self.session is not None
@@ -113,12 +118,36 @@ class Driver:
     def execute(self, read_only_script):
         return self.command("POST", "/execute/sync", {"script": read_only_script, "args": []})
 
-    def element_path(self, selector):
+    def find_element_path(self, selector):
         item = self.command("POST", "/element", {"using": "css selector", "value": selector})[ELEMENT]
         return "/element/" + quote(item, safe="")
 
+    def element_path(self, selector):
+        panels = self.execute(f"""
+            const panels = [];
+            let node = document.querySelector({json.dumps(selector)});
+            while (node) {{
+                const parent = node.parentElement;
+                if (parent?.matches('details[data-panel]:not([open])') &&
+                    node !== parent.querySelector(':scope > summary')) panels.unshift(parent.id);
+                node = parent;
+            }}
+            return panels;
+        """)
+        for panel in panels:
+            self.command("POST", self.find_element_path(f"#{panel} > summary") + "/click", {})
+        return self.find_element_path(selector)
+
     def click(self, selector):
-        self.command("POST", self.element_path(selector) + "/click", {})
+        path = self.element_path(selector)
+        try:
+            self.command("POST", path + "/click", {})
+        except ProtocolError as error:
+            if error.error != "element click intercepted":
+                raise
+            # A prior panel can leave a toolbar control under the sticky header.
+            self.execute(f"document.querySelector({json.dumps(selector)}).scrollIntoView({{block:'center'}});")
+            self.command("POST", path + "/click", {})
 
     def type(self, selector, text):
         self.command("POST", self.element_path(selector) + "/value", {"text": text})
@@ -1136,6 +1165,100 @@ finally:
     print(json.dumps({"native_kitty_disambiguation": True, "pty_bytes_verified": len(actual)}), flush=True)
 
 
+def exercise_terminal_shell(driver, owned):
+    def state():
+        return driver.execute(READ)
+
+    def keys(*chord):
+        events = [{"type": "keyDown", "value": key} for key in chord]
+        events.extend({"type": "keyUp", "value": key} for key in reversed(chord))
+        driver.command("POST", "/actions", {"actions": [{"type": "key", "id": "shell-shortcuts", "actions": events}]})
+
+    def session():
+        shell = state()
+        return shell["current_tab"] if shell["focused"] == "ime-input" and shell["writable"] else None
+
+    def report_size(name):
+        receipt = owned / name
+        driver.type("#ime-input", f"stty size > {shlex.quote(str(receipt))}\ue007")
+        return wait_for(lambda: receipt.exists() and receipt.read_text().strip(), "stty did not report PTY size")
+
+    def displayed_size():
+        match = re.match(r"(\d+) × (\d+) cells", state()["cursor"])
+        return f"{match[2]} {match[1]}" if match else None
+
+    assert driver.execute("""
+        return !document.querySelector('#terminal-empty').hidden
+          && !document.querySelector('#terminal-history').open
+          && !document.querySelector('#session-tools').open
+          && document.querySelector('#terminal-panes').clientHeight > innerHeight * .65;
+    """), "the terminal should dominate the initial window"
+    ctrl, shift = "\ue009", "\ue008"
+    driver.click("#terminal-tab")
+    keys(ctrl, shift, "T")
+    first = wait_for(session, "new-shell shortcut did not focus the PTY")
+    initial = wait_for(displayed_size, "the opening shell never painted a grid")
+    driver.command("POST", "/window/rect", {"width": 760, "height": 570})
+    resized = wait_for(lambda: ((size := displayed_size()) != initial and size),
+                       "the live grid did not fit the smaller window")
+    assert report_size("resized-size") == resized
+
+    driver.type("#ime-input", "stty -echo; printf '\\033[2J\\033[H%s' AETHER_COPY; IFS= read -r clipboard_gate\ue007")
+    wait_for(lambda: "cursor row 1, column 12" in state()["cursor"], "copy fixture did not paint")
+    x, y = driver.execute("""
+        const { left, top } = document.querySelector('#active-pane canvas').getBoundingClientRect();
+        return [Math.floor(left + 6), Math.floor(top + 12)];
+    """)
+    driver.command("POST", "/actions", {"actions": [{
+        "type": "pointer", "id": "clipboard-pointer", "parameters": {"pointerType": "mouse"},
+        "actions": [
+            {"type": "pointerMove", "duration": 0, "x": x, "y": y},
+            {"type": "pointerDown", "button": 0},
+            {"type": "pointerMove", "duration": 100, "x": x + 10 * 12, "y": y},
+            {"type": "pointerUp", "button": 0},
+        ],
+    }]})
+    wait_for(lambda: driver.execute("return !document.querySelector('#copy-selection').disabled"), "terminal selection did not settle")
+    keys(ctrl, shift, "C")
+    wait_for(lambda: state()["status"] == "Terminal selection copied.", "copy shortcut did not write to the clipboard")
+    assert subprocess.check_output(["xclip", "-selection", "clipboard", "-o"], timeout=4) == b"AETHER_COPY"
+    keys("\ue007")
+
+    keys(ctrl, shift, "D")
+    second = wait_for(lambda: (tab if (tab := session()) != first and state()["split"] == "bottom" else None),
+                      "top/bottom shortcut did not open a second pane")
+    keys(ctrl, shift, "E")
+    wait_for(lambda: state()["split"] == "right", "left/right shortcut did not reorient the same panes")
+    assert len(state()["tabs"]) == 2
+    keys(ctrl, "\ue004")
+    wait_for(lambda: session() == first, "Ctrl+Tab did not return to the first shell")
+    keys(ctrl, shift, "\ue004")
+    try:
+        wait_for(lambda: session() == second, "Ctrl+Shift+Tab did not return to the second shell")
+    except AssertionError as error:
+        raise AssertionError(f"{error}: {state()['status']!r}, focus={state()['focused']!r}") from error
+
+    driver.type("#ime-input", "printf '%s%s\\n' AETHER_CHROME_ NEEDLE; seq 1 80\ue007")
+    keys(ctrl, shift, "F")
+    wait_for(lambda: state()["focused"] == "history-find-query", "find shortcut did not focus the history query")
+    driver.type("#history-find-query", "AETHER_CHROME_NEEDLE\ue007")
+    wait_for(lambda: state()["selected_history"] == "AETHER_CHROME_NEEDLE", "archive search did not find PTY output")
+    driver.click("#history-back-live")
+    wait_for(lambda: session() == second, "leaving history did not restore shell input")
+    keys(ctrl, shift, "P")
+    wait_for(lambda: state()["focused"] == "command-palette-query", "command palette did not focus its search")
+    driver.type("#command-palette-query", "return one")
+    keys("\ue015")
+    keys("\ue007")
+    wait_for(lambda: state()["split"] == "" and session() == second, "palette did not restore a single live pane")
+    keys(ctrl, shift, "W")
+    wait_for(lambda: state()["tabs"] == [first] and not state()["current_tab"], "close affected the wrong shell")
+    click_tab(driver, first)
+    assert report_size("survivor-size")
+    print(json.dumps({"native_terminal_shell": True, "fit_updates_real_pty": True,
+                      "keyboard_palette_history_and_split": True, "copy_shortcut_updates_native_clipboard": True}), flush=True)
+
+
 def exercise_restart(driver, owned, binary, integrated=False):
     def state():
         return driver.execute(READ)
@@ -1603,10 +1726,13 @@ def exercise_terminal_workflows(driver, owned, *, verify_bookmarks=True):
     assert view()["defaults"] == ["quoted value", "default"]
     assert not driver.execute("return document.querySelector('#command-block-matches').children.length;")
     assert receipt.read_text() == expected, "changing focus executed the workflow"
-    driver.click("#workflow-insert")
-    wait_for(lambda: driver.execute(READ)["current_tab"] == original and not view()["open"] and
-             driver.execute(READ)["status"].startswith("Workflow queued at the shell cursor."),
-             "workflow was not inserted at the original terminal after switching focus")
+    driver.type("#workflow-insert", "\ue007")
+    try:
+        wait_for(lambda: driver.execute(READ)["current_tab"] == original and not view()["open"] and
+                 driver.execute(READ)["status"].startswith("Workflow queued at the shell cursor."),
+                 "workflow was not inserted at the original terminal after switching focus")
+    except AssertionError as error:
+        raise AssertionError(f"{error}: {view()['message']!r}, {driver.execute(READ)['status']!r}") from error
     assert receipt.read_text() == expected, "insert executed without explicit Enter"
     driver.type(terminal, "\ue007")
     expected += "quoted value-default\n"
@@ -3425,7 +3551,7 @@ def private_accessibility_address():
 
 def run(binary, jsh, workspace, api, native, notebook=False, output_review=False, vim9=False,
         inline_graphics_only=False, history_graphics_only=False, workspace_only=False, backend="x11",
-        vim_binary=None, workflow_only=False):
+        vim_binary=None, workflow_only=False, shell_chrome_only=False):
     executable = shutil.which("WebKitWebDriver")
     if not executable:
         raise RuntimeError("run with official WebKitWebDriver")
@@ -3496,8 +3622,11 @@ def run(binary, jsh, workspace, api, native, notebook=False, output_review=False
                     except OSError:
                         return False
                 wait_for(ready, "loopback WebKitWebDriver not ready")
-                driver.open(binary)
+                driver.open(binary, fit=shell_chrome_only)
                 wait_for(lambda: opened_page(driver), "embedded Aether tauri: page did not load")
+                if shell_chrome_only:
+                    exercise_terminal_shell(driver, owned)
+                    return
                 if workspace_only:
                     exercise_workspace(driver, owned, binary, env, transcripts)
                     return
@@ -3564,6 +3693,7 @@ if __name__ == "__main__":
     parser.add_argument("--vim-binary", type=Path, help="exact Vim executable for an isolated native fixture")
     parser.add_argument("--inline-graphics-only", action="store_true", help="exercise real PTY image rendering and reconnect")
     parser.add_argument("--history-graphics-only", action="store_true", help="exercise projected history rendering and selection")
+    parser.add_argument("--shell-chrome-only", action="store_true", help="exercise the native terminal controls and shortcuts")
     args = parser.parse_args()
     if not args.binary.is_absolute() or args.binary.is_symlink() or not args.binary.is_file() or not os.access(args.binary, os.X_OK):
         parser.error("an absolute regular executable is required")
@@ -3586,4 +3716,5 @@ if __name__ == "__main__":
     run(args.binary, args.jsh, args.workspace, args.api_chat, args.native_task, args.notebook,
         args.output_review, args.vim9, args.inline_graphics_only, args.history_graphics_only,
         workspace_only=args.workspace_only, backend=args.backend,
-        vim_binary=args.vim_binary.resolve() if args.vim_binary else None, workflow_only=args.workflow_only)
+        vim_binary=args.vim_binary.resolve() if args.vim_binary else None, workflow_only=args.workflow_only,
+        shell_chrome_only=args.shell_chrome_only)

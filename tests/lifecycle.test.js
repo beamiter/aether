@@ -3,6 +3,7 @@ import {installPasteReview} from '../web/paste.js';
 import {installTerminalFocus} from '../web/terminal-focus.js';
 import {installTerminalMouse} from '../web/terminal-mouse.js';
 import {installTerminalSelection} from '../web/terminal-selection.js';
+import {installTerminalShell} from '../web/terminal-shell.js';
 import {dimensions,resizeQueue,cursorTarget,terminalCellAt,viewportDimensions} from '../web/viewport.js';
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import vm from 'node:vm';
 import {installHistory} from '../web/history.js';
@@ -33,7 +34,7 @@ function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsuppo
   return result;
  };
  const elements=new Map(),timers=new Map();let id=0;
- const element=()=>({disabled:false,value:'',textContent:'',style:{},dataset:{},handlers:{},focus(){},append(){},scrollTo(){},setAttribute(){},replaceChildren(...options){this.options=options;},addEventListener(name,fn){this.handlers[name]=fn}});
+ const element=()=>({disabled:false,value:'',textContent:'',style:{},dataset:{},handlers:{},classList:{toggle(){}},focus(){},append(){},scrollTo(){},setAttribute(){},replaceChildren(...options){this.options=options;},addEventListener(name,fn){this.handlers[name]=fn}});
  const el=selector=>{if(!elements.has(selector))elements.set(selector,element());return elements.get(selector)};
  const canvasEvents=new Map();
  if (animation.mouseCanvas) {
@@ -52,8 +53,8 @@ function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsuppo
  const pageEvents=new Map(),windowEvents=new Map();
  const listen=events=>(name,fn)=>events.set(name,[...(events.get(name)??[]),fn]);
  const fire=(events,name)=>{for(const fn of events.get(name)??[])fn({target:document.activeElement});};
- const document={querySelector:el,createElement:element,activeElement:null,hidden:false,hasFocus:()=>true,addEventListener:listen(pageEvents)};
- const context={validateReloadView,retainedReloadView,saveReloadTicket,takeReloadTicket,installFilePreviewPanel:()=>({dismiss(){}}),document,addEventListener:listen(windowEvents),__TAURI__:{core:{invoke,Channel}},acceptFull,acceptUpdate,clearPaint,acceptChannelFrame,channelCounter,CHANNEL_FRAME_VERSION,installIme,installHistory,installCommandBlocks,installTerminalChat,installWorkflows,validateChatStatus,installPasteReview,installTerminalFocus,installTerminalMouse,installTerminalSelection,dimensions,resizeQueue,cursorTarget,terminalCellAt,viewportDimensions,paint,TextEncoder:Encoder,TextDecoder,
+ const document={querySelector:el,querySelectorAll:()=>[],createElement:element,body:element(),activeElement:null,hidden:false,hasFocus:()=>true,addEventListener:listen(pageEvents)};
+ const context={validateReloadView,retainedReloadView,saveReloadTicket,takeReloadTicket,installFilePreviewPanel:()=>({dismiss(){}}),document,addEventListener:listen(windowEvents),__TAURI__:{core:{invoke,Channel}},acceptFull,acceptUpdate,clearPaint,acceptChannelFrame,channelCounter,CHANNEL_FRAME_VERSION,installIme,installHistory,installCommandBlocks,installTerminalChat,installTerminalShell,installWorkflows,validateChatStatus,installPasteReview,installTerminalFocus,installTerminalMouse,installTerminalSelection,dimensions,resizeQueue,cursorTarget,terminalCellAt,viewportDimensions,paint,TextEncoder:Encoder,TextDecoder,
  installInlineHistory,
  plainLocalTab,MAX_LOCAL_SHELLS,validLocalGeometry,localSplitPair,readLocalShellLayout:()=>readLocalShellLayout(storage),saveLocalShellLayout:value=>saveLocalShellLayout(value,storage),
  setInterval(fn){timers.set(++id,fn);return id},clearInterval(i){timers.delete(i)},setTimeout,...animation};
@@ -558,7 +559,7 @@ test('late demo result cannot overwrite a newly opened live session',async()=>{
  const pending=deferred();const fixture=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
  const h=harness(async name=>{if(name==='demo_frame')return pending.promise;if(name==='open_shell')return 1;if(name==='poll_shell')return null;throw Error(name)});
  const demo=h.click('#demo');assert.equal(h.el('#open').disabled,true);await h.click('#open');pending.resolve(fixture);await demo;
- assert.match(h.el('#status').textContent,/Experimental/);assert.equal(h.el('#demo').disabled,true);
+ assert.match(h.el('#status').textContent,/Local \/bin\/sh/);assert.equal(h.el('#demo').disabled,true);
 });
 
 test('exit status disables input but keeps tail draining active',async()=>{
@@ -576,7 +577,7 @@ test('late resize failure cannot replace the next session status',async()=>{
  let epoch=0;const old=deferred();
  const h=harness(async name=>{if(name==='open_shell')return ++epoch;if(name==='resize_shell')return old.promise;return null;});
  await h.click('#open');const resize=h.click('#resize');await h.click('#close');await h.click('#open');old.reject(Error('old resize failure'));await resize;
- assert.match(h.el('#status').textContent,/Experimental/);assert.equal(h.el('#resize').disabled,false);
+ assert.match(h.el('#status').textContent,/Local \/bin\/sh/);assert.equal(h.el('#resize').disabled,false);
 });
 
 test('writer error is surfaced without stopping output draining',async()=>{
@@ -772,7 +773,7 @@ test('old completed command cannot erase a reopened session draft',async()=>{
  await h.click('#close');await h.click('#open');h.el('#input').value='new unsent draft';
  old.resolve(writes[0].bytes.length);await submit;
  assert.equal(h.el('#input').value,'new unsent draft');assert.equal(h.el('#input').disabled,false);
- assert.equal(writes.length,1);assert.equal(writes[0].epoch,1);assert.match(h.el('#status').textContent,/Experimental/);
+ assert.equal(writes.length,1);assert.equal(writes[0].epoch,1);assert.match(h.el('#status').textContent,/Local \/bin\/sh/);
 });
 
 test('stale partial command acknowledgement sends no suffix into reopened session',async()=>{
@@ -787,7 +788,7 @@ test('stale command rejection leaves reopened draft and input unlocked',async()=
  const h=harness(async name=>{if(name==='open_shell')return ++epoch;if(name==='write_shell')return old.promise;return null;});
  await h.click('#open');h.el('#input').value='old';const submit=h.submit();await tick();
  await h.click('#close');await h.click('#open');h.el('#input').value='fresh';old.reject(Error('closed old writer'));await submit;
- assert.equal(h.el('#input').value,'fresh');assert.equal(h.el('#input').disabled,false);assert.match(h.el('#status').textContent,/Experimental/);
+ assert.equal(h.el('#input').value,'fresh');assert.equal(h.el('#input').disabled,false);assert.match(h.el('#status').textContent,/Local \/bin\/sh/);
 });
 test('current command success still clears draft after exact accepted suffixes',async()=>{
  const writes=[];const h=harness(async(name,args)=>{if(name==='open_shell')return 1;if(name==='write_shell'){writes.push(Array.from(args.bytes));return Math.min(2,args.bytes.length);}return null;});
@@ -1226,10 +1227,10 @@ test('restore creates fresh tabs with their saved shell and presentation, then s
   if(name==='poll_shell'||name==='ack_shell')return null;
   throw Error(name);
  },undefined,undefined,undefined,storage);
- assert.equal(h.el('#saved-local-layout').hidden,false);
+ assert.equal(h.el('#restore-local-layout').hidden,false);
  assert.deepEqual(calls,[]);
  await h.click('#restore-local-layout');
- assert.equal(h.el('#saved-local-layout').hidden,true);
+ assert.equal(h.el('#restore-local-layout').hidden,true);
  assert.equal(h.el('#input').disabled,false);
  assert.equal(h.el('#input').value,'');
  assert.equal(h.el('#command').hidden,false);
@@ -1276,7 +1277,7 @@ test('a lost first restore reply discovers the retained shell without launching 
  await h.click('#restore-local-layout');
  assert.match(h.el('#status').textContent,/restore incomplete.*missing open reply/);
  assert.equal(h.el('#local-tabs').hidden,false);
- assert.equal(h.el('#saved-local-layout').hidden,true);
+ assert.equal(h.el('#restore-local-layout').hidden,true);
  assert.equal(h.el('#local-tab-list').options[0].dataset.epoch,'4');
  assert.equal(openCalls,1);
 });
@@ -1300,7 +1301,7 @@ test('reattaching one retained shell preserves the launch and presentation of an
  h.el('#local-shell-selection').value='2';
  h.el('#local-shell-selection').handlers.change();
  await h.click('#attach-selected-local');
- assert.equal(h.el('#saved-local-layout').hidden,true);
+ assert.equal(h.el('#restore-local-layout').hidden,true);
  assert.equal(h.el('#input').disabled,true);
  assert.deepEqual(readLocalShellLayout(storage),layout);
 });
@@ -1528,7 +1529,7 @@ test('public restore opens three fresh tabs, confirms each size, preserves split
   throw Error('unexpected IPC '+name);
  },undefined,undefined,undefined,storage);
  assert.deepEqual(readLocalShellLayout(storage),layout);
- assert.equal(h.el('#saved-local-layout').hidden,false);
+ assert.equal(h.el('#restore-local-layout').hidden,false);
  await h.click('#restore-local-layout');
  assert.equal(h.el('#status').textContent,'Opened 3 fresh shells in the saved layout.');
  assert.equal(h.el('#local-tab-list').options.length,3);
@@ -1616,7 +1617,7 @@ test('expired SSH claim recovers only retained local metadata, keeps input close
   throw Error('unexpected launch or input '+name);
  },undefined,TextEncoder,()=>{},{},undefined,{sessionStorage,recoverReloadLayout:()=>({view})});
  await tick();await tick();
- assert.equal(h.el('#saved-local-layout').hidden,true);assert.equal(h.el('#input').disabled,true);assert.equal(h.el('#input').value,'');
+ assert.equal(h.el('#restore-local-layout').hidden,true);assert.equal(h.el('#input').disabled,true);assert.equal(h.el('#input').value,'');
  assert.deepEqual(h.el('#local-tab-list').options.map(tab=>tab.dataset.epoch),['4']);
  assert.match(h.el('#status').textContent,/view-only/);assert.equal(items.size,0);
  assert.equal(calls.filter(([name])=>name==='open_shell'||name==='open_second_local_shell'||name==='activate_local_tab').length,0);
@@ -1645,7 +1646,7 @@ test('failed handoff without metadata never launches a saved layout while retain
   const items=new Map([['aether.ssh-writer-reload','invalid']]),sessionStorage={getItem:k=>items.get(k),removeItem:k=>items.delete(k)};
   const storage=layoutStorage({tabs:[plainLocalTab],active:0,split:false});let opens=0;
   const h=harness(async name=>{if(name==='list_local_shells'){if(unavailable)throw Error('unavailable');return [4];}if(name==='open_shell'){opens++;return 5;}throw Error(name);},undefined,TextEncoder,()=>{},storage,undefined,{sessionStorage});
-  await tick();await tick();assert.equal(h.el('#saved-local-layout').hidden,true);assert.equal(h.el('#restore-local-layout').disabled,true);
+  await tick();await tick();assert.equal(h.el('#restore-local-layout').hidden,true);assert.equal(h.el('#restore-local-layout').disabled,true);
   await h.click('#restore-local-layout');assert.equal(opens,0);assert.equal(h.el('#input').disabled,true);
  }
 });

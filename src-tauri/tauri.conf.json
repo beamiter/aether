@@ -6,7 +6,7 @@
   "build": { "frontendDist": "../web" },
   "app": {
     "withGlobalTauri": true,
-    "windows": [{ "label": "main", "title": "Terminal Frame Lab · limited experimental shell", "width": 960, "height": 420 }],
+    "windows": [{ "label": "main", "title": "Aether", "width": 1080, "height": 720 }],
     "security": { "csp": "default-src 'self'; script-src 'self'; style-src 'self'; connect-src ipc: http://ipc.localhost 'self'; img-src 'self' data:" }
   },
   "bundle": { "active": false }

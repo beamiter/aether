@@ -95,6 +95,13 @@ jobs:
           xvfb-run --auto-servernum --server-args="-screen 0 1600x1000x24 -nolisten tcp" \
             dbus-run-session -- /usr/bin/python3 -B scripts/test-two-local-webkit.py \
               "$CARGO_TARGET_DIR/debug/tauri-terminal-lab" --inline-graphics-only
+      - name: Terminal controls, shortcuts and automatic PTY sizing on X11
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 2
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1600x1000x24 -nolisten tcp" \
+            dbus-run-session -- /usr/bin/python3 -B scripts/test-two-local-webkit.py \
+              "$CARGO_TARGET_DIR/debug/tauri-terminal-lab" --shell-chrome-only
       - name: Real PTY archived graphics, reflow and selection on X11
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 2

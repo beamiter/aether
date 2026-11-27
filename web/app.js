@@ -1,6 +1,7 @@
 import {installTerminalMouse} from './terminal-mouse.js';
 import {installTerminalFocus} from './terminal-focus.js';
 import {installTerminalSelection} from './terminal-selection.js';
+import {installTerminalShell} from './terminal-shell.js';
 import {validateReloadView,retainedReloadView,saveReloadTicket,takeReloadTicket} from './ssh-reload.js';
 import {installFilePreviewPanel} from './file-preview-panel.js';
 import {openVim9Snapshot} from './vim9-workbench.js';
@@ -22,7 +23,14 @@ const localTools=document.querySelector('#local-shells'),showLocal=document.quer
 const tabs=document.querySelector('#local-tabs'),tabList=document.querySelector('#local-tab-list'),newTab=document.querySelector('#new-local-tab'),retryTab=document.querySelector('#retry-local-tab');
 const newJshTab=document.querySelector('#new-jsh-tab');
 const splitToggle=document.querySelector('#split-local'),panes=document.querySelector('#terminal-panes'),peerPane=document.querySelector('#peer-pane'),peerCanvas=document.querySelector('#peer-canvas'),focusPeer=document.querySelector('#focus-peer-pane');
-const savedLayoutPanel=document.querySelector('#saved-local-layout'),restoreLayout=document.querySelector('#restore-local-layout');
+const restoreLayout=document.querySelector('#restore-local-layout');
+const terminalPanel=document.querySelector('#terminal-panel');
+const emptyTerminal=document.querySelector('#terminal-empty');
+const sessionIndicator=document.querySelector('#session-indicator');
+const sessionState=document.querySelector('#session-state');
+const terminalSize=document.querySelector('#terminal-size');
+const sshConnect=document.querySelector('#show-ssh-connection');
+const recoverButton=document.querySelector('#recover');
 let roster=[],localListRequest=0;
 const localDrafts=new Map();
 const localTabEpochs=new Set();
@@ -40,6 +48,13 @@ const savedSshSelect=document.querySelector('#saved-ssh-shell'),resumeSavedSsh=d
 let savedSshShells=[],savedSshRequest=0;
 let localStream=null,localTransport='channel',localInputSuspended=false,localFrameRecovery=false;
 let splitEnabled=false,splitEpochs=[],splitLayout=1,settingSplit=false,peerState=null;
+function readPreference(key){
+  try{return globalThis.localStorage?.getItem(key)??null;}catch{return null;}
+}
+function writePreference(key,value){
+  try{globalThis.localStorage?.setItem(key,value);}catch{/* A preference must not interrupt the terminal. */}
+}
+let splitAxis=readPreference('aether.split-axis')==='vertical'?'vertical':'horizontal';
 const selectionOverlay = document.querySelector('#terminal-selection');
 const copySelection = document.querySelector('#copy-selection');
 const liveSelection = selectionOverlay && typeof canvas.setPointerCapture === 'function'
@@ -127,6 +142,7 @@ let savedLayout=invoke?readLocalShellLayout():null;
 const sshCommands={poll_shell:'poll',ack_shell:'ack',shell_status:'status',history_shell:'history',recover_shell:'recover',detach_shell:'detach',close_shell:'close',write_shell:'write',key_shell:'key',text_shell:'text',paste_shell:'paste',resize_shell:'resize',focus_shell:'focus',mouse_shell:'mouse'};
 function setOpenDisabled(disabled) {
   open.disabled=openIntegrated.disabled=openSsh.disabled=sshHost.disabled=disabled||!invoke;
+  sshConnect.disabled=openSsh.disabled;
   showSavedSsh.disabled=openSsh.disabled;
   if(showSavedSsh.disabled){savedSshRequest++;savedSshPanel.hidden=true;}
   updateSavedSshSelection();
@@ -141,8 +157,27 @@ function setLocalTools(available) {
   }
 }
 function renderSavedLayout(){
-  savedLayoutPanel.hidden=retainedLayoutBlocked||!savedLayout||owner!==null||sshSession!==null||localTabEpochs.size>0;
+  restoreLayout.hidden=retainedLayoutBlocked||!savedLayout||owner!==null||sshSession!==null||localTabEpochs.size>0;
   restoreLayout.disabled=retainedLayoutBlocked||open.disabled||restoringLocalLayout;
+}
+function renderTerminalStage(){
+  const phase=owner?(keyQueue.locked?'read-only':'live'):state?'preview':'idle';
+  sessionIndicator.dataset.state=phase;
+  const title=phase==='idle'?'No session':phase==='preview'?'Frame preview':
+    (owner.session===sshSession?'SSH':'Local')+(phase==='read-only'?' · Read only':' · Live');
+  if(sessionState.textContent!==title)sessionState.textContent=title;
+  emptyTerminal.hidden=!!(owner||state||changingTab);
+  canvas.tabIndex=emptyTerminal.hidden?0:-1;
+  open.hidden=!!owner||!!changingTab;
+  newTab.hidden=newJshTab.hidden=!owner||sshSession!==null;
+  recoverButton.disabled=!owner||!!changingTab||!!recovery;
+  const size=state?`${state.cols} × ${state.rows.length}`:'';
+  if(terminalSize.textContent!==size)terminalSize.textContent=size;
+}
+function focusTerminal(){
+  if(terminalPanel.hidden)return;
+  document.body.scrollTop=0;
+  (emptyTerminal.hidden?(input.disabled?canvas:imeInput):open).focus({preventScroll:true});
 }
 function rememberLocalGeometry(frame){
   if(!frame||!localTabEpochs.has(frame.epoch)||localTabOwners.get(frame.epoch)?.session!==frame.session)return;
@@ -183,10 +218,11 @@ function observerTarget(){
 }
 function renderSplit(){
   const target=observerTarget();
-  splitToggle.disabled=!owner||sshSession!==null||localTabEpochs.size<2||!!changingTab||!!recovery||restoringLocalLayout||settingSplit;
+  splitToggle.disabled=!owner||sshSession!==null||!!changingTab||!!recovery||restoringLocalLayout||settingSplit;
   splitToggle.setAttribute('aria-pressed',String(!!target));
-  splitToggle.textContent=target?'Single pane':'Split panes';
-  panes.dataset.split=target?(splitEpochs[0]===epoch?'left':'right'):'';
+  splitToggle.textContent=target?'Single pane':'Split';
+  const first=splitEpochs[0]===epoch;
+  panes.dataset.split=target?(splitAxis==='vertical'?(first?'top':'bottom'):(first?'left':'right')):'';
   peerPane.hidden=!target;
   focusPeer.disabled=splitToggle.disabled;
   if(target)focusPeer.textContent=`Focus Shell ${target.epoch}`;
@@ -195,6 +231,7 @@ function renderSplit(){
   }
 }
 function renderLocalTabs(focusActive=false) {
+  renderTerminalStage();
   renderSavedLayout();
   renderSplit();
   history.updateSearchControls();
@@ -202,20 +239,25 @@ function renderLocalTabs(focusActive=false) {
   refreshTerminalControls();
   terminalFocus.refresh();
   tabs.hidden=!invoke||sshSession!==null||!localTabEpochs.size||(!owner&&showLocal.disabled&&!changingTab);
+  newTab.disabled=newJshTab.disabled=!owner||changingTab!==null||recovery!==null||restoringLocalLayout||localTabEpochs.size>=MAX_LOCAL_SHELLS;
+  retryTab.hidden=!changingTab||changingTab.busy||restoringLocalLayout;
   if(tabs.hidden)return;
   let activeButton=null;
   const buttons=[...localTabEpochs].sort((a,b)=>a-b).map(number=>{
     const tab=document.createElement('button');
     const active=number===epoch;
-    tab.type='button';tab.dataset.epoch=String(number);tab.textContent=`Shell ${number}`;
+    const kind=localShellKinds.get(localTabOwners.get(number)?.session);
+    tab.type='button';tab.dataset.epoch=String(number);tab.textContent=`${kind==='jsh'?'jsh':'Shell'} ${number}`;
     if(active){tab.setAttribute('aria-current','true');activeButton=tab;}
     tab.disabled=changingTab!==null||recovery!==null||restoringLocalLayout;
-    tab.addEventListener('click',()=>{if(!tab.disabled&&!active)startLocalTab(number);});
+    tab.addEventListener('click',()=>{
+      if(tab.disabled)return;
+      if(active)focusTerminal();
+      else startLocalTab(number,{focusTerminal:true});
+    });
     return tab;
   });
   tabList.replaceChildren(...buttons);
-  newTab.disabled=newJshTab.disabled=!owner||changingTab!==null||recovery!==null||restoringLocalLayout||localTabEpochs.size>=MAX_LOCAL_SHELLS;
-  retryTab.hidden=!changingTab||changingTab.busy||restoringLocalLayout;
   if(focusActive)activeButton?.focus();
 }
 function validatePeerFrame(frame,target){
@@ -251,11 +293,21 @@ async function syncObserver(stream){
   })();
   try{await stream.adjusting;}finally{stream.adjusting=null;}
 }
-splitToggle.addEventListener('click',async()=>{
+async function setSplit(axis){
   if(splitToggle.disabled)return;
-  splitEnabled=!splitEnabled;splitLayout++;
-  splitEpochs=splitEnabled?[...localTabEpochs].filter(number=>number!==epoch).slice(0,1).concat(epoch).sort((a,b)=>a-b):[];
-  settingSplit=true;renderSplit();recordLocalLayout();
+  if(axis&&localTabEpochs.size<2){
+    const configuration=localShellKinds.get(owner.session)==='jsh'?jshLocalTab:plainLocalTab;
+    return startLocalTab(null,{configuration,focusTerminal:true,splitOnActivate:axis});
+  }
+  if(axis&&splitEnabled&&splitAxis===axis)return;
+  if(axis){
+    splitAxis=axis;
+    writePreference('aether.split-axis',axis);
+  }
+  if(axis&&!splitEnabled)splitEpochs=localSplitPair([...localTabEpochs].sort((a,b)=>a-b),epoch);
+  if(!axis)splitEpochs=[];
+  splitEnabled=!!axis;splitLayout++;
+  settingSplit=true;renderSplit();
   const attachment=owner;
   try{
     if(localStream)await syncObserver(localStream);
@@ -265,7 +317,8 @@ splitToggle.addEventListener('click',async()=>{
   }
   catch(error){if(owner===attachment)status.textContent=`Split pane unavailable: ${String(error?.message??error)}`;}
   finally{settingSplit=false;renderSplit();recordLocalLayout();}
-});
+}
+splitToggle.addEventListener('click',()=>setSplit(splitEnabled?null:'horizontal'));
 function selectPeer(){
   const target=observerTarget();
   if(target&&!focusPeer.disabled)return startLocalTab(target.epoch,{focusTerminal:true});
@@ -447,7 +500,7 @@ button.addEventListener('click',async()=>{
       frame=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));
     }
     if(currentGeneration!==generation)return;
-    const next=acceptFull(state,frame);paintLiveFrame(next);state=next;describeCursor();
+    const next=acceptFull(state,frame);paintLiveFrame(next);state=next;describeCursor();renderTerminalStage();
     if(invoke) await invoke('acknowledge',{session:state.session,epoch:state.epoch,revision:state.revision});
     status.textContent=`Rust frame ${state.revision} accepted. No PTY attached.`;
   }catch(e){if(currentGeneration!==generation)return;status.textContent=`Stopped: ${String(e?.message??e)}. Restart the app to reset.`;}
@@ -497,7 +550,11 @@ function showShellStatus(info,mode){
   }
   health.textContent=`Unsupported sequences: ${info.unsupported}. Dropped reply bytes: ${info.dropped_reply_bytes}. Shell ${info.exited?'exited; output remains visible':'running'}.${info.write_error?' Input disabled: '+info.write_error:''}`;
   if(info.exit_output_notice)health.textContent+=' '+info.exit_output_notice;
-  if(info.exited||info.write_error){pasteReview.reset();keyQueue.locked=true;input.disabled=send.disabled=resize.disabled=true;}
+  if(info.exited||info.write_error){
+    const wasWritable=!keyQueue.locked;
+    pasteReview.reset();keyQueue.locked=true;input.disabled=send.disabled=resize.disabled=true;
+    if(wasWritable)renderTerminalStage();
+  }
   if (owner && owner.session === sshSession) {
     sshMouseOwner = info.mouse_reporting === true ? owner : null;
     const capable = info.focus_reporting === true ? owner : null;
@@ -538,6 +595,7 @@ function suspendLocalOutput(error,recoverFrame=false){
   localInputSuspended=!keyQueue.locked&&!keyQueue.pending&&!input.disabled;
   pasteReview.reset();ime.reset();keyQueue.locked=true;
   input.disabled=send.disabled=resize.disabled=true;
+  renderTerminalStage();
   refreshTerminalControls();
   status.textContent=`Local output stream paused: ${String(error?.message??error)}. Recover the output snapshot to continue.`;
 }
@@ -641,6 +699,7 @@ async function poll(){
     pasteReview.reset();ime.reset();keyQueue.locked=true;clearInterval(timer);
     status.textContent=isSsh?`SSH terminal paused: ${String(e?.message??e)}. Use Recover output snapshot.`:`Shell stopped: ${String(e?.message??e)}. Close/reopen before continuing.`;
     input.disabled=send.disabled=resize.disabled=true;
+    renderTerminalStage();
     terminalChat.updateOwner();
   }
   finally{if(polling===ticket)polling=null;}
@@ -650,7 +709,7 @@ function setActiveControls(writable){
   close.disabled=detach.disabled=restoringLocalLayout;
   if (writable && fitSize?.checked) void Promise.resolve().then(requestFit);
 }
-function startLocalTab(targetEpoch,{fromRestore=false,focusTerminal=false,configuration=plainLocalTab}={}) {
+function startLocalTab(targetEpoch,{fromRestore=false,focusTerminal=false,configuration=plainLocalTab,splitOnActivate=null}={}) {
   if(sshSession!==null||changingTab||recovery||restoringLocalLayout&&!fromRestore||
       (!owner&&(showLocal.disabled||targetEpoch===null)))return;
   if(owner&&!fromRestore&&(keyQueue.pending||(!keyQueue.locked&&input.disabled))){
@@ -659,7 +718,7 @@ function startLocalTab(targetEpoch,{fromRestore=false,focusTerminal=false,config
   }
   const preserveInput=owner!==null&&!keyQueue.locked&&(fromRestore||!input.disabled);
   changingTab={source:owner,targetEpoch,preserveInput,resizeDisabled:resize.disabled,hadChannel:localStream!==null||localTransport==='recovery',focusTerminal,configuration,
-    previousFrame:state,busy:false,view:null};
+    previousFrame:state,busy:false,view:null,splitOnActivate};
   if(owner)rememberLocalDraft(owner);
   transport++;polling=null;stopTransport();
   filePreview.dismiss();pasteReview.reset();ime.reset();history.reset();
@@ -722,8 +781,9 @@ async function attemptLocalTab(){
     setActiveControls(next.writable);setLocalTools(true);
     status.textContent=`Local shell ${epoch} active${next.writable?'.':' in view-only mode.'}`;
     changingTab=null;recordLocalLayout();renderLocalTabs(!change.focusTerminal);
-    if(change.focusTerminal)(next.writable?imeInput:canvas).focus();
+    if(change.focusTerminal)focusTerminal();
     await startTransport();
+    if(owner===next.owner&&change.splitOnActivate)await setSplit(change.splitOnActivate);
   }catch(e){
     if(changingTab!==change)return;
     clearTerminalPaint();
@@ -731,9 +791,9 @@ async function attemptLocalTab(){
     change.busy=false;renderLocalTabs();retryTab.focus();
   }
 }
-newTab.addEventListener('click',()=>{if(!newTab.disabled)return startLocalTab(null);});
+newTab.addEventListener('click',()=>{if(!newTab.disabled)return startLocalTab(null,{focusTerminal:true});});
 const jshLocalTab={shell:'jsh',presentation:'terminal'};
-newJshTab.addEventListener('click',()=>{if(!newJshTab.disabled)return startLocalTab(null,{configuration:jshLocalTab});});
+newJshTab.addEventListener('click',()=>{if(!newJshTab.disabled)return startLocalTab(null,{configuration:jshLocalTab,focusTerminal:true});});
 retryTab.addEventListener('click',attemptLocalTab);
 
 async function restoreLocalGeometry(configuration){
@@ -812,7 +872,8 @@ restoreLayout.addEventListener('click',async()=>{
       else{setOpenDisabled(false);attach.disabled=button.disabled=false;}
     }
     if(complete)recordLocalLayout();
-    renderLocalTabs(complete);
+    renderLocalTabs();
+    if(complete)focusTerminal();
   }
 });
 
@@ -820,7 +881,7 @@ async function openShell({destination=null,retained=null,fromRestore=false,confi
   if(epoch!==null||sshSession||restoringLocalLayout&&!fromRestore)return;
   const attempt=++generation;transport++;sshInputSuspended=false;
   filePreview.dismiss();pasteReview.reset();history.reset();setOpenDisabled(true);attach.disabled=button.disabled=true;
-  if(destination!==null)status.textContent=`Opening SSH terminal on ${destination}…`;
+  status.textContent=destination!==null?`Opening SSH terminal on ${destination}…`:'Opening local shell…';
   const integrated=configuration.shell==='jsh';
   try{
     const options=channelSnapshots();
@@ -841,8 +902,9 @@ async function openShell({destination=null,retained=null,fromRestore=false,confi
     setActiveControls(true);
     if(destination===null){setLocalTools(true);recordLocalLayout();}
     renderLocalTabs();
-    status.textContent=retained?'Second local shell opened; the first remains retained.':destination!==null?`SSH shell connected to ${destination}.`:integrated?'Local jsh opened. Completed commands are available in Command blocks.':'Experimental /bin/sh opened. Focus the terminal to type.';
+    status.textContent=retained?'Second local shell opened; the first remains retained.':destination!==null?`SSH shell connected to ${destination}.`:integrated?'jsh with command blocks':'Local /bin/sh';
     if(destination!==null&&typeof result?.save_warning==='string')status.textContent+=' '+result.save_warning;
+    if(!fromRestore)focusTerminal();
     await startTransport();
   }catch(e){if(generation===attempt){status.textContent=retained?'Second shell open unconfirmed: '+String(e?.message??e)+'. Show retained local shells before trying again.':String(e?.message??e);if(!fromRestore){setOpenDisabled(false);attach.disabled=button.disabled=false;}}}
 }
@@ -954,7 +1016,8 @@ async function reconnect(selected=null,saved=null){
       recordLocalLayout();
       renderLocalTabs();
       if(selected!==null)showLocal.focus();
-    }
+    }else renderTerminalStage();
+    if(selected===null)focusTerminal();
     await startTransport();
   }catch(e){if(generation===attempt)status.textContent=String(e?.message??e);}
   finally{if(generation===attempt&&epoch===null){setOpenDisabled(sshSession!==null);attach.disabled=false;button.disabled=sshSession!==null;}}
@@ -966,6 +1029,7 @@ function clearTerminalPaint(){
   rememberLocalGeometry(state);
   document.querySelector('#cursor-status').textContent='';
   const health=document.querySelector('#health');health.textContent='';delete health.dataset.transport;
+  renderTerminalStage();
 }
 async function detachView(){
   if(!owner||detach.disabled||recovery?.epoch===epoch)return false;
@@ -1033,28 +1097,30 @@ function requestFit() {
   const size = viewportDimensions(fitViewport, globalThis.getComputedStyle?.(fitViewport));
   if (!size || (lastFit?.owner === owner && lastFit.rows === size.rows && lastFit.cols === size.cols)) return;
   lastFit = {owner, ...size};
+  colsInput.value=String(size.cols);rowsInput.value=String(size.rows);
   if (state?.rows.length === size.rows && state.cols === size.cols) return;
   void sizes.request(size.rows, size.cols);
 }
+function setFit(enabled){
+  fitSize.checked=enabled;
+  writePreference('aether.fit-terminal',enabled?'on':'off');
+  lastFit=null;
+  fitViewport.classList.toggle('fit-terminal',enabled);
+  if(enabled)requestFit();
+  else sizes.cancelPending();
+}
 if (fitSize && fitViewport) {
   fitSize.disabled = !invoke;
-  fitSize.addEventListener('change', () => {
-    lastFit = null;
-    fitViewport.classList.toggle('fit-terminal', fitSize.checked);
-    if (fitSize.checked) requestFit();
-    else sizes.cancelPending();
-  });
+  fitSize.checked = readPreference('aether.fit-terminal') !== 'off';
+  fitViewport.classList.toggle('fit-terminal', fitSize.checked);
+  fitSize.addEventListener('change',()=>setFit(fitSize.checked));
   if (invoke && typeof ResizeObserver === 'function') new ResizeObserver(requestFit).observe(fitViewport);
 }
 resize.addEventListener('click', async () => {
   if (epoch === null || input.disabled) return;
   try {
     const {rows, cols} = dimensions(Number(rowsInput.value), Number(colsInput.value));
-    if (fitSize?.checked) {
-      fitSize.checked = false;
-      fitViewport?.classList.remove('fit-terminal');
-      lastFit = null;
-    }
+    if(fitSize?.checked)setFit(false);
     await sizes.request(rows, cols);
   } catch (e) {
     status.textContent = String(e?.message ?? e);
@@ -1070,6 +1136,8 @@ function describeCursor(frame=visibleLiveFrame()){
     layer.style.left=left;layer.style.top=top;
   }
   rememberLocalGeometry(state);
+  const size=`${frame.cols} × ${frame.rows.length}`;
+  if(terminalSize.textContent!==size)terminalSize.textContent=size;
   document.querySelector('#cursor-status').textContent=`${frame.cols} × ${frame.rows.length} cells · cursor row ${frame.cursor_row+1}, column ${frame.cursor_col+1} · ${frame.cursor_shape}${frame.cursor_visible?'':' (hidden)'}${frame.pending_wrap?' · wrap pending':''}`;
 }
 function hyperlinkAt(event){
@@ -1105,7 +1173,7 @@ function revealLiveCursor(){
   const viewport=document.querySelector('#active-pane .viewport');
   viewport.scrollTo(cursorTarget(frame,selectionOverlay?.parentElement ?? canvas,viewport));
 }
-document.querySelector('#reveal-cursor').addEventListener('click',revealLiveCursor);
+document.querySelector('#reveal-cursor').addEventListener('click',()=>{revealLiveCursor();focusTerminal();});
 
 
 // Browser supplies logical events only; Rust chooses all terminal wire sequences.
@@ -1159,7 +1227,7 @@ function enqueueLogical(command,payload,onReceipt){
       const result=await invokeAttached(command,{epoch:current,...payload},attachment);
       if(ownsInput(attachment,queue))onReceipt?.(result);
     }
-    catch(e){if(!mouse&&ownsInput(attachment,queue)){pasteReview.reset();queue.locked=true;input.disabled=send.disabled=true;status.textContent=`Input not accepted: ${String(e?.message??e)}. Close/reopen before retrying.`;}}
+    catch(e){if(!mouse&&ownsInput(attachment,queue)){pasteReview.reset();queue.locked=true;input.disabled=send.disabled=true;renderTerminalStage();status.textContent=`Input not accepted: ${String(e?.message??e)}. Close/reopen before retrying.`;}}
   }).finally(()=>{
     queue.pending--;
     if (queue.pending === 125) terminalFocus.refresh();
@@ -1201,6 +1269,7 @@ copySelection?.addEventListener('click', () => {
   if (!selection) return;
   history.reset();
   const output = document.querySelector('#history-output');
+  document.querySelector('#terminal-history').open=true;
   output.value = selection.text;
   output.focus();
   output.select();
@@ -1278,7 +1347,7 @@ async function recoverOutput(previousStatus=null){
   }catch(e){if(epoch===current&&transport===ticket)status.textContent=`Recovery failed: ${String(e?.message??e)}. Retry recovery or close.`;}
   finally{if(recovery===operation){recovery=null;if(epoch===current&&transport===ticket){detach.disabled=false;setLocalTools(true);renderLocalTabs();}}}
 }
-document.querySelector('#recover').addEventListener('click',()=>recoverOutput());
+recoverButton.addEventListener('click',()=>recoverOutput());
 
 
 function captureSshReloadView(){
@@ -1361,4 +1430,118 @@ async function recoverSshReloadLayout(reason=null){
     }
   }
 }
+
+const historyPanel=document.querySelector('#terminal-history');
+const sessionTools=document.querySelector('#session-tools');
+const workspaceTools=document.querySelector('#terminal-tools');
+const historyQuery=document.querySelector('#history-find-query');
+function revealPanel(panel,focus=panel.querySelector('summary')){
+  panel.open=true;
+  panel.scrollIntoView({block:'start'});
+  focus?.focus({preventScroll:true});
+}
+function showHistory(search=false){
+  const canFind=!document.querySelector('#history-find-form').hidden;
+  revealPanel(historyPanel,search&&canFind?historyQuery:undefined);
+  if((!search||!canFind)&&owner&&!document.querySelector('#history-output').value)
+    document.querySelector('#history-refresh').click();
+}
+function showTool(id){
+  const tool=document.querySelector(id);
+  workspaceTools.open=true;
+  revealPanel(tool);
+}
+for(const [button,panel,show] of [
+  ['#show-history',historyPanel,()=>showHistory()],
+  ['#show-session-tools',sessionTools,()=>revealPanel(sessionTools)],
+  ['#show-workspace-tools',workspaceTools,()=>revealPanel(workspaceTools)],
+]){
+  const control=document.querySelector(button);
+  control.setAttribute('aria-expanded','false');
+  panel.addEventListener('toggle',()=>control.setAttribute('aria-expanded',String(panel.open)));
+  control.addEventListener('click',()=>{
+    if(panel.open){panel.open=false;focusTerminal();}
+    else show();
+  });
+}
+function showSsh(){revealPanel(sessionTools,sshHost);}
+sshConnect.addEventListener('click',showSsh);
+document.querySelector('#history-back-live').addEventListener('click',()=>{
+  historyPanel.open=false;
+  focusTerminal();
+});
+for(const control of document.querySelectorAll('.return-to-terminal')){
+  control.addEventListener('click',()=>{
+    control.closest('details').open=false;
+    focusTerminal();
+  });
+}
+
+function cycleTabs(step){
+  const ordered=[...localTabEpochs].sort((a,b)=>a-b);
+  const current=ordered.indexOf(epoch);
+  const selected=current<0?(step>0?0:ordered.length-1):(ordered.length+current+step)%ordered.length;
+  if(ordered[selected]!==epoch)startLocalTab(ordered[selected],{focusTerminal:true});
+}
+const canCycleTabs=()=>!tabs.hidden&&!changingTab&&!recovery&&!restoringLocalLayout&&
+  localTabEpochs.size>(owner?1:0);
+const canUseHistory=()=>!!owner&&!changingTab;
+function clickAction(label,id,hint,keys){
+  const target=document.querySelector(id);
+  return {label,hint,keys,enabled:()=>!target.hidden&&!target.disabled,run:()=>target.click()};
+}
+async function copyTerminalSelection(){
+  const attachment=owner, selection=liveSelection?.snapshot();
+  if(!attachment||!selection?.text)return;
+  try{
+    await invoke('copy_terminal_text',{text:selection.text});
+    if(owner===attachment)status.textContent='Terminal selection copied.';
+  }catch(error){
+    if(owner===attachment)status.textContent=String(error?.message??error);
+  }
+}
+const actions=[
+  {label:'New local shell',hint:'Ctrl+Shift+T',keys:['Shift+t'],
+    enabled:()=>owner?!newTab.disabled:!open.disabled,run:()=>(owner?newTab:open).click()},
+  {label:'New jsh shell',enabled:()=>owner?!newJshTab.disabled:!openIntegrated.disabled,
+    run:()=>(owner?newJshTab:openIntegrated).click()},
+  {label:'Connect over SSH',enabled:()=>!sshConnect.disabled,run:showSsh},
+  clickAction('Restore shell tabs','#restore-local-layout'),
+  clickAction('Reconnect view','#attach'),
+  clickAction('Close shell','#close','Ctrl+Shift+W',['Shift+w']),
+  {label:'Next tab',hint:'Ctrl+Tab',keys:['tab','pagedown'],enabled:canCycleTabs,run:()=>cycleTabs(1)},
+  {label:'Previous tab',hint:'Ctrl+Shift+Tab',keys:['Shift+tab','pageup'],enabled:canCycleTabs,run:()=>cycleTabs(-1)},
+  {label:'Split left and right',hint:'Ctrl+Shift+E',keys:['Shift+e'],enabled:()=>!splitToggle.disabled,run:()=>setSplit('horizontal')},
+  {label:'Split top and bottom',hint:'Ctrl+Shift+D',keys:['Shift+d'],enabled:()=>!splitToggle.disabled,run:()=>setSplit('vertical')},
+  {label:'Return to one pane',enabled:()=>splitEnabled&&!splitToggle.disabled,run:()=>setSplit(null)},
+  {label:'Search terminal history',hint:'Ctrl+Shift+F',keys:['Shift+f'],enabled:canUseHistory,run:()=>showHistory(true)},
+  {label:'Copy terminal selection',hint:'Ctrl+Shift+C',keys:['Shift+c'],
+    enabled:()=>!!owner&&!copySelection.disabled,run:copyTerminalSelection},
+  clickAction('Detach terminal view','#detach'),
+  clickAction('Recover output snapshot','#recover'),
+  clickAction('Terminal Chat','#terminal-chat-toggle'),
+  clickAction('Workflows','#workflows'),
+  {label:'Session controls',run:()=>revealPanel(sessionTools)},
+  {label:'Workspace tools',run:()=>revealPanel(workspaceTools)},
+];
+for(const [label,id] of [
+  ['Agent Workspace','#agent-workspace'],['SSH Files','#ssh-files'],['Remote Workspace','#ssh-workspace'],
+  ['Vim9 Workbench','#vim9-workbench'],['Notebook','#local-notebook'],['Local file preview','#local-file-tools'],
+]){
+  actions.push({label,enabled:()=>!document.querySelector(id).hidden,run:()=>showTool(id)});
+}
+if(invoke)actions.push(clickAction('Remote Desktop','#remote-tab'));
+const availableActions=actions.map(action=>({...action,enabled:()=>!terminalPanel.hidden&&(!action.enabled||action.enabled())}));
+if(invoke)availableActions.push({
+  label:'Terminal',enabled:()=>terminalPanel.hidden,run:()=>document.querySelector('#terminal-tab').click(),
+});
+installTerminalShell(document,{
+  actions:availableActions,
+  isComposing:()=>ime.isComposing(),
+  paletteScope:target=>pasteReviewPanel.hidden&&(target===document.body||
+    !!target?.closest?.('#app-header, #terminal-main, #remote-panel')),
+  keyboardScope:target=>!terminalPanel.hidden&&pasteReviewPanel.hidden&&
+    (target===document.body||!!target?.closest?.('#terminal-stage, #app-header, #terminal-history')),
+});
+renderTerminalStage();
 void claimSshReload();

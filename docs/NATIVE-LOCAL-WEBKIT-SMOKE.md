@@ -38,6 +38,12 @@ from the inactive PTY, changes only the selected PTY's geometry, and transfers
 keyboard focus to the other shell. Frame colors and PTY identities remain
 distinct through the focus transfer.
 
+Run the driver with `--shell-chrome-only` to verify the default terminal
+layout and its shortcuts. It compares the resized canvas grid with `stty size`
+from the live PTY, creates and reorients a split, cycles tabs, searches PTY
+history, copies selected terminal cells into the native clipboard, and runs
+a command palette action using the keyboard.
+
 The history journey searches text produced by a real PTY and selects the
 newest matching text in the native textarea. **Older match** reaches a prior
 history window, and searching the same term in the other shell finds no match.

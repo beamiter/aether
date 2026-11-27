@@ -25,11 +25,25 @@ Unicode text, resizing and returning from the alternate screen.
 
 ## Terminal session synchronization
 
-Open the experimental shell to start a semantic session. **Recover output
-snapshot** resynchronizes the current view. **Detach view** leaves the shell open
-for **Reconnect view**, which restores the output in read-only mode. Reloading
-the desktop page also leaves the local shell running. **Reconnect view** restores
-its output, including output produced during the reload.
+Choose **New shell** to start a local PTY and type directly in the terminal.
+The active writable PTY follows the pane size by default. To set a fixed
+size, open **Session**, enter the rows and columns, and choose **Apply size**.
+An inactive split retains its PTY size until it takes focus.
+
+| Shortcut | Action |
+| --- | --- |
+| `Ctrl+Shift+T` / `Ctrl+Shift+W` | Open a local shell / close the active shell |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous local tab |
+| `Ctrl+PageDown` / `Ctrl+PageUp` | Next / previous local tab |
+| `Ctrl+Shift+E` / `Ctrl+Shift+D` | Split left/right / top/bottom |
+| `Ctrl+Shift+F` | Search retained history in the active local shell |
+| `Ctrl+Shift+C` | Copy the selected live terminal text |
+| `Ctrl+Shift+P` | Open the searchable command palette |
+
+**Session** contains connection, detach, geometry and diagnostic controls.
+**Recover output snapshot** resynchronizes the current view. **Detach view**
+leaves the shell running for **Reconnect view**, which restores the output in
+read-only mode. Reloading the desktop page also leaves the local shell running.
 
 Use **New shell tab** or **New jsh tab** to open a second local shell. Select the
 numbered tabs to return to each shell's output, draft, and working process. A tab that was parked
@@ -40,9 +54,11 @@ view** and **Reconnect view** still provide an explicit read-only path.
 
 After restarting Aether, **Restore shell tabs** opens fresh PTYs with each
 saved shell type and Terminal Chat preference. It restores the selected tab
-and the split layout. With two shells, **Split panes** shows both outputs side
-by side. Click the other pane to transfer keyboard input and sizing to that
-shell. Closing the last shell clears the saved layout.
+and the split layout. **Split** shows two local shells side by side. The split
+shortcuts open a second shell of the same type when needed and can change the
+orientation of an existing pair. Click the other pane to transfer keyboard
+input and sizing to that shell. **Single pane** keeps both shells running.
+Closing the last shell clears the saved layout.
 
 For a remote PTY, run `aether-terminal-host serve` on the Linux host and use
 **Open SSH shell** with an OpenSSH host alias or `user@host`. The same terminal
@@ -74,14 +90,14 @@ process output and input while holding the last complete frame through a
 short repaint burst. It publishes once output is quiet or the one-second
 hold limit is reached.
 
-Use **Refresh history / copy snapshot** to read the local archive. The history
+Open **History** to read the local archive. The history
 viewport displays retained styles and images at the current terminal width.
 Select cells in the viewport or use the text field to copy its snapshot.
 **Find in local history** searches the selected shell with a literal,
 case-sensitive query and selects the match. **Older match** continues the
 same search, and **Cancel** stops between history windows.
 
-With jsh installed on the application's PATH, **Open jsh with Blocks** starts
+With jsh installed on the application's PATH, **Open jsh** starts
 an integrated local shell. **Command blocks** shows completed commands with
 their reported exit status, directory, source, and bounded plain-text output.
 Expand a card to copy its output. **Insert command at shell prompt** inserts
@@ -131,14 +147,14 @@ owns one waits for the cleared frame's feedback and the daemon's acceptance.
 
 ## SSH terminals, files and read-only Workspace
 
-In **Terminal**, enter an OpenSSH alias and choose **Open SSH shell**. After
+Choose **Connect over SSH**, enter an OpenSSH alias and select **Open SSH shell**. After
 restarting Aether, choose **Saved SSH shells** and **Reconnect view-only** to
 see the existing shell when its remote owner still has the PTY. **Forget
 saved shell** removes the local listing. **Close shell** in the connected
 view closes the remote PTY. The restart workflow requires a current
 `aether-terminal-host` on the SSH host.
 
-In **SSH Files**, enter a known OpenSSH host and an absolute Linux project
+Under **Tools → SSH Files**, enter a known OpenSSH host and an absolute Linux project
 directory. Install `aether-terminal-host` on that host's PATH. Aether starts
 `aether-terminal-host files` on an independent SSH connection and holds the
 chosen directory open until **Close SSH project**. Browse directories, preview
@@ -157,7 +173,7 @@ replaces a result, run the search again to select the new revision.
 
 ## Agent Workspace
 
-Open **Agent Workspace** to list the CLI conversations in the shared local
+Open **Tools → Agent Workspace** to list the CLI conversations in the shared local
 session host. The catalog identifies each provider history by its original
 profile and session ID. Select a conversation and choose **Attach terminal**
 to resume it or take over its running terminal after the other view detaches.

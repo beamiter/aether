@@ -1,45 +1,34 @@
 <!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Terminal frame bridge laboratory</title><link rel="stylesheet" href="style.css">
-<nav id="workspace-nav" aria-label="Workspace" hidden>
-  <button id="terminal-tab" type="button" aria-controls="terminal-panel" aria-pressed="true">Terminal</button>
-  <button id="remote-tab" type="button" aria-controls="remote-panel" aria-pressed="false">Remote Desktop</button>
-</nav>
+<title>Aether</title><link rel="stylesheet" href="style.css">
+<header id="app-header">
+  <div class="app-brand"><span aria-hidden="true">&gt;_</span> Aether</div>
+  <nav id="workspace-nav" aria-label="Workspace" hidden>
+    <button id="terminal-tab" type="button" aria-controls="terminal-panel" aria-pressed="true">Terminal</button>
+    <button id="remote-tab" type="button" aria-controls="remote-panel" aria-pressed="false">Remote Desktop</button>
+  </nav>
+  <button id="command-palette-open" type="button" aria-haspopup="dialog" aria-keyshortcuts="Control+Shift+P">Commands <kbd>Ctrl ⇧ P</kbd></button>
+</header>
 <div id="terminal-panel">
-<main><p class="tag">TAURI 2 / SELF-OWNED RUST CORE</p><h1>Frame bridge laboratory</h1>
-<p>Transport / paint prototype with a limited Linux shell experiment. Real PTY / basic Vim tested; not a daily terminal or native GUI acceptance.</p>
-<form id="ssh-terminal-form" hidden>
-  <label>SSH host <input id="ssh-terminal-host" placeholder="Host alias or user@host" maxlength="255" spellcheck="false" autocomplete="off" required></label>
-  <button id="open-ssh" type="submit" disabled>Open SSH shell</button>
-  <button id="show-saved-ssh" type="button" disabled>Saved SSH shells</button>
-</form>
-<section id="saved-ssh" hidden aria-label="Saved SSH shells">
-  <label>Saved shell <select id="saved-ssh-shell"></select></label>
-  <button id="resume-saved-ssh" type="button" disabled>Reconnect view-only</button>
-  <button id="forget-saved-ssh" type="button" disabled>Forget saved shell</button>
-</section>
-<button id="recover">Recover output snapshot</button> <button id="demo">Load frame</button> <button id="open" disabled>Open experimental shell</button> <button id="open-integrated" type="button" disabled>Open jsh with Blocks</button> <button id="detach" disabled>Detach view</button> <button id="attach" disabled>Reconnect view</button> <button id="close" disabled>Close shell</button> <label>Columns <input id="cols" type="number" min="1" max="256" step="1" value="100"></label> <label>Rows <input id="rows" type="number" min="1" max="128" step="1" value="24"></label> <button id="resize" disabled>Apply size</button> <label><input id="fit-size" type="checkbox" disabled> Fit terminal to pane</label> <button id="reveal-cursor">Show cursor</button><p id="cursor-status"></p><p id="status" role="status">Ready. ANSI parsing never runs in this WebView.</p>
-<section id="local-shells" hidden aria-label="Retained local shells">
-  <div id="saved-local-layout" hidden>
-    <button id="restore-local-layout" type="button" aria-describedby="restore-local-note">Restore shell tabs</button>
-    <p class="note" id="restore-local-note">Opens fresh shells with the saved shell types, views and split layout.</p>
+<main id="terminal-main">
+<div id="terminal-stage">
+<div class="terminal-toolbar" aria-label="Terminal controls">
+  <div class="terminal-sessions">
+    <nav id="local-tabs" hidden aria-label="Local shell tabs"><div id="local-tab-list"></div></nav>
+    <button id="open" class="primary-action" type="button" aria-keyshortcuts="Control+Shift+T" disabled>+ New shell</button>
+    <button id="new-local-tab" type="button" aria-label="New shell tab" title="New shell tab (Ctrl+Shift+T)" disabled hidden>+</button>
+    <button id="restore-local-layout" type="button" hidden>Restore shell tabs</button>
   </div>
-  <nav id="local-tabs" hidden aria-label="Local shell tabs">
-    <div id="local-tab-list"></div>
-    <button id="new-local-tab" type="button">New shell tab</button>
-    <button id="new-jsh-tab" type="button">New jsh tab</button>
-    <button id="split-local" type="button" aria-pressed="false" disabled>Split panes</button>
-    <button id="terminal-chat-toggle" type="button" aria-pressed="false" disabled>Terminal Chat</button>
+  <div class="terminal-actions">
+    <button id="new-jsh-tab" type="button" disabled hidden>New jsh tab</button>
+    <button id="split-local" type="button" aria-pressed="false" aria-keyshortcuts="Control+Shift+E" disabled>Split</button>
+    <button id="terminal-chat-toggle" type="button" aria-pressed="false" disabled>Chat</button>
     <button id="workflows" type="button" aria-controls="workflow-picker" aria-expanded="false" disabled>Workflows</button>
     <button id="retry-local-tab" type="button" hidden>Retry tab switch</button>
-  </nav>
-  <button id="manage-local" type="button" disabled>Show retained local shells</button>
-  <div id="local-shell-options" hidden>
-    <label>Retained local shell <select id="local-shell-selection"></select></label>
-    <button id="attach-selected-local" type="button" disabled>Reconnect selected view-only</button>
-    <button id="open-second-local" type="button" disabled>Open second local shell</button>
-    <p class="note">Select a different shell to switch views. Detach before opening a second shell. Reconnected views are read-only.</p>
+    <button id="show-history" type="button" aria-controls="terminal-history" aria-keyshortcuts="Control+Shift+F">History</button>
+    <button id="show-session-tools" type="button" aria-controls="session-tools">Session</button>
+    <button id="show-workspace-tools" type="button" aria-controls="terminal-tools">Tools</button>
   </div>
-</section>
+</div>
 <section id="workflow-picker" hidden aria-label="Shell workflows">
   <div class="workflow-controls">
     <label>Find workflows <input id="workflow-search" type="search" maxlength="4096" autocomplete="off"></label>
@@ -57,7 +46,6 @@
     </div>
   </div>
 </section>
-<p class="note">The scrollable canvas shows the live grid only. Show cursor brings its position into view without changing terminal state. Archived history is a separate snapshot below.</p>
 <div id="terminal-panes">
   <section id="active-pane" aria-label="Active terminal pane">
     <div id="terminal-chat-transcript"></div>
@@ -65,10 +53,20 @@
       <span id="terminal-chat-surface"></span>
       <button id="terminal-chat-send" type="button" disabled>Send command</button>
     </div>
-    <div class="viewport"><p id="health" aria-live="polite"></p>
+    <div class="viewport">
       <div class="terminal-surface"><canvas tabindex="0" aria-label="Active terminal keyboard and composition input"></canvas><div id="terminal-selection" aria-hidden="true"></div></div>
       <textarea id="ime-input" rows="1" wrap="off" spellcheck="false" autocomplete="off" aria-label="Terminal input"></textarea>
       <span id="terminal-preedit" aria-label="Terminal composition" hidden></span>
+    </div>
+    <div id="terminal-empty">
+      <span class="terminal-symbol" aria-hidden="true">&gt;_</span>
+      <h1>Start a terminal session</h1>
+      <p>Open a local shell, start jsh with command blocks, or connect to an SSH host.</p>
+      <div class="empty-actions">
+        <button id="open-integrated" type="button" disabled>Open jsh</button>
+        <button id="show-ssh-connection" type="button" disabled>Connect over SSH</button>
+        <button id="attach" type="button" disabled>Reconnect view</button>
+      </div>
     </div>
   </section>
   <section id="peer-pane" hidden aria-label="Inactive terminal pane">
@@ -76,6 +74,57 @@
     <div class="viewport"><canvas id="peer-canvas" aria-label="Inactive terminal output"></canvas></div>
   </section>
 </div>
+<footer class="terminal-status">
+  <span id="session-indicator"><span aria-hidden="true"></span><span id="session-state">No session</span></span>
+  <p id="status" role="status">Ready</p>
+  <output id="terminal-size" aria-label="Terminal size"></output>
+</footer>
+</div>
+<details id="session-tools" class="terminal-panel" data-panel>
+<summary>Session controls</summary>
+<div class="panel-content">
+<div class="terminal-controls">
+  <button class="return-to-terminal" type="button">Back to terminal</button>
+</div>
+<form id="ssh-terminal-form" hidden>
+  <label>SSH host <input id="ssh-terminal-host" placeholder="Host alias or user@host" maxlength="255" spellcheck="false" autocomplete="off" required></label>
+  <button id="open-ssh" type="submit" disabled>Open SSH shell</button>
+  <button id="show-saved-ssh" type="button" disabled>Saved SSH shells</button>
+</form>
+<section id="saved-ssh" hidden aria-label="Saved SSH shells">
+  <label>Saved shell <select id="saved-ssh-shell"></select></label>
+  <button id="resume-saved-ssh" type="button" disabled>Reconnect view-only</button>
+  <button id="forget-saved-ssh" type="button" disabled>Forget saved shell</button>
+</section>
+<div class="terminal-controls">
+  <button id="close" type="button" aria-keyshortcuts="Control+Shift+W" disabled>Close shell</button>
+  <button id="detach" type="button" disabled>Detach view</button>
+  <button id="recover" type="button" disabled>Recover output snapshot</button>
+  <button id="reveal-cursor" type="button">Show cursor</button>
+</div>
+<div class="terminal-controls terminal-geometry">
+  <label><input id="fit-size" type="checkbox" checked disabled> Fit terminal to pane</label>
+  <label>Columns <input id="cols" type="number" min="1" max="256" step="1" value="100"></label>
+  <label>Rows <input id="rows" type="number" min="1" max="128" step="1" value="24"></label>
+  <button id="resize" type="button" disabled>Apply size</button>
+</div>
+<section id="local-shells" hidden aria-label="Retained local shells">
+  <button id="manage-local" type="button" disabled>Show retained local shells</button>
+  <div id="local-shell-options" hidden>
+    <label>Retained local shell <select id="local-shell-selection"></select></label>
+    <button id="attach-selected-local" type="button" disabled>Reconnect selected view-only</button>
+    <button id="open-second-local" type="button" disabled>Open second local shell</button>
+    <p class="note">Select a different shell to switch views. Detach before opening a second shell. Reconnected views are read-only.</p>
+  </div>
+</section>
+<form id="command"><label>Shell command <input id="input" autocomplete="off" placeholder="Enter a command" disabled></label> <button id="send" disabled>Send line</button></form>
+<details id="terminal-diagnostics" class="terminal-diagnostics" data-panel>
+  <summary>Diagnostics</summary>
+  <p id="health"></p><p id="cursor-status"></p>
+  <button id="demo" type="button">Load frame</button>
+</details>
+</div>
+</details>
 <div id="command-block-home"><section id="command-blocks" hidden aria-label="Local command blocks">
   <button id="command-block-toggle" type="button" aria-controls="command-block-panel" aria-expanded="false">Command blocks</button>
   <div id="command-block-panel" hidden>
@@ -110,9 +159,14 @@
   </div>
 </section></div>
 <section id="paste-review" hidden aria-label="Review multiline paste"><h2>Review multiline paste</h2><p>Newlines may execute commands. Verify every line before sending. This review applies even when bracketed paste is enabled; terminal modes can change.</p><textarea id="paste-preview" readonly rows="6" spellcheck="false" aria-label="Clipboard text with visual line breaks" aria-describedby="paste-line-endings"></textarea><p id="paste-line-endings">The preview displays CR, LF and CRLF as line breaks. The original clipboard text is shown below as a quoted string: \r means carriage return, \n means line feed, \t means tab and \\ means a literal backslash. Unicode format characters, including bidirectional controls and zero-width joiners, appear as \uXXXX escapes (two escapes for a supplementary character); this does not remove them from the paste. Other characters remain literal, so this is not a complete code-point listing. On delivery, each CRLF pair, lone CR or LF becomes one carriage return. Bracketed paste markers depend on the terminal mode at delivery.</p><pre id="paste-escaped" tabindex="0" role="region" aria-label="Original clipboard text with escaped line endings and format characters" aria-describedby="paste-line-endings"></pre><button id="paste-confirm" type="button" disabled>Send reviewed paste</button> <button id="paste-cancel" type="button">Cancel paste</button></section>
-<section aria-label="Terminal history">
+<details id="terminal-history" class="terminal-panel" data-panel>
+  <summary>Terminal history</summary>
+  <div class="panel-content">
+  <div class="terminal-controls">
+  <button id="history-back-live" type="button">Back to terminal</button>
   <button id="copy-visible">Snapshot visible text</button> <button id="copy-selection" type="button" disabled>Snapshot selection</button> <button id="history-older">Older 20 rows</button> <button id="history-newer">Newer 20 rows</button> <button id="history-refresh">Refresh history / copy snapshot</button>
   <button id="history-copy" type="button" disabled>Copy selection</button>
+  </div>
   <form id="history-find-form" hidden>
     <label>Find in local history <input id="history-find-query" type="search" maxlength="128" autocomplete="off" spellcheck="false"></label>
     <button id="history-find" type="submit">Find</button>
@@ -126,8 +180,13 @@
     <div id="history-grid-size"><canvas id="history-canvas" aria-label="Archived terminal grid"></canvas></div>
   </div>
   <textarea id="history-output" readonly rows="12" wrap="off" spellcheck="false" aria-label="Terminal history text snapshot for selection and copy"></textarea>
-</section>
-<form id="command"><label>Shell command <input id="input" autocomplete="off" placeholder="printf hello" disabled></label> <button id="send" disabled>Send line</button></form><p class="note">Experimental: fixed /bin/sh; focus terminal for logical keyboard input. Multiline clipboard paste requires review before sending; newlines may execute commands when bracketed paste is off. Still required: production process containment, Unicode shaping, native keyboard/IME acceptance and broad Vim compatibility, IME and accessibility.</p></main>
+  </div>
+</details>
+</main>
+<details id="terminal-tools" class="terminal-panel" data-panel>
+<summary>Workspace tools</summary>
+<div class="panel-content">
+<button class="return-to-terminal" type="button">Back to terminal</button>
 <details id="agent-workspace" hidden>
   <summary>Agent Workspace</summary>
   <div class="workspace-controls">
@@ -474,7 +533,20 @@
     <button id="vim9-paste-cancel" type="button">Cancel paste</button>
   </section>
 </details>
-<section aria-label="Explicit local file preview"><h2>Local file preview (experimental)</h2><p>This opt-in preview reads only files selected below. Ctrl+left-click an exact visible relative file name to select it, then confirm Preview selected file. The confirmation is required because terminal output cannot prove a local or remote identity. Positive :line or :line:column suffixes are passed to Vim when you choose the matching file in its native chooser. Wrapped paths, absolute paths and OSC 8 links are not resolved. Markdown, TSX, HTML and SVG are plain source text, never executed. Static PNG and baseline JPEG are limited to 2 MiB, 4096 per side and 4 megapixels. Other image formats are not decoded. Re-select the folder to refresh its snapshot.</p><label>Select a trusted local folder (at most 2048 total files) <input id="preview-folder" type="file" webkitdirectory multiple></label><label>Select one file (large projects, no folder enumeration) <input id="preview-single" type="file"></label><label>Preview file <select id="preview-files" disabled></select></label><button id="preview-show" type="button" disabled>Preview selected file</button> <button id="preview-clear" type="button">Clear local access</button><p id="preview-notice" role="status">No local files authorized.</p></section><aside id="file-preview" hidden aria-label="Local source preview"><button id="preview-close" type="button">Close preview</button> <button id="preview-vim9" type="button" hidden>Open verified local file in Vim9…</button><h2 id="preview-title"></h2><div id="preview-confirmation" hidden><p>Confirm this reference belongs to your selected local folder, not a remote session.</p><button id="preview-confirm-local" type="button">Preview selected local file</button></div><canvas id="preview-raster" hidden aria-label="Selected local raster image"></canvas><div id="preview-source-tools" hidden><label>Find in source <input id="preview-source-query" type="search" maxlength="4096"></label> <label><input id="preview-source-case" type="checkbox"> Match case</label> <button id="preview-source-prev" type="button" disabled>Previous</button> <button id="preview-source-next" type="button" disabled>Next</button> <span id="preview-source-find-status" role="status"></span></div><pre id="preview-source" tabindex="0" aria-label="Source text, not executable"></pre></aside>
+<details id="local-file-tools" data-panel><summary>Local file preview</summary>
+  <p>Choose a file or folder to preview. Ctrl-click a relative path in the terminal to look it up in the selected folder. Source files open as text. PNG and baseline JPEG previews support up to 2 MiB and 4 megapixels.</p>
+  <div class="terminal-controls">
+    <label>Select a local folder <input id="preview-folder" type="file" webkitdirectory multiple></label>
+    <label>Select one file <input id="preview-single" type="file"></label>
+    <label>Preview file <select id="preview-files" disabled></select></label>
+    <button id="preview-show" type="button" disabled>Preview selected file</button>
+    <button id="preview-clear" type="button">Clear local access</button>
+  </div>
+  <p id="preview-notice" role="status">No local files authorized.</p>
+</details>
+</div>
+</details>
+<aside id="file-preview" hidden aria-label="Local source preview"><button id="preview-close" type="button">Close preview</button> <button id="preview-vim9" type="button" hidden>Open verified local file in Vim9…</button><h2 id="preview-title"></h2><div id="preview-confirmation" hidden><p>Confirm this reference belongs to your selected local folder, not a remote session.</p><button id="preview-confirm-local" type="button">Preview selected local file</button></div><canvas id="preview-raster" hidden aria-label="Selected local raster image"></canvas><div id="preview-source-tools" hidden><label>Find in source <input id="preview-source-query" type="search" maxlength="4096"></label> <label><input id="preview-source-case" type="checkbox"> Match case</label> <button id="preview-source-prev" type="button" disabled>Previous</button> <button id="preview-source-next" type="button" disabled>Next</button> <span id="preview-source-find-status" role="status"></span></div><pre id="preview-source" tabindex="0" aria-label="Source text, not executable"></pre></aside>
 </div>
 <section id="remote-panel" hidden aria-labelledby="remote-title">
   <h1 id="remote-title">Remote Desktop</h1>
@@ -518,6 +590,12 @@
     <pre id="remote-metrics" aria-label="Viewer performance" hidden></pre>
   </div>
 </section>
+<dialog id="command-palette" aria-labelledby="command-palette-title">
+  <h2 id="command-palette-title">Commands</h2>
+  <input id="command-palette-query" type="search" aria-label="Find a command" placeholder="Find a command…" autocomplete="off" spellcheck="false" autofocus>
+  <ul id="command-palette-results" aria-label="Matching commands"></ul>
+  <p id="command-palette-empty" role="status" hidden>No matching commands</p>
+</dialog>
 <script type="module" src="app.js"></script>
 <script type="module" src="agent-workspace.js"></script>
 <script type="module" src="workspace-chat.js"></script>
