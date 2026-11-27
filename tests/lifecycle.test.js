@@ -744,6 +744,54 @@ test('directional palette actions move the single writer by visible layout, not 
  assert.equal(h.el('#terminal-panes').dataset.split,'left');
 });
 
+test('directional palette stays blocked until both accepted terminal key receipts settle',async()=>{
+ const own=(epoch,generation)=>({session:String(epoch).repeat(32),epoch,generation});
+ const raw=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+ const [first,second]=[deferred(),deferred()];
+ const keys=[],activations=[];
+ let generation=1;
+ const h=harness(async(name,args)=>{
+  if(name==='open_shell')return own(1,1);
+  if(name==='activate_local_tab'){
+   const target=args.targetEpoch??2,owner=own(target,++generation);
+   activations.push(target);
+   return {Ok:{owner,frame:channelSnapshot({...raw,session:owner.session,epoch:target}),input_allowed:true}};
+  }
+  if(name==='key_shell'){
+   keys.push([args.epoch,args.name]);
+   return args.name==='a'?first.promise:second.promise;
+  }
+  return null;
+ },undefined,undefined,undefined,{},testChannel());
+ await h.click('#open');await h.click('#new-local-tab');await h.click('#split-local');
+ for(const key of ['a','b'])h.el('canvas').handlers.keydown({key,preventDefault(){}});
+ await tick();
+ const query=h.el('#command-palette-query'), dialog=h.el('#command-palette');
+ const list=h.el('#command-palette-results');
+ list.querySelectorAll=()=>list.options.map(item=>item.children[0]);
+ h.click('#command-palette-open');
+ query.value='focus pane left';query.handlers.input();
+ const result=list.querySelectorAll()[0];
+ const enter=()=>dialog.handlers.keydown({key:'Enter',target:query,preventDefault(){}});
+ assert.deepEqual(keys,[[2,'a']]);
+ assert.equal(result.getAttribute('aria-disabled'),'true');
+ enter();await tick();
+ assert.equal(dialog.open,true);assert.deepEqual(activations,[2]);
+ first.resolve();await tick();
+ assert.deepEqual(keys,[[2,'a'],[2,'b']]);
+ assert.equal(result.getAttribute('aria-disabled'),'true');
+ enter();await tick();
+ assert.equal(dialog.open,true);assert.deepEqual(activations,[2]);
+ second.resolve();await tick();
+ assert.equal(dialog.open,true);
+ assert.equal(query.value,'focus pane left');
+ assert.equal(list.querySelectorAll()[0],result);
+ assert.equal(result.getAttribute('aria-disabled'),null);
+ enter();await tick();
+ assert.equal(dialog.open,false);assert.deepEqual(activations,[2,1]);
+ assert.deepEqual(keys,[[2,'a'],[2,'b']]);
+});
+
 for(const [closed,expectedSplit,expectedPeer] of [[3,'right',1],[1,'top',3]]){
  test(`closing visible shell ${closed} preserves the other two panes and never selects parked shell 4`,async()=>{
   const own=(epoch,generation)=>({session:String(epoch).repeat(32),epoch,generation});
