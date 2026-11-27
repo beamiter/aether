@@ -1,4 +1,5 @@
 //! Aether host contract, through the production parser and archive entry points.
+use jterm_engine::TerminalCell;
 use jterm_headless_session_spike::Terminal;
 
 fn feed_at_cut(t: &mut Terminal, input: &str, cut: usize) -> Vec<u8> {
@@ -23,9 +24,27 @@ fn copies_only_the_virgin_gap_differently_without_changing_live_cells() {
             assert!(feed_at_cut(&mut t, input, cut).is_empty());
             let frame = t.frame().unwrap();
             assert_eq!(frame.cursor(), baseline_frame.cursor());
-            for (row, baseline) in frame.rows().iter().zip(baseline_frame.rows()) {
-                assert_eq!(row.cells, baseline.cells);
+            assert_eq!(frame.rows().len(), baseline_frame.rows().len());
+            for (row_index, (row, baseline)) in
+                frame.rows().iter().zip(baseline_frame.rows()).enumerate()
+            {
+                assert_eq!(row.cells.len(), baseline.cells.len());
                 assert_eq!(row.wrapped, baseline.wrapped);
+                if row_index == 0 && margin.is_empty() {
+                    // The core now tracks printed-space provenance in live cells.
+                    // Only the virgin margin lacks it: the value and rendition
+                    // must otherwise paint like the authored blank.
+                    let plain = TerminalCell::default();
+                    assert_eq!(row.cells[..3], baseline.cells[..3]);
+                    assert_eq!(row.cells[3], plain);
+                    let mut authored = baseline.cells[3];
+                    assert_ne!(authored.flags, plain.flags);
+                    assert!(authored.flags.is_plain_text());
+                    authored.flags = plain.flags;
+                    assert_eq!(authored, row.cells[3]);
+                } else {
+                    assert_eq!(row.cells, baseline.cells);
+                }
             }
             assert_eq!(t.history_rows(), 0);
             t.feed(b"\r\n\r\n").unwrap();
