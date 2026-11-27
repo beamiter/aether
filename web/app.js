@@ -161,6 +161,7 @@ function renderSavedLayout(){
   restoreLayout.disabled=retainedLayoutBlocked||open.disabled||restoringLocalLayout;
 }
 function renderTerminalStage(){
+  if(inPlaceHistory&&(historyOrigin!==owner||changingTab||recovery))closeHistory(false);
   const phase=owner?(keyQueue.locked?'read-only':'live'):state?'preview':'idle';
   sessionIndicator.dataset.state=phase;
   const title=phase==='idle'?'No session':phase==='preview'?'Frame preview':
@@ -1434,19 +1435,32 @@ async function recoverSshReloadLayout(reason=null){
 }
 
 const historyPanel=document.querySelector('#terminal-history');
+const historyDock=document.querySelector('#terminal-history-dock');
+const activePane=document.querySelector('#active-pane');
 const sessionTools=document.querySelector('#session-tools');
 const workspaceTools=document.querySelector('#terminal-tools');
 const historyQuery=document.querySelector('#history-find-query');
-let historyOrigin;
+let historyOrigin,inPlaceHistory=false;
+function dockHistory(inPlace) {
+  if(inPlaceHistory===inPlace)return;
+  inPlaceHistory=inPlace;
+  historyPanel.classList.toggle('history-in-place',inPlace);
+  (inPlace?activePane:historyDock).append(historyPanel);
+}
 document.querySelector('#terminal-history > summary').addEventListener('click',()=>{
   if(!historyPanel.open)historyOrigin=owner;
 });
-function closeHistory() {
+function closeHistory(restoreFocus=true) {
   const origin=historyOrigin;
   historyOrigin=undefined;
   history.dismiss();
   historyPanel.open=false;
-  if(origin!==undefined&&owner===origin&&!changingTab&&!recovery)focusTerminal();
+  const wasInPlace=inPlaceHistory;
+  dockHistory(false);
+  if(restoreFocus&&origin!==undefined&&owner===origin&&!changingTab&&!recovery){
+    if(wasInPlace)(input.disabled?canvas:imeInput).focus({preventScroll:true});
+    else focusTerminal();
+  }
 }
 historyPanel.addEventListener('keydown',event=>{
   if(!historyPanel.open||event.key!=='Escape'||event.defaultPrevented||
@@ -1462,7 +1476,11 @@ function revealPanel(panel,focus=panel.querySelector('summary')){
 function showHistory(search=false){
   if(!historyPanel.open||historyOrigin===undefined)historyOrigin=owner;
   const canFind=!document.querySelector('#history-find-form').hidden;
-  revealPanel(historyPanel,search&&canFind?historyQuery:undefined);
+  dockHistory(search&&canFind);
+  if(inPlaceHistory){
+    historyPanel.open=true;
+    historyQuery.focus({preventScroll:true});
+  }else revealPanel(historyPanel);
   if((!search||!canFind)&&owner&&!document.querySelector('#history-output').value)
     document.querySelector('#history-refresh').click();
 }
@@ -1480,18 +1498,18 @@ for(const [button,panel,show] of [
   control.setAttribute('aria-expanded','false');
   panel.addEventListener('toggle',()=>{
     control.setAttribute('aria-expanded',String(panel.open));
-    if(panel===historyPanel&&!panel.open){historyOrigin=undefined;history.dismiss();}
+    if(panel===historyPanel&&!panel.open){historyOrigin=undefined;history.dismiss();dockHistory(false);}
   });
   control.addEventListener('click',()=>{
     if(panel.open){
-      if(panel===historyPanel)closeHistory();
+      if(panel===historyPanel){if(inPlaceHistory)showHistory();else closeHistory();}
       else {panel.open=false;focusTerminal();}
     } else show();
   });
 }
 function showSsh(){revealPanel(sessionTools,sshHost);}
 sshConnect.addEventListener('click',showSsh);
-document.querySelector('#history-back-live').addEventListener('click',closeHistory);
+document.querySelector('#history-back-live').addEventListener('click',()=>closeHistory());
 for(const control of document.querySelectorAll('.return-to-terminal')){
   control.addEventListener('click',()=>{
     control.closest('details').open=false;
@@ -1507,7 +1525,7 @@ function cycleTabs(step){
 }
 const canCycleTabs=()=>!tabs.hidden&&!changingTab&&!recovery&&!restoringLocalLayout&&
   localTabEpochs.size>(owner?1:0);
-const canUseHistory=()=>!!owner&&!changingTab;
+const canUseHistory=()=>!!owner&&!changingTab&&!recovery&&!document.querySelector('#history-find-form').hidden;
 function clickAction(label,id,hint,keys,unavailableReason){
   const target=document.querySelector(id);
   return {label,hint,keys,unavailableReason,enabled:()=>!target.hidden&&!target.disabled,run:()=>target.click()};
@@ -1536,7 +1554,7 @@ const actions=[
   {label:'Split left and right',hint:'Ctrl+Shift+E',keys:['Shift+e'],enabled:()=>!splitToggle.disabled,unavailableReason:()=> 'Requires two available local shell tabs.',run:()=>setSplit('horizontal')},
   {label:'Split top and bottom',hint:'Ctrl+Shift+D',keys:['Shift+d'],enabled:()=>!splitToggle.disabled,unavailableReason:()=> 'Requires two available local shell tabs.',run:()=>setSplit('vertical')},
   {label:'Return to one pane',enabled:()=>splitEnabled&&!splitToggle.disabled,run:()=>setSplit(null)},
-  {label:'Search terminal history',hint:'Ctrl+Shift+F',keys:['Shift+f'],enabled:canUseHistory,unavailableReason:()=> 'Requires an attached terminal view.',run:()=>showHistory(true)},
+  {label:'Search terminal history',hint:'Ctrl+Shift+F',keys:['Shift+f'],enabled:canUseHistory,unavailableReason:()=> 'Requires a local terminal with searchable history.',run:()=>showHistory(true)},
   {label:'Copy terminal selection',hint:'Ctrl+Shift+C',keys:['Shift+c'],
     enabled:()=>!!owner&&!copySelection.disabled,unavailableReason:()=> 'Select text in the attached terminal first.',run:copyTerminalSelection},
   clickAction('Detach terminal view','#detach'),

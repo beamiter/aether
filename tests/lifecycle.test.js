@@ -59,7 +59,7 @@ function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsuppo
  plainLocalTab,MAX_LOCAL_SHELLS,validLocalGeometry,localSplitPair,readLocalShellLayout:()=>readLocalShellLayout(storage),saveLocalShellLayout:value=>saveLocalShellLayout(value,storage),
  setInterval(fn){timers.set(++id,fn);return id},clearInterval(i){timers.delete(i)},setTimeout,...animation};
  vm.runInNewContext(fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8').replace(/^import .*\n/gm,''),context);
- return {el,timers,click:s=>el(s).handlers.click(),submit:()=>el('#command').handlers.submit({preventDefault(){}}),submitSsh:()=>el('#ssh-terminal-form').handlers.submit({preventDefault(){}}),
+ return {el,timers,keydown(event){for(const fn of pageEvents.get('keydown')??[])fn(event);},click:s=>el(s).handlers.click(),submit:()=>el('#command').handlers.submit({preventDefault(){}}),submitSsh:()=>el('#ssh-terminal-form').handlers.submit({preventDefault(){}}),
   focus(selector){document.activeElement=el(selector);fire(pageEvents,'focusout');fire(pageEvents,'focusin');},
   visibility(hidden){document.hidden=hidden;fire(pageEvents,'visibilitychange');},
   pointer(name,extra={}){
@@ -104,6 +104,48 @@ test('history Escape returns to the opening pane except during composition or af
  assert.equal(escape(),true);
  assert.equal(panel.open,false);
  assert.equal(focused,newPaneFocus,'the old history surface must not redirect the new pane');
+});
+
+test('Find uses the active pane without scrolling and History keeps its own full panel',async()=>{
+ const h=harness(async name=>name==='open_shell'?1:null);
+ const history=h.el('#terminal-history'),pane=h.el('#active-pane'),dock=h.el('#terminal-history-dock');
+ const query=h.el('#history-find-query'),ime=h.el('#ime-input');
+ const placement=[],focused=[];
+ let pageScrolls=0;
+ history.querySelector=()=>query;
+ history.scrollIntoView=()=>pageScrolls++;
+ h.el('#history-refresh').click=()=>{};
+ pane.append=node=>placement.push(['pane',node]);
+ dock.append=node=>placement.push(['dock',node]);
+ query.focus=options=>focused.push(['query',options?.preventScroll]);
+ ime.focus=options=>focused.push(['pty',options?.preventScroll]);
+
+ await h.click('#open');await tick();
+ h.el('#history-find-form').hidden=false;
+ const find=()=>h.keydown({key:'F',ctrlKey:true,shiftKey:true,target:{closest:()=>true},preventDefault(){}});
+ const close=()=>history.handlers.keydown({key:'Escape',preventDefault(){}});
+ find();
+ assert.equal(history.open,true);
+ assert.deepEqual(placement.at(-1),['pane',history]);
+ assert.deepEqual(focused.at(-1),['query',true]);
+ assert.equal(pageScrolls,0);
+ close();
+ assert.equal(history.open,false);
+ assert.deepEqual(placement.at(-1),['dock',history]);
+ assert.deepEqual(focused.at(-1),['pty',true]);
+ assert.equal(pageScrolls,0);
+
+ find();
+ h.click('#show-history');
+ assert.deepEqual(placement.at(-1),['dock',history]);
+ assert.equal(history.open,true);
+ assert.equal(pageScrolls,1);
+ close();
+
+ find();
+ await h.click('#close');
+ assert.equal(history.open,false,'the old search must close on detach');
+ assert.deepEqual(placement.at(-1),['dock',history]);
 });
 
 test('auto-fit keeps a return to painted geometry while a smaller resize is in flight',async()=>{

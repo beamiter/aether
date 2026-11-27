@@ -316,6 +316,27 @@ kbd {color: var(--muted); font: 11px monospace; white-space: nowrap;}
 
 .terminal-panel {margin: 8px 0; scroll-margin-top: 60px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel);}
 #terminal-tools {margin-inline: 12px;}
+/* Find floats inside the active pane so opening it never resizes the PTY. */
+#terminal-history.history-in-place {
+  position: absolute;
+  inset: 6px 6px auto auto;
+  z-index: 4;
+  width: min(35rem, calc(100% - 12px));
+  max-height: calc(100% - 12px);
+  box-sizing: border-box;
+  overflow: auto;
+  overscroll-behavior: contain;
+  margin: 0;
+  box-shadow: 0 8px 24px #0009;
+}
+#terminal-history.history-in-place #history-find-form {margin-top: 6px;}
+#terminal-panes .history-in-place #history-viewport {
+  padding: 0;
+  max-height: 9rem;
+  border: 1px solid var(--border);
+}
+.history-in-place #history-output {max-height: 6rem;}
+
 .terminal-panel > summary, .terminal-diagnostics > summary, #local-file-tools > summary {
   padding: 10px 12px;
   font-weight: 650;

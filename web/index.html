@@ -24,7 +24,7 @@
     <button id="terminal-chat-toggle" type="button" aria-pressed="false" disabled>Chat</button>
     <button id="workflows" type="button" aria-controls="workflow-picker" aria-expanded="false" disabled>Workflows</button>
     <button id="retry-local-tab" type="button" hidden>Retry tab switch</button>
-    <button id="show-history" type="button" aria-controls="terminal-history" aria-keyshortcuts="Control+Shift+F">History</button>
+    <button id="show-history" type="button" aria-controls="terminal-history">History</button>
     <button id="show-session-tools" type="button" aria-controls="session-tools">Session</button>
     <button id="show-workspace-tools" type="button" aria-controls="terminal-tools">Tools</button>
   </div>
@@ -159,7 +159,8 @@
   </div>
 </section></div>
 <section id="paste-review" hidden aria-label="Review multiline paste"><h2>Review multiline paste</h2><p>Newlines may execute commands. Verify every line before sending. This review applies even when bracketed paste is enabled; terminal modes can change.</p><textarea id="paste-preview" readonly rows="6" spellcheck="false" aria-label="Clipboard text with visual line breaks" aria-describedby="paste-line-endings"></textarea><p id="paste-line-endings">The preview displays CR, LF and CRLF as line breaks. The original clipboard text is shown below as a quoted string: \r means carriage return, \n means line feed, \t means tab and \\ means a literal backslash. Unicode format characters, including bidirectional controls and zero-width joiners, appear as \uXXXX escapes (two escapes for a supplementary character); this does not remove them from the paste. Other characters remain literal, so this is not a complete code-point listing. On delivery, each CRLF pair, lone CR or LF becomes one carriage return. Bracketed paste markers depend on the terminal mode at delivery.</p><pre id="paste-escaped" tabindex="0" role="region" aria-label="Original clipboard text with escaped line endings and format characters" aria-describedby="paste-line-endings"></pre><button id="paste-confirm" type="button" disabled>Send reviewed paste</button> <button id="paste-cancel" type="button">Cancel paste</button></section>
-<details id="terminal-history" class="terminal-panel" data-panel>
+<div id="terminal-history-dock">
+<details id="terminal-history" class="terminal-panel" data-panel aria-keyshortcuts="Control+Shift+F">
   <summary>Terminal history</summary>
   <div class="panel-content">
   <div class="terminal-controls">
@@ -182,6 +183,7 @@
   <textarea id="history-output" readonly rows="12" wrap="off" spellcheck="false" aria-label="Terminal history text snapshot for selection and copy"></textarea>
   </div>
 </details>
+</div>
 </main>
 <details id="terminal-tools" class="terminal-panel" data-panel>
 <summary>Workspace tools</summary>

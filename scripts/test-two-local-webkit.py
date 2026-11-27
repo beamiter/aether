@@ -1339,8 +1339,16 @@ def exercise_terminal_shell(driver, owned):
         raise AssertionError(f"{error}: {state()['status']!r}, focus={state()['focused']!r}") from error
 
     driver.type("#ime-input", "printf '%s%s\\n' AETHER_CHROME_ NEEDLE; seq 1 80\ue007")
+    before_find = geometry_receipt(driver, "#active-pane canvas")
     keys(ctrl, shift, "F")
     wait_for(lambda: state()["focused"] == "history-find-query", "find shortcut did not focus the history query")
+    assert driver.execute("""
+        return document.querySelector('#active-pane > #terminal-history')?.open === true;
+    """), "Find did not open inside the active terminal pane"
+    during_find = geometry_receipt(driver, "#active-pane canvas")
+    assert all(key in before_find and before_find[key] == during_find.get(key)
+               for key in ("viewport", "bodyScroll", "rootScroll", "rows", "cols")), (
+        "Find changed the viewport or its PTY size", before_find, during_find)
     archive_query = "AETHER_CHROME_NEEDLE"
 
     def archive_ready():
@@ -1363,8 +1371,13 @@ def exercise_terminal_shell(driver, owned):
             "marker_retained": archive_query in shell["dump"].splitlines(),
             "exact_match_selected": shell["selected_history"] == archive_query,
         }) from error
-    driver.click("#history-back-live")
-    wait_for(lambda: session() == second, "leaving history did not restore shell input")
+    driver.execute("document.querySelector('#history-find-query').focus({preventScroll:true});")
+    keys("\ue00c")
+    wait_for(lambda: session() == second, "Escape did not restore input to the original PTY")
+    assert driver.execute("""
+        return document.querySelector('#terminal-history-dock > #terminal-history')?.open === false;
+    """), "Escape did not dismiss the in-place Find surface"
+    assert report_size("after-find-size"), "the original PTY did not accept input after Escape"
     keys(ctrl, shift, "P")
     wait_for(lambda: state()["focused"] == "command-palette-query", "command palette did not focus its search")
     driver.type("#command-palette-query", "return one")
