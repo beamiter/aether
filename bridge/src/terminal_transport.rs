@@ -176,16 +176,14 @@ impl Host {
     fn reply(&mut self, request: Request) -> Reply {
         let result = if request.protocol != VERSION || request.request == 0 {
             Err("unsupported terminal transport version or request ID".into())
-        } else if matches!(
+        } else if (matches!(
             &request.command,
             Command::Focus { .. } | Command::Mouse { .. }
-        ) && request.host.as_ref() != Some(&self.identity)
-        {
-            Err(HOST_CHANGED.into())
-        } else if request
-            .host
-            .as_ref()
-            .is_some_and(|host| host != &self.identity)
+        ) && request.host.as_ref() != Some(&self.identity))
+            || request
+                .host
+                .as_ref()
+                .is_some_and(|host| host != &self.identity)
         {
             Err(HOST_CHANGED.into())
         } else {

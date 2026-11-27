@@ -741,16 +741,71 @@ def exercise_hyperlinks(driver, owned):
                       "native_v4_osc8_credentials_fail_closed": True}), flush=True)
 
 
+def geometry_receipt(driver, selector, point=None):
+    """Bounded fixture diagnostics: geometry and element roles, no input or output."""
+    try:
+        return driver.execute(f"""
+            const canvas = document.querySelector({json.dumps(selector)});
+            const box = node => node ? Array.from(
+                ['left','top','width','height'], k => Math.round(node.getBoundingClientRect()[k])
+            ) : null;
+            const viewport = canvas?.closest('.viewport, #history-viewport');
+            const rect = canvas?.getBoundingClientRect(), clip = viewport?.getBoundingClientRect();
+            let point = {json.dumps(point)};
+            if (!point && canvas?.id === 'history-canvas') {{
+                const first = Number(canvas.dataset.firstRow);
+                if (Number.isInteger(first)) point = [
+                    Math.floor(rect.left + 9.5 * 12), Math.floor(rect.top + (1 - first) * 24 + 12),
+                ];
+            }}
+            if (!point && rect && clip) {{
+                point = [
+                  Math.floor((Math.max(0, rect.left, clip.left) + Math.min(innerWidth, rect.right, clip.right))/2),
+                  Math.floor((Math.max(0, rect.top, clip.top) + Math.min(innerHeight, rect.bottom, clip.bottom))/2),
+                ];
+            }}
+            const hit = point && document.elementFromPoint(...point);
+            const control = id => document.getElementById(id);
+            const role = node => !node ? null : node === canvas ? 'canvas' :
+              node === control('ime-input') ? 'ime' : node === control('app-header') ? 'header' :
+              node.closest('#terminal-stage') ? 'terminal-stage' :
+              node.closest('#terminal-history') ? 'history' : node.tagName;
+            const chat = control('active-pane')?.dataset.chatSurface;
+            const value = id => {{
+                const raw = control(id)?.value;
+                return /^[0-9]{{1,3}}$/.test(raw ?? '') ? Number(raw) : null;
+            }};
+            return {{
+                inner: [innerWidth, innerHeight], scale: devicePixelRatio,
+                bodyScroll: Math.round(document.body.scrollTop),
+                rootScroll: Math.round(document.scrollingElement?.scrollTop ?? 0),
+                canvas: box(canvas), viewport: box(viewport), point, hit: role(hit),
+                focused: role(document.activeElement), scroll: viewport ?
+                  [viewport.scrollLeft, viewport.scrollTop, viewport.clientWidth, viewport.clientHeight] : null,
+                terminalHidden: control('terminal-panel')?.hidden,
+                historyOpen: control('terminal-history')?.open,
+                toolsOpen: control('session-tools')?.open,
+                chat: ['prompt', 'fullscreen'].includes(chat) ? chat : null,
+                fit: control('fit-size')?.checked, rows: value('rows'), cols: value('cols'),
+            }};
+        """)
+    except (ProtocolError, OSError):
+        return {"unavailable": True}
+
+
 def click_visible_terminal(driver):
-    point = wait_for(lambda: driver.execute("""
-        const canvas = document.querySelector('main canvas');
-        const rect = canvas.getBoundingClientRect(), clip = canvas.parentElement.getBoundingClientRect();
-        const left = Math.max(0, rect.left, clip.left), right = Math.min(innerWidth, rect.right, clip.right);
-        const top = Math.max(0, rect.top, clip.top), bottom = Math.min(innerHeight, rect.bottom, clip.bottom);
-        if (left >= right || top >= bottom) return null;
-        const x = Math.floor((left + right) / 2), y = Math.floor((top + bottom) / 2);
-        return document.elementFromPoint(x, y) === canvas ? {x, y} : null;
-    """), "terminal canvas has no visible click target")
+    try:
+        point = wait_for(lambda: driver.execute("""
+            const canvas = document.querySelector('main canvas');
+            const rect = canvas.getBoundingClientRect(), clip = canvas.parentElement.getBoundingClientRect();
+            const left = Math.max(0, rect.left, clip.left), right = Math.min(innerWidth, rect.right, clip.right);
+            const top = Math.max(0, rect.top, clip.top), bottom = Math.min(innerHeight, rect.bottom, clip.bottom);
+            if (left >= right || top >= bottom) return null;
+            const x = Math.floor((left + right) / 2), y = Math.floor((top + bottom) / 2);
+            return document.elementFromPoint(x, y) === canvas ? {x, y} : null;
+        """), "terminal canvas has no visible click target")
+    except AssertionError as error:
+        raise AssertionError(str(error), geometry_receipt(driver, "main canvas")) from error
     driver.command("POST", "/actions", {"actions": [{
         "type": "pointer", "id": "terminal-pointer", "parameters": {"pointerType": "mouse"},
         "actions": [
@@ -979,7 +1034,8 @@ finally:
         const x = Math.floor(geo.left + 9.5*12), y = Math.floor(geo.top + (1-Number(canvas.dataset.firstRow))*24 + 12);
         return document.elementFromPoint(x,y) === canvas ? {x,y} : null;
     """)
-    assert point, "history viewport clipped the wide-character selection fixture"
+    assert point, ("history viewport clipped the wide-character selection fixture",
+                   geometry_receipt(driver, "#history-canvas"))
     driver.command("POST", "/actions", {"actions": [{"id": "history-pointer", "type": "pointer",
         "parameters": {"pointerType": "mouse"}, "actions": [
             {"type": "pointerMove", "origin": "viewport", "duration": 0, **point},
@@ -1201,7 +1257,12 @@ def exercise_terminal_shell(driver, owned):
     driver.command("POST", "/window/rect", {"width": 760, "height": 570})
     resized = wait_for(lambda: ((size := displayed_size()) != initial and size),
                        "the live grid did not fit the smaller window")
-    assert report_size("resized-size") == resized
+    reported = report_size("resized-size")
+    assert reported == resized, {
+        "initial": initial, "first_changed": resized, "actual_pty": reported,
+        "at_assertion": displayed_size(),
+        "geometry": geometry_receipt(driver, "#active-pane canvas"),
+    }
 
     driver.type("#ime-input", "stty -echo; printf '\\033[2J\\033[H%s' AETHER_COPY; IFS= read -r clipboard_gate\ue007")
     wait_for(lambda: "cursor row 1, column 12" in state()["cursor"], "copy fixture did not paint")

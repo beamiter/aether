@@ -155,13 +155,12 @@ impl Mouse {
     ) -> Result<bool, String> {
         let terminal = session.terminal();
         let profile = terminal.mouse_report_profile();
-        if profile.is_none() {
-            if !terminal.alternate_scroll_active()
+        if profile.is_none()
+            && (!terminal.alternate_scroll_active()
                 || !matches!(report.kind, Action::WheelUp | Action::WheelDown)
-                || report.button.is_some()
-            {
-                return Ok(false);
-            }
+                || report.button.is_some())
+        {
+            return Ok(false);
         }
         if generation(terminal) != Some(report.generation) {
             return Ok(false);
