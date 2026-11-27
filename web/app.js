@@ -13,7 +13,7 @@ import {installInlineHistory} from './inline-history.js';
 import {installCommandBlocks} from './command-blocks.js';
 import {installTerminalChat,validateChatStatus} from './terminal-chat.js';
 import {installWorkflows} from './workflows.js';
-import {plainLocalTab,readLocalShellLayout,saveLocalShellLayout,validPaneId,MAX_LOCAL_SHELLS,validLocalGeometry,localSplitPair} from './local-layout.js';
+import {plainLocalTab,readLocalShellLayout,saveLocalShellLayout,readThreePaneLayout,saveThreePaneLayout,validPaneId,MAX_LOCAL_SHELLS,validLocalGeometry,localSplitPair} from './local-layout.js';
 import {acceptFull,acceptUpdate,clearPaint,paint} from './frames.js'; import {installIme} from './ime.js';
 import {acceptChannelFrame,channelCounter,CHANNEL_RENDITION_VERSION} from './frames-v4.js';
 const canvas=document.querySelector('canvas'),status=document.querySelector('#status'),button=document.querySelector('#demo');
@@ -162,7 +162,7 @@ const Channel=globalThis.__TAURI__?.core?.Channel;
 const channelSnapshots=()=>typeof Channel==='function'?{frameVersion:CHANNEL_RENDITION_VERSION}:{};
 const acceptAttachedSnapshot=(frame,attachment,options)=>options.frameVersion===CHANNEL_RENDITION_VERSION
   ?acceptChannelFrame(null,frame,{...attachment,frameVersion:options.frameVersion},true):acceptFull(null,frame,attachment);
-let savedLayout=invoke?readLocalShellLayout():null,protectSavedLayout=false;
+let savedLayout=invoke?(threePanePreview?readThreePaneLayout():null)??readLocalShellLayout():null,protectSavedLayout=false;
 const sshCommands={poll_shell:'poll',ack_shell:'ack',shell_status:'status',history_shell:'history',recover_shell:'recover',detach_shell:'detach',close_shell:'close',write_shell:'write',key_shell:'key',text_shell:'text',paste_shell:'paste',resize_shell:'resize',focus_shell:'focus',mouse_shell:'mouse'};
 function setOpenDisabled(disabled) {
   open.disabled=openIntegrated.disabled=openSsh.disabled=sshHost.disabled=disabled||!invoke;
@@ -253,7 +253,15 @@ function persistLocalLayout(deliberate){
     next.tabs=configurations.map((tab,index)=>({...tab,geometry:localTabGeometry.get(epochs[index])}));
     next.panes=split?splitEpochs.map(number=>epochs.indexOf(number)):[];
   }
-  const stored=saveLocalShellLayout(next);
+  if(threePanePreview&&tripleEpochs.length){
+    if(deliberate||!complete||!epochs.includes(epoch))return false;
+    const triple=tripleEpochs.map(number=>epochs.indexOf(number));
+    if(triple.some(index=>index<0))return false;
+    const preview={tabs:next.tabs,active,triple};
+    if(!saveThreePaneLayout(preview))return false;
+    savedLayout=preview;renderSavedLayout();return true;
+  }
+  const stored=saveLocalShellLayout(next)&&(!threePanePreview||saveThreePaneLayout(null));
   if(deliberate&&!stored)return false;
   savedLayout=next;
   if(deliberate)protectSavedLayout=false;
@@ -400,7 +408,7 @@ async function toggleTriple(){
       try{await syncObserver(stream);}catch{ /* Output authority is unchanged. */ }
       if(owner===attachment)status.textContent=`Three panes unavailable: ${String(error?.message??error)}`;
     }
-  }finally{settingSplit=false;renderSplit();renderSavedLayout();}
+  }finally{settingSplit=false;renderSplit();recordLocalLayout();}
 }
 tripleToggle.addEventListener('click',toggleTriple);
 passivePanes.forEach(({focus,canvas:surface},index)=>{
@@ -947,7 +955,7 @@ restoreLayout.addEventListener('click',async()=>{
   if(retainedLayoutBlocked||restoreLayout.disabled||!savedLayout||owner||localTabEpochs.size||restoringLocalLayout)return;
   const layout=savedLayout;
   protectSavedLayout=true;
-  splitEnabled=layout.split;splitLayout=allocateLayoutToken();
+  splitEnabled=!!layout.split;splitLayout=allocateLayoutToken();
   restoringLocalLayout=true;
   setOpenDisabled(true);attach.disabled=button.disabled=true;
   status.textContent='Restoring shell tabs…';
@@ -983,8 +991,13 @@ restoreLayout.addEventListener('click',async()=>{
       if(changingTab)return;
       if(owner.epoch!==created[layout.active]||keyQueue.locked)throw new Error(status.textContent);
     }
+    if(layout.triple){
+      if(!localStream?.ready||localTransport!=='channel')throw new Error('Three panes require the local output stream.');
+      tripleEpochs=layout.triple.map(index=>created[index]);
+    }
     renderSplit();
     if(localStream)await syncObserver(localStream);
+    if(layout.triple&&(!tripleIsVisible()||!localStream?.ready))throw new Error('Three pane output was not confirmed.');
     complete=true;
     status.textContent=layout.tabs.length===1?'Opened one fresh shell in the saved layout.':layout.tabs.length===2?'Opened two fresh shells in the saved layout.':`Opened ${layout.tabs.length} fresh shells in the saved layout.`;
   }catch(e){

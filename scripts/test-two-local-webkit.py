@@ -3714,7 +3714,7 @@ def private_accessibility_address():
     return address.unpack()[0]
 
 
-def exercise_three_shells(driver, owned, backend):
+def exercise_three_shells(driver, owned, backend, binary):
     """Three real PTYs, two independently updated passive canvases and one writer."""
     assert driver.execute("return document.querySelector('#split-three-local').hidden;")
     origin = driver.execute("return performance.timeOrigin;")
@@ -3826,6 +3826,45 @@ def exercise_three_shells(driver, owned, backend):
     wait_for(lambda: state()["current_tab"] == tabs[2] and state()["writable"] and
              driver.execute("return document.querySelector('#terminal-panes').dataset.triple;") == "true",
              "third shell did not return to its preview slot")
+    prior = [*identities, parked_id]
+    forbidden = owned / "three-restore-must-not-run"
+    driver.type("#input", f"printf replayed > {shlex.quote(str(forbidden))}")
+    driver.close()
+    for pid, stamp in prior:
+        wait_for(lambda: birth(pid) != stamp, "old three-pane PTY survived desktop shutdown")
+    driver.open(binary)
+    wait_for(lambda: state()["restore_layout"], "three-pane restore was not offered after reopening")
+    assert not state()["tabs"] and not state()["writable"], "reopening started shells before explicit restore"
+    driver.click("#restore-local-layout")
+    wait_for(lambda: state()["status"] == "Opened 4 fresh shells in the saved layout.",
+             "three-pane restoration did not complete")
+    restored = state()
+    *tabs, parked = restored["tabs"]
+    assert restored["writable"] and restored["current_tab"] == tabs[2]
+    assert restored["draft"] == "" and not forbidden.exists(), "three-pane restore replayed a draft"
+    assert restored["cursor"].startswith("84 × 12"), "third pane's saved terminal size was lost"
+    visible = driver.execute("""
+       const panes = document.querySelector('#terminal-panes');
+       if (panes.dataset.triple !== 'true') return null;
+       return Array.from(panes.querySelectorAll('[data-slot]:not([hidden])'))
+         .sort((a,b)=>Number(a.dataset.slot)-Number(b.dataset.slot))
+         .map(pane=>pane.querySelector('button[id^="focus-preview"]')?.textContent ??
+                     'Focus Shell '+document.querySelector('#local-tab-list [aria-current]').dataset.epoch);
+    """)
+    assert visible == [f"Focus Shell {tab}" for tab in tabs], "restored slots included the parked tab"
+    fresh = []
+    for number, tab in enumerate([*tabs, parked]):
+        click_tab(driver, tab)
+        assert state()["draft"] == ""
+        fresh.append(write_from_current_tab(driver, owned / f"three-restored-{number}.pid"))
+        wait_for(lambda: state()["draft"] == "", "restored shell command still pending")
+    assert len(set([*prior, *fresh])) == 8 and not forbidden.exists()
+    identities, parked_id = fresh[:3], fresh[3]
+    click_tab(driver, tabs[2])
+    print(json.dumps({"case": "AETHER.THREE_PANES.RESTART_LAYOUT", "backend": backend,
+                      "fresh_shells_after_explicit_restore": True, "visible_order_and_parked_tab_preserved": True,
+                      "saved_active_size_and_draft_boundary_preserved": True}), flush=True)
+
     driver.click("#close")
     wait_for(lambda: state()["current_tab"] == tabs[1] and state()["writable"] and
              state()["split"] == "right" and set(state()["tabs"]) == {tabs[0], tabs[1], parked},
@@ -3921,7 +3960,7 @@ def run(binary, jsh, workspace, api, native, notebook=False, output_review=False
                 driver.open(binary, fit=shell_chrome_only)
                 wait_for(lambda: opened_page(driver), "embedded Aether tauri: page did not load")
                 if three_shells_only:
-                    exercise_three_shells(driver, owned, backend)
+                    exercise_three_shells(driver, owned, backend, binary)
                     return
                 if shell_chrome_only:
                     exercise_terminal_shell(driver, owned)

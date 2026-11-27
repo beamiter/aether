@@ -136,3 +136,49 @@ export function saveLocalShellLayout(layout, environment = globalThis) {
     return false;
   }
 }
+
+// The opt-in L preview has a separate record so older builds can keep
+// reading their last supported layout. A later older-build write wins.
+const previewKey = 'aether.local-shell-layout.preview-v1';
+
+function layoutSource(storage) {
+  const modern = storage.getItem(modernKey);
+  const legacy = storage.getItem(legacyKey);
+  if ((modern?.length ?? 0) > 4096 || (legacy?.length ?? 0) > 2048) return null;
+  return JSON.stringify([modern, legacy, storage.getItem('aether.split-axis') === 'vertical']);
+}
+
+function threePaneRecord(layout) {
+  if (!layout || !Array.isArray(layout.triple) || layout.triple.length !== 3 ||
+      new Set(layout.triple).size !== 3 || !layout.triple.includes(layout.active)) return null;
+  const clean = encodeLayout({tabs: layout.tabs, active: layout.active, split: false, panes: []});
+  if (!clean || layout.triple.some(i => !Number.isInteger(i) || i < 0 || i >= clean.tabs.length)) return null;
+  return {tabs: clean.tabs, active: clean.active, triple: [...layout.triple]};
+}
+
+export function readThreePaneLayout(environment = globalThis) {
+  try {
+    const storage = environment.localStorage, source = layoutSource(storage);
+    const raw = storage.getItem(previewKey);
+    if (!source || !raw || raw.length > 8192) return null;
+    const value = JSON.parse(raw);
+    if (!value || value.version !== 1 || value.source !== source) return null;
+    return threePaneRecord(value.layout);
+  } catch { return null; }
+}
+
+export function saveThreePaneLayout(layout, environment = globalThis) {
+  try {
+    const storage = environment.localStorage;
+    if (layout === null) {
+      if (storage.getItem(previewKey) != null) storage.removeItem(previewKey);
+      return true;
+    }
+    const source = layoutSource(storage), clean = threePaneRecord(layout);
+    if (!source || !clean) return false;
+    const raw = JSON.stringify({version: 1, source, layout: clean});
+    if (raw.length > 8192) return false;
+    storage.setItem(previewKey, raw);
+    return true;
+  } catch { return false; }
+}

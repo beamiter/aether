@@ -12,7 +12,7 @@ import {installInlineHistory} from '../web/inline-history.js';
 import {installCommandBlocks} from '../web/command-blocks.js';
 import {installTerminalChat,validateChatStatus} from '../web/terminal-chat.js';
 import {installWorkflows} from '../web/workflows.js';
-import {plainLocalTab,readLocalShellLayout,saveLocalShellLayout,MAX_LOCAL_SHELLS,validLocalGeometry,localSplitPair} from '../web/local-layout.js';
+import {plainLocalTab,readLocalShellLayout,saveLocalShellLayout,readThreePaneLayout,saveThreePaneLayout,MAX_LOCAL_SHELLS,validLocalGeometry,localSplitPair} from '../web/local-layout.js';
 import {acceptFull,acceptUpdate,clearPaint,paint as paintFrame} from '../web/frames.js'; import {installIme} from '../web/ime.js';
 import {acceptChannelFrame,channelCounter,CHANNEL_RENDITION_VERSION} from '../web/frames-v4.js';
 import {packedRow} from './fixtures/packed-channel.js';
@@ -58,7 +58,7 @@ function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsuppo
  const document={querySelector:el,querySelectorAll:()=>[],createElement:element,body:element(),activeElement:null,hidden:false,hasFocus:()=>true,addEventListener:listen(pageEvents)};
  const context={makePassiveSurfaces,validateReloadView,retainedReloadView,saveReloadTicket,takeReloadTicket,installFilePreviewPanel:()=>({dismiss(){}}),document,addEventListener:listen(windowEvents),__TAURI__:{core:{invoke,Channel}},acceptFull,acceptUpdate,clearPaint,acceptChannelFrame,channelCounter,CHANNEL_RENDITION_VERSION,installIme,installHistory,installCommandBlocks,installTerminalChat,installTerminalShell,installWorkflows,validateChatStatus,installPasteReview,installTerminalFocus,installTerminalMouse,installTerminalSelection,dimensions,resizeQueue,cursorTarget,terminalCellAt,viewportDimensions,paint,TextEncoder:Encoder,TextDecoder,
  installInlineHistory,
- plainLocalTab,MAX_LOCAL_SHELLS,validLocalGeometry,localSplitPair,readLocalShellLayout:()=>readLocalShellLayout(storage),saveLocalShellLayout:value=>saveLocalShellLayout(value,storage),
+ plainLocalTab,MAX_LOCAL_SHELLS,validLocalGeometry,localSplitPair,readLocalShellLayout:()=>readLocalShellLayout(storage),saveLocalShellLayout:value=>saveLocalShellLayout(value,storage),readThreePaneLayout:()=>readThreePaneLayout(storage),saveThreePaneLayout:value=>saveThreePaneLayout(value,storage),
  setInterval(fn){timers.set(++id,fn);return id},clearInterval(i){timers.delete(i)},setTimeout,...animation};
  vm.runInNewContext(fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8').replace(/^import .*\n/gm,''),context);
  return {el,timers,keydown(event){for(const fn of pageEvents.get('keydown')??[])fn(event);},click:s=>el(s).handlers.click(),submit:()=>el('#command').handlers.submit({preventDefault(){}}),submitSsh:()=>el('#ssh-terminal-form').handlers.submit({preventDefault(){}}),
@@ -1468,6 +1468,72 @@ function layoutStorage(layout){
  saveLocalShellLayout(layout,environment);
  return environment;
 }
+
+test('preview preference preserves the older record and detects a later older-build edit',()=>{
+ const geometry={rows:24,cols:80},tab={...plainLocalTab,geometry};
+ const legacy={tabs:[tab,tab],active:0,split:true,panes:[0,1]};
+ const storage=layoutStorage(legacy);
+ const key='aether.local-shell-layout.v5';
+ const original=storage.localStorage.getItem(key);
+ const preview={tabs:[tab,tab,tab,tab],active:2,triple:[2,0,1]};
+ assert.equal(saveThreePaneLayout({...preview,triple:[2,0,0]},storage),false);
+ assert.equal(saveThreePaneLayout(preview,storage),true);
+ assert.deepEqual(readThreePaneLayout(storage)?.triple,[2,0,1]);
+ assert.equal(storage.localStorage.getItem(key),original);
+ assert.equal(saveLocalShellLayout({...legacy,active:1},storage),true);
+ assert.equal(readThreePaneLayout(storage),null);
+ assert.equal(readLocalShellLayout(storage).active,1);
+ assert.equal(saveThreePaneLayout(preview,storage),true);
+ assert.equal(saveThreePaneLayout(null,storage),true);
+ assert.equal(readThreePaneLayout(storage),null);
+ assert.equal(readLocalShellLayout(storage).active,1);
+});
+
+test('explicit preview restore brings back ordered visible slots and leaves the fourth tab parked',async()=>{
+ const raw=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+ const geometry={rows:raw.rows.length,cols:raw.cols};
+ const legacy={tabs:[{...plainLocalTab,geometry}],active:0,split:false,panes:[]};
+ const tabs=Array.from({length:4},()=>({...plainLocalTab,geometry,paneId:undefined}));
+ const layout={tabs,active:0,triple:[2,0,1]};
+ const storage=layoutStorage(legacy);
+ storage.localStorage.setItem('aether.preview-three-panes','1');
+ assert.equal(saveThreePaneLayout(layout,storage),true);
+ const calls=[],owners=new Map();let next=10;
+ const create=()=>{const epoch=++next;const owner={session:epoch.toString(16).repeat(32),epoch,generation:1};owners.set(epoch,owner);return owner;};
+ const frame=owner=>channelSnapshot({...raw,session:owner.session,epoch:owner.epoch});
+ const h=harness(async(name,args)=>{
+  calls.push([name,args]);
+  if(name==='list_local_shells')return [];
+  if(name==='open_shell')return create();
+  if(name==='activate_local_tab'){
+   const before=owners.get(args.targetEpoch);
+   const owner=before?{...before,generation:before.generation+1}:create();
+   owners.set(owner.epoch,owner);
+   return {Ok:{owner,frame:frame(owner),input_allowed:true}};
+  }
+  if(name==='subscribe_local_shell'){
+   await args.stream.onmessage({owner:args.owner,kind:'update',sequence:'1',frame:frame(args.owner),
+    preview:null,status:channelHealth(args.owner.epoch)});
+   return null;
+  }
+  if(['ack_shell','ack_local_stream','set_local_observer','set_local_observers'].includes(name))return null;
+  throw Error(name);
+ },undefined,undefined,undefined,storage,testChannel(),storage);
+ await tick();
+ assert.equal(h.el('#restore-local-layout').hidden,false);
+ assert.ok(!calls.some(([name])=>name==='open_shell'));
+ await h.click('#restore-local-layout');
+ assert.equal(h.el('#status').textContent,'Opened 4 fresh shells in the saved layout.');
+ assert.deepEqual(h.el('#local-tab-list').options.map(tab=>tab.dataset.epoch),['11','12','13','14']);
+ assert.equal(h.el('#terminal-panes').dataset.triple,'true');
+ assert.equal(h.el('#active-pane').dataset.slot,'1');
+ const observers=calls.findLast(([name])=>name==='set_local_observers')[1].observers;
+ assert.deepEqual(Array.from(observers,target=>target.epoch),[13,12]);
+ assert.equal(h.el('#input').disabled,false);
+ assert.ok(!calls.some(([name])=>['write_shell','key_shell','text_shell','paste_shell'].includes(name)));
+ assert.deepEqual(readThreePaneLayout(storage),layout);
+ assert.deepEqual(readLocalShellLayout(storage),legacy);
+});
 
 test('restore creates fresh tabs with their saved shell and presentation, then selects the saved position',async()=>{
  const layout={tabs:[plainLocalTab,{shell:'jsh',presentation:'chat'}],active:0,split:false};

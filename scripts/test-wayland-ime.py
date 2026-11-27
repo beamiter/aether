@@ -379,7 +379,7 @@ def run(args):
         cleanup.callback(driver.close)
         wait_for(lambda: fixtures["opened_page"](driver), "embedded Aether page did not load")
         if args.three_shells_preview:
-            fixtures["exercise_three_shells"](driver, root, "wayland")
+            fixtures["exercise_three_shells"](driver, root, "wayland", binary)
             return
         swaymsg = Path(args.sway).with_name("swaymsg")
         if args.companion_daemon:
