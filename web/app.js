@@ -1,3 +1,4 @@
+import {directionalPaneNeighbor,retainedPaneTree} from './pane-geometry.js';
 import {makePassiveSurfaces} from './passive-surfaces.js';
 import {installTerminalMouse} from './terminal-mouse.js';
 import {installTerminalFocus} from './terminal-focus.js';
@@ -1825,22 +1826,10 @@ async function copyTerminalSelection(){
 // Resolve the visible neighbor, never the next tab in the parked roster.
 function directionalPane(direction){
   if(splitToggle.disabled)return null;
-  if(tripleIsVisible()){
-    // The left leaf spans both rows: right from it deterministically picks
-    // the upper right leaf. The two right leaves are vertical neighbors.
-    const slot=tripleEpochs.indexOf(epoch);
-    const next=[
-      {right:1},
-      {left:0,down:2},
-      {left:0,up:1},
-    ][slot]?.[direction];
-    return tripleEpochs[next]??null;
-  }
-  const peer=observerTarget();
-  if(!peer)return null;
-  const first=splitEpochs[0]===epoch;
-  const towardPeer=splitAxis==='vertical'?(first?'down':'up'):(first?'right':'left');
-  return direction===towardPeer?peer.epoch:null;
+  const three=tripleIsVisible();
+  if(!three&&!observerTarget())return null;
+  const tree=retainedPaneTree(three?tripleEpochs:splitEpochs,splitAxis,three);
+  return directionalPaneNeighbor(tree,epoch,direction);
 }
 const directionalPaneActions=['left','right','up','down'].map(direction=>({
   label:`Focus pane ${direction}`,
