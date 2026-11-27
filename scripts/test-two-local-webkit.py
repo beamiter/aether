@@ -3972,6 +3972,23 @@ def exercise_three_shells(driver, owned, backend, binary):
     wait_for(lambda: state()["current_tab"] == tabs[2] and state()["writable"] and
              driver.execute("return document.querySelector('#terminal-panes').dataset.triple;") == "true",
              "third shell did not return to its preview slot")
+    # Use actual WebDriver pointer + key input to pick a directional action,
+    # and have the selected shell attest its identity after each hop.
+    for direction, slot in (("up", 1), ("left", 0), ("right", 1), ("down", 2)):
+        driver.execute("document.body.scrollTop = 0;")
+        driver.click("#command-palette-open")
+        wait_for(lambda: state()["focused"] == "command-palette-query",
+                 "directional action did not focus the command palette")
+        driver.type("#command-palette-query", f"focus pane {direction}\ue007")
+        wait_for(lambda: state()["current_tab"] == tabs[slot] and
+                         state()["focused"] == "ime-input" and state()["writable"],
+                 f"directional {direction} did not activate the expected visible PTY")
+        assert write_from_current_tab(driver, owned / f"three-direction-{direction}.pid") == identities[slot]
+        wait_for(lambda: state()["draft"] == "", "directional input receipt still pending")
+    assert parked in state()["tabs"] and birth(parked_id[0]) == parked_id[1]
+    print(json.dumps({"case": "AETHER.THREE_PANES.DIRECTIONAL_FOCUS", "backend": backend,
+                      "four_palette_directions": True, "visible_pty_identity_and_focus": True,
+                      "parked_pty_retained": True}), flush=True)
     prior = [*identities, parked_id]
     forbidden = owned / "three-restore-must-not-run"
     driver.type("#input", f"printf replayed > {shlex.quote(str(forbidden))}")

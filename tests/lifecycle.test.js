@@ -37,7 +37,7 @@ function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsuppo
   return result;
  };
  const elements=new Map(),timers=new Map();let id=0;
- const element=()=>({disabled:false,value:'',textContent:'',style:{},dataset:{},handlers:{},classList:{toggle(){}},focus(){},append(){},scrollTo(){},attributes:new Map(),setAttribute(name,value){this.attributes.set(name,String(value));},removeAttribute(name){this.attributes.delete(name);},replaceChildren(...options){this.options=options;},addEventListener(name,fn){this.handlers[name]=fn}});
+ const element=()=>({children:[],disabled:false,value:'',textContent:'',style:{},dataset:{},handlers:{},classList:{toggle(){}},focus(){},append(child){this.children.push(child);},showModal(){this.open=true;},close(){this.open=false;},click(){return this.handlers.click?.();},getAttribute(name){return this.attributes.get(name)??null;},scrollTo(){},attributes:new Map(),setAttribute(name,value){this.attributes.set(name,String(value));},removeAttribute(name){this.attributes.delete(name);},replaceChildren(...options){this.options=options;},addEventListener(name,fn){this.handlers[name]=fn}});
  const el=selector=>{if(!elements.has(selector))elements.set(selector,element());return elements.get(selector)};
  const canvasEvents=new Map();
  if (animation.mouseCanvas) {
@@ -653,6 +653,60 @@ test('three visible shells rotate a single writer and ACK a retired preview on t
  assert.equal(h.el('#preview-pane-1').hidden,false);
  assert.equal(h.el('#preview-pane-2').hidden,false);
  assert.deepEqual(writes,[3,1]);
+});
+
+test('directional palette actions move the single writer by visible layout, not the tab roster',async()=>{
+ const own=(epoch,generation)=>({session:String(epoch).repeat(32),epoch,generation});
+ const raw=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+ const activations=[],writes=[];
+ let opened=1,generation=1;
+ const h=harness(async(name,args)=>{
+  switch(name){
+   case 'open_shell':return own(1,1);
+   case 'activate_local_tab':{
+    const next=args.targetEpoch??++opened, owner=own(next,++generation);
+    activations.push(next);
+    return {Ok:{owner,frame:channelSnapshot({...raw,session:owner.session,epoch:next}),input_allowed:true}};
+   }
+   case 'write_shell':writes.push(args.epoch);return args.bytes.length;
+   default:return null;
+  }
+ },undefined,undefined,undefined,{},testChannel(),
+ {localStorage:{getItem:key=>key==='aether.preview-three-panes'?'1':null}});
+ let focused=0;
+ h.el('#ime-input').focus=()=>focused++;
+ const choose=async(direction,active)=>{
+  h.click('#command-palette-open');
+  const query=h.el('#command-palette-query'), dialog=h.el('#command-palette');
+  query.value='focus pane '+direction;query.handlers.input();
+  const results=h.el('#command-palette-results').options;
+  assert.equal(results.length,1);
+  const button=results[0].children[0];
+  assert.equal(button.getAttribute('aria-disabled'),active?null:'true');
+  const count=activations.length, previous=focused;
+  await button.click();await tick();
+  assert.equal(activations.length,count+(active?1:0));
+  assert.equal(dialog.open,!active);
+  if(active)assert.ok(focused>previous,'the selected pane owns keyboard focus');
+  else h.click('#command-palette-open');
+ };
+ await h.click('#open');
+ for(let i=0;i<3;i++)await h.click('#new-local-tab');
+ await h.click('#split-three-local'); // Shell 4 is lower-right; shell 3 is parked.
+ await choose('right',false);
+ await choose('up',true);assert.equal(activations.at(-1),2);
+ await choose('left',true);assert.equal(activations.at(-1),1);
+ await choose('down',false);
+ await choose('right',true);assert.equal(activations.at(-1),2);
+ h.el('#input').value='write only to the selected pane';await h.submit();
+ assert.deepEqual(writes,[2]);
+ assert.equal(h.el('#terminal-panes').dataset.triple,'true');
+ await h.click('#split-three-local'); // A non-split tab roster offers no directions.
+ await choose('left',false);
+ await h.click('#split-local');
+ await choose('up',false);
+ await choose('left',true);assert.equal(activations.at(-1),1);
+ assert.equal(h.el('#terminal-panes').dataset.split,'left');
 });
 
 for(const [closed,expectedSplit,expectedPeer] of [[3,'right',1],[1,'top',3]]){

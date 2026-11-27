@@ -1805,6 +1805,35 @@ async function copyTerminalSelection(){
     if(owner===attachment)status.textContent=String(error?.message??error);
   }
 }
+// Resolve the visible neighbor, never the next tab in the parked roster.
+function directionalPane(direction){
+  if(splitToggle.disabled)return null;
+  if(tripleIsVisible()){
+    // The left leaf spans both rows: right from it deterministically picks
+    // the upper right leaf. The two right leaves are vertical neighbors.
+    const slot=tripleEpochs.indexOf(epoch);
+    const next=[
+      {right:1},
+      {left:0,down:2},
+      {left:0,up:1},
+    ][slot]?.[direction];
+    return tripleEpochs[next]??null;
+  }
+  const peer=observerTarget();
+  if(!peer)return null;
+  const first=splitEpochs[0]===epoch;
+  const towardPeer=splitAxis==='vertical'?(first?'down':'up'):(first?'right':'left');
+  return direction===towardPeer?peer.epoch:null;
+}
+const directionalPaneActions=['left','right','up','down'].map(direction=>({
+  label:`Focus pane ${direction}`,
+  enabled:()=>directionalPane(direction)!==null,
+  unavailableReason:()=> 'No visible local pane in this direction.',
+  run:()=>{
+    const target=directionalPane(direction);
+    if(target!==null)return startLocalTab(target,{focusTerminal:true});
+  },
+}));
 const actions=[
   {label:'New local shell',hint:'Ctrl+Shift+T',keys:['Shift+t'],
     enabled:()=>owner?!newTab.disabled:!open.disabled,run:()=>(owner?newTab:open).click()},
@@ -1819,6 +1848,7 @@ const actions=[
   {label:'Split left and right',hint:'Ctrl+Shift+E',keys:['Shift+e'],enabled:()=>!splitToggle.disabled,unavailableReason:()=> 'Requires two available local shell tabs.',run:()=>setSplit('horizontal')},
   {label:'Split top and bottom',hint:'Ctrl+Shift+D',keys:['Shift+d'],enabled:()=>!splitToggle.disabled,unavailableReason:()=> 'Requires two available local shell tabs.',run:()=>setSplit('vertical')},
   clickAction('Toggle three panes','#split-three-local'),
+  ...directionalPaneActions,
   {label:'Return to one pane',enabled:()=>(splitEnabled||tripleIsVisible())&&!splitToggle.disabled,run:()=>setSplit(null)},
   {label:'Search terminal history',hint:'Ctrl+Shift+F',keys:['Shift+f'],enabled:canUseHistory,unavailableReason:()=> 'Requires a local terminal with searchable history.',run:()=>showHistory(true)},
   {label:'Copy terminal selection',hint:'Ctrl+Shift+C',keys:['Shift+c'],
