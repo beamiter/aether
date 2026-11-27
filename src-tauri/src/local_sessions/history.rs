@@ -71,8 +71,15 @@ struct Checkpoint {
 struct Archive {
     path: PathBuf,
     pane: String,
-    _lease: File,
+    lease: File,
     closed: AtomicBool,
+}
+
+impl Drop for Archive {
+    fn drop(&mut self) {
+        // A PTY child can briefly retain the open file description between fork and exec.
+        let _ = File::unlock(&self.lease);
+    }
 }
 
 impl Archive {
@@ -106,7 +113,7 @@ impl Archive {
         Ok(Self {
             path: directory.join(format!("{pane}.json")),
             pane,
-            _lease: lease,
+            lease,
             closed: AtomicBool::new(false),
         })
     }
@@ -315,8 +322,10 @@ mod tests {
             io::ErrorKind::InvalidData
         );
         let path = archive.path.clone();
+        let inherited_lease = archive.lease.try_clone().unwrap();
         drop(archive);
-        assert!(Archive::lock(request()).is_ok());
+        Archive::lock(request()).expect("the lock is released even with a duplicate descriptor");
+        drop(inherited_lease);
         assert_eq!(std::fs::read(path).unwrap(), bytes);
     }
 }
