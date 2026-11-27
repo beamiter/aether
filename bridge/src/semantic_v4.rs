@@ -16,7 +16,7 @@ use jterm_protocol::{
     terminal::RgbColor,
 };
 use std::{
-    collections::{btree_map::Entry, BTreeMap, BTreeSet, HashMap},
+    collections::{btree_map::Entry, BTreeMap, BTreeSet},
     io::{self, Write},
     sync::{Arc, OnceLock},
 };
@@ -459,22 +459,25 @@ fn pack_row(row: wire::RowData<EncodedCell<'_>>) -> EncodedRow<'_> {
     // early and send the ordinary cell shape for such rows.
     let max_styles = (row.cells.len() / 4).clamp(1, 32);
     let mut styles = Vec::new();
-    let mut style_indices = HashMap::new();
     let mut last = None;
-    let mut indices = Vec::with_capacity(row.cells.len());
-    for cell in &row.cells {
+    // Validated rows fit in the stack buffer. The bounded palette also
+    // serves as the lookup table for styles that recur in separate runs.
+    let mut indices = [0u16; wire::MAX_COLUMNS];
+    let Some(indices) = indices.get_mut(..row.cells.len()) else {
+        return EncodedRow::Cells(row);
+    };
+    for (cell, index) in row.cells.iter().zip(indices.iter_mut()) {
         let paint = packed_style(cell);
-        let index = match last {
+        *index = match last {
             Some((previous, index)) if previous == paint => index,
             _ => {
-                let index = if let Some(&index) = style_indices.get(&paint) {
-                    index
+                let index = if let Some(index) = styles.iter().position(|style| *style == paint) {
+                    index as u16
                 } else {
                     if styles.len() == max_styles {
                         return EncodedRow::Cells(row);
                     }
                     let index = styles.len() as u16;
-                    style_indices.insert(paint, index);
                     styles.push(paint);
                     index
                 };
@@ -482,10 +485,9 @@ fn pack_row(row: wire::RowData<EncodedCell<'_>>) -> EncodedRow<'_> {
                 index
             }
         };
-        indices.push(index);
     }
     let mut runs = Vec::new();
-    for (cell, index) in row.cells.into_iter().zip(indices) {
+    for (cell, index) in row.cells.into_iter().zip(indices.iter().copied()) {
         if let (1, EncodedText::Scalar(character), Some(last)) =
             (cell.width, &cell.text, runs.last_mut())
         {
@@ -590,93 +592,91 @@ impl<'a> Projection<'a> {
         hyperlink: impl Fn(HyperlinkId) -> Option<&'a str>,
         mut underline_runs: &[UnderlineColorRun],
     ) -> Result<Vec<EncodedCell<'a>>, String> {
-        row.cells
-            .iter()
-            .enumerate()
-            .map(|(column, cell)| {
-                // Columns are visited in order, so each color run only
-                // needs to be found once per row.
-                while underline_runs
-                    .first()
-                    .is_some_and(|run| usize::from(run.end) <= column)
-                {
-                    underline_runs = &underline_runs[1..];
+        let columns = row.cells.len();
+        let mut cells = Vec::with_capacity(columns);
+        for (column, cell) in row.cells.iter().enumerate() {
+            // Columns are visited in order, so each color run only
+            // needs to be found once per row.
+            while underline_runs
+                .first()
+                .is_some_and(|run| usize::from(run.end) <= column)
+            {
+                underline_runs = &underline_runs[1..];
+            }
+            let underline_color = underline_runs
+                .first()
+                .filter(|run| usize::from(run.start) <= column)
+                .map(|run| paint_rgb(run.color, true, self.colors));
+            let flags = cell.flags;
+            let width = cell_width(flags, column, columns);
+            let text = if width == 0 {
+                EncodedText::Scalar(' ')
+            } else {
+                cluster(column).map_or(EncodedText::Scalar(cell.character), EncodedText::Cluster)
+            };
+            self.text_bytes += text.len();
+            if text.len() > wire::MAX_CLUSTER_BYTES || self.text_bytes > wire::MAX_TEXT_BYTES {
+                return Err("terminal frame exceeds text limit".into());
+            }
+            let hyperlink_id = if cell.hyperlink_id.is_none() {
+                None
+            } else {
+                let id = cell.hyperlink_id.as_raw();
+                if usize::from(id) > wire::MAX_HYPERLINKS {
+                    return Err("terminal hyperlink ID exceeds limit".into());
                 }
-                let underline_color = underline_runs
-                    .first()
-                    .filter(|run| usize::from(run.start) <= column)
-                    .map(|run| paint_rgb(run.color, true, self.colors));
-                let flags = cell.flags;
-                let width = cell_width(flags, column, row.cells.len());
-                let text = if width == 0 {
-                    EncodedText::Scalar(' ')
-                } else {
-                    cluster(column)
-                        .map_or(EncodedText::Scalar(cell.character), EncodedText::Cluster)
-                };
-                self.text_bytes += text.len();
-                if text.len() > wire::MAX_CLUSTER_BYTES || self.text_bytes > wire::MAX_TEXT_BYTES {
-                    return Err("terminal frame exceeds text limit".into());
-                }
-                let hyperlink_id = if cell.hyperlink_id.is_none() {
-                    None
-                } else {
-                    let id = cell.hyperlink_id.as_raw();
-                    if usize::from(id) > wire::MAX_HYPERLINKS {
-                        return Err("terminal hyperlink ID exceeds limit".into());
-                    }
-                    if self.last_hyperlink != Some(id) {
-                        if let Entry::Vacant(entry) = self.hyperlinks.entry(id) {
-                            let target = hyperlink(cell.hyperlink_id)
-                                .ok_or("terminal frame has an unresolved hyperlink")?;
-                            self.hyperlink_bytes += target.len();
-                            if target.len() > wire::MAX_HYPERLINK_TARGET_BYTES
-                                || self.hyperlink_bytes > wire::MAX_HYPERLINK_BYTES
-                            {
-                                return Err("terminal frame exceeds hyperlink byte limit".into());
-                            }
-                            entry.insert(target);
+                if self.last_hyperlink != Some(id) {
+                    if let Entry::Vacant(entry) = self.hyperlinks.entry(id) {
+                        let target = hyperlink(cell.hyperlink_id)
+                            .ok_or("terminal frame has an unresolved hyperlink")?;
+                        self.hyperlink_bytes += target.len();
+                        if target.len() > wire::MAX_HYPERLINK_TARGET_BYTES
+                            || self.hyperlink_bytes > wire::MAX_HYPERLINK_BYTES
+                        {
+                            return Err("terminal frame exceeds hyperlink byte limit".into());
                         }
-                        self.last_hyperlink = Some(id);
+                        entry.insert(target);
                     }
-                    Some(id)
-                };
-                let mut foreground = paint_rgb(cell.foreground, true, self.colors);
-                let mut background = paint_rgb(cell.background, false, self.colors);
-                if flags.inverse() {
-                    std::mem::swap(&mut foreground, &mut background);
+                    self.last_hyperlink = Some(id);
                 }
-                let rendition = if self.extended_rendition {
-                    (u8::from(flags.concealed()) * wire::STYLE_CONCEALED)
-                        | (u8::from(flags.overline()) * wire::STYLE_OVERLINE)
-                } else {
-                    0
-                };
-                Ok(wire::CellData {
-                    text,
-                    foreground,
-                    background,
-                    width,
-                    style: u8::from(flags.bold())
-                        | (u8::from(flags.italic()) << 1)
-                        | (u8::from(flags.strikethrough()) << 3)
-                        | (u8::from(flags.dim()) << 4)
-                        | (u8::from(flags.blink()) << 5)
-                        | (u8::from(flags.protected()) << 6)
-                        | rendition,
-                    underline: match flags.underline() {
-                        UnderlineStyle::None => None,
-                        UnderlineStyle::Single => Some(wire::Underline::Single),
-                        UnderlineStyle::Double => Some(wire::Underline::Double),
-                        UnderlineStyle::Curly => Some(wire::Underline::Curly),
-                        UnderlineStyle::Dotted => Some(wire::Underline::Dotted),
-                        UnderlineStyle::Dashed => Some(wire::Underline::Dashed),
-                    },
-                    underline_color,
-                    hyperlink_id,
-                })
-            })
-            .collect()
+                Some(id)
+            };
+            let mut foreground = paint_rgb(cell.foreground, true, self.colors);
+            let mut background = paint_rgb(cell.background, false, self.colors);
+            if flags.inverse() {
+                std::mem::swap(&mut foreground, &mut background);
+            }
+            let rendition = if self.extended_rendition {
+                (u8::from(flags.concealed()) * wire::STYLE_CONCEALED)
+                    | (u8::from(flags.overline()) * wire::STYLE_OVERLINE)
+            } else {
+                0
+            };
+            cells.push(wire::CellData {
+                text,
+                foreground,
+                background,
+                width,
+                style: u8::from(flags.bold())
+                    | (u8::from(flags.italic()) << 1)
+                    | (u8::from(flags.strikethrough()) << 3)
+                    | (u8::from(flags.dim()) << 4)
+                    | (u8::from(flags.blink()) << 5)
+                    | (u8::from(flags.protected()) << 6)
+                    | rendition,
+                underline: match flags.underline() {
+                    UnderlineStyle::None => None,
+                    UnderlineStyle::Single => Some(wire::Underline::Single),
+                    UnderlineStyle::Double => Some(wire::Underline::Double),
+                    UnderlineStyle::Curly => Some(wire::Underline::Curly),
+                    UnderlineStyle::Dotted => Some(wire::Underline::Dotted),
+                    UnderlineStyle::Dashed => Some(wire::Underline::Dashed),
+                },
+                underline_color,
+                hyperlink_id,
+            });
+        }
+        Ok(cells)
     }
 }
 
@@ -820,6 +820,28 @@ mod tests {
     }
 
     #[test]
+    fn packed_runs_reuse_styles_across_nonadjacent_cells() {
+        let mut terminal = jterm_engine::terminal::Terminal::new(1, 16).unwrap();
+        terminal
+            .feed(b"\x1b[31mABCD\x1b[32mEFGH\x1b[31mIJKL\x1b[32mMNOP")
+            .unwrap();
+        let (_, encoded) = encode(
+            None,
+            &terminal.frame().unwrap(),
+            "alternating",
+            wire::RENDITION_VERSION,
+        )
+        .unwrap();
+        let packed: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        let row = &packed["rows"][0];
+        assert_eq!(row["styles"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            row["runs"],
+            serde_json::json!([[0, "ABCD"], [1, "EFGH"], [0, "IJKL"], [1, "MNOP"]])
+        );
+    }
+
+    #[test]
     fn packed_rows_admit_uniform_spans_with_distinct_sampled_styles() {
         let budget = Arc::new(RetainedBytesBudget::new(JSON_WORKSPACE_BYTES));
         let scratch = FrameScratch::reserve_from(&budget).unwrap();
@@ -839,22 +861,26 @@ mod tests {
         assert_eq!(row["runs"].as_array().unwrap().len(), 16);
         assert_eq!(row["runs"][0], serde_json::json!([0, "ABCDEFGH"]));
 
-        terminal.feed(b"\x1b[H").unwrap();
-        for green in 0..128 {
-            terminal
-                .feed(format!("\x1b[38;2;75;{green};123mA").as_bytes())
+        // A uniform prefix can pass sampling and then exceed the palette.
+        for uniform_prefix in [0, 88] {
+            terminal.feed(b"\x1b[H").unwrap();
+            for column in 0..128usize {
+                let green = column.saturating_sub(uniform_prefix);
+                terminal
+                    .feed(format!("\x1b[38;2;75;{green};123mA").as_bytes())
+                    .unwrap();
+            }
+            let (_, encoded) = scratch
+                .encode(
+                    None,
+                    &terminal.frame().unwrap(),
+                    "pixels",
+                    wire::RENDITION_VERSION,
+                )
                 .unwrap();
+            let ordinary: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(ordinary["rows"][0]["cells"].as_array().unwrap().len(), 128);
         }
-        let (_, encoded) = scratch
-            .encode(
-                None,
-                &terminal.frame().unwrap(),
-                "pixels",
-                wire::RENDITION_VERSION,
-            )
-            .unwrap();
-        let ordinary: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(ordinary["rows"][0]["cells"].as_array().unwrap().len(), 128);
     }
 
     #[test]
