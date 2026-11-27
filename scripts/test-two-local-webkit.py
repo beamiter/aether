@@ -796,8 +796,11 @@ def geometry_receipt(driver, selector, point=None):
 def click_visible_terminal(driver):
     try:
         point = wait_for(lambda: driver.execute("""
-            const canvas = document.querySelector('main canvas');
-            const rect = canvas.getBoundingClientRect(), clip = canvas.parentElement.getBoundingClientRect();
+            const canvas = document.querySelector('#active-pane canvas');
+            const viewport = canvas?.closest('.viewport');
+            if (!viewport) return null;
+            // Chat caps the scroll viewport, not the full-height surface wrapper.
+            const rect = canvas.getBoundingClientRect(), clip = viewport.getBoundingClientRect();
             const left = Math.max(0, rect.left, clip.left), right = Math.min(innerWidth, rect.right, clip.right);
             const top = Math.max(0, rect.top, clip.top), bottom = Math.min(innerHeight, rect.bottom, clip.bottom);
             if (left >= right || top >= bottom) return null;
@@ -805,7 +808,7 @@ def click_visible_terminal(driver):
             return document.elementFromPoint(x, y) === canvas ? {x, y} : null;
         """), "terminal canvas has no visible click target")
     except AssertionError as error:
-        raise AssertionError(str(error), geometry_receipt(driver, "main canvas")) from error
+        raise AssertionError(str(error), geometry_receipt(driver, "#active-pane canvas")) from error
     driver.command("POST", "/actions", {"actions": [{
         "type": "pointer", "id": "terminal-pointer", "parameters": {"pointerType": "mouse"},
         "actions": [
@@ -1029,13 +1032,20 @@ finally:
                      "the ordinary history projection did not paint both archived image slices")
     assert first["text"].startswith("x" * 80 + "XY") and "🐍hist-image" in first["text"]
     assert first["width"] == 80 * 12 and first["tile"] < first["page"]
-    point = driver.execute("""
-        const canvas = document.querySelector('#history-canvas'), geo = canvas.getBoundingClientRect();
-        const x = Math.floor(geo.left + 9.5*12), y = Math.floor(geo.top + (1-Number(canvas.dataset.firstRow))*24 + 12);
-        return document.elementFromPoint(x,y) === canvas ? {x,y} : null;
-    """)
-    assert point, ("history viewport clipped the wide-character selection fixture",
-                   geometry_receipt(driver, "#history-canvas"))
+    # Pixels can exist in a virtualized tile outside the window. Bring the
+    # viewport into view, then still perform the real pointer click below.
+    driver.execute("document.querySelector('#history-viewport').scrollIntoView({block:'center'});")
+    def history_target():
+        return driver.execute("""
+            const canvas = document.querySelector('#history-canvas'), geo = canvas.getBoundingClientRect();
+            const x = Math.floor(geo.left + 9.5*12), y = Math.floor(geo.top + (1-Number(canvas.dataset.firstRow))*24 + 12);
+            return document.elementFromPoint(x,y) === canvas ? {x,y} : null;
+        """)
+
+    try:
+        point = wait_for(history_target, "history viewport clipped the wide-character selection fixture")
+    except AssertionError as error:
+        raise AssertionError(str(error), geometry_receipt(driver, "#history-canvas")) from error
     driver.command("POST", "/actions", {"actions": [{"id": "history-pointer", "type": "pointer",
         "parameters": {"pointerType": "mouse"}, "actions": [
             {"type": "pointerMove", "origin": "viewport", "duration": 0, **point},
@@ -1254,13 +1264,42 @@ def exercise_terminal_shell(driver, owned):
     keys(ctrl, shift, "T")
     first = wait_for(session, "new-shell shortcut did not focus the PTY")
     initial = wait_for(displayed_size, "the opening shell never painted a grid")
+    initial_viewport = geometry_receipt(driver, "#active-pane canvas").get("inner")
+    assert initial_viewport, "could not measure starting terminal window"
     driver.command("POST", "/window/rect", {"width": 760, "height": 570})
-    resized = wait_for(lambda: ((size := displayed_size()) != initial and size),
-                       "the live grid did not fit the smaller window")
+
+    def requested_size():
+        # Fit writes the geometry requested for this viewport to these
+        # controls before the PTY resize and the held frame publication finish.
+        receipt = geometry_receipt(driver, "#active-pane canvas")
+        rows, cols = receipt.get("rows"), receipt.get("cols")
+        viewport = receipt.get("inner")
+        if (receipt.get("fit") and rows and cols and viewport
+                and all(current < previous for current, previous in zip(viewport, initial_viewport))):
+            return f"{rows} {cols}"
+        return None
+
+    last_fit = None
+
+    def presented_fit():
+        nonlocal last_fit
+        target, painted = requested_size(), displayed_size()
+        ready = target if target and target != initial and target == painted else None
+        settled = ready if ready == last_fit else None
+        last_fit = ready
+        return settled
+
+    try:
+        resized = wait_for(presented_fit, "the live grid did not settle at the fitted viewport size")
+    except AssertionError as error:
+        raise AssertionError(str(error), {
+            "initial": initial, "requested": requested_size(), "presented": displayed_size(),
+            "geometry": geometry_receipt(driver, "#active-pane canvas"),
+        }) from error
     reported = report_size("resized-size")
-    assert reported == resized, {
-        "initial": initial, "first_changed": resized, "actual_pty": reported,
-        "at_assertion": displayed_size(),
+    assert reported == resized == displayed_size() == requested_size(), {
+        "initial": initial, "settled": resized, "actual_pty": reported,
+        "at_assertion": displayed_size(), "requested": requested_size(),
         "geometry": geometry_receipt(driver, "#active-pane canvas"),
     }
 
