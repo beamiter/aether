@@ -319,6 +319,7 @@ function renderSplit(){
     peerState=null;clearPaint(peerCanvas);delete peerCanvas.dataset.geometry;
   }
 }
+let localTabButtons=[];
 function renderLocalTabs(focusActive=false) {
   renderTerminalStage();
   renderSavedLayout();
@@ -331,22 +332,33 @@ function renderLocalTabs(focusActive=false) {
   newTab.disabled=newJshTab.disabled=!owner||changingTab!==null||recovery!==null||restoringLocalLayout||localTabEpochs.size>=MAX_LOCAL_SHELLS;
   retryTab.hidden=!changingTab||changingTab.busy||restoringLocalLayout;
   if(tabs.hidden)return;
-  let activeButton=null;
-  const buttons=[...localTabEpochs].sort((a,b)=>a-b).map(number=>{
-    const tab=document.createElement('button');
-    const active=number===epoch;
-    const kind=localShellKinds.get(localTabOwners.get(number)?.session);
-    tab.type='button';tab.dataset.epoch=String(number);tab.textContent=`${kind==='jsh'?'jsh':'Shell'} ${number}`;
-    if(active){tab.setAttribute('aria-current','true');activeButton=tab;}
-    tab.disabled=changingTab!==null||recovery!==null||restoringLocalLayout;
-    tab.addEventListener('click',()=>{
-      if(tab.disabled)return;
-      if(active)focusTerminal();
-      else startLocalTab(number,{focusTerminal:true});
+  const numbers=[...localTabEpochs].sort((a,b)=>a-b);
+  // A refresh with the same roster must not detach a button that is
+  // focused or between native pointer-down and click.
+  if(localTabButtons.length!==numbers.length||
+      numbers.some((number,index)=>localTabButtons[index].dataset.epoch!==String(number))){
+    localTabButtons=numbers.map(number=>{
+      const tab=document.createElement('button');
+      tab.type='button';tab.dataset.epoch=String(number);
+      tab.addEventListener('click',()=>{
+        if(tabs.hidden||tab.disabled||!localTabButtons.includes(tab))return;
+        if(number===epoch)focusTerminal();
+        else startLocalTab(number,{focusTerminal:true});
+      });
+      return tab;
     });
-    return tab;
+    tabList.replaceChildren(...localTabButtons);
+  }
+  let activeButton=null;
+  const disabled=changingTab!==null||recovery!==null||restoringLocalLayout;
+  localTabButtons.forEach((tab,index)=>{
+    const number=numbers[index],kind=localShellKinds.get(localTabOwners.get(number)?.session);
+    const label=`${kind==='jsh'?'jsh':'Shell'} ${number}`;
+    if(tab.textContent!==label)tab.textContent=label;
+    if(number===epoch){tab.setAttribute('aria-current','true');activeButton=tab;}
+    else tab.removeAttribute('aria-current');
+    tab.disabled=disabled;
   });
-  tabList.replaceChildren(...buttons);
   if(focusActive)activeButton?.focus();
 }
 function validatePeerFrame(frame,target){

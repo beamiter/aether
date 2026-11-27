@@ -36,7 +36,7 @@ function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsuppo
   return result;
  };
  const elements=new Map(),timers=new Map();let id=0;
- const element=()=>({disabled:false,value:'',textContent:'',style:{},dataset:{},handlers:{},classList:{toggle(){}},focus(){},append(){},scrollTo(){},setAttribute(){},replaceChildren(...options){this.options=options;},addEventListener(name,fn){this.handlers[name]=fn}});
+ const element=()=>({disabled:false,value:'',textContent:'',style:{},dataset:{},handlers:{},classList:{toggle(){}},focus(){},append(){},scrollTo(){},attributes:new Map(),setAttribute(name,value){this.attributes.set(name,String(value));},removeAttribute(name){this.attributes.delete(name);},replaceChildren(...options){this.options=options;},addEventListener(name,fn){this.handlers[name]=fn}});
  const el=selector=>{if(!elements.has(selector))elements.set(selector,element());return elements.get(selector)};
  const canvasEvents=new Map();
  if (animation.mouseCanvas) {
@@ -1914,7 +1914,15 @@ test('public restore opens three fresh tabs, confirms each size, preserves split
  await [...h.timers.values()][0]();
  assert.equal(h.el('#peer-canvas').dataset.geometry,'71x17');
  assert.deepEqual(readLocalShellLayout(storage),layout);
- h.el('#local-tab-list').options.find(button=>button.dataset.epoch==='103').handlers.click();await tick();
+ const tabList=h.el('#local-tab-list'),tabButtons=tabList.options;
+ const [,before,targetButton]=tabButtons;
+ assert.equal(before.attributes.get('aria-current'),'true');
+ assert.equal(targetButton.attributes.has('aria-current'),false);
+ targetButton.handlers.click();await tick();
+ assert.equal(tabList.options,tabButtons,'tab activation must not replace the native buttons when the roster is unchanged');
+ assert.equal(before.attributes.has('aria-current'),false);
+ assert.equal(targetButton.attributes.get('aria-current'),'true');
+ assert.equal(targetButton.disabled,false);
  await [...h.timers.values()][0]();
  assert.equal(h.el('#peer-canvas').dataset.geometry,'71x17');
  assert.equal(h.el('#cols').value,'95');assert.equal(h.el('#rows').value,'19');
