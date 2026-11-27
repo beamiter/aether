@@ -376,6 +376,19 @@ async fn key_shell(
     .await
 }
 #[tauri::command]
+async fn focus_shell<R: tauri::Runtime>(
+    window: tauri::WebviewWindow<R>,
+    owner: Attachment,
+    focused: bool,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
+) -> Result<bool, String> {
+    require_terminal_window(&window)?;
+    run_input(bridge.inner().clone(), owner, move |bridge, epoch| {
+        bridge.focus(epoch, focused)
+    })
+    .await
+}
+#[tauri::command]
 async fn mouse_shell<R: tauri::Runtime>(
     window: tauri::WebviewWindow<R>,
     owner: Attachment,
@@ -637,6 +650,7 @@ fn application<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<
             resize_shell,
             key_shell,
             mouse_shell,
+            focus_shell,
             submit_local_chat,
             local_workflows::local_workflow_library,
             local_workflows::insert_local_workflow,

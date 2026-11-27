@@ -1,5 +1,8 @@
 import {validateReloadView,retainedReloadView,saveReloadTicket,takeReloadTicket} from '../web/ssh-reload.js';
 import {installPasteReview} from '../web/paste.js';
+import {installTerminalFocus} from '../web/terminal-focus.js';
+import {installTerminalMouse} from '../web/terminal-mouse.js';
+import {installTerminalSelection} from '../web/terminal-selection.js';
 import {dimensions,resizeQueue,cursorTarget,terminalCellAt,viewportDimensions} from '../web/viewport.js';
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import vm from 'node:vm';
 import {installHistory} from '../web/history.js';
@@ -15,7 +18,7 @@ function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsuppo
  const invoke=async(name,args)=>{
   if(name==='ssh_terminal'&&args?.action?.operation==='recover_reload_layout')return animation.recoverReloadLayout?.()??null;
   const {owner,...parameters}=args??{};
-  const keepsOwner=['activate_local_tab','subscribe_local_shell','ack_local_stream','set_local_observer','observe_local_shell','local_command_blocks'].includes(name);
+  const keepsOwner=['activate_local_tab','subscribe_local_shell','ack_local_stream','set_local_observer','observe_local_shell','local_command_blocks','focus_shell'].includes(name);
   const legacy=owner&&!keepsOwner?{epoch:owner.epoch,...parameters}:args;
   if(name==='shell_status')return {drained:false,write_error:null,dropped_reply_bytes:'0',...await health(legacy)};
   const result=await rawInvoke(name,legacy);
@@ -31,14 +34,209 @@ function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsuppo
  const elements=new Map(),timers=new Map();let id=0;
  const element=()=>({disabled:false,value:'',textContent:'',style:{},dataset:{},handlers:{},focus(){},append(){},scrollTo(){},setAttribute(){},replaceChildren(...options){this.options=options;},addEventListener(name,fn){this.handlers[name]=fn}});
  const el=selector=>{if(!elements.has(selector))elements.set(selector,element());return elements.get(selector)};
- const context={validateReloadView,retainedReloadView,saveReloadTicket,takeReloadTicket,installFilePreviewPanel:()=>({dismiss(){}}),document:{querySelector:el,createElement:element},__TAURI__:{core:{invoke,Channel}},acceptFull,acceptUpdate,clearPaint,acceptChannelFrame,channelCounter,CHANNEL_FRAME_VERSION,installIme,installHistory,installCommandBlocks,installTerminalChat,installWorkflows,validateChatStatus,installPasteReview,dimensions,resizeQueue,cursorTarget,terminalCellAt,viewportDimensions,paint,TextEncoder:Encoder,TextDecoder,
+ const canvasEvents=new Map();
+ if (animation.mouseCanvas) {
+  const canvas=el('canvas'), captured=new Set();
+  canvas.setPointerCapture=id=>captured.add(id);
+  canvas.releasePointerCapture=id=>captured.delete(id);
+  canvas.hasPointerCapture=id=>captured.has(id);
+  canvas.getBoundingClientRect=()=>({left:0,top:0,width:600,height:300});
+  canvas.addEventListener=(name,fn,options)=>{
+   canvas.handlers[name]=fn;
+   const listeners=canvasEvents.get(name)??[];
+   listeners.push({fn,capture:options===true||options?.capture===true});
+   canvasEvents.set(name,listeners);
+  };
+ }
+ const pageEvents=new Map(),windowEvents=new Map();
+ const listen=events=>(name,fn)=>events.set(name,[...(events.get(name)??[]),fn]);
+ const fire=(events,name)=>{for(const fn of events.get(name)??[])fn({target:document.activeElement});};
+ const document={querySelector:el,createElement:element,activeElement:null,hidden:false,hasFocus:()=>true,addEventListener:listen(pageEvents)};
+ const context={validateReloadView,retainedReloadView,saveReloadTicket,takeReloadTicket,installFilePreviewPanel:()=>({dismiss(){}}),document,addEventListener:listen(windowEvents),__TAURI__:{core:{invoke,Channel}},acceptFull,acceptUpdate,clearPaint,acceptChannelFrame,channelCounter,CHANNEL_FRAME_VERSION,installIme,installHistory,installCommandBlocks,installTerminalChat,installWorkflows,validateChatStatus,installPasteReview,installTerminalFocus,installTerminalMouse,installTerminalSelection,dimensions,resizeQueue,cursorTarget,terminalCellAt,viewportDimensions,paint,TextEncoder:Encoder,TextDecoder,
  plainLocalTab,MAX_LOCAL_SHELLS,validLocalGeometry,localSplitPair,readLocalShellLayout:()=>readLocalShellLayout(storage),saveLocalShellLayout:value=>saveLocalShellLayout(value,storage),
  setInterval(fn){timers.set(++id,fn);return id},clearInterval(i){timers.delete(i)},setTimeout,...animation};
  vm.runInNewContext(fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8').replace(/^import .*\n/gm,''),context);
- return {el,timers,click:s=>el(s).handlers.click(),submit:()=>el('#command').handlers.submit({preventDefault(){}}),submitSsh:()=>el('#ssh-terminal-form').handlers.submit({preventDefault(){}})};
+ return {el,timers,click:s=>el(s).handlers.click(),submit:()=>el('#command').handlers.submit({preventDefault(){}}),submitSsh:()=>el('#ssh-terminal-form').handlers.submit({preventDefault(){}}),
+  focus(selector){document.activeElement=el(selector);fire(pageEvents,'focusout');fire(pageEvents,'focusin');},
+  visibility(hidden){document.hidden=hidden;fire(pageEvents,'visibilitychange');},
+  pointer(name,extra={}){
+   const event={isPrimary:true,pointerType:'mouse',pointerId:1,clientX:1,clientY:1,button:0,
+    preventDefault(){this.defaultPrevented=true;},...extra};
+   const listeners=canvasEvents.get(name)??[];
+   for(const capture of [true,false])for(const entry of listeners)if(entry.capture===capture)entry.fn(event);
+  },
+  windowFocus(focused){fire(windowEvents,focused?'focus':'blur');}};
 }
 
 const channelHealth=epoch=>({epoch,exited:false,drained:false,write_error:null,dropped_reply_bytes:'0',unsupported:'0'});
+
+test('local terminal focus follows the viewport, IME, window and document visibility',async()=>{
+ const shell={session:'a'.repeat(32),epoch:1,generation:1};
+ const signals=[];
+ const h=harness(async(name,args)=>{
+  if(name==='open_shell')return shell;
+  if(name==='poll_shell')return null;
+  if(name==='focus_shell'){
+   signals.push([args.owner.generation,args.focused]);
+   if(!args.focused)throw Error('focus report unavailable');
+   return true;
+  }
+  throw Error('unexpected local IPC '+name);
+ });
+ await h.click('#open');
+ h.focus('canvas');await tick();
+ h.focus('#ime-input');await tick();
+ h.windowFocus(false);h.windowFocus(false);await tick();
+ h.windowFocus(true);await tick();
+ h.visibility(true);await tick();
+ h.visibility(false);await tick();
+ h.focus('#input');await tick();
+ assert.deepEqual(signals,[[1,true],[1,false],[1,true],[1,false],[1,true],[1,false]]);
+ assert.equal(h.el('#input').disabled,false);
+});
+
+test('focus queued before detach cannot reach a stale or read-only attachment',async()=>{
+ const shell={session:'a'.repeat(32),epoch:1,generation:1};
+ const reattached={...shell,generation:3};
+ const frame=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+ const running=deferred(),signals=[];
+ const h=harness(async(name,args)=>{
+  if(name==='open_shell')return shell;
+  if(name==='poll_shell'||name==='detach_shell'||name==='ack_shell')return null;
+  if(name==='attach_shell')return {owner:reattached,frame:{...frame,session:shell.session}};
+  if(name==='focus_shell'){
+   signals.push([args.owner.generation,args.focused]);
+   return running.promise;
+  }
+  throw Error('unexpected local IPC '+name);
+ });
+ await h.click('#open');
+ h.focus('canvas');await tick();
+ h.windowFocus(false);await tick();
+ await h.click('#detach');
+ await h.click('#attach');
+ h.windowFocus(true);h.focus('#ime-input');
+ running.resolve(true);await tick();
+ assert.deepEqual(signals,[[1,true]]);
+ assert.equal(h.el('#input').disabled,true);
+});
+
+test('SSH focus requires an explicit capability for each writable attachment',async()=>{
+ const first={session:'a'.repeat(32),epoch:1,generation:1};
+ const recovered={...first,generation:2},readonly={...first,generation:4};
+ const frame={...JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8')),session:first.session,epoch:1};
+ const signals=[];
+ let advertised;
+ const h=harness(async(name,{action})=>{
+  assert.equal(name,'ssh_terminal');
+  if(action.operation==='open')return first;
+  if(action.operation==='attach')return {owner:readonly,frame};
+  const command=action.command;
+  switch(command.kind){
+   case 'poll':case 'ack':case 'detach':return null;
+   case 'status':return {...channelHealth(command.owner.epoch),focus_reporting:advertised};
+   case 'recover':return {owner:recovered,frame,input_allowed:true};
+   case 'focus':signals.push([command.owner.generation,command.focused]);return true;
+   default:throw Error(command.kind);
+  }
+ });
+ h.el('#ssh-terminal-host').value='lab';await h.submitSsh();
+ h.focus('canvas');await tick();
+ assert.deepEqual(signals,[]);
+ advertised='true';await [...h.timers.values()][0]();await tick();
+ assert.deepEqual(signals,[]);
+ advertised=true;await [...h.timers.values()][0]();await tick();
+ h.windowFocus(false);await tick();
+ h.windowFocus(true);await tick();
+ assert.deepEqual(signals,[[1,true],[1,false],[1,true]]);
+ advertised=undefined;await h.click('#recover');await tick();
+ assert.deepEqual(signals,[[1,true],[1,false],[1,true]]);
+ advertised=true;await [...h.timers.values()][0]();await tick();
+ assert.deepEqual(signals,[[1,true],[1,false],[1,true],[2,true]]);
+ await h.click('#detach');await h.click('#attach');
+ h.focus('#ime-input');await tick();
+ assert.deepEqual(signals,[[1,true],[1,false],[1,true],[2,true]]);
+ assert.equal(h.el('#input').disabled,true);
+});
+
+test('SSH mouse requires a negotiated writable owner and its matching visible frame',async()=>{
+ const first={session:'b'.repeat(32),epoch:1,generation:1},readonly={...first,generation:3};
+ const frame={...JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8')),session:first.session,epoch:1};
+ const descriptor={layout:String(frame.layout),revision:String(frame.revision),generation:7,tracking:'drag'};
+ const reports=[];
+ let firstPoll=true,capability,mouse=descriptor;
+ const h=harness(async(name,{action})=>{
+  assert.equal(name,'ssh_terminal');
+  if(action.operation==='open')return first;
+  if(action.operation==='attach')return {owner:readonly,frame};
+  const command=action.command;
+  switch(command.kind){
+   case 'poll':if(firstPoll){firstPoll=false;return {kind:'snapshot',frame};}return null;
+   case 'ack':case 'detach':return null;
+   case 'status':return {...channelHealth(command.owner.epoch),mouse_reporting:capability,mouse};
+   case 'mouse':reports.push(command);return true;
+   default:throw Error(command.kind);
+  }
+ },undefined,undefined,()=>{}, {},undefined,{mouseCanvas:true});
+ const poll=async()=>{await [...h.timers.values()][0]();await tick();};
+ const click=async(extra)=>{h.pointer('pointerdown',extra);h.pointer('pointerup',extra);await tick();};
+ h.el('#ssh-terminal-host').value='lab';await h.submitSsh();
+ await click();assert.deepEqual(reports,[]);
+ capability=true;mouse={...descriptor,revision:String(Number(descriptor.revision)+1)};
+ await poll();await click();assert.deepEqual(reports,[]);
+ mouse=descriptor;await poll();
+ await click({shiftKey:true});assert.deepEqual(reports,[]);
+ h.pointer('pointerdown');await tick();
+ mouse=undefined;await poll();
+ h.pointer('pointerup');await tick();
+ assert.deepEqual(reports.map(({owner,report})=>[owner.generation,report.kind,report.layout,report.revision,report.generation,report.row,report.col]),[
+  [1,'press',descriptor.layout,descriptor.revision,7,0,0],
+  [1,'release',descriptor.layout,descriptor.revision,7,0,0],
+ ]);
+ await h.click('#detach');await h.click('#attach');
+ mouse=descriptor;await poll();await click();
+ assert.equal(reports.length,2);
+ assert.equal(h.el('#input').disabled,true);
+});
+
+test('SSH alternate scroll uses a negotiated visible stamp and defers to mouse tracking',async()=>{
+ const owner={session:'d'.repeat(32),epoch:1,generation:1};
+ const frame={...JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8')),session:owner.session,epoch:1};
+ const stamp={layout:String(frame.layout),revision:String(frame.revision),generation:8};
+ const reports=[];
+ let firstPoll=true,capability,alternate={...stamp},mouse;
+ const h=harness(async(name,{action})=>{
+  assert.equal(name,'ssh_terminal');
+  if(action.operation==='open')return owner;
+  const command=action.command;
+  switch(command.kind){
+   case 'poll':if(firstPoll){firstPoll=false;return {kind:'snapshot',frame};}return null;
+   case 'ack':return null;
+   case 'status':return {...channelHealth(command.owner.epoch),mouse_reporting:capability,mouse,alternate_scroll:alternate};
+   case 'mouse':reports.push(command);return true;
+   default:throw Error(command.kind);
+  }
+ },undefined,undefined,()=>{}, {},undefined,{mouseCanvas:true});
+ const poll=async()=>{await [...h.timers.values()][0]();await tick();};
+ const wheel=async()=>{h.pointer('wheel',{deltaX:0,deltaY:-1,deltaMode:1});await tick();};
+ h.el('#ssh-terminal-host').value='lab';await h.submitSsh();
+ await wheel();assert.deepEqual(reports,[]);
+ capability=true;alternate={...stamp,revision:String(Number(stamp.revision)+1)};
+ await poll();await wheel();assert.deepEqual(reports,[]);
+ alternate=stamp;await poll();
+ h.pointer('pointerdown');h.pointer('pointerup');await tick();
+ assert.deepEqual(reports,[]);
+ await wheel();
+ assert.deepEqual(reports.map(({owner,report})=>[owner.generation,report.kind,report.revision,report.generation]),[
+  [1,'wheel_up',stamp.revision,8],
+ ]);
+ mouse={...stamp,generation:9,tracking:'button'};
+ await poll();h.pointer('pointerdown');h.pointer('pointerup');await tick();
+ assert.deepEqual(reports.map(({report})=>[report.kind,report.generation]),[
+  ['wheel_up',8],['press',9],['release',9],
+ ]);
+});
+
 test('terminal Chat sends each displayed prompt at most once while preserving normal input',async()=>{
  const submissions=[];
  const prompt=value=>({surface:'prompt',prompt:value,newest_completed:null});

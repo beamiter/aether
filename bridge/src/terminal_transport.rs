@@ -82,6 +82,14 @@ pub enum Command {
         alt: bool,
         ctrl: bool,
     },
+    Mouse {
+        owner: Attachment,
+        report: crate::live::MouseReport,
+    },
+    Focus {
+        owner: Attachment,
+        focused: bool,
+    },
     Text {
         owner: Attachment,
         text: String,
@@ -168,6 +176,12 @@ impl Host {
     fn reply(&mut self, request: Request) -> Reply {
         let result = if request.protocol != VERSION || request.request == 0 {
             Err("unsupported terminal transport version or request ID".into())
+        } else if matches!(
+            &request.command,
+            Command::Focus { .. } | Command::Mouse { .. }
+        ) && request.host.as_ref() != Some(&self.identity)
+        {
+            Err(HOST_CHANGED.into())
         } else if request
             .host
             .as_ref()
@@ -230,7 +244,16 @@ impl Host {
                 reply_value(bridge.acknowledge(epoch, revision)?)
             })?,
             Command::Status { owner } => self.attached(owner, false, |bridge, epoch| {
-                reply_value(bridge.status(epoch)?)
+                let mut status = reply_value(bridge.status(epoch)?)?;
+                status["focus_reporting"] = Value::Bool(true);
+                status["mouse_reporting"] = Value::Bool(true);
+                if let Some(mouse) = bridge.mouse_view(epoch)? {
+                    status["mouse"] = reply_value(mouse)?;
+                }
+                if let Some(alternate) = bridge.alternate_scroll_view(epoch)? {
+                    status["alternate_scroll"] = reply_value(alternate)?;
+                }
+                Ok(status)
             })?,
             Command::History { owner, offset } => {
                 self.attached(owner, false, |bridge, epoch| {
@@ -268,6 +291,12 @@ impl Host {
                     reply_value(bridge.paste(epoch, &text)?)
                 })?
             }
+            Command::Mouse { owner, report } => self.attached(owner, true, |bridge, epoch| {
+                reply_value(bridge.mouse(epoch, report)?)
+            })?,
+            Command::Focus { owner, focused } => self.attached(owner, true, |bridge, epoch| {
+                reply_value(bridge.focus(epoch, focused)?)
+            })?,
             Command::Resize { owner, rows, cols } => {
                 check_grid(rows, cols)?;
                 self.attached(owner, true, |bridge, epoch| {
@@ -625,6 +654,406 @@ mod tests {
                 .result,
             Ok(Value::String(identity)),
         );
+    }
+
+    #[test]
+    fn remote_alternate_scroll_uses_existing_authenticated_mouse_transport() {
+        use std::{ffi::OsString, path::Path};
+        let argv = [
+            "/usr/bin/python3",
+            "-c",
+            r#"
+import os,tty
+tty.setraw(0)
+os.write(1,b'\x1b[?1049h\x1b[?1007hREADY')
+got=b''
+while len(got)<3:got+=os.read(0,3-len(got))
+assert got==b'\x1b[A',got
+os.write(1,b'DONE')
+os.read(0,1)
+"#,
+        ]
+        .map(OsString::from);
+        let mut bridge = LiveBridge::default();
+        let epoch = bridge
+            .open_prepared_editor(4, 40, &argv, Path::new("/"), &[])
+            .unwrap();
+        let owner = bridge.attachment(epoch).unwrap();
+        let mut host = Host::new().unwrap();
+        host.sessions
+            .admit(|| Ok((owner.session.clone(), bridge, Value::Null)))
+            .unwrap();
+        let wait = |host: &mut Host, marker: &str| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                host.pump(Instant::now());
+                let bridge = host.bridge(&owner.session).unwrap();
+                let frame = bridge.recover_frame(epoch).unwrap();
+                let text: String = frame
+                    .rows
+                    .iter()
+                    .flatten()
+                    .map(|c| c.text.as_str())
+                    .collect();
+                bridge.acknowledge(epoch, frame.revision).unwrap();
+                if text.contains(marker) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "missing {marker}");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        wait(&mut host, "READY");
+        let status = host
+            .execute(Command::Status {
+                owner: owner.clone(),
+            })
+            .unwrap();
+        assert_eq!(status["mouse_reporting"], true);
+        assert!(status.get("mouse").is_none());
+        let view = status["alternate_scroll"].clone();
+        assert_eq!(view.as_object().unwrap().len(), 3);
+        let report = |kind: &str, button: Option<&str>| {
+            serde_json::from_value::<crate::live::MouseReport>(serde_json::json!({"layout":view["layout"],"revision":view["revision"],"generation":view["generation"],"row":0,"col":0,"kind":kind,"button":button,"alt":false,"ctrl":false})).unwrap()
+        };
+        let send = |host: &mut Host, report| {
+            let request = Request {
+                protocol: VERSION,
+                request: 1,
+                host: Some(host.identity.clone()),
+                command: Command::Mouse {
+                    owner: owner.clone(),
+                    report,
+                },
+            };
+            host.reply(request).result
+        };
+        assert_eq!(
+            send(&mut host, report("press", Some("left"))).unwrap(),
+            false
+        );
+        assert_eq!(send(&mut host, report("wheel_up", None)).unwrap(), true);
+        wait(&mut host, "DONE");
+        host.execute(Command::Detach {
+            owner: owner.clone(),
+        })
+        .unwrap();
+        assert!(send(&mut host, report("wheel_down", None)).is_err());
+        let resumed = host
+            .execute(Command::AttachReadOnly {
+                session: owner.session.clone(),
+                epoch,
+            })
+            .unwrap();
+        let reader: Attachment = serde_json::from_value(resumed["owner"].clone()).unwrap();
+        let status = host
+            .execute(Command::Status {
+                owner: reader.clone(),
+            })
+            .unwrap();
+        assert!(status.get("alternate_scroll").is_none());
+        assert!(host
+            .execute(Command::Mouse {
+                owner: reader.clone(),
+                report: report("wheel_up", None)
+            })
+            .is_err());
+        host.execute(Command::Close { owner: reader }).unwrap();
+    }
+
+    #[test]
+    fn remote_mouse_reports_require_identity_lease_and_rendered_surface() {
+        use std::{ffi::OsString, path::Path};
+        let argv = [
+            "/usr/bin/python3",
+            "-c",
+            r#"
+import os,tty
+tty.setraw(0)
+def expect(want):
+ got=b''
+ while len(got)<len(want): got+=os.read(0,len(want)-len(got))
+ assert got==want,got
+os.write(1,b'\x1b[?1002;1006hREADY')
+expect(b'\x1b[<0;3;2M')
+os.write(1,b'PAINT')
+expect(b'\x1b[<0;3;2m')
+os.write(1,b'\x1b[?1006lMODE')
+expect(b'\x1b[M\x20\x23\x22\x1b[M\x23\x23\x22')
+os.write(1,b'DONE')
+expect(b'.')
+"#,
+        ]
+        .map(OsString::from);
+        let mut bridge = LiveBridge::default();
+        let epoch = bridge
+            .open_prepared_editor(4, 80, &argv, Path::new("/"), &[])
+            .unwrap();
+        let owner = bridge.attachment(epoch).unwrap();
+        let mut host = Host::new().unwrap();
+        host.sessions
+            .admit(|| Ok((owner.session.clone(), bridge, Value::Null)))
+            .unwrap();
+        let wait = |host: &mut Host, marker: &str| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                host.pump(Instant::now());
+                let bridge = host.bridge(&owner.session).unwrap();
+                let frame = bridge.recover_frame(epoch).unwrap();
+                let text: String = frame
+                    .rows
+                    .iter()
+                    .flatten()
+                    .map(|c| c.text.as_str())
+                    .collect();
+                bridge.acknowledge(epoch, frame.revision).unwrap();
+                if text.contains(marker) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "missing {marker}");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let status = |host: &mut Host| {
+            host.execute(Command::Status {
+                owner: owner.clone(),
+            })
+            .unwrap()
+        };
+        let report = |view: &Value, kind: &str| serde_json::json!({"layout":view["layout"],"revision":view["revision"],"generation":view["generation"],"row":1,"col":2,"kind":kind,"button":"left","alt":false,"ctrl":false});
+        let mouse = |host: &mut Host, view: &Value, kind: &str| {
+            let request = Request {
+                protocol: VERSION,
+                request: 1,
+                host: Some(host.identity.clone()),
+                command: Command::Mouse {
+                    owner: owner.clone(),
+                    report: serde_json::from_value(report(view, kind)).unwrap(),
+                },
+            };
+            host.reply(request).result
+        };
+        wait(&mut host, "READY");
+        let info = status(&mut host);
+        assert_eq!(info["mouse_reporting"], true);
+        let view = info["mouse"].clone();
+        assert_eq!(view["tracking"], "drag");
+        assert_eq!(
+            host.reply(Request {
+                protocol: VERSION,
+                request: 1,
+                host: None,
+                command: Command::Mouse {
+                    owner: owner.clone(),
+                    report: serde_json::from_value(report(&view, "press")).unwrap()
+                }
+            })
+            .result,
+            Err(HOST_CHANGED.into())
+        );
+        let mut stale = view.clone();
+        stale["revision"] = Value::String("999999".into());
+        assert_eq!(mouse(&mut host, &stale, "press").unwrap(), false);
+        let mut wrong = view.clone();
+        wrong["generation"] = Value::from(view["generation"].as_u64().unwrap() + 1);
+        assert_eq!(mouse(&mut host, &wrong, "press").unwrap(), false);
+        assert_eq!(mouse(&mut host, &view, "press").unwrap(), true);
+        wait(&mut host, "PAINT");
+        assert_eq!(
+            mouse(&mut host, &view, "release").unwrap(),
+            true,
+            "held release survives visible repaint and old ledger eviction"
+        );
+        wait(&mut host, "MODE");
+        assert_eq!(
+            mouse(&mut host, &view, "press").unwrap(),
+            false,
+            "old encoding generation retired"
+        );
+        let fresh = status(&mut host)["mouse"].clone();
+        assert_eq!(mouse(&mut host, &fresh, "press").unwrap(), true);
+        assert_eq!(mouse(&mut host, &fresh, "release").unwrap(), true);
+        wait(&mut host, "DONE");
+        host.execute(Command::Detach {
+            owner: owner.clone(),
+        })
+        .unwrap();
+        assert!(mouse(&mut host, &fresh, "press").is_err());
+        let resumed = host
+            .execute(Command::AttachReadOnly {
+                session: owner.session.clone(),
+                epoch,
+            })
+            .unwrap();
+        let reader: Attachment = serde_json::from_value(resumed["owner"].clone()).unwrap();
+        assert!(host
+            .execute(Command::Mouse {
+                owner: reader.clone(),
+                report: serde_json::from_value(report(&fresh, "press")).unwrap()
+            })
+            .is_err());
+        host.execute(Command::Close { owner: reader }).unwrap();
+    }
+
+    #[test]
+    fn remote_focus_capability_uses_live_pty_modes_and_writer_leases() {
+        use std::{ffi::OsString, path::Path};
+        let argv = [
+            "/usr/bin/python3",
+            "-c",
+            r#"
+import os, tty
+tty.setraw(0)
+def expect(want):
+    got=b''
+    while len(got)<len(want): got+=os.read(0,len(want)-len(got))
+    assert got==want,got
+os.write(1,b'\x1b[?1004hREADY')
+expect(b'\x1b[I\x1b[O')
+os.write(1,b'\x1b[?1004lDISABLED')
+expect(b'!')
+os.write(1,b'\x1b[?1004hENABLED')
+expect(b'\x1b[I')
+os.write(1,b'FOCUSED')
+expect(b'\x1b[O')
+os.write(1,b'RETIRED')
+"#,
+        ]
+        .map(OsString::from);
+        let mut bridge = LiveBridge::default();
+        let epoch = bridge
+            .open_prepared_editor(4, 80, &argv, Path::new("/"), &[])
+            .unwrap();
+        let owner = bridge.attachment(epoch).unwrap();
+        let mut host = Host::new().unwrap();
+        host.sessions
+            .admit(|| Ok((owner.session.clone(), bridge, Value::Null)))
+            .unwrap();
+        let wait = |host: &mut Host, marker: &str| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                host.pump(Instant::now());
+                let frame = host
+                    .bridge(&owner.session)
+                    .unwrap()
+                    .recover_frame(epoch)
+                    .unwrap();
+                let text: String = frame
+                    .rows
+                    .iter()
+                    .flatten()
+                    .map(|c| c.text.as_str())
+                    .collect();
+                if text.contains(marker) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "missing {marker}");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        wait(&mut host, "READY");
+        assert_eq!(
+            host.reply(Request {
+                protocol: VERSION,
+                request: 1,
+                host: None,
+                command: Command::Focus {
+                    owner: owner.clone(),
+                    focused: true
+                }
+            })
+            .result,
+            Err(HOST_CHANGED.into())
+        );
+
+        assert_eq!(
+            host.execute(Command::Status {
+                owner: owner.clone()
+            })
+            .unwrap()["focus_reporting"],
+            true
+        );
+        assert_eq!(
+            host.execute(Command::Focus {
+                owner: owner.clone(),
+                focused: true
+            })
+            .unwrap(),
+            true
+        );
+        assert_eq!(
+            host.execute(Command::Focus {
+                owner: owner.clone(),
+                focused: true
+            })
+            .unwrap(),
+            false
+        );
+        assert_eq!(
+            host.execute(Command::Focus {
+                owner: owner.clone(),
+                focused: false
+            })
+            .unwrap(),
+            true
+        );
+        wait(&mut host, "DISABLED");
+        assert_eq!(
+            host.execute(Command::Focus {
+                owner: owner.clone(),
+                focused: true
+            })
+            .unwrap(),
+            false
+        );
+        assert_eq!(
+            host.execute(Command::Focus {
+                owner: owner.clone(),
+                focused: false
+            })
+            .unwrap(),
+            false
+        );
+        host.execute(Command::Text {
+            owner: owner.clone(),
+            text: "!".into(),
+        })
+        .unwrap();
+        wait(&mut host, "ENABLED");
+        assert_eq!(
+            host.execute(Command::Focus {
+                owner: owner.clone(),
+                focused: true
+            })
+            .unwrap(),
+            true
+        );
+        wait(&mut host, "FOCUSED");
+        host.execute(Command::Detach {
+            owner: owner.clone(),
+        })
+        .unwrap();
+        wait(&mut host, "RETIRED");
+        assert!(host
+            .execute(Command::Focus {
+                owner: owner.clone(),
+                focused: false
+            })
+            .is_err());
+        let resumed = host
+            .execute(Command::AttachReadOnly {
+                session: owner.session.clone(),
+                epoch,
+            })
+            .unwrap();
+        let reader: Attachment = serde_json::from_value(resumed["owner"].clone()).unwrap();
+        assert!(host
+            .execute(Command::Focus {
+                owner: reader.clone(),
+                focused: true
+            })
+            .is_err());
+        host.execute(Command::Close { owner: reader }).unwrap();
     }
 
     #[test]

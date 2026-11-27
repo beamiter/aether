@@ -1,40 +1,17 @@
 use crate::protocol_v4::Counter;
-use jterm_engine::{frame::Stamp, mouse::MouseInput, terminal::Terminal};
+use jterm_engine::{
+    frame::Stamp,
+    mouse::{MouseInput, MouseTracking},
+    terminal::Terminal,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Tracking {
+    PressOnly,
     Button,
     Drag,
     Any,
-}
-
-#[derive(PartialEq, Eq)]
-struct Profile {
-    tracking: Tracking,
-    encoding: Vec<u8>,
-}
-
-impl Profile {
-    fn read(terminal: &Terminal) -> Option<Self> {
-        // An extended button distinguishes UTF-8 from legacy bytes even at (0, 0).
-        // These probes only encode bytes and never send input to the PTY.
-        let encoding = terminal.encode_mouse(MouseInput::Press(96), 0, 0, 0)?;
-        let tracking = if terminal
-            .encode_mouse(MouseInput::Motion(None), 0, 0, 0)
-            .is_some()
-        {
-            Tracking::Any
-        } else if terminal
-            .encode_mouse(MouseInput::Motion(Some(0)), 0, 0, 0)
-            .is_some()
-        {
-            Tracking::Drag
-        } else {
-            Tracking::Button
-        };
-        Some(Self { tracking, encoding })
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -45,7 +22,15 @@ pub struct MouseView {
     tracking: Tracking,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+/// Wheel-only alternate-screen scrolling; separate from negotiated mouse tracking.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct AlternateScrollView {
+    layout: Counter,
+    revision: Counter,
+    generation: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Button {
     Left,
@@ -63,7 +48,7 @@ impl Button {
     }
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Action {
     Press,
@@ -73,7 +58,7 @@ enum Action {
     WheelDown,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MouseReport {
     layout: Counter,
@@ -89,33 +74,28 @@ pub struct MouseReport {
 
 #[derive(Default)]
 pub(super) struct Mouse {
-    profile: Option<Profile>,
+    pressed: Option<Pressed>,
+}
+
+#[derive(Clone, Copy)]
+struct Pressed {
+    stamp: Stamp,
     generation: u32,
-    pressed: Option<(Stamp, Button)>,
+    button: Button,
 }
 
 impl Mouse {
-    pub(super) fn observe(&mut self, terminal: &Terminal) {
-        let profile = Profile::read(terminal);
-        if profile != self.profile {
-            self.profile = profile;
-            self.generation = self.generation.saturating_add(1);
-            self.pressed = None;
-        }
-        if self.pressed.is_some_and(|(stamp, _)| {
-            let current = terminal.frame().ok().map(|frame| frame.stamp());
-            !current.is_some_and(|current| same_surface(stamp, current))
-        }) {
-            self.pressed = None;
-        }
-    }
-
     pub(super) fn retire(&mut self) {
         self.pressed = None;
     }
 
     pub(super) fn view(&self, terminal: &Terminal, presented: Stamp) -> Option<MouseView> {
-        let tracking = self.profile.as_ref()?.tracking;
+        let tracking = match terminal.mouse_report_profile()?.tracking {
+            MouseTracking::PressOnly => Tracking::PressOnly,
+            MouseTracking::Button => Tracking::Button,
+            MouseTracking::Drag => Tracking::Drag,
+            MouseTracking::Any => Tracking::Any,
+        };
         let current = terminal.frame().ok()?.stamp();
         if presented != current || terminal.publication_held() {
             return None;
@@ -123,15 +103,48 @@ impl Mouse {
         Some(MouseView {
             layout: Counter::new(presented.layout)?,
             revision: Counter::new(presented.revision)?,
-            generation: self.generation,
+            generation: generation(terminal)?,
             tracking,
         })
     }
 
-    pub(super) fn matches(&self, presented: Stamp, report: &MouseReport) -> bool {
-        self.generation == report.generation
-            && report.revision.get() == presented.revision
-            && report.layout.get() == presented.layout
+    pub(super) fn alternate_view(
+        &self,
+        terminal: &Terminal,
+        presented: Stamp,
+    ) -> Option<AlternateScrollView> {
+        if !terminal.alternate_scroll_active()
+            || terminal.publication_held()
+            || terminal.frame().ok()?.stamp() != presented
+        {
+            return None;
+        }
+        Some(AlternateScrollView {
+            layout: Counter::new(presented.layout)?,
+            revision: Counter::new(presented.revision)?,
+            generation: generation(terminal)?,
+        })
+    }
+
+    pub(super) fn presented_stamp(
+        &self,
+        report: &MouseReport,
+        mut published: impl Iterator<Item = Stamp>,
+    ) -> Option<Stamp> {
+        let matches = |stamp: &Stamp| {
+            report.revision.get() == stamp.revision && report.layout.get() == stamp.layout
+        };
+        // A release may refer to the surface that accepted its press even
+        // after that exact publication leaves the bounded frame ledger.
+        if let Some(held) = self.pressed.filter(|held| {
+            matches!(report.kind, Action::Release)
+                && report.button == Some(held.button)
+                && report.generation == held.generation
+                && matches(&held.stamp)
+        }) {
+            return Some(held.stamp);
+        }
+        published.find(matches)
     }
 
     pub(super) fn send(
@@ -140,41 +153,65 @@ impl Mouse {
         presented: Stamp,
         report: MouseReport,
     ) -> Result<bool, String> {
-        if self.profile.is_none() {
-            return Ok(false);
-        }
         let terminal = session.terminal();
-        let current = terminal.frame()?.stamp();
-        if !same_surface(presented, current) || terminal.publication_held() {
+        let profile = terminal.mouse_report_profile();
+        if profile.is_none() {
+            if !terminal.alternate_scroll_active()
+                || !matches!(report.kind, Action::WheelUp | Action::WheelDown)
+                || report.button.is_some()
+            {
+                return Ok(false);
+            }
+        }
+        if generation(terminal) != Some(report.generation) {
             return Ok(false);
         }
-        let held = self
-            .pressed
-            .filter(|(stamp, _)| same_surface(*stamp, presented));
+        let current = terminal.frame()?.stamp();
+        if !same_surface(presented, current) {
+            return Ok(false);
+        }
+        let held = self.pressed.filter(|held| {
+            held.generation == report.generation && same_surface(held.stamp, presented)
+        });
         let input = match (report.kind, report.button) {
             (Action::Press, Some(button)) if held.is_none() => MouseInput::Press(button.code()),
-            (Action::Release, Some(button)) if held.is_some_and(|(_, held)| held == button) => {
+            (Action::Release, Some(button)) if held.is_some_and(|held| held.button == button) => {
                 MouseInput::Release(button.code())
             }
-            (Action::Motion, button) if held.map(|(_, held)| held) == button => {
+            (Action::Motion, button) if held.map(|held| held.button) == button => {
                 MouseInput::Motion(button.map(Button::code))
             }
             (Action::WheelUp, None) => MouseInput::WheelUp,
             (Action::WheelDown, None) => MouseInput::WheelDown,
             _ => return Ok(false),
         };
+        if terminal.publication_held() && !matches!(input, MouseInput::Release(_)) {
+            return Ok(false);
+        }
         let modifiers = (u8::from(report.alt) << 3) | (u8::from(report.ctrl) << 4);
         let Some(bytes) = terminal.encode_mouse(input, report.col, report.row, modifiers) else {
             return Ok(false);
         };
         session.submit_input(bytes)?;
         match input {
-            MouseInput::Press(_) => self.pressed = report.button.map(|button| (presented, button)),
-            MouseInput::Release(_) => self.pressed = None,
+            MouseInput::Press(_)
+                if profile.is_some_and(|profile| profile.tracking != MouseTracking::PressOnly) =>
+            {
+                self.pressed = report.button.map(|button| Pressed {
+                    stamp: presented,
+                    generation: report.generation,
+                    button,
+                });
+            }
+            MouseInput::Press(_) | MouseInput::Release(_) => self.pressed = None,
             _ => {}
         }
         Ok(true)
     }
+}
+
+fn generation(terminal: &Terminal) -> Option<u32> {
+    u32::try_from(terminal.mouse_report_generation()).ok()
 }
 
 fn same_surface(left: Stamp, right: Stamp) -> bool {

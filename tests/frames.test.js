@@ -271,3 +271,29 @@ test('reset, fractional row edges and interrupted deltas fall back to a full rep
  assert.deepEqual(clears,[[0,0,24,96],[0,0,24,96]]);
  assert.deepEqual(writes,[['width',24],['height',96],['width',24]]);
 });
+
+test('optional cursor color validates and repaints an otherwise empty delta',()=>{
+ const raw={...demo(),cursor_visible:true,cursor_shape:'block'};
+ const base=acceptFull(null,raw);
+ assert.equal(base.cursor_color,undefined);
+ for(const color of ['#123456','#AbCdEf']){
+  assert.equal(acceptFull(null,{...raw,cursor_color:color}).cursor_color,color);
+ }
+ for(const cursor_color of [null,1,'red','#123','#11223344','url(x)']){
+  assert.throws(()=>acceptFull(null,{...raw,cursor_color}),/cursor color/);
+ }
+ const colors=[];
+ const g={setTransform(){},clearRect(){},scale(){},fillRect(){},save(){},beginPath(){},rect(){},clip(){},fillText(){},restore(){},strokeRect(){colors.push(this.strokeStyle);}};
+ const canvas={style:{},getContext:()=>g};
+ paint(canvas,base,1);
+ assert.equal(colors.at(-1),'#9ac6ff');
+ const next=acceptUpdate(base,{kind:'delta',frame:{...raw,base_revision:base.revision,
+  revision:base.revision+1,rows:[],cursor_color:'#123456'}});
+ assert.equal(next.rows[0],base.rows[0]);
+ paint(canvas,next,1);
+ assert.equal(colors.at(-1),'#123456');
+ const reset=acceptUpdate(next,{kind:'delta',frame:{...raw,base_revision:next.revision,
+  revision:next.revision+1,rows:[]}});
+ paint(canvas,reset,1);
+ assert.equal(colors.at(-1),'#9ac6ff');
+});

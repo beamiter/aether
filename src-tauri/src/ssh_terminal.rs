@@ -66,6 +66,8 @@ struct RemoteSession {
     input_uncertain: bool,
     recovered_from: Option<Attachment>,
     pending_snapshot: Option<u32>,
+    focus_reporting: bool,
+    mouse_reporting: bool,
 }
 
 #[tauri::command]
@@ -204,6 +206,8 @@ impl SshTerminal {
                     input_uncertain: false,
                     recovered_from: None,
                     pending_snapshot: None,
+                    focus_reporting: false,
+                    mouse_reporting: false,
                 });
                 Ok(json!({"owner": opened, "save_warning": remembered.err()}))
             }
@@ -277,6 +281,8 @@ impl SshTerminal {
                     | Command::Status { owner }
                     | Command::History { owner, .. }
                     | Command::Write { owner, .. }
+                    | Command::Mouse { owner, .. }
+                    | Command::Focus { owner, .. }
                     | Command::Key { owner, .. }
                     | Command::Text { owner, .. }
                     | Command::Paste { owner, .. }
@@ -505,6 +511,8 @@ impl SshTerminal {
             input_uncertain: false,
             recovered_from: None,
             pending_snapshot: Some(revision),
+            focus_reporting: false,
+            mouse_reporting: false,
         });
         Ok(result)
     }
@@ -544,6 +552,8 @@ impl RemoteSession {
             return Err("Invalid SSH terminal recovery snapshot.".into());
         }
         self.owner = next;
+        self.focus_reporting = false;
+        self.mouse_reporting = false;
         self.pending_snapshot = Some(revision);
         Ok(())
     }
@@ -581,23 +591,100 @@ impl RemoteSession {
     }
 
     fn exchange(&mut self, command: Command, reconnect: bool) -> Result<Value, String> {
+        if self.relay.is_none() {
+            self.focus_reporting = false;
+            self.mouse_reporting = false;
+        }
+        // A new command must never be sent to an old helper. Capability is
+        // learned only from a normal Status on this bound link and attachment.
+        if matches!(command, Command::Focus { .. })
+            && (!self.focus_reporting
+                || !self.input_allowed()
+                || self.detached
+                || !self.instance.as_deref().is_some_and(valid_identity))
+        {
+            return Err("SSH terminal focus reporting is unavailable.".into());
+        }
+
+        if matches!(command, Command::Mouse { .. })
+            && (!self.mouse_reporting
+                || !self.input_allowed()
+                || self.detached
+                || !self.instance.as_deref().is_some_and(valid_identity))
+        {
+            return Err("SSH terminal mouse reporting is unavailable.".into());
+        }
+
         if reconnect && self.relay.is_none() {
+            self.focus_reporting = false;
+            self.mouse_reporting = false;
             self.relay = Some(connect(&self.endpoint, self.instance.as_deref())?);
         }
         let relay = self
             .relay
             .as_mut()
             .ok_or("SSH terminal connection ended.")?;
-        let input = is_input(&command);
+        let input =
+            is_input(&command) && !matches!(command, Command::Focus { .. } | Command::Mouse { .. });
+        let status = matches!(command, Command::Status { .. });
+        let retiring = matches!(command, Command::Recover { .. } | Command::Detach { .. });
+        if retiring {
+            self.focus_reporting = false;
+            self.mouse_reporting = false;
+        }
         match relay.call(command) {
-            Ok(reply) => reply,
+            Ok(mut reply) => {
+                if reply.is_err() {
+                    self.focus_reporting = false;
+                    self.mouse_reporting = false;
+                }
+                if status {
+                    self.focus_reporting = reply
+                        .as_ref()
+                        .ok()
+                        .is_some_and(|value| focus_capability(self.instance.as_deref(), value));
+                    self.mouse_reporting = reply
+                        .as_ref()
+                        .ok()
+                        .is_some_and(|value| mouse_capability(self.instance.as_deref(), value));
+                    if let Ok(value) = &mut reply {
+                        if let Some(object) = value.as_object_mut() {
+                            object.insert(
+                                "focus_reporting".into(),
+                                Value::Bool(self.focus_reporting),
+                            );
+                            object.insert(
+                                "mouse_reporting".into(),
+                                Value::Bool(self.mouse_reporting),
+                            );
+                            if !self.mouse_reporting {
+                                object.remove("mouse");
+                                object.remove("alternate_scroll");
+                            }
+                        }
+                    }
+                }
+                reply
+            }
             Err(_) => {
                 self.relay = None;
+                self.focus_reporting = false;
+                self.mouse_reporting = false;
                 self.input_uncertain |= input;
                 Err("SSH terminal connection ended.".into())
             }
         }
     }
+}
+
+fn mouse_capability(instance: Option<&str>, status: &Value) -> bool {
+    instance.is_some_and(valid_identity)
+        && status.get("mouse_reporting") == Some(&Value::Bool(true))
+}
+
+fn focus_capability(instance: Option<&str>, status: &Value) -> bool {
+    instance.is_some_and(valid_identity)
+        && status.get("focus_reporting") == Some(&Value::Bool(true))
 }
 
 fn input_grant(result: &Value, explicit: bool) -> Result<bool, String> {
@@ -613,6 +700,8 @@ fn is_input(command: &Command) -> bool {
     matches!(
         command,
         Command::Write { .. }
+            | Command::Mouse { .. }
+            | Command::Focus { .. }
             | Command::Key { .. }
             | Command::Text { .. }
             | Command::Paste { .. }
@@ -652,9 +741,94 @@ mod reload_tests {
                 input_uncertain: false,
                 recovered_from: None,
                 pending_snapshot: None,
+                focus_reporting: false,
+                mouse_reporting: false,
             }),
         }
     }
+
+    #[test]
+    fn mouse_capability_requires_bound_current_status_before_any_command() {
+        let identity = "a".repeat(32);
+        for status in [
+            json!({}),
+            json!({"mouse_reporting":false}),
+            json!({"mouse_reporting":"true"}),
+        ] {
+            assert!(!mouse_capability(Some(&identity), &status));
+        }
+        assert!(!mouse_capability(None, &json!({"mouse_reporting":true})));
+        assert!(mouse_capability(
+            Some(&identity),
+            &json!({"mouse_reporting":true})
+        ));
+        let mut t = terminal(Duration::ZERO);
+        t.pending_reload = None;
+        let report=serde_json::from_value(json!({"layout":"1","revision":"1","generation":1,"row":0,"col":0,"kind":"press","button":"left","alt":false,"ctrl":false})).unwrap();
+        let result = t.execute(
+            Action::Request {
+                command: Command::Mouse {
+                    owner: owner(),
+                    report,
+                },
+            },
+            None,
+            "main",
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            "SSH terminal mouse reporting is unavailable."
+        );
+        assert!(t.session.as_ref().unwrap().relay.is_none());
+        assert!(!t.session.as_ref().unwrap().input_uncertain);
+    }
+
+    #[test]
+    fn focus_capability_requires_current_bound_status_and_never_probes_old_hosts() {
+        assert!(!focus_capability(
+            Some(&"a".repeat(32)),
+            &json!({"exited":false})
+        ));
+        assert!(!focus_capability(None, &json!({"focus_reporting":true})));
+        assert!(!focus_capability(
+            Some("bad"),
+            &json!({"focus_reporting":true})
+        ));
+        assert!(!focus_capability(
+            Some(&"a".repeat(32)),
+            &json!({"focus_reporting":"true"})
+        ));
+        assert!(focus_capability(
+            Some(&"a".repeat(32)),
+            &json!({"focus_reporting":true})
+        ));
+        let mut t = terminal(Duration::ZERO);
+        let session = t.session.as_mut().unwrap();
+        let command = || Command::Focus {
+            owner: owner(),
+            focused: true,
+        };
+        // No relay exists: unsupported focus must fail at the capability gate,
+        // before any attempt to reconnect or send an unfamiliar command.
+        assert_eq!(
+            session.exchange(command(), false).unwrap_err(),
+            "SSH terminal focus reporting is unavailable."
+        );
+        assert!(!session.input_uncertain);
+        session.focus_reporting = true;
+        session.read_only = true;
+        assert!(session
+            .exchange(command(), false)
+            .unwrap_err()
+            .contains("focus reporting"));
+        session.read_only = false;
+        session.pending_snapshot = Some(1);
+        assert!(session
+            .exchange(command(), false)
+            .unwrap_err()
+            .contains("focus reporting"));
+    }
+
     #[test]
     fn ssh_reload_pending_blocks_old_input_and_wrong_claim_consumes_without_network() {
         let mut t = terminal(Duration::ZERO);

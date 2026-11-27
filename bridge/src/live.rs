@@ -25,7 +25,7 @@ pub use crate::protocol::{CloseStatus, HistorySnapshot, SessionStatus};
 pub use command_blocks::{
     BlockSelection, CommandActivity, CommandBlockSnapshot, CompletedPaneHistory, RetainedBlock,
 };
-pub use mouse::{MouseReport, MouseView};
+pub use mouse::{AlternateScrollView, MouseReport, MouseView};
 use raw_suffix::RawSuffix;
 
 const HISTORY_PAGE_ROWS: usize = 128;
@@ -79,6 +79,8 @@ pub struct LiveBridge {
     stable: Option<RetainedCellFrame>,
     resize_repaint: Option<ResizeRepaint>,
     mouse: mouse::Mouse,
+    focus_state: Option<(u32, bool)>,
+    focus_retiring: bool,
     #[cfg(test)]
     frame_budget_override:
         Option<std::sync::Arc<jterm_engine::retained_bytes::RetainedBytesBudget>>,
@@ -175,6 +177,7 @@ impl LiveBridge {
         let mut session = spawn(frame_epoch)?;
         session.enable_ordered_input();
         if self.local_desktop {
+            session.set_color_defaults(jterm_protocol::engine_projection::WIRE_COLOR_DEFAULTS);
             session.enable_underline_colors();
             session.enable_grapheme_clusters();
             session.enable_keyboard_disambiguation();
@@ -202,6 +205,8 @@ impl LiveBridge {
         self.command_source_stream = command_source_stream;
         self.restored_commands = Default::default();
         self.raw = RawSuffix::default();
+        self.focus_state = None;
+        self.focus_retiring = false;
         Ok(epoch)
     }
     fn check(&self, epoch: u32) -> Result<(), String> {
@@ -380,8 +385,10 @@ impl LiveBridge {
     }
 
     pub fn detach(&mut self, owner: &Attachment) -> Result<(), String> {
-        self.generation = self.next_detached_generation(owner)?;
+        let generation = self.next_detached_generation(owner)?;
         self.session.as_mut().unwrap().retire_pending_input();
+        self.retire_focus();
+        self.generation = generation;
         self.raw.retire_view();
         self.mouse.retire();
         self.input_attached = false;
@@ -422,7 +429,6 @@ impl LiveBridge {
             .checked_add(1)
             .ok_or("attachment exhausted")?;
         let frame = self.recover_frame_with(self.epoch, encode)?;
-        self.generation = generation;
         let session = self.session.as_mut().unwrap();
         if expected.is_none() {
             session.retire_pending_input();
@@ -430,9 +436,12 @@ impl LiveBridge {
         } else if session.retire_partial_input() {
             self.input_attached = false;
         }
+        self.retire_focus();
+        self.generation = generation;
         self.raw.retire_view();
         self.resumed_from = expected.map(|owner| owner.generation);
         self.accepted = None;
+        self.mouse.retire();
         self.history_search = None;
         Ok(Some(Resume {
             owner: self.attachment(self.epoch)?,
@@ -447,9 +456,6 @@ impl LiveBridge {
             self.input_attached = false;
         }
         let bytes = result?;
-        if self.local_desktop {
-            self.mouse.observe(session.terminal());
-        }
         if let Some(repaint) = &mut self.resize_repaint {
             let now = Instant::now();
             if bytes != 0 && repaint.held(now) {
@@ -486,11 +492,19 @@ impl LiveBridge {
 
     /// A local desktop owner may drain a detached PTY after witnessing that
     /// no raw input transaction or reader is active under its registry lock.
-    /// Never consumes logical input or touches frame publication/ACK state.
+    /// This can finish a queued focus release from the retired viewer while
+    /// leaving the frame acknowledgement state intact.
     #[doc(hidden)]
     pub fn pump_detached_idle(&mut self) -> Result<bool, String> {
         if !self.local_desktop || self.input_attached {
             return Ok(false);
+        }
+        if self.focus_retiring {
+            let active = self.pump_unpublished()?;
+            self.focus_retiring = self.session.as_ref().is_some_and(|session| {
+                !session.input_idle() && session.write_error().is_none() && !session.is_exited()
+            });
+            return Ok(active);
         }
         match &mut self.session {
             Some(session) => session.poll_detached_idle(),
@@ -934,7 +948,7 @@ impl LiveBridge {
     }
     pub fn mouse_view(&self, epoch: u32) -> Result<Option<MouseView>, String> {
         self.check(epoch)?;
-        if !self.local_desktop || !self.input_attached || self.resize_held(Instant::now()) {
+        if !self.input_attached || self.resize_held(Instant::now()) {
             return Ok(None);
         }
         let session = self.session.as_ref().unwrap();
@@ -948,22 +962,110 @@ impl LiveBridge {
             .and_then(|frame| self.mouse.view(session.terminal(), frame.stamp())))
     }
 
+    pub fn alternate_scroll_view(&self, epoch: u32) -> Result<Option<AlternateScrollView>, String> {
+        self.check(epoch)?;
+        if !self.input_attached || self.resize_held(Instant::now()) {
+            return Ok(None);
+        }
+        let session = self.session.as_ref().unwrap();
+        if session.is_exited() || session.write_error().is_some() {
+            return Ok(None);
+        }
+        Ok(self
+            .flight
+            .as_ref()
+            .or(self.accepted.as_ref())
+            .and_then(|frame| self.mouse.alternate_view(session.terminal(), frame.stamp())))
+    }
+
     pub fn mouse(&mut self, epoch: u32, report: MouseReport) -> Result<bool, String> {
         self.check(epoch)?;
-        if !self.local_desktop || self.resize_held(Instant::now()) {
+        if !self.raw.is_idle() {
+            return Err("finish the pending raw input event first".into());
+        }
+        if !self.input_attached || self.resize_held(Instant::now()) {
             return Ok(false);
         }
         // Drive first so a mode change or a layout update already waiting in
         // the reader invalidates the painted pointer target.
         self.poll_io(self.flight.is_none())?;
-        for frame in self.flight.iter().chain(self.accepted.iter()) {
-            if self.mouse.matches(frame.stamp(), &report) {
-                return self
-                    .mouse
-                    .send(self.session.as_mut().unwrap(), frame.stamp(), report);
+        if !self.input_attached {
+            return Ok(false);
+        }
+        let frames = self
+            .flight
+            .iter()
+            .chain(self.accepted.iter())
+            .map(|frame| frame.stamp());
+        let Some(stamp) = self.mouse.presented_stamp(&report, frames) else {
+            return Ok(false);
+        };
+        self.mouse
+            .send(self.session.as_mut().unwrap(), stamp, report)
+    }
+
+    /// Retire the old viewer's advisory focus before rotating its writer lease.
+    /// A partial raw event or failed writer cannot safely accept another event.
+    fn retire_focus(&mut self) {
+        let was_focused = self.focus_state.take() == Some((self.generation, true));
+        if !was_focused || !self.raw.is_idle() {
+            return;
+        }
+        if self.pump_unpublished().is_err() {
+            return;
+        }
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        if session.is_exited() || session.write_error().is_some() {
+            return;
+        }
+        if let Some(bytes) = session.terminal().encode_focus(false) {
+            if session.submit_input(bytes.to_vec()).is_ok() {
+                self.focus_retiring = true;
+                // Drive once now; a blocked ordered release is finished by
+                // detached maintenance without admitting new viewer input.
+                let _ = self.pump_unpublished();
+                self.focus_retiring = self.session.as_ref().is_some_and(|session| {
+                    !session.input_idle() && session.write_error().is_none() && !session.is_exited()
+                });
             }
         }
-        Ok(false)
+    }
+
+    /// Focus events share the ordered input writer and attachment lease.
+    pub fn focus(&mut self, epoch: u32, focused: bool) -> Result<bool, String> {
+        self.check(epoch)?;
+        if !self.input_attached {
+            return Err("terminal input is detached".into());
+        }
+        if self.input_waits_for_snapshot && self.accepted.is_none() {
+            return Err("acknowledge the local tab snapshot before sending input".into());
+        }
+        if !self.raw.is_idle() {
+            return Err("finish the pending raw input event first".into());
+        }
+        // Preserve every completed/held publication while observing mode changes
+        // already queued by the child before encoding the focus notification.
+        self.pump_unpublished()?;
+        let session = self.session.as_ref().unwrap();
+        if !self.input_attached || session.is_exited() || session.write_error().is_some() {
+            return Err("terminal input is closed".into());
+        }
+        if self.focus_state == Some((self.generation, focused)) {
+            return Ok(false);
+        }
+        let bytes = session
+            .terminal()
+            .encode_focus(focused)
+            .unwrap_or_default()
+            .to_vec();
+        let sent = !bytes.is_empty();
+        if sent {
+            self.enqueue(epoch, bytes)?;
+        }
+        self.focus_state = Some((self.generation, focused));
+        Ok(sent)
     }
 
     pub fn key(
@@ -1025,6 +1127,7 @@ impl LiveBridge {
         };
         session.resize(rows, cols)?;
         if changed {
+            self.mouse.retire();
             let now = Instant::now();
             if let Some(repaint) = &mut self.resize_repaint {
                 repaint.extend(now);
@@ -1256,10 +1359,16 @@ mod tests {
             assert!(Instant::now() < timeout);
             thread::sleep(Duration::from_millis(10));
         }
-        let (_, frame) = bridge
-            .poll_channel_frame(epoch, true, SnapshotFormat::Channel)
-            .unwrap()
-            .unwrap();
+        let (_, frame) = loop {
+            if let Some(publication) = bridge
+                .poll_channel_frame(epoch, true, SnapshotFormat::Channel)
+                .unwrap()
+            {
+                break publication;
+            }
+            assert!(Instant::now() < timeout, "Channel scratch stayed busy");
+            thread::sleep(Duration::from_millis(10));
+        };
         let json: serde_json::Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(json["stamp"]["session"], owner.session);
         let line: String = json["rows"][0]["cells"]
@@ -1496,6 +1605,103 @@ mod tests {
     }
 
     #[test]
+    fn local_alternate_scroll_wheel_uses_current_key_modes_and_painted_stamp() {
+        use std::{ffi::OsString, path::Path};
+        let argv = [
+            "/usr/bin/python3",
+            "-c",
+            r#"
+import os,tty
+tty.setraw(0)
+def expect(want):
+ got=b''
+ while len(got)<len(want): got+=os.read(0,len(want)-len(got))
+ assert got==want,got
+os.write(1,b'\x1b[?1049h\x1b[?1007hALT')
+expect(b'\x1b[A\x1b[B')
+os.write(1,b'\x1b[?1hMODE')
+expect(b'\x1bOA')
+os.write(1,b'\x1b[?1007lOFF')
+expect(b'!')
+os.write(1,b'\x1b[?1007h\x1b[?1002;1006hTRACK')
+expect(b'\x1b[<64;3;2M')
+os.write(1,b'\x1b[?1002;1006l\x1b[?1049lPRIMARY')
+expect(b'.')
+"#,
+        ]
+        .map(OsString::from);
+        let mut bridge = LiveBridge::local_desktop();
+        let epoch = bridge
+            .open_prepared_editor(4, 40, &argv, Path::new("/"), &[])
+            .unwrap();
+        let wait = |bridge: &mut LiveBridge, marker: &str| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                bridge.pump_unpublished().unwrap();
+                let frame = bridge.recover_frame(epoch).unwrap();
+                bridge.acknowledge(epoch, frame.revision).unwrap();
+                if bridge
+                    .session
+                    .as_ref()
+                    .unwrap()
+                    .terminal()
+                    .visible_text()
+                    .contains(marker)
+                {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "missing {marker}");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let report = |view: &serde_json::Value, kind: &str, button: Option<&str>| {
+            serde_json::from_value::<MouseReport>(serde_json::json!({"layout":view["layout"],"revision":view["revision"],"generation":view["generation"],"row":1,"col":2,"kind":kind,"button":button,"alt":false,"ctrl":false})).unwrap()
+        };
+        wait(&mut bridge, "ALT");
+        assert!(bridge.mouse_view(epoch).unwrap().is_none());
+        let view =
+            serde_json::to_value(bridge.alternate_scroll_view(epoch).unwrap().unwrap()).unwrap();
+        assert_eq!(view.as_object().unwrap().len(), 3);
+        assert!(!bridge
+            .mouse(epoch, report(&view, "press", Some("left")))
+            .unwrap());
+        assert!(bridge
+            .mouse(epoch, report(&view, "wheel_up", None))
+            .unwrap());
+        assert!(bridge
+            .mouse(epoch, report(&view, "wheel_down", None))
+            .unwrap());
+        wait(&mut bridge, "MODE");
+        assert!(!bridge
+            .mouse(epoch, report(&view, "wheel_up", None))
+            .unwrap());
+        let current =
+            serde_json::to_value(bridge.alternate_scroll_view(epoch).unwrap().unwrap()).unwrap();
+        assert_ne!(view["generation"], current["generation"]);
+        assert!(bridge
+            .mouse(epoch, report(&current, "wheel_up", None))
+            .unwrap());
+        wait(&mut bridge, "OFF");
+        assert!(bridge.alternate_scroll_view(epoch).unwrap().is_none());
+        assert!(!bridge
+            .mouse(epoch, report(&current, "wheel_up", None))
+            .unwrap());
+        bridge.text(epoch, "!").unwrap();
+        wait(&mut bridge, "TRACK");
+        assert!(bridge.alternate_scroll_view(epoch).unwrap().is_none());
+        let mouse = serde_json::to_value(bridge.mouse_view(epoch).unwrap().unwrap()).unwrap();
+        assert!(bridge
+            .mouse(epoch, report(&mouse, "wheel_up", None))
+            .unwrap());
+        wait(&mut bridge, "PRIMARY");
+        assert!(bridge.alternate_scroll_view(epoch).unwrap().is_none());
+        assert!(!bridge
+            .mouse(epoch, report(&view, "wheel_up", None))
+            .unwrap());
+        bridge.close(epoch).unwrap();
+    }
+
+    #[test]
     fn local_mouse_uses_the_published_surface_and_delivers_real_pty_reports() {
         let mut bridge = LiveBridge::local_desktop();
         let epoch = bridge.open(6, 100).unwrap();
@@ -1558,6 +1764,437 @@ mod tests {
             .mouse(epoch, report("press", &view["layout"], generation))
             .unwrap());
         bridge.close(epoch).unwrap();
+    }
+
+    #[test]
+    fn x10_clicks_reach_the_pty_without_a_held_button() {
+        use std::{ffi::OsString, path::Path};
+
+        let child = r#"
+import os, tty
+tty.setraw(0)
+def expect(expected):
+    got = b''
+    while len(got) < len(expected):
+        chunk = os.read(0, len(expected) - len(got))
+        assert chunk
+        got += chunk
+    assert got == expected, got
+os.write(1, b'\x1b[?9hREADY')
+expect(b'\x1b[M\x20\x23\x22\x1b[M\x22\x23\x22')
+os.write(1, b'\x1b[?1000;1006h\rNORMAL')
+expect(b'\x1b[<16;3;2M\x1b[<16;3;2m')
+os.write(1, b'\x1b[?1000l\rX10 AGAIN')
+expect(b'\x1b[<1;3;2M')
+"#;
+        let argv = ["/usr/bin/python3", "-c", child].map(OsString::from);
+        let mut bridge = LiveBridge::local_desktop();
+        let epoch = bridge
+            .open_prepared_editor(4, 24, &argv, Path::new("/"), &[])
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let poll_view = |bridge: &mut LiveBridge, marker: &str| loop {
+            if let Some(frame) = bridge.poll(epoch).unwrap() {
+                bridge.acknowledge(epoch, frame.revision).unwrap();
+            }
+            if bridge
+                .session
+                .as_ref()
+                .unwrap()
+                .terminal()
+                .visible_text()
+                .contains(marker)
+            {
+                if let Some(view) = bridge.mouse_view(epoch).unwrap() {
+                    break serde_json::to_value(view).unwrap();
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "mouse view did not reach {marker}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let send = |bridge: &mut LiveBridge,
+                    view: &serde_json::Value,
+                    kind: &str,
+                    button: Option<&str>| {
+            let report = serde_json::from_value::<MouseReport>(serde_json::json!({
+                "layout": view["layout"], "revision": view["revision"], "generation": view["generation"],
+                "row": 1, "col": 2, "kind": kind, "button": button, "alt": false, "ctrl": true,
+            })).unwrap();
+            bridge.mouse(epoch, report).unwrap()
+        };
+        let initial = poll_view(&mut bridge, "READY");
+        assert_eq!(initial["tracking"], "press_only");
+        assert!(send(&mut bridge, &initial, "press", Some("left")));
+        assert!(!send(&mut bridge, &initial, "release", Some("left")));
+        assert!(!send(&mut bridge, &initial, "motion", None));
+        assert!(!send(&mut bridge, &initial, "wheel_down", None));
+        assert!(send(&mut bridge, &initial, "press", Some("right")));
+
+        let normal = poll_view(&mut bridge, "NORMAL");
+        assert_eq!(normal["tracking"], "button");
+        assert_ne!(normal["generation"], initial["generation"]);
+        assert!(send(&mut bridge, &normal, "press", Some("left")));
+        assert!(send(&mut bridge, &normal, "release", Some("left")));
+
+        let restored = poll_view(&mut bridge, "X10 AGAIN");
+        assert_eq!(restored["tracking"], "press_only");
+        assert_ne!(restored["generation"], normal["generation"]);
+        assert!(send(&mut bridge, &restored, "press", Some("middle")));
+        while bridge.pump_attached_io(epoch).unwrap() {
+            assert!(Instant::now() < deadline, "X10 round trip did not finish");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(bridge.session.as_ref().unwrap().exit_code(), Some(0));
+    }
+
+    #[test]
+    fn held_mouse_release_reaches_pty_and_mode_round_trip_retires_old_gesture() {
+        use std::{ffi::OsString, path::Path};
+
+        let child = r#"
+import os, tty
+tty.setraw(0)
+def expect(expected):
+    got = b''
+    while len(got) < len(expected):
+        chunk = os.read(0, len(expected) - len(got))
+        assert chunk
+        got += chunk
+    assert got == expected, got
+press = b'\x1b[<0;3;2M'
+release = b'\x1b[<0;3;2m'
+os.write(1, b'\x1b[?1002;1006hREADY')
+expect(press)
+os.write(1, b'\rNEWER')
+expect(b'!')
+os.write(1, b'\x1b[?2026h')
+expect(release)
+os.write(1, b'\x1b[?2026l\rAFTER')
+expect(press)
+os.write(1, b'\x1b[?1006l\x1b[?1006h')
+expect(press)
+expect(release)
+"#;
+        let argv = ["/usr/bin/python3", "-c", child].map(OsString::from);
+        let mut bridge = LiveBridge::local_desktop();
+        let epoch = bridge
+            .open_prepared_editor(4, 24, &argv, Path::new("/"), &[])
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let report = |view: &serde_json::Value, kind: &str, button: &str| {
+            serde_json::from_value::<MouseReport>(serde_json::json!({
+                "layout": view["layout"], "revision": view["revision"], "generation": view["generation"],
+                "row": 1, "col": 2, "kind": kind, "button": button, "alt": false, "ctrl": false,
+            }))
+            .unwrap()
+        };
+        let poll_view = |bridge: &mut LiveBridge, marker: &str| loop {
+            if let Some(frame) = bridge.poll(epoch).unwrap() {
+                bridge.acknowledge(epoch, frame.revision).unwrap();
+            }
+            if bridge
+                .session
+                .as_ref()
+                .unwrap()
+                .terminal()
+                .visible_text()
+                .contains(marker)
+            {
+                if let Some(view) = bridge.mouse_view(epoch).unwrap() {
+                    break serde_json::to_value(view).unwrap();
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "mouse view did not reach {marker}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+
+        let pressed = poll_view(&mut bridge, "READY");
+        assert!(bridge
+            .mouse(epoch, report(&pressed, "press", "left"))
+            .unwrap());
+        let newer = poll_view(&mut bridge, "NEWER");
+        assert_ne!(pressed["revision"], newer["revision"]);
+        bridge
+            .session
+            .as_mut()
+            .unwrap()
+            .submit_input(vec![b'!'])
+            .unwrap();
+        while !bridge
+            .session
+            .as_ref()
+            .unwrap()
+            .terminal()
+            .publication_held()
+        {
+            bridge.pump_attached_io(epoch).unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "missing synchronized output hold"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(bridge.mouse_view(epoch).unwrap().is_none());
+        assert!(!bridge
+            .mouse(epoch, report(&newer, "motion", "left"))
+            .unwrap());
+        assert!(!bridge
+            .mouse(epoch, report(&pressed, "release", "right"))
+            .unwrap());
+        assert!(bridge
+            .mouse(epoch, report(&pressed, "release", "left"))
+            .unwrap());
+
+        let after = poll_view(&mut bridge, "AFTER");
+        assert!(bridge
+            .mouse(epoch, report(&after, "press", "left"))
+            .unwrap());
+        let next = loop {
+            let view = poll_view(&mut bridge, "AFTER");
+            if view["generation"] != after["generation"] {
+                break view;
+            }
+            assert!(Instant::now() < deadline, "missing in-batch mode change");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(after["revision"], next["revision"]);
+        assert_eq!(after["tracking"], next["tracking"]);
+        assert!(!bridge
+            .mouse(epoch, report(&after, "release", "left"))
+            .unwrap());
+        assert!(bridge.mouse(epoch, report(&next, "press", "left")).unwrap());
+        assert!(bridge
+            .mouse(epoch, report(&next, "release", "left"))
+            .unwrap());
+        while bridge.pump_attached_io(epoch).unwrap() {
+            assert!(Instant::now() < deadline, "mouse round trip did not finish");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(bridge.session.as_ref().unwrap().exit_code(), Some(0));
+    }
+
+    #[test]
+    fn local_focus_reports_follow_live_modes_and_the_attachment_lease() {
+        use std::{ffi::OsString, path::Path};
+        let child = r#"
+import os, tty
+tty.setraw(0)
+def expect(want):
+    got = b''
+    while len(got) < len(want):
+        got += os.read(0, len(want) - len(got))
+    assert got == want, got
+os.write(1, b'\x1b[?1004hREADY')
+expect(b'\x1b[I\x1b[O')
+os.write(1, b'\x1b[?1004lDISABLED')
+expect(b'!')
+os.write(1, b'\x1b[?1004hENABLED')
+expect(b'\x1b[I')
+os.write(1, b'DONE')
+expect(b'\x1b[O')
+os.write(1, b'RECOVERED')
+expect(b'\x1b[I')
+os.write(1, b'REFOCUSED')
+expect(b'\x1b[O')
+os.write(1, b'RETIRED')
+"#;
+        let argv = ["/usr/bin/python3", "-c", child].map(OsString::from);
+        let mut bridge = LiveBridge::local_desktop();
+        let epoch = bridge
+            .open_prepared_editor(4, 80, &argv, Path::new("/"), &[])
+            .unwrap();
+        let owner = bridge.attachment(epoch).unwrap();
+        let wait = |bridge: &mut LiveBridge, marker: &str| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                bridge.pump_unpublished().unwrap();
+                if bridge
+                    .session
+                    .as_ref()
+                    .unwrap()
+                    .terminal()
+                    .visible_text()
+                    .contains(marker)
+                {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "missing {marker}");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        wait(&mut bridge, "READY");
+        let snapshot = bridge.recover_frame(epoch).unwrap();
+        bridge.acknowledge(epoch, snapshot.revision).unwrap();
+        bridge
+            .raw
+            .write(owner.clone(), b"raw".to_vec(), |_| Ok(0))
+            .unwrap();
+        assert!(bridge.focus(epoch, true).unwrap_err().contains("raw input"));
+        bridge.raw = RawSuffix::default();
+        assert!(bridge.focus(epoch, true).unwrap());
+        assert!(!bridge.focus(epoch, true).unwrap());
+        assert!(bridge.focus(epoch, false).unwrap());
+        wait(&mut bridge, "DISABLED");
+        assert!(!bridge.focus(epoch, true).unwrap());
+        assert!(!bridge.focus(epoch, false).unwrap());
+        bridge.text(epoch, "!").unwrap();
+        wait(&mut bridge, "ENABLED");
+        assert!(bridge.focus(epoch, true).unwrap());
+        wait(&mut bridge, "DONE");
+        // Focus drains must leave the child output available for publication.
+        let frame = bridge.recover_frame(epoch).unwrap();
+        assert!(frame.rows.iter().flatten().any(|cell| cell.text == "D"));
+        let resumed = bridge.resume(Some(&owner)).unwrap().unwrap();
+        assert!(bridge.validate_logical_input(&owner).is_err());
+        wait(&mut bridge, "RECOVERED");
+        bridge.acknowledge(epoch, resumed.frame.revision).unwrap();
+        assert!(bridge.focus(epoch, true).unwrap());
+        wait(&mut bridge, "REFOCUSED");
+        bridge.detach(&resumed.owner).unwrap();
+        assert!(bridge.validate_logical_input(&owner).is_err());
+        assert!(bridge.focus(epoch, false).is_err());
+        wait(&mut bridge, "RETIRED");
+        bridge.close(epoch).unwrap();
+        assert!(bridge.focus(epoch, true).is_err());
+    }
+
+    #[test]
+    fn local_osc_colors_reach_pty_channel_history_and_held_recovery() {
+        use crate::protocol_v4::{HistoryView, Update as ChannelUpdate};
+        use std::{ffi::OsString, path::Path};
+
+        let child = r#"
+import os, tty
+tty.setraw(0)
+def expect(expected):
+    got = b''
+    while len(got) < len(expected):
+        chunk = os.read(0, len(expected) - len(got))
+        assert chunk
+        got += chunk
+    assert got == expected, got
+os.write(1, b'\x1b[31mH\x1b[0m' + b'\r\n' * 4 + b'\x1b[H\x1b[31;4:2;58:5:1mA\x1b[0mB')
+expect(b'!')
+os.write(1, b'\x1b]10;#112233;#445566;#778899\x07\x1b]4;1;#abcdef\x07\x1b]10;?;?;?\x07')
+expect(b'\x1b]10;rgb:1111/2222/3333\x07\x1b]11;rgb:4444/5555/6666\x07\x1b]12;rgb:7777/8888/9999\x07')
+expect(b'+')
+os.write(1, b'\x1b[?2026h\x1b]112\x07')
+expect(b'-')
+os.write(1, b'\x1b[?2026l')
+"#;
+        let argv = ["/usr/bin/python3", "-c", child].map(OsString::from);
+        let mut bridge = LiveBridge::local_desktop();
+        let epoch = bridge
+            .open_prepared_editor(4, 24, &argv, Path::new("/"), &[])
+            .unwrap();
+        let format = SnapshotFormat::ChannelImages;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let poll = |bridge: &mut LiveBridge| loop {
+            if let Some((revision, json)) = bridge.poll_channel_frame(epoch, false, format).unwrap()
+            {
+                bridge.acknowledge(epoch, revision.get() as u32).unwrap();
+                break serde_json::from_str::<ChannelUpdate>(&json).unwrap();
+            }
+            assert!(Instant::now() < deadline, "missing terminal Channel update");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        while !bridge
+            .session
+            .as_ref()
+            .unwrap()
+            .terminal()
+            .visible_text()
+            .contains("AB")
+        {
+            poll(&mut bridge);
+        }
+        let initial = bridge.current_snapshot().unwrap();
+        assert_eq!(
+            initial.paint_colors().unwrap().effective_background(),
+            (0x11, 0x18, 0x20)
+        );
+        bridge
+            .session
+            .as_mut()
+            .unwrap()
+            .submit_input(vec![b'!'])
+            .unwrap();
+        let (stamp, rows) = loop {
+            let update = poll(&mut bridge);
+            if let ChannelUpdate::Snapshot { stamp, rows, .. } = update {
+                if stamp.cursor_color == Some((0x77, 0x88, 0x99).into()) {
+                    break (stamp, rows);
+                }
+            }
+        };
+        assert_eq!(rows[0].cells[0].text, "A");
+        assert_eq!(rows[0].cells[0].foreground, "#abcdef");
+        assert_eq!(rows[0].cells[0].underline_color.as_deref(), Some("#abcdef"));
+        assert_eq!(rows[0].cells[1].foreground, "#112233");
+        assert_eq!(rows[0].cells[1].background, "#445566");
+        let history: HistoryView =
+            serde_json::from_str(&bridge.history_projection(epoch, 0, None, 0).unwrap()).unwrap();
+        assert_eq!(history.default_background, Some((0x44, 0x55, 0x66).into()));
+        assert_eq!(history.rows[0].paint.cells[0].text, "H");
+        assert_eq!(history.rows[0].paint.cells[0].foreground, "#abcdef");
+
+        bridge
+            .session
+            .as_mut()
+            .unwrap()
+            .submit_input(vec![b'+'])
+            .unwrap();
+        while !bridge
+            .session
+            .as_ref()
+            .unwrap()
+            .terminal()
+            .publication_held()
+        {
+            bridge.pump_attached_io(epoch).unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "application never entered synchronized output"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let held = bridge
+            .observe_channel_frame(epoch, None, format)
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.0, stamp.revision);
+        let ChannelUpdate::Snapshot {
+            stamp: held_stamp, ..
+        } = serde_json::from_str(&held.1).unwrap()
+        else {
+            panic!("read-only recovery must return a snapshot");
+        };
+        assert_eq!(held_stamp.cursor_color, Some((0x77, 0x88, 0x99).into()));
+        bridge
+            .session
+            .as_mut()
+            .unwrap()
+            .submit_input(vec![b'-'])
+            .unwrap();
+        let ChannelUpdate::Delta {
+            stamp: next, rows, ..
+        } = poll(&mut bridge)
+        else {
+            panic!("cursor-only reset must keep the accepted rows");
+        };
+        assert_eq!(next.cursor_color, Some((0x9a, 0xc6, 0xff).into()));
+        assert!(rows.is_empty());
+        while bridge.pump_attached_io(epoch).unwrap() {
+            assert!(Instant::now() < deadline, "color round trip did not finish");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(bridge.session.as_ref().unwrap().exit_code(), Some(0));
     }
 
     #[test]

@@ -14,8 +14,10 @@ use jterm_engine::{
 };
 use std::sync::Arc;
 
+#[cfg(test)]
+use jterm_protocol::engine_projection::color;
 pub use jterm_protocol::engine_projection::from_engine;
-use jterm_protocol::engine_projection::{cell_width, color, cursor_shape};
+use jterm_protocol::engine_projection::{cell_width, cursor_shape};
 pub use jterm_protocol::file_reference;
 pub use jterm_protocol::terminal as protocol;
 pub use jterm_protocol::terminal_v4 as protocol_v4;

@@ -1,14 +1,16 @@
 //! Convert immutable engine paint state to bounded Channel frames.
 
-use crate::{cell_width, color, cursor_shape, protocol_v4 as wire, semantic::validate_grid};
+use crate::{cell_width, cursor_shape, protocol_v4 as wire, semantic::validate_grid};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use jterm_engine::{
+    colors::ColorState,
     frame::{CellFrame, Row, Screen},
     history_reflow::HistoryAnchor,
     retained_bytes::{RetainedBytes, RetainedBytesBudget},
     terminal::{HistoryPage, InlineImage},
     Color, HyperlinkId, UnderlineStyle,
 };
+use jterm_protocol::engine_projection::{paint_color, same_cell_colors};
 use std::{
     collections::{btree_map::Entry, BTreeMap, BTreeSet},
     io::{self, Write},
@@ -107,6 +109,7 @@ pub(crate) fn encode_history(
     let _scratch = FrameScratch::acquire().ok_or(ENCODERS_BUSY)?;
     let mut projection = Projection {
         images_enabled: true,
+        colors: page.paint_colors(),
         ..Projection::default()
     };
     let rows = page
@@ -159,6 +162,9 @@ pub(crate) fn encode_history(
         text: text.into(),
         hyperlinks,
         images,
+        default_background: page
+            .paint_colors()
+            .map(|colors| colors.effective_background().into()),
     };
     encode_json(&view, &view.images)
 }
@@ -172,6 +178,7 @@ fn update(
     validate_grid(frame)?;
     let engine_stamp = frame.stamp();
     let cursor = frame.cursor();
+    let colors = frame.paint_colors();
     let stamp = wire::Stamp {
         version,
         session: session.into(),
@@ -187,17 +194,25 @@ fn update(
         cursor_col: cursor.col as u16,
         cursor_visible: cursor.visible,
         cursor_shape: cursor_shape(cursor.shape),
+        cursor_color: colors.map(|colors| colors.effective_cursor().into()),
         pending_wrap: cursor.pending_wrap,
     };
     let mut projection = Projection {
         images_enabled: version == wire::IMAGE_VERSION,
+        colors,
         ..Projection::default()
     };
     if let Some((base, delta)) = previous
+        .filter(|base| same_cell_colors(base.paint_colors(), colors))
         .and_then(|base| base.delta_to(frame).ok().map(|delta| (base, delta)))
         .filter(|(_, delta)| delta.rows.len() < frame.rows().len())
     {
-        if projection.images_enabled {
+        if projection.images_enabled
+            && delta
+                .rows
+                .iter()
+                .any(|(index, _)| row_images(frame, *index).next().is_some())
+        {
             projection.base_images = (0..base.rows().len())
                 .flat_map(|index| row_images(base, index))
                 .map(|(_, image, _)| image.id().get())
@@ -237,6 +252,7 @@ fn update(
 
 #[derive(Default)]
 struct Projection<'a> {
+    colors: Option<&'a ColorState>,
     text_bytes: usize,
     hyperlink_bytes: usize,
     hyperlinks: BTreeMap<u16, &'a str>,
@@ -343,8 +359,8 @@ impl<'a> Projection<'a> {
                     }
                     Some(id)
                 };
-                let mut foreground = color(cell.foreground, true);
-                let mut background = color(cell.background, false);
+                let mut foreground = paint_color(cell.foreground, true, self.colors);
+                let mut background = paint_color(cell.background, false, self.colors);
                 if flags.inverse() {
                     std::mem::swap(&mut foreground, &mut background);
                 }
@@ -367,7 +383,8 @@ impl<'a> Projection<'a> {
                         UnderlineStyle::Dotted => Some(wire::Underline::Dotted),
                         UnderlineStyle::Dashed => Some(wire::Underline::Dashed),
                     },
-                    underline_color: underline(column).map(|color_value| color(color_value, true)),
+                    underline_color: underline(column)
+                        .map(|color_value| paint_color(color_value, true, self.colors)),
                     hyperlink_id,
                 })
             })
@@ -425,6 +442,13 @@ impl Write for BoundedJson {
         Ok(bytes.len())
     }
 
+    // This sink accepts the whole slice or fails before appending any bytes.
+    // Avoid the generic partial-write/retry loop for each JSON fragment.
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.write(bytes)?;
+        Ok(())
+    }
+
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
@@ -460,6 +484,10 @@ mod tests {
             limit: 19,
         };
         writer.write_all(b"1234567890").unwrap();
+        let capacity = writer.bytes.capacity();
+        assert!(writer.write_all(b"abcdefghij").is_err());
+        assert_eq!(writer.bytes, b"1234567890");
+        assert_eq!(writer.bytes.capacity(), capacity);
         writer.write_all(b"abcdefghi").unwrap();
         assert_eq!(writer.bytes, b"1234567890abcdefghi");
         assert_eq!(writer.bytes.capacity(), 19);

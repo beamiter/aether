@@ -1,4 +1,5 @@
 import {installTerminalMouse} from './terminal-mouse.js';
+import {installTerminalFocus} from './terminal-focus.js';
 import {installTerminalSelection} from './terminal-selection.js';
 import {validateReloadView,retainedReloadView,saveReloadTicket,takeReloadTicket} from './ssh-reload.js';
 import {installFilePreviewPanel} from './file-preview-panel.js';
@@ -32,6 +33,7 @@ let changingTab=null,restoringLocalLayout=false;
 let mouseView=null;
 let state=null,epoch=null,owner=null,timer=null,polling=null,generation=0,transport=0,recovery=null;
 let sshSession=null,sshInputSuspended=false,detachedLocal=null,sshReloadNeeded=false,retainedLayoutBlocked=false;
+let sshFocusOwner=null,sshMouseOwner=null;
 const showSavedSsh=document.querySelector('#show-saved-ssh'),savedSshPanel=document.querySelector('#saved-ssh');
 const savedSshSelect=document.querySelector('#saved-ssh-shell'),resumeSavedSsh=document.querySelector('#resume-saved-ssh'),forgetSavedSsh=document.querySelector('#forget-saved-ssh');
 let savedSshShells=[],savedSshRequest=0;
@@ -64,13 +66,17 @@ const terminalMouse = typeof canvas.setPointerCapture === 'function'
   ? installTerminalMouse({
     canvas,
     getFrame() {
-      if (input.disabled || changingTab || recovery || !owner || owner.session === sshSession ||
+      if (input.disabled || changingTab || recovery || !canReportMouse(owner) ||
           mouseView?.owner !== owner) return null;
       const frame = visibleLiveFrame();
       if (!frame || frame.session !== owner.session || frame.epoch !== owner.epoch ||
           String(frame.revision) !== mouseView.mouse.revision ||
           String(frame.layout) !== mouseView.mouse.layout) return null;
-      return {...frame, mouse: mouseView.mouse};
+      return {...frame, mouse: mouseView.mouse, attachment: owner};
+    },
+    canRelease(frame) {
+      return !input.disabled && !changingTab && !recovery &&
+        canReportMouse(owner) && frame.attachment === owner;
     },
     send: report => enqueueLogical('mouse_shell', {report}),
     focus: () => imeInput.focus(),
@@ -107,7 +113,7 @@ const channelSnapshots=()=>typeof Channel==='function'?{frameVersion:CHANNEL_FRA
 const acceptAttachedSnapshot=(frame,attachment,options)=>options.frameVersion===CHANNEL_FRAME_VERSION
   ?acceptChannelFrame(null,frame,{...attachment,frameVersion:options.frameVersion},true):acceptFull(null,frame,attachment);
 let savedLayout=invoke?readLocalShellLayout():null;
-const sshCommands={poll_shell:'poll',ack_shell:'ack',shell_status:'status',history_shell:'history',recover_shell:'recover',detach_shell:'detach',close_shell:'close',write_shell:'write',key_shell:'key',text_shell:'text',paste_shell:'paste',resize_shell:'resize'};
+const sshCommands={poll_shell:'poll',ack_shell:'ack',shell_status:'status',history_shell:'history',recover_shell:'recover',detach_shell:'detach',close_shell:'close',write_shell:'write',key_shell:'key',text_shell:'text',paste_shell:'paste',resize_shell:'resize',focus_shell:'focus',mouse_shell:'mouse'};
 function setOpenDisabled(disabled) {
   open.disabled=openIntegrated.disabled=openSsh.disabled=sshHost.disabled=disabled||!invoke;
   showSavedSsh.disabled=openSsh.disabled;
@@ -183,6 +189,7 @@ function renderLocalTabs(focusActive=false) {
   history.updateSearchControls();
   blocks.updateOwner();
   refreshTerminalControls();
+  terminalFocus.refresh();
   tabs.hidden=!invoke||sshSession!==null||!localTabEpochs.size||(!owner&&showLocal.disabled&&!changingTab);
   if(tabs.hidden)return;
   let activeButton=null;
@@ -435,23 +442,31 @@ button.addEventListener('click',async()=>{
   }catch(e){if(currentGeneration!==generation)return;status.textContent=`Stopped: ${String(e?.message??e)}. Restart the app to reset.`;}
   finally {if(currentGeneration===generation){button.disabled=!invoke&&state!==null;setOpenDisabled(false);attach.disabled=!invoke;}}
 });
+function validateStampedMouseView(view) {
+  if (!view || !Number.isInteger(view.generation) || view.generation < 1 || view.generation > 0xffffffff) {
+    throw new Error('invalid terminal mouse state');
+  }
+  channelCounter(view.layout);
+  channelCounter(view.revision);
+}
 function validateShellStatus(info,expectedEpoch){
   if(!info||info.epoch!==expectedEpoch||typeof info.exited!=='boolean'||typeof info.drained!=='boolean'||(info.write_error!==null&&typeof info.write_error!=='string')||typeof info.dropped_reply_bytes!=='string'||!/^[0-9]{1,20}$/.test(info.dropped_reply_bytes)||typeof info.unsupported!=='string'||!/^[0-9]{1,20}$/.test(info.unsupported))throw new Error('invalid session status');
   const exitNotice=info.exit_output_notice;
   if(exitNotice!=null&&(typeof exitNotice!=='string'||exitNotice.length>256))throw new Error('invalid exit output notice');
-  if(owner?.session!==sshSession){
+  const local = owner?.session !== sshSession;
+  if(local){
     validateChatStatus(info.chat);
     acceptLocalPane(info);
     if(info.history_oldest_row!==undefined)channelCounter(info.history_oldest_row);
+  }
+  if (local || info.mouse_reporting === true) {
     if (info.mouse !== undefined) {
-      const mouse = info.mouse;
-      if (!mouse || !['button', 'drag', 'any'].includes(mouse.tracking) ||
-          !Number.isInteger(mouse.generation) || mouse.generation < 1 || mouse.generation > 0xffffffff) {
-        throw new Error('invalid terminal mouse state');
+      validateStampedMouseView(info.mouse);
+      if (!['press_only', 'button', 'drag', 'any'].includes(info.mouse.tracking)) {
+        throw new Error('invalid terminal mouse tracking');
       }
-      channelCounter(mouse.layout);
-      channelCounter(mouse.revision);
     }
+    if (info.alternate_scroll !== undefined) validateStampedMouseView(info.alternate_scroll);
   }
 }
 function showShellStatus(info,mode){
@@ -470,11 +485,21 @@ function showShellStatus(info,mode){
   health.textContent=`Unsupported sequences: ${info.unsupported}. Dropped reply bytes: ${info.dropped_reply_bytes}. Shell ${info.exited?'exited; output remains visible':'running'}.${info.write_error?' Input disabled: '+info.write_error:''}`;
   if(info.exit_output_notice)health.textContent+=' '+info.exit_output_notice;
   if(info.exited||info.write_error){pasteReview.reset();keyQueue.locked=true;input.disabled=send.disabled=resize.disabled=true;}
+  if (owner && owner.session === sshSession) {
+    sshMouseOwner = info.mouse_reporting === true ? owner : null;
+    const capable = info.focus_reporting === true ? owner : null;
+    if (capable !== sshFocusOwner) {
+      sshFocusOwner = capable;
+      terminalFocus.refresh();
+    }
+  }
   if(owner&&owner.session!==sshSession){
     terminalChat.showStatus(info,owner);
     if(info.history_oldest_row!==undefined)history.updateRetained(owner,info.history_oldest_row);
   }
-  mouseView = owner && owner.session !== sshSession && info.mouse ? {owner, mouse: info.mouse} : null;
+  const mouse = info.mouse ?? (info.alternate_scroll
+    ? {...info.alternate_scroll, tracking: 'alternate_scroll'} : null);
+  mouseView = canReportMouse(owner) && mouse ? {owner, mouse} : null;
   terminalMouse?.frameChanged();
   workflows.updateOwner();
   if(document.activeElement===imeInput||document.activeElement===canvas)terminalChat.followCursor();
@@ -979,7 +1004,7 @@ document.querySelector('#command').addEventListener('submit',async event=>{
     if(n===0)await new Promise(resolve=>setTimeout(resolve,10));
   }if(at!==bytes.length)throw new Error('write blocked; do not resend automatically');input.value='';if(attachment.session!==sshSession)localDrafts.delete(attachment.session);}
   catch(e){failed=true;if(ownsInput(attachment,queue)){pasteReview.reset();queue.locked=true;status.textContent=`${at} bytes accepted: ${String(e?.message??e)}. Input locked; close/reopen before retrying.`;}}
-  finally{if(ownsInput(attachment,queue)&&!failed&&!queue.locked){send.disabled=false;input.disabled=false;input.focus();}}
+ finally{if(ownsInput(attachment,queue)&&!failed&&!queue.locked){send.disabled=false;input.disabled=false;input.focus();terminalFocus.refresh();}}
 });
 
 const colsInput=document.querySelector('#cols'),rowsInput=document.querySelector('#rows');
@@ -1069,24 +1094,59 @@ document.querySelector('#reveal-cursor').addEventListener('click',revealLiveCurs
 
 // Browser supplies logical events only; Rust chooses all terminal wire sequences.
 let keyQueue={chain:Promise.resolve(),pending:0,locked:false};
+const terminalFocus = installTerminalFocus({
+  document, window: globalThis,
+  getOwner: focusOwner,
+  isTerminalElement: element => element === canvas || element === imeInput,
+  send: enqueueFocus,
+});
+function focusOwner() {
+  return owner && (owner.session !== sshSession || owner === sshFocusOwner) ? owner : null;
+}
+function canReportMouse(attachment) {
+  return attachment !== null && (attachment.session !== sshSession || attachment === sshMouseOwner);
+}
 function ownsInput(attachment,queue){
   return changingTab===null&&attachment!==null&&owner===attachment&&keyQueue===queue;
+}
+function enqueueFocus(attachment, focused) {
+  const queue = keyQueue;
+  const advisory = queue.focusPending ?? 0;
+  if (!ownsInput(attachment, queue) || input.disabled || queue.locked || recovery ||
+      advisory >= 2 || queue.pending >= 126) return false;
+  queue.focusPending = advisory + 1;
+  queue.chain = queue.chain.then(async () => {
+    if (!ownsInput(attachment, queue) || attachment !== focusOwner() ||
+        input.disabled || queue.locked || recovery) return;
+    try {
+      await invokeAttached('focus_shell', {epoch: attachment.epoch, focused}, attachment);
+    } catch {
+      // View retirement or a pending write can race this advisory input.
+    }
+  }).finally(() => {
+    queue.focusPending--;
+    terminalFocus.refresh();
+  });
+  return true;
 }
 function enqueueLogical(command,payload,onReceipt){
   if(epoch===null||input.disabled)return;
   const queue=keyQueue;
   const mouse=command==='mouse_shell';
-  if (mouse && queue.pending >= (payload.report.kind === 'release' ? 128 : 126)) return;
+  if (mouse && (!canReportMouse(owner) || queue.pending >= (payload.report.kind === 'release' ? 128 : 126))) return;
   if(queue.pending>=128){pasteReview.reset();queue.locked=true;status.textContent='Keyboard queue full; input locked. Close/reopen before retrying.';input.disabled=send.disabled=true;return;}
   const current=epoch,attachment=owner;queue.pending++;
   queue.chain=queue.chain.then(async()=>{
-    if(!ownsInput(attachment,queue)||queue.locked)return;
+    if(!ownsInput(attachment,queue)||queue.locked||mouse&&!canReportMouse(attachment))return;
     try{
       const result=await invokeAttached(command,{epoch:current,...payload},attachment);
       if(ownsInput(attachment,queue))onReceipt?.(result);
     }
     catch(e){if(!mouse&&ownsInput(attachment,queue)){pasteReview.reset();queue.locked=true;input.disabled=send.disabled=true;status.textContent=`Input not accepted: ${String(e?.message??e)}. Close/reopen before retrying.`;}}
-  }).finally(()=>{queue.pending--;});
+  }).finally(()=>{
+    queue.pending--;
+    if (queue.pending === 125) terminalFocus.refresh();
+  });
   return queue.chain;
 }
 function keydown(event){

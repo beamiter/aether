@@ -33,13 +33,14 @@ function validateRow(row, cols) {
 }
 
 function finishFrame(frame, cols, rows) {
+  if (frame.cursor_color !== undefined && (typeof frame.cursor_color !== 'string' || !/^#[a-f0-9]{6}$/i.test(frame.cursor_color))) throw new Error('cursor color');
   if (typeof frame.cursor_visible !== 'boolean' || typeof frame.pending_wrap !== 'boolean' ||
       !['block','underline','beam'].includes(frame.cursor_shape)) throw new Error('cursor visibility');
   if (!Number.isInteger(frame.cursor_row) || !Number.isInteger(frame.cursor_col) ||
       frame.cursor_row<0 || frame.cursor_row>=rows.length || frame.cursor_col<0 || frame.cursor_col>=cols) throw new Error('cursor');
   return Object.freeze({version:3,session:frame.session,epoch:frame.epoch,revision:frame.revision,layout:frame.layout,cols,
     rows:Object.freeze(rows),cursor_row:frame.cursor_row,cursor_col:frame.cursor_col,
-    cursor_visible:frame.cursor_visible,cursor_shape:frame.cursor_shape,pending_wrap:frame.pending_wrap});
+    cursor_visible:frame.cursor_visible,cursor_shape:frame.cursor_shape,cursor_color:frame.cursor_color,pending_wrap:frame.pending_wrap});
 }
 
 export function acceptFull(previous, frame, expected = {session:'frame-demo',epoch:1}) {
@@ -140,7 +141,7 @@ export function paint(canvas, frame, scale = globalThis.devicePixelRatio || 1) {
     previous.rows.length !== frame.rows.length || previous.selection !== frame.selection;
   const cursorMoved = !full && (previous.cursor_row !== frame.cursor_row ||
     previous.cursor_col !== frame.cursor_col || previous.cursor_shape !== frame.cursor_shape ||
-    previous.cursor_visible !== frame.cursor_visible);
+    previous.cursor_visible !== frame.cursor_visible || previous.cursor_color !== frame.cursor_color);
   const oldCursorRow = cursorMoved && previous.cursor_visible ? previous.cursor_row : -1;
   const newCursorRow = cursorMoved && frame.cursor_visible ? frame.cursor_row : -1;
   const dirty = [];
@@ -204,7 +205,7 @@ export function paint(canvas, frame, scale = globalThis.devicePixelRatio || 1) {
     for (const {row,first,last} of frame.selection) g.fillRect(first*cw,row*ch,(last-first)*cw,ch);
   }
   if(frame.cursor_visible && dirty.includes(frame.cursor_row)){
-    const x=frame.cursor_col*cw,y=frame.cursor_row*ch,width=cw*(frame.rows[frame.cursor_row][frame.cursor_col].width===2?2:1);g.fillStyle=g.strokeStyle='#9ac6ff';
+    const x=frame.cursor_col*cw,y=frame.cursor_row*ch,width=cw*(frame.rows[frame.cursor_row][frame.cursor_col].width===2?2:1);g.fillStyle=g.strokeStyle=frame.cursor_color ?? '#9ac6ff';
     if(frame.cursor_shape==='beam')g.fillRect(x,y,2,ch);
     else if(frame.cursor_shape==='underline')g.fillRect(x,y+ch-2,width,2);
     else g.strokeRect(x+.5,y+.5,width-1,ch-1);

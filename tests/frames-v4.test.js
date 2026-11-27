@@ -161,3 +161,31 @@ test('an archived page rejects stale ownership, false cell offsets and conflicti
   assert.throws(()=>admit({...archive,rows:[archive.rows[0],{...archive.rows[1],source:archive.rows[0].source}]}),/row source/);
   assert.throws(()=>admit({...archive,images:[]}),/unresolved/);
 });
+
+test('Channel v4 and v5 optional cursor color accepts old frames and color-only deltas',()=>{
+ for(const version of [4,5]){
+  const full={...snapshot,stamp:{...stamp,version,cursor_visible:true,cursor_color:'#abcdef'}};
+  const base=accept(null,full);
+  assert.equal(base.cursor_color,'#abcdef');
+  const next=accept(base,{kind:'delta',stamp:{...full.stamp,revision:'9007199254740993',cursor_color:'#123456'},
+   base_revision:stamp.revision,rows:[],hyperlinks:[]});
+  assert.equal(next.cursor_color,'#123456');
+  assert.equal(next.rows[0],base.rows[0]);
+  const legacy=accept(null,{...snapshot,stamp:{...stamp,version}});
+  assert.equal(legacy.cursor_color,undefined);
+  for(const cursor_color of [null,1,'blue','#abc','#11223344']){
+   assert.throws(()=>accept(null,{...full,stamp:{...full.stamp,cursor_color}}),/cursor color/);
+  }
+ }
+});
+
+test('history padding uses the supplied default background and accepts legacy pages',()=>{
+ const old=acceptHistoryProjection(JSON.stringify(archive),archiveOwner);
+ assert.equal(old.rows[1].at(-1).background,'#111820');
+ const next=acceptHistoryProjection(JSON.stringify({...archive,default_background:'#2468ac'}),archiveOwner);
+ assert.equal(next.rows[1].at(-1).background,'#2468ac');
+ assert.equal(next.rows[1][0].background,old.rows[1][0].background);
+ for(const default_background of [null,1,'white','#abc','#12345678']){
+  assert.throws(()=>acceptHistoryProjection(JSON.stringify({...archive,default_background}),archiveOwner),/default background/);
+ }
+});

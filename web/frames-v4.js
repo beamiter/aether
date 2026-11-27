@@ -218,7 +218,9 @@ export function acceptChannelFrame(previous, encoded, expected, snapshotOnly = f
     if (linkBytes > maxHyperlinkBytes) throw new Error('Channel hyperlink byte limit');
     hyperlinks[id] = url;
   }
-  const {cursor_row, cursor_col, cursor_shape, cursor_visible, pending_wrap} = stamp;
+  const {cursor_row, cursor_col, cursor_shape, cursor_visible, pending_wrap, cursor_color} = stamp;
+  if (cursor_color !== undefined && (typeof cursor_color !== 'string' || !/^#[a-f0-9]{6}$/i.test(cursor_color)))
+    throw new Error('invalid Channel cursor color');
   if (!Number.isInteger(cursor_row) || cursor_row < 0 || cursor_row >= rows.length ||
       !Number.isInteger(cursor_col) || cursor_col < 0 || cursor_col >= cols ||
       !['block','underline','beam'].includes(cursor_shape) || typeof cursor_visible !== 'boolean' || typeof pending_wrap !== 'boolean')
@@ -226,7 +228,7 @@ export function acceptChannelFrame(previous, encoded, expected, snapshotOnly = f
   const images = resolveImages(rows, cols, newImages, imageBase);
   return Object.freeze({version: stamp.version, session: stamp.session, epoch: expected.epoch,
     revision: stamp.revision, layout: stamp.layout, screen: stamp.screen, cols, rows: Object.freeze(rows),
-    hyperlinks:Object.freeze(hyperlinks), images, cursor_row, cursor_col, cursor_shape, cursor_visible, pending_wrap});
+    hyperlinks:Object.freeze(hyperlinks), images, cursor_row, cursor_col, cursor_shape, cursor_visible, pending_wrap, cursor_color});
 }
 
 export const MAX_PROJECTED_HISTORY_ROWS = 65536;
@@ -244,7 +246,11 @@ export function acceptHistoryProjection(encoded, owner, search = false) {
   if (!view || view.version !== CHANNEL_FRAME_VERSION || view.owner?.session !== owner.session ||
       view.owner.epoch !== owner.epoch || view.owner.generation !== owner.generation)
     throw new Error('foreign history projection');
-  const {cols,text,offset,total_rows,revision} = view;
+  const {cols,text,offset,total_rows,revision,default_background} = view;
+  if (default_background !== undefined && (typeof default_background !== 'string' || !/^#[a-f0-9]{6}$/i.test(default_background)))
+    throw new Error('invalid history default background');
+  const blank = default_background === undefined || default_background === historyBlank.background
+    ? historyBlank : Object.freeze({...historyBlank,background:default_background});
   channelCounter(revision);
   if (!Number.isInteger(cols) || cols < 1 || cols > 256 ||
       !Number.isInteger(offset) || offset < 0 || !Number.isInteger(total_rows) ||
@@ -282,7 +288,7 @@ export function acceptHistoryProjection(encoded, owner, search = false) {
     }
     end = bounds[width];wraps = row.wrapped;
     offsets.push(Object.freeze(bounds));
-    return Object.freeze(Object.assign([...row,...Array(cols-width).fill(historyBlank)], {imageSlices:row.imageSlices}));
+    return Object.freeze(Object.assign([...row,...Array(cols-width).fill(blank)], {imageSlices:row.imageSlices}));
   });
   if (end > text.length || text.length - end > (search ? 128 : 0) ||
       paintBytes > maxTextBytes || links.size !== referenced.size)
