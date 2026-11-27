@@ -1437,12 +1437,30 @@ const historyPanel=document.querySelector('#terminal-history');
 const sessionTools=document.querySelector('#session-tools');
 const workspaceTools=document.querySelector('#terminal-tools');
 const historyQuery=document.querySelector('#history-find-query');
+let historyOrigin;
+document.querySelector('#terminal-history > summary').addEventListener('click',()=>{
+  if(!historyPanel.open)historyOrigin=owner;
+});
+function closeHistory() {
+  const origin=historyOrigin;
+  historyOrigin=undefined;
+  history.dismiss();
+  historyPanel.open=false;
+  if(origin!==undefined&&owner===origin&&!changingTab&&!recovery)focusTerminal();
+}
+historyPanel.addEventListener('keydown',event=>{
+  if(!historyPanel.open||event.key!=='Escape'||event.defaultPrevented||
+      event.isComposing||event.keyCode===229||ime.isComposing())return;
+  event.preventDefault();
+  closeHistory();
+});
 function revealPanel(panel,focus=panel.querySelector('summary')){
   panel.open=true;
   panel.scrollIntoView({block:'start'});
   focus?.focus({preventScroll:true});
 }
 function showHistory(search=false){
+  if(!historyPanel.open||historyOrigin===undefined)historyOrigin=owner;
   const canFind=!document.querySelector('#history-find-form').hidden;
   revealPanel(historyPanel,search&&canFind?historyQuery:undefined);
   if((!search||!canFind)&&owner&&!document.querySelector('#history-output').value)
@@ -1460,18 +1478,20 @@ for(const [button,panel,show] of [
 ]){
   const control=document.querySelector(button);
   control.setAttribute('aria-expanded','false');
-  panel.addEventListener('toggle',()=>control.setAttribute('aria-expanded',String(panel.open)));
+  panel.addEventListener('toggle',()=>{
+    control.setAttribute('aria-expanded',String(panel.open));
+    if(panel===historyPanel&&!panel.open){historyOrigin=undefined;history.dismiss();}
+  });
   control.addEventListener('click',()=>{
-    if(panel.open){panel.open=false;focusTerminal();}
-    else show();
+    if(panel.open){
+      if(panel===historyPanel)closeHistory();
+      else {panel.open=false;focusTerminal();}
+    } else show();
   });
 }
 function showSsh(){revealPanel(sessionTools,sshHost);}
 sshConnect.addEventListener('click',showSsh);
-document.querySelector('#history-back-live').addEventListener('click',()=>{
-  historyPanel.open=false;
-  focusTerminal();
-});
+document.querySelector('#history-back-live').addEventListener('click',closeHistory);
 for(const control of document.querySelectorAll('.return-to-terminal')){
   control.addEventListener('click',()=>{
     control.closest('details').open=false;

@@ -73,6 +73,39 @@ function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsuppo
 
 const channelHealth=epoch=>({epoch,exited:false,drained:false,write_error:null,dropped_reply_bytes:'0',unsupported:'0'});
 
+test('history Escape returns to the opening pane except during composition or after owner changes',async()=>{
+ let epoch=0;
+ const h=harness(async(name)=>name==='open_shell'?++epoch:null);
+ const panel=h.el('#terminal-history'),ime=h.el('#ime-input');
+ panel.querySelector=()=>h.el('#history-find-query');
+ panel.scrollIntoView=()=>{};
+ h.el('#history-refresh').click=()=>{};
+ let focused=0;
+ ime.focus=()=>{focused++;};
+ function escape(extra={}){
+  const event={key:'Escape',preventDefault(){this.defaultPrevented=true;},...extra};
+  panel.handlers.keydown(event);
+  return event.defaultPrevented;
+ }
+ await h.click('#open');await tick();
+ h.click('#show-history');
+ const before=focused;
+ assert.equal(escape({isComposing:true}),undefined);
+ assert.equal(panel.open,true);
+ assert.equal(focused,before);
+ assert.equal(escape(),true);
+ assert.equal(panel.open,false);
+ assert.equal(focused,before+1);
+
+ h.click('#show-history');
+ await h.click('#close');
+ await h.click('#open');await tick();
+ const newPaneFocus=focused;
+ assert.equal(escape(),true);
+ assert.equal(panel.open,false);
+ assert.equal(focused,newPaneFocus,'the old history surface must not redirect the new pane');
+});
+
 test('auto-fit keeps a return to painted geometry while a smaller resize is in flight',async()=>{
  const raw=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
  const owner={session:'a'.repeat(32),epoch:1,generation:1};

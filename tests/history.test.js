@@ -289,9 +289,10 @@ function searchSetup(){
  const requests=[];
  const controls={form:element(),query:element(),find:element(),older:element(),cancel:element(),status:element(),enabled:()=>true};
  const output=element(), older=element();
+ output.focus=()=>{output.focusCount=(output.focusCount??0)+1;};
  const history=installHistory({output,label:element(),older,newer:element(),refresh:element(),searchControls:controls,
   getOwner:()=>owner,invoke:(name,args)=>new Promise((resolve,reject)=>requests.push({name,args,resolve,reject}))});
- return {controls,output,requests,olderPage:()=>older.handlers.click(),
+ return {controls,output,requests,dismiss:history.dismiss,olderPage:()=>older.handlers.click(),
   rotate:()=>{owner={...owner,generation:owner.generation+1};history.updateSearchControls();},
   find:query=>{controls.query.value=query;return controls.form.handlers.submit({preventDefault(){}});}};
 }
@@ -317,6 +318,21 @@ test('a matched history window supplies the next ordinary page offset',async()=>
  h.requests[1].resolve({...page(1,'older',14,200),row_count:4});await older;
  assert.equal(h.output.value,'older');
 });
+test('dismissed history ignores a late match even after reopening on the same pane',async()=>{
+ const h=searchSetup();
+ const stale=h.find('old');
+ h.dismiss();
+ const resumed=h.find('new');
+ h.requests[0].resolve({kind:'match',id:1,epoch:1,snapshot:page(1,'old'),start:0,end:3});
+ await stale;
+ assert.equal(h.output.value,'');
+ assert.equal(h.output.focusCount,undefined);
+ h.requests[1].resolve({kind:'match',id:2,epoch:1,snapshot:page(1,'new'),start:0,end:3});
+ await resumed;
+ assert.equal(h.output.value,'new');
+ assert.equal(h.output.focusCount,1);
+});
+
 test('cancel and an attachment change leave no stale search continuation or selection',async()=>{
  const h=searchSetup();
  const canceled=h.find('old');

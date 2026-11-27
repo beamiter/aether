@@ -353,6 +353,11 @@ export function installHistory({older,newer,refresh,output,label,invoke,getOwner
   }
   return {
     updateSearchControls,
+    dismiss(){
+      stopSearch();
+      // Preserve the visible page, but retire any outstanding page request.
+      if(group)group={...group,desired:group.offset,pending:null,promise:null};
+    },
     updateRetained(owner,first){
       retained={owner,first:channelCounter(first)};
       if(sameShell(group?.owner,owner)&&isExpired(group.projection,owner))dropPage(expired);
