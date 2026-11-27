@@ -465,6 +465,11 @@ function selectPeer(){
 focusPeer.addEventListener('click',selectPeer);
 peerCanvas.addEventListener('click',selectPeer);
 function setTabRoster(records){
+  // A passive leaf can disappear from the runtime roster independently of
+  // Close. Preserve the current writer and collapse only the missing leaf.
+  const missing=tripleIsVisible()&&records.includes(epoch)?
+    tripleEpochs.filter(number=>!records.includes(number)):[];
+  const survivors=missing.length===1?previewCloseSurvivors(localTabOwners.get(missing[0])):null;
   for(const [number,attachment] of localTabOwners){
     if(records.includes(number))continue;
     localTabOwners.delete(number);localDrafts.delete(attachment.session);
@@ -472,7 +477,16 @@ function setTabRoster(records){
   }
   localTabEpochs.clear();
   for(const number of records)localTabEpochs.add(number);
-  updateSplitPair();renderLocalTabs();
+  const collapsed=installPreviewSurvivors(survivors);
+  if(!collapsed)updateSplitPair();
+  renderLocalTabs();
+  if(collapsed){
+    recordLocalLayout();
+    const stream=localStream;
+    if(stream)void syncObserver(stream).catch(error=>{
+      if(localStream===stream)status.textContent=`Split pane unavailable: ${String(error?.message??error)}`;
+    });
+  }
 }
 function rememberLocalDraft(attachment) {
   if(input.value)localDrafts.set(attachment.session,input.value);
@@ -1215,6 +1229,17 @@ function previewCloseSurvivors(attachment){
   if(peers.length!==2||peers.some(peer=>!peer))return null;
   return {axis:closed===left?'vertical':'horizontal',peers,target:closed===top?bottom:top};
 }
+function installPreviewSurvivors(survivors){
+  if(!survivors||!survivors.peers.every(peer=>localTabEpochs.has(peer.epoch)&&
+      localTabOwners.get(peer.epoch)?.session===peer.session))return false;
+  tripleEpochs=[];
+  splitEnabled=true;
+  splitEpochs=survivors.peers.map(peer=>peer.epoch);
+  splitAxis=survivors.axis;
+  writePreference('aether.split-axis',splitAxis);
+  splitLayout=allocateLayoutToken();
+  return true;
+}
 close.addEventListener('click',async()=>{
   // SSH and local shells can have the same numeric epoch. Retire the poll
   // before Close can give up that view, even if the close response is lost.
@@ -1235,14 +1260,7 @@ close.addEventListener('click',async()=>{
     input.value='';localDrafts.delete(oldOwner.session);localTabEpochs.delete(oldOwner.epoch);
     localTabOwners.delete(oldOwner.epoch);localShellKinds.delete(oldOwner.session);localPaneIds.delete(oldOwner.session);
     localTabGeometry.delete(oldOwner.epoch);terminalChat.forget(oldOwner.session);
-    if(survivors&&survivors.peers.every(peer=>localTabEpochs.has(peer.epoch)&&
-        localTabOwners.get(peer.epoch)?.session===peer.session)){
-      tripleEpochs=[];
-      splitEnabled=true;
-      splitEpochs=survivors.peers.map(peer=>peer.epoch);
-      splitAxis=survivors.axis;
-      writePreference('aether.split-axis',splitAxis);
-      splitLayout=allocateLayoutToken();
+    if(installPreviewSurvivors(survivors)){
       resume=survivors.target;
     }else if(localTabEpochs.size<2){
       splitEnabled=false;splitEpochs=[];tripleEpochs=[];

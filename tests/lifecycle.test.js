@@ -696,6 +696,65 @@ for(const [closed,expectedSplit,expectedPeer] of [[3,'right',1],[1,'top',3]]){
  });
 }
 
+for(const [removed,expectedSplit,expectedPeer] of [[3,'right',1],[1,'top',3]]){
+ test(`refresh dropping passive shell ${removed} retains the active writer and exact surviving split`,async()=>{
+  const own=(epoch,generation)=>({session:String(epoch).repeat(32),epoch,generation});
+  const [a,b,c,d]=[1,2,3,4].map(epoch=>own(epoch,epoch)),returned=own(2,5);
+  const raw=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+  const frame=owner=>channelSnapshot({...raw,session:owner.session,epoch:owner.epoch});
+  const opening=[b,c,d],seen=[],acks=[],painted=[],targets=[];
+  const listeners=[];
+  const h=harness(async(name,args)=>{
+   switch(name){
+    case 'open_shell':return a;
+    case 'subscribe_local_shell':listeners.push(args.stream.onmessage);return null;
+    case 'ack_shell':return null;
+    case 'set_local_observers':targets.push(...args.observers);return null;
+    case 'set_local_observer':targets.push(args.observer);return null;
+    case 'list_local_shells':return [1,2,3,4].filter(value=>value!==removed);
+    case 'ack_local_stream':acks.push([args.owner.epoch,args.sequence,args.revision]);return null;
+    case 'write_shell':seen.push(['write',args.epoch]);return args.bytes.length;
+    case 'activate_local_tab':{
+     const next=args.targetEpoch===null?opening.shift():returned;
+     seen.push(['activate',next.epoch]);return {Ok:{owner:next,frame:frame(next),input_allowed:true}};
+    }
+    default:throw Error('unexpected local IPC '+name);
+   }
+  },undefined,undefined,(canvas,frame)=>painted.push([canvas,frame.epoch]),{},testChannel(),
+    {localStorage:{getItem:key=>key==='aether.preview-three-panes'?'1':null}});
+  await h.click('#open');
+  for(let i=0;i<3;i++)await h.click('#new-local-tab');
+  h.el('#local-tab-list').options.find(tab=>tab.dataset.epoch==='2').handlers.click();await tick();
+  await h.click('#split-three-local');
+  assert.equal(h.el('#terminal-panes').dataset.triple,'true');
+  const old=targets.find(target=>target?.epoch===removed);
+  const listener=listeners.at(-1);
+  const event=(seq,preview)=>({owner:returned,kind:'update',sequence:String(seq),frame:null,preview,status:channelHealth(2)});
+  await listener(event(1,{layout:old.layout,frame:frame(removed===1?a:c)}));
+  assert.equal(painted.at(-1)[1],removed);
+  const size=seen.length;
+  h.el('#input').value='unsent draft on B';
+  await h.click('#manage-local');
+  assert.equal(h.el('#terminal-panes').dataset.triple,'');
+  assert.equal(h.el('#terminal-panes').dataset.split,expectedSplit);
+  assert.equal(targets.at(-1).epoch,expectedPeer);
+  assert.notEqual(targets.at(-1).layout,old.layout);
+  assert.equal(h.el('#input').value,'unsent draft on B');
+  assert.equal(h.el('#input').disabled,false);
+  assert.equal(h.el('#local-tab-list').options.find(tab=>tab.dataset.epoch==='2').attributes.get('aria-current'),'true');
+  assert.ok(h.el('#local-tab-list').options.some(tab=>tab.dataset.epoch==='4'));
+  assert.equal(seen.length,size);
+  const paints=painted.length;
+  await listener(event(2,{layout:old.layout,frame:'obsolete malformed preview'}));
+  assert.equal(painted.length,paints);
+  assert.deepEqual(acks,[[2,'1',null],[2,'2',null]]);
+  await listener(event(3,{layout:targets.at(-1).layout,frame:frame(expectedPeer===1?a:c)}));
+  assert.deepEqual(painted.at(-1),[h.el('#peer-canvas'),expectedPeer]);
+  await h.submit();
+  assert.deepEqual(seen.slice(size),[['write',2]]);
+ });
+}
+
 test('SSH terminal recovers the same grid on a new generation and reattaches read-only',async()=>{
  const old={session:'a'.repeat(32),epoch:1,generation:1},next={...old,generation:2},readonly={...old,generation:4};
  const frame={...JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8')),session:old.session,epoch:1};
