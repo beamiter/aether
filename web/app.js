@@ -30,7 +30,7 @@ const passivePanes=[1,2].map(index=>({
   canvas:document.querySelector(`#preview-canvas-${index}`),
   focus:document.querySelector(`#focus-preview-pane-${index}`),
 }));
-const restoreLayout=document.querySelector('#restore-local-layout');
+const restoreLayout=document.querySelector('#restore-local-layout'),saveRecoveredLayout=document.querySelector('#save-recovered-layout');
 const terminalPanel=document.querySelector('#terminal-panel');
 const emptyTerminal=document.querySelector('#terminal-empty');
 const sessionIndicator=document.querySelector('#session-indicator');
@@ -162,7 +162,7 @@ const Channel=globalThis.__TAURI__?.core?.Channel;
 const channelSnapshots=()=>typeof Channel==='function'?{frameVersion:CHANNEL_FRAME_VERSION}:{};
 const acceptAttachedSnapshot=(frame,attachment,options)=>options.frameVersion===CHANNEL_FRAME_VERSION
   ?acceptChannelFrame(null,frame,{...attachment,frameVersion:options.frameVersion},true):acceptFull(null,frame,attachment);
-let savedLayout=invoke?readLocalShellLayout():null;
+let savedLayout=invoke?readLocalShellLayout():null,protectSavedLayout=false;
 const sshCommands={poll_shell:'poll',ack_shell:'ack',shell_status:'status',history_shell:'history',recover_shell:'recover',detach_shell:'detach',close_shell:'close',write_shell:'write',key_shell:'key',text_shell:'text',paste_shell:'paste',resize_shell:'resize',focus_shell:'focus',mouse_shell:'mouse'};
 function setOpenDisabled(disabled) {
   open.disabled=openIntegrated.disabled=openSsh.disabled=sshHost.disabled=disabled||!invoke;
@@ -180,7 +180,14 @@ function setLocalTools(available) {
     attachLocal.disabled=openSecond.disabled=true;
   }
 }
+function canSaveRecoveredLayout(){
+  return protectSavedLayout&&!!owner&&sshSession===null&&!restoringLocalLayout&&!changingTab&&!recovery&&
+    !settingSplit&&!tripleEpochs.length&&localTabEpochs.has(epoch)&&
+    [...localTabEpochs].every(value=>localTabOwners.has(value)&&localTabGeometry.has(value));
+}
 function renderSavedLayout(){
+  saveRecoveredLayout.hidden=!protectSavedLayout||!owner||sshSession!==null;
+  saveRecoveredLayout.disabled=!canSaveRecoveredLayout();
   restoreLayout.hidden=retainedLayoutBlocked||!savedLayout||owner!==null||sshSession!==null||localTabEpochs.size>0;
   restoreLayout.disabled=retainedLayoutBlocked||open.disabled||restoringLocalLayout;
 }
@@ -224,26 +231,39 @@ function updateSplitPair(previous=null){
   if(splitEnabled)splitEpochs=localSplitPair([...localTabEpochs].sort((a,b)=>a-b),epoch,splitEpochs,previous);
 }
 function recordLocalLayout(){
-  if(restoringLocalLayout||changingTab||settingSplit)return;
+  if(protectSavedLayout){renderSavedLayout();return;}
+  persistLocalLayout(false);
+}
+function persistLocalLayout(deliberate){
+  if(restoringLocalLayout||changingTab||settingSplit)return false;
   const epochs=[...localTabEpochs].sort((a,b)=>a-b);
   const configurations=[];
   for(const number of epochs){
     const session=localTabOwners.get(number)?.session;
     const shell=localShellKinds.get(session);
-    if(!shell)return;
+    if(!shell)return false;
     configurations.push({shell,presentation:terminalChat.modeFor(session),paneId:localPaneIds.get(session)});
   }
   const active=Math.max(0,epochs.indexOf(epoch));
   const split=splitEnabled&&splitEpochs.length===2&&splitEpochs.every(number=>epochs.includes(number));
   const complete=epochs.every(number=>localTabGeometry.has(number));
-  if(epochs.length>2&&!complete)return;
-  savedLayout=epochs.length?{tabs:configurations,active,split}:null;
-  if(savedLayout&&complete){
-    savedLayout.tabs=configurations.map((tab,index)=>({...tab,geometry:localTabGeometry.get(epochs[index])}));
-    savedLayout.panes=split?splitEpochs.map(number=>epochs.indexOf(number)):[];
+  if((epochs.length>2||deliberate)&&!complete)return false;
+  const next=epochs.length?{tabs:configurations,active,split}:null;
+  if(next&&complete){
+    next.tabs=configurations.map((tab,index)=>({...tab,geometry:localTabGeometry.get(epochs[index])}));
+    next.panes=split?splitEpochs.map(number=>epochs.indexOf(number)):[];
   }
-  saveLocalShellLayout(savedLayout);renderSavedLayout();
+  const stored=saveLocalShellLayout(next);
+  if(deliberate&&!stored)return false;
+  savedLayout=next;
+  if(deliberate)protectSavedLayout=false;
+  renderSavedLayout();
+  return stored;
 }
+saveRecoveredLayout.addEventListener('click',()=>{
+  if(!canSaveRecoveredLayout())return;
+  status.textContent=persistLocalLayout(true)?'Saved current shell tabs.':'Could not save current tabs. The previous layout is retained.';
+});
 function observerTarget(){
   if(tripleIsVisible()||!splitEnabled||!owner||sshSession!==null||localTabEpochs.size<2||!splitEpochs.includes(epoch))return null;
   const other=splitEpochs.find(number=>number!==epoch&&localTabEpochs.has(number));
@@ -380,7 +400,7 @@ async function toggleTriple(){
       try{await syncObserver(stream);}catch{ /* Output authority is unchanged. */ }
       if(owner===attachment)status.textContent=`Three panes unavailable: ${String(error?.message??error)}`;
     }
-  }finally{settingSplit=false;renderSplit();}
+  }finally{settingSplit=false;renderSplit();renderSavedLayout();}
 }
 tripleToggle.addEventListener('click',toggleTriple);
 passivePanes.forEach(({focus,canvas:surface},index)=>{
@@ -926,6 +946,7 @@ async function restoreLocalGeometry(configuration){
 restoreLayout.addEventListener('click',async()=>{
   if(retainedLayoutBlocked||restoreLayout.disabled||!savedLayout||owner||localTabEpochs.size||restoringLocalLayout)return;
   const layout=savedLayout;
+  protectSavedLayout=true;
   splitEnabled=layout.split;splitLayout=allocateLayoutToken();
   restoringLocalLayout=true;
   setOpenDisabled(true);attach.disabled=button.disabled=true;
@@ -974,7 +995,7 @@ restoreLayout.addEventListener('click',async()=>{
       if(owner){setActiveControls(!keyQueue.locked);setLocalTools(true);}
       else{setOpenDisabled(false);attach.disabled=button.disabled=false;}
     }
-    if(complete)recordLocalLayout();
+    if(complete){protectSavedLayout=false;recordLocalLayout();}
     renderLocalTabs();
     if(complete)focusTerminal();
   }

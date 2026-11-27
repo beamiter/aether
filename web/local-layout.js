@@ -111,7 +111,7 @@ export function readLocalShellLayout(environment = globalThis) {
 export function saveLocalShellLayout(layout, environment = globalThis) {
   try {
     const storage = environment.localStorage;
-    if (!storage) return;
+    if (!storage) return false;
     const legacy = legacyState(storage);
     if (!layout) {
       // Publish the clear before touching legacy state. If removal fails, the
@@ -122,15 +122,17 @@ export function saveLocalShellLayout(layout, environment = globalThis) {
       if (after.available && after.absent) {
         storage.setItem(modernKey, JSON.stringify({storageVersion:1,layout:null,legacyToken:'absent'}));
       }
-      return;
+      return true;
     }
     const clean = encodeLayout(layout);
-    if (!clean) return;
+    if (!clean) return false;
     // New consumers never overwrite a prior release's supported snapshot.
     // An older app may subsequently edit that slot; reads detect that change.
     storage.setItem(modernKey, JSON.stringify({storageVersion:1,layout:clean,legacyToken:legacy.token}));
+    return true;
   } catch {
     // Unavailable preference storage never interrupts current shells. An
     // unconfirmed clear is not replaced with a stale legacy-layout fallback.
+    return false;
   }
 }

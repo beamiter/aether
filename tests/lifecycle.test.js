@@ -1484,6 +1484,52 @@ test('failure to restore the jsh tab leaves the plain shell usable and the prefe
  assert.deepEqual(readLocalShellLayout(storage),layout);
 });
 
+test('late geometry after a partial restore cannot replace the last complete saved layout',async()=>{
+ const geometry={rows:24,cols:80};
+ const layout={tabs:[plainLocalTab,plainLocalTab,plainLocalTab,plainLocalTab].map(tab=>({...tab,geometry})),active:2,split:true,panes:[1,2]};
+ const storage=layoutStorage(layout),owners=new Map();
+ const raw=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+ let next=0,revision=0,late=false;
+ function frame(owner){
+  const cols=owner.epoch===2&&late?79:80;
+  return {...raw,session:owner.session,epoch:owner.epoch,revision:++revision,layout:revision,cols,
+   rows:Array.from({length:24},()=>Array.from({length:cols},()=>({...raw.rows[0][0],text:' ',width:1})))};
+ }
+ const h=harness(async(name,args)=>{
+  if(name==='list_local_shells')return [];
+  if(name==='open_shell'||name==='activate_local_tab'){
+   if(next===2)return {Err:'third PTY unavailable'};
+   const epoch=++next,owner={session:String(epoch).repeat(32),epoch,generation:1};
+   owners.set(epoch,owner);
+   return name==='open_shell'?owner:{Ok:{owner,frame:frame(owner),input_allowed:true}};
+  }
+  if(name==='poll_shell'||name==='observe_local_shell')return frame(owners.get(args.epoch));
+  if(name==='ack_shell')return null;
+  throw Error('unexpected IPC '+name);
+ },undefined,undefined,undefined,storage);
+ await h.click('#restore-local-layout');
+ assert.match(h.el('#status').textContent,/third PTY unavailable/);
+ assert.equal(h.el('#local-tab-list').options.length,2);
+ assert.equal(h.el('#input').disabled,false);
+ assert.deepEqual(readLocalShellLayout(storage),layout);
+ late=true;await [...h.timers.values()][0]();
+ assert.match(h.el('#cursor-status').textContent,/^79 × 24/);
+ assert.deepEqual(readLocalShellLayout(storage),layout);
+ const save=h.el('#save-recovered-layout');
+ assert.equal(save.hidden,false);assert.equal(save.disabled,false);
+ const write=storage.localStorage.setItem;
+ storage.localStorage.setItem=()=>{throw Error('storage full');};
+ await h.click('#save-recovered-layout');
+ assert.deepEqual(readLocalShellLayout(storage),layout);
+ assert.equal(save.hidden,false);
+ assert.match(h.el('#status').textContent,/previous layout is retained/);
+ storage.localStorage.setItem=write;
+ await h.click('#save-recovered-layout');
+ assert.equal(save.hidden,true);
+ assert.deepEqual(readLocalShellLayout(storage),{tabs:[
+  {...plainLocalTab,geometry},{...plainLocalTab,geometry:{rows:24,cols:79}}],active:1,split:true,panes:[0,1]});
+});
+
 test('a lost first restore reply discovers the retained shell without launching again',async()=>{
  const storage=layoutStorage({tabs:[plainLocalTab],active:0,split:false});
  let openCalls=0;
