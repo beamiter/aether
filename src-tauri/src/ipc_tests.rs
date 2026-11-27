@@ -57,6 +57,15 @@ fn observe_resized_pane(
 
 #[test]
 fn local_v4_snapshot_recovery_and_attach_keep_exact_lease_and_receipt() {
+    assert_snapshot_recovery_and_attach_keep_exact_lease_and_receipt(4);
+}
+
+#[test]
+fn local_v6_snapshot_recovery_and_attach_keep_exact_lease_and_receipt() {
+    assert_snapshot_recovery_and_attach_keep_exact_lease_and_receipt(6);
+}
+
+fn assert_snapshot_recovery_and_attach_keep_exact_lease_and_receipt(frame_version: u8) {
     let app = super::application(tauri::test::mock_builder())
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
         .unwrap();
@@ -66,16 +75,16 @@ fn local_v4_snapshot_recovery_and_attach_keep_exact_lease_and_receipt() {
     let owner = invoke(&window, "open_shell", json!({}));
     assert!(tauri::test::get_ipc_response(
         &window,
-        request("recover_shell", json!({"owner":owner,"frameVersion":6}))
+        request("recover_shell", json!({"owner":owner,"frameVersion":255}))
     )
     .is_err());
-    let arguments = json!({"owner":owner,"frameVersion":4});
+    let arguments = json!({"owner":owner,"frameVersion":frame_version});
     let recovered = invoke(&window, "recover_shell", arguments.clone());
     assert_eq!(invoke(&window, "recover_shell", arguments), recovered);
     let frame: Value = serde_json::from_str(recovered["frame"].as_str().unwrap()).unwrap();
     let current = &recovered["owner"];
     assert_eq!(frame["kind"], "snapshot");
-    assert_eq!(frame["stamp"]["version"], 4);
+    assert_eq!(frame["stamp"]["version"], frame_version);
     assert_eq!(frame["stamp"]["session"], owner["session"]);
     assert_eq!(current["generation"], 2);
     let revision = &frame["stamp"]["revision"];
@@ -94,10 +103,10 @@ fn local_v4_snapshot_recovery_and_attach_keep_exact_lease_and_receipt() {
     let attached = invoke(
         &window,
         "attach_selected_local_shell",
-        json!({"epoch":current["epoch"],"frameVersion":4}),
+        json!({"epoch":current["epoch"],"frameVersion":frame_version}),
     );
     let frame: Value = serde_json::from_str(attached["frame"].as_str().unwrap()).unwrap();
-    assert_eq!(frame["stamp"]["version"], 4);
+    assert_eq!(frame["stamp"]["version"], frame_version);
     assert_eq!(frame["stamp"]["session"], current["session"]);
     assert_eq!(attached["owner"]["generation"], 4);
     invoke(&window, "close_shell", json!({"owner":attached["owner"]}));
