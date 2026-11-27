@@ -29,7 +29,8 @@ export function viewportDimensions(viewport, style) {
 // never blocks a new session; accepted writes are independent of resizing.
 export function resizeQueue({getEpoch,invoke,onDone,onError}) {
   let group=null;
-  return {cancelPending(){if(group)group.pending=null;},request(rows,cols){
+  return {busy(){return Boolean(group?.promise && group.epoch===getEpoch());},
+    cancelPending(){if(group)group.pending=null;},request(rows,cols){
     const size=dimensions(rows,cols),epoch=getEpoch();if(epoch===null)return Promise.resolve();
     if(!group||group.epoch!==epoch)group={epoch,pending:null,promise:null};
     const current=group;current.pending=size;

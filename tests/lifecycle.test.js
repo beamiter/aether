@@ -73,6 +73,44 @@ function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsuppo
 
 const channelHealth=epoch=>({epoch,exited:false,drained:false,write_error:null,dropped_reply_bytes:'0',unsupported:'0'});
 
+test('auto-fit keeps a return to painted geometry while a smaller resize is in flight',async()=>{
+ const raw=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+ const owner={session:'a'.repeat(32),epoch:1,generation:1};
+ const baseline={...raw,session:owner.session};
+ const original=[baseline.rows.length,baseline.cols];
+ const smaller=[original[0]-1,original[1]-1];
+ const outstanding=deferred(),resizes=[];
+ let observeFit;
+ const h=harness(async(name,args)=>{
+  if(name==='open_shell')return owner;
+  if(name==='poll_shell')return baseline;
+  if(name==='resize_shell'){
+   resizes.push([args.rows,args.cols]);
+   if(resizes.length===1)return outstanding.promise;
+   return null;
+  }
+  return null;
+ },undefined,undefined,undefined,undefined,undefined,{
+  ResizeObserver:class{constructor(fn){observeFit=fn}observe(){}},
+  getComputedStyle:()=>({}),
+ });
+ const viewport=h.el('#active-pane .viewport');
+ let [rows,cols]=original;
+ viewport.getBoundingClientRect=()=>({height:rows*24,width:cols*12});
+ viewport.offsetWidth=viewport.clientWidth=0;
+ const fit=h.el('#fit-size');
+ fit.checked=false;
+ await h.click('#open');await tick();
+ fit.checked=true;fit.handlers.change();
+ assert.deepEqual(resizes,[],'settled paint should not send redundant IPC');
+ [rows,cols]=smaller;observeFit();await tick();
+ assert.deepEqual(resizes,[smaller]);
+ [rows,cols]=original;observeFit();
+ assert.deepEqual(resizes,[smaller],'one IPC at a time');
+ outstanding.resolve();await tick();await tick();
+ assert.deepEqual(resizes,[smaller,original],'restored viewport must become the final size');
+});
+
 test('local terminal focus follows the viewport, IME, window and document visibility',async()=>{
  const shell={session:'a'.repeat(32),epoch:1,generation:1};
  const signals=[];

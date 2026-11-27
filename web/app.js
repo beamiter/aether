@@ -1098,7 +1098,9 @@ function requestFit() {
   if (!size || (lastFit?.owner === owner && lastFit.rows === size.rows && lastFit.cols === size.cols)) return;
   lastFit = {owner, ...size};
   colsInput.value=String(size.cols);rowsInput.value=String(size.rows);
-  if (state?.rows.length === size.rows && state.cols === size.cols) return;
+  // The painted frame can lag an in-flight resize. A restored viewport
+  // still needs to replace the pending intent even if the old paint matches.
+  if (!sizes.busy() && state?.rows.length === size.rows && state.cols === size.cols) return;
   void sizes.request(size.rows, size.cols);
 }
 function setFit(enabled){
