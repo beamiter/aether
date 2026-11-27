@@ -24,7 +24,6 @@ const MAX_LOCAL_SHELLS: usize = 8;
 
 /// Stable PTY ownership and the single reader lease. View generations and
 /// input permissions remain inside each bridge, not in the table key.
-
 struct Registry<T, const LIMIT: usize> {
     sessions: BTreeMap<String, T>,
     reader: Option<String>,
@@ -144,6 +143,13 @@ struct OwnedLocalPty {
     target: SessionSelector,
     pump_candidate: bool,
     parked_input: bool,
+}
+
+pub(crate) struct TabActivation {
+    pub(crate) preserve_input: bool,
+    pub(crate) integrated: bool,
+    pub(crate) format: SnapshotFormat,
+    pub(crate) history: Option<HistoryRequest>,
 }
 
 #[derive(serde::Serialize)]
@@ -342,12 +348,15 @@ impl LocalSessions {
         &mut self,
         owner: Option<&Attachment>,
         target_epoch: Option<u32>,
-        preserve_input: bool,
-        integrated: bool,
-        format: SnapshotFormat,
-        history: Option<HistoryRequest>,
+        options: TabActivation,
         shared: Weak<Mutex<Self>>,
     ) -> Result<AttachedView, String> {
+        let TabActivation {
+            preserve_input,
+            integrated,
+            format,
+            history,
+        } = options;
         if integrated && target_epoch.is_some() {
             return Err("Choose the shell type when opening a new tab.".into());
         }

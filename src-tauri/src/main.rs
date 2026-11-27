@@ -1,4 +1,4 @@
-use local_sessions::{HistoryRequest, LocalSessions, LocalShellStatus};
+use local_sessions::{HistoryRequest, LocalSessions, LocalShellStatus, TabActivation};
 use std::sync::{Arc, Mutex};
 use tauri::{ipc::Channel, webview::PageLoadEvent, Manager};
 use tauri_terminal_frame_bridge::{
@@ -96,7 +96,6 @@ async fn activate_local_tab<R: tauri::Runtime>(
     integrated: Option<bool>,
     pane_history_id: Option<String>,
     frame_version: Option<u8>,
-    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<Result<local_sessions::AttachedView, String>, String> {
     require_terminal_window(&window)?;
     let format = SnapshotFormat::negotiate(frame_version)?;
@@ -106,16 +105,22 @@ async fn activate_local_tab<R: tauri::Runtime>(
         pane_history_id,
         window.path().app_data_dir().ok(),
     )?;
-    let shared = bridge.inner().clone();
+    let shared = window
+        .try_state::<Arc<Mutex<LocalSessions>>>()
+        .ok_or_else(|| "local shell state is unavailable".to_owned())?
+        .inner()
+        .clone();
     let weak = Arc::downgrade(&shared);
     run_bridge(shared, move |bridge| {
         Ok(bridge.activate_tab(
             owner.as_ref(),
             target_epoch,
-            preserve_input,
-            integrated,
-            format,
-            history,
+            TabActivation {
+                preserve_input,
+                integrated,
+                format,
+                history,
+            },
             weak,
         ))
     })

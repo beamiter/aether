@@ -170,10 +170,12 @@ fn local_tab_activation_rotates_the_lease_after_an_ack_and_retries_exactly() {
             .activate_tab(
                 Some(&source),
                 Some(target_epoch),
-                true,
-                false,
-                super::SnapshotFormat::Compatibility,
-                None,
+                super::TabActivation {
+                    preserve_input: true,
+                    integrated: false,
+                    format: super::SnapshotFormat::Compatibility,
+                    history: None,
+                },
                 Arc::downgrade(local.inner()),
             )
             .err()
