@@ -1341,8 +1341,28 @@ def exercise_terminal_shell(driver, owned):
     driver.type("#ime-input", "printf '%s%s\\n' AETHER_CHROME_ NEEDLE; seq 1 80\ue007")
     keys(ctrl, shift, "F")
     wait_for(lambda: state()["focused"] == "history-find-query", "find shortcut did not focus the history query")
-    driver.type("#history-find-query", "AETHER_CHROME_NEEDLE\ue007")
-    wait_for(lambda: state()["selected_history"] == "AETHER_CHROME_NEEDLE", "archive search did not find PTY output")
+    archive_query = "AETHER_CHROME_NEEDLE"
+
+    def archive_ready():
+        # Search holds its source. Prove the owned PTY has archived the
+        # marker before starting the single query, not merely echoing input.
+        driver.click("#history-refresh")
+        shell = state()
+        return shell["current_tab"] == second and archive_query in shell["dump"].splitlines()
+
+    wait_for(archive_ready, "the same PTY did not archive the search marker")
+    driver.type("#history-find-query", archive_query + "\ue007")
+    try:
+        wait_for(lambda: state()["selected_history"] == archive_query, "archive search did not find PTY output")
+    except AssertionError as error:
+        shell = state()
+        raise AssertionError(str(error), {
+            "same_tab": shell["current_tab"] == second,
+            "find_pending": "Searching" in shell["find_status"],
+            "find_no_matches": shell["find_status"] == "No matches in retained history.",
+            "marker_retained": archive_query in shell["dump"].splitlines(),
+            "exact_match_selected": shell["selected_history"] == archive_query,
+        }) from error
     driver.click("#history-back-live")
     wait_for(lambda: session() == second, "leaving history did not restore shell input")
     keys(ctrl, shift, "P")

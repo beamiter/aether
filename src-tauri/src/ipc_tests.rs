@@ -23,6 +23,38 @@ fn invoke(window: &tauri::WebviewWindow<MockRuntime>, command: &str, body: Value
         .unwrap()
 }
 
+// Read-only observers may see the previous stable frame during a resize
+// repaint hold. Never relax the exact retained session and geometry check.
+fn observe_resized_pane(
+    window: &tauri::WebviewWindow<MockRuntime>,
+    owner: &Value,
+    target: &Value,
+    rows: usize,
+    cols: u64,
+) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let frame = invoke(
+            window,
+            "observe_local_shell",
+            json!({"owner":owner,"epoch":target["epoch"],"revision":null}),
+        );
+        assert_eq!(frame["session"], target["session"]);
+        let actual = (
+            frame["rows"].as_array().unwrap().len(),
+            frame["cols"].as_u64(),
+        );
+        if actual == (rows, Some(cols)) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "retained PTY geometry never settled: {actual:?}; expected ({rows}, {cols})"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn local_v4_snapshot_recovery_and_attach_keep_exact_lease_and_receipt() {
     let app = super::application(tauri::test::mock_builder())
@@ -213,11 +245,7 @@ fn split_poll_observes_inactive_geometry_without_transferring_resize_authority()
         "ack_shell",
         json!({"owner":second,"revision":other["Ok"]["frame"]["revision"]}),
     );
-    let observe = json!({"owner":second,"epoch":first["epoch"],"revision":null});
-    let snapshot = invoke(&window, "observe_local_shell", observe);
-    assert_eq!(snapshot["session"], first["session"]);
-    assert_eq!(snapshot["cols"], 71);
-    assert_eq!(snapshot["rows"].as_array().unwrap().len(), 17);
+    observe_resized_pane(&window, second, &first, 17, 71);
     assert!(tauri::test::get_ipc_response(
         &window,
         request("resize_shell", json!({"owner":first,"rows":1,"cols":1}))
@@ -994,13 +1022,7 @@ fn three_local_tabs_keep_physical_geometry_and_observers_cannot_resize() {
         json!([first["epoch"], second["epoch"], third["epoch"]])
     );
     for (target, rows, cols) in [(&first, 17, 71), (&second, 12, 83)] {
-        let frame = invoke(
-            &window,
-            "observe_local_shell",
-            json!({"owner":third,"epoch":target["epoch"],"revision":null}),
-        );
-        assert_eq!(frame["cols"], cols);
-        assert_eq!(frame["rows"].as_array().unwrap().len(), rows);
+        observe_resized_pane(&window, &third, target, rows, cols);
         assert!(tauri::test::get_ipc_response(
             &window,
             request("resize_shell", json!({"owner":target,"rows":1,"cols":1}))
