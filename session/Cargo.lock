@@ -40,7 +40,7 @@ dependencies = [
 [[package]]
 name = "jterm_engine"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core?rev=b5595b03fdce538ae326f2f6e57875da70071c6e#b5595b03fdce538ae326f2f6e57875da70071c6e"
+source = "git+https://github.com/beamiter/jterm_core?rev=ffaa1ebcb6d693b976c7c6ebf817e3b57c3c2556#ffaa1ebcb6d693b976c7c6ebf817e3b57c3c2556"
 dependencies = [
  "smallvec",
  "unicode-normalization",
@@ -51,7 +51,7 @@ dependencies = [
 [[package]]
 name = "jterm_runtime"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core?rev=b5595b03fdce538ae326f2f6e57875da70071c6e#b5595b03fdce538ae326f2f6e57875da70071c6e"
+source = "git+https://github.com/beamiter/jterm_core?rev=ffaa1ebcb6d693b976c7c6ebf817e3b57c3c2556#ffaa1ebcb6d693b976c7c6ebf817e3b57c3c2556"
 dependencies = [
  "crossbeam-channel",
  "jterm_engine",

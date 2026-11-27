@@ -10,7 +10,10 @@ use jterm_engine::{
     terminal::{HistoryPage, InlineImage},
     Color, HyperlinkId, UnderlineStyle,
 };
-use jterm_protocol::engine_projection::{paint_color, same_cell_colors};
+use jterm_protocol::{
+    engine_projection::{paint_rgb, same_cell_colors},
+    terminal::RgbColor,
+};
 use std::{
     collections::{btree_map::Entry, BTreeMap, BTreeSet},
     io::{self, Write},
@@ -46,9 +49,11 @@ impl FrameScratch {
         session: &str,
         version: u8,
     ) -> Result<(wire::Counter, String), String> {
-        let update = update(previous, frame, session, version)?;
+        let update = project_update(previous, frame, session, version)?;
         let images = match &update {
-            wire::Update::Snapshot { images, .. } | wire::Update::Delta { images, .. } => images,
+            wire::UpdateData::Snapshot { images, .. } | wire::UpdateData::Delta { images, .. } => {
+                images
+            }
         };
         Ok((update.revision(), encode_json(&update, images)?))
     }
@@ -136,12 +141,12 @@ pub(crate) fn encode_history(
                 .row
                 .checked_add(1)
                 .ok_or("history source exhausted")?;
-            Ok(wire::HistoryRow {
+            Ok(wire::HistoryRowData {
                 source: wire::HistorySource {
                     row: counter(row_id)?,
                     column: source.column,
                 },
-                paint: wire::Row {
+                paint: wire::RowData {
                     wrapped: row.wrapped,
                     cells,
                     image_slices,
@@ -151,7 +156,7 @@ pub(crate) fn encode_history(
         })
         .collect::<Result<_, String>>()?;
     let (hyperlinks, images) = projection.into_resources();
-    let view = wire::HistoryView {
+    let view = wire::HistoryViewData {
         owner,
         revision: counter(revision)?,
         version: wire::IMAGE_VERSION,
@@ -169,12 +174,12 @@ pub(crate) fn encode_history(
     encode_json(&view, &view.images)
 }
 
-fn update(
+fn project_update<'a>(
     previous: Option<&CellFrame>,
-    frame: &CellFrame,
+    frame: &'a CellFrame,
     session: &str,
     version: u8,
-) -> Result<wire::Update, String> {
+) -> Result<wire::UpdateData<EncodedCell<'a>>, String> {
     validate_grid(frame)?;
     let engine_stamp = frame.stamp();
     let cursor = frame.cursor();
@@ -229,14 +234,14 @@ fn update(
             let rows = rows
                 .into_iter()
                 .map(|index| {
-                    Ok(wire::ChangedRow {
+                    Ok(wire::ChangedRowData {
                         index: index as u16,
                         row: wire_row(frame, index, &mut projection)?,
                     })
                 })
                 .collect::<Result<_, String>>()?;
             let (hyperlinks, images) = projection.into_resources();
-            return Ok(wire::Update::Delta {
+            return Ok(wire::UpdateData::Delta {
                 stamp,
                 base_revision: counter(base.stamp().revision)?,
                 rows,
@@ -250,7 +255,7 @@ fn update(
         .map(|index| wire_row(frame, index, &mut projection))
         .collect::<Result<_, _>>()?;
     let (hyperlinks, images) = projection.into_resources();
-    Ok(wire::Update::Snapshot {
+    Ok(wire::UpdateData::Snapshot {
         stamp,
         cols: frame.cols() as u16,
         rows,
@@ -297,11 +302,30 @@ fn split_row_moves(
     (rows, moves)
 }
 
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum EncodedText<'a> {
+    Scalar(char),
+    Cluster(&'a str),
+}
+
+impl EncodedText<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Scalar(character) => character.len_utf8(),
+            Self::Cluster(cluster) => cluster.len(),
+        }
+    }
+}
+
+type EncodedCell<'a> = wire::CellData<EncodedText<'a>, RgbColor>;
+
 #[derive(Default)]
 struct Projection<'a> {
     colors: Option<&'a ColorState>,
     text_bytes: usize,
     hyperlink_bytes: usize,
+    last_hyperlink: Option<u16>,
     hyperlinks: BTreeMap<u16, &'a str>,
     images_enabled: bool,
     image_bytes: usize,
@@ -369,18 +393,18 @@ impl<'a> Projection<'a> {
         cluster: impl Fn(usize) -> Option<&'a str>,
         hyperlink: impl Fn(HyperlinkId) -> Option<&'a str>,
         underline: impl Fn(usize) -> Option<Color>,
-    ) -> Result<Vec<wire::Cell>, String> {
+    ) -> Result<Vec<EncodedCell<'a>>, String> {
         row.cells
             .iter()
             .enumerate()
             .map(|(column, cell)| {
                 let flags = cell.flags;
                 let width = cell_width(flags, column, row.cells.len());
-                let mut scalar = [0; 4];
                 let text = if width == 0 {
-                    " "
+                    EncodedText::Scalar(' ')
                 } else {
-                    cluster(column).unwrap_or_else(|| cell.character.encode_utf8(&mut scalar))
+                    cluster(column)
+                        .map_or(EncodedText::Scalar(cell.character), EncodedText::Cluster)
                 };
                 self.text_bytes += text.len();
                 if text.len() > wire::MAX_CLUSTER_BYTES || self.text_bytes > wire::MAX_TEXT_BYTES {
@@ -393,26 +417,29 @@ impl<'a> Projection<'a> {
                     if usize::from(id) > wire::MAX_HYPERLINKS {
                         return Err("terminal hyperlink ID exceeds limit".into());
                     }
-                    if let Entry::Vacant(entry) = self.hyperlinks.entry(id) {
-                        let target = hyperlink(cell.hyperlink_id)
-                            .ok_or("terminal frame has an unresolved hyperlink")?;
-                        self.hyperlink_bytes += target.len();
-                        if target.len() > wire::MAX_HYPERLINK_TARGET_BYTES
-                            || self.hyperlink_bytes > wire::MAX_HYPERLINK_BYTES
-                        {
-                            return Err("terminal frame exceeds hyperlink byte limit".into());
+                    if self.last_hyperlink != Some(id) {
+                        if let Entry::Vacant(entry) = self.hyperlinks.entry(id) {
+                            let target = hyperlink(cell.hyperlink_id)
+                                .ok_or("terminal frame has an unresolved hyperlink")?;
+                            self.hyperlink_bytes += target.len();
+                            if target.len() > wire::MAX_HYPERLINK_TARGET_BYTES
+                                || self.hyperlink_bytes > wire::MAX_HYPERLINK_BYTES
+                            {
+                                return Err("terminal frame exceeds hyperlink byte limit".into());
+                            }
+                            entry.insert(target);
                         }
-                        entry.insert(target);
+                        self.last_hyperlink = Some(id);
                     }
                     Some(id)
                 };
-                let mut foreground = paint_color(cell.foreground, true, self.colors);
-                let mut background = paint_color(cell.background, false, self.colors);
+                let mut foreground = paint_rgb(cell.foreground, true, self.colors);
+                let mut background = paint_rgb(cell.background, false, self.colors);
                 if flags.inverse() {
                     std::mem::swap(&mut foreground, &mut background);
                 }
-                Ok(wire::Cell {
-                    text: text.to_string(),
+                Ok(wire::CellData {
+                    text,
                     foreground,
                     background,
                     width,
@@ -431,7 +458,7 @@ impl<'a> Projection<'a> {
                         UnderlineStyle::Dashed => Some(wire::Underline::Dashed),
                     },
                     underline_color: underline(column)
-                        .map(|color_value| paint_color(color_value, true, self.colors)),
+                        .map(|color_value| paint_rgb(color_value, true, self.colors)),
                     hyperlink_id,
                 })
             })
@@ -449,9 +476,9 @@ fn wire_row<'a>(
     frame: &'a CellFrame,
     index: usize,
     projection: &mut Projection<'a>,
-) -> Result<wire::Row, String> {
+) -> Result<wire::RowData<EncodedCell<'a>>, String> {
     let row = &frame.rows()[index];
-    Ok(wire::Row {
+    Ok(wire::RowData {
         wrapped: row.wrapped,
         cells: projection.cells(
             row,
@@ -509,6 +536,17 @@ mod tests {
         CursorShape, TerminalCell,
     };
     use std::sync::Arc;
+
+    fn update(
+        previous: Option<&CellFrame>,
+        frame: &CellFrame,
+        session: &str,
+        version: u8,
+    ) -> Result<wire::Update, String> {
+        let projected = project_update(previous, frame, session, version)?;
+        let data = serde_json::to_vec(&projected).map_err(|error| error.to_string())?;
+        serde_json::from_slice(&data).map_err(|error| error.to_string())
+    }
 
     #[test]
     fn process_encoding_workspace_defers_new_encoders_until_reservations_are_released() {
