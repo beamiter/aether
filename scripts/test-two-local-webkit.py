@@ -3802,6 +3802,10 @@ def exercise_three_restore_fit_x11(driver, owned, binary, tabs, parked, identiti
     driver.click("#fit-size")
     fresh = [first_id]
     for name, tab, expected in zip(("peer", "parked"), (tabs[1], parked), passive_sizes[1:]):
+        if tab == parked:
+            # Use the bottom slot to inspect the parked shell. Returning to
+            # that bottom shell restores the layout for the close check.
+            click_tab(driver, tabs[2])
         click_tab(driver, tab)
         identity = write_from_current_tab(driver, owned / f"three-fit-{name}.pid")
         assert pty_size(identity) == expected
