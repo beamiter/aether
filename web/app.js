@@ -1341,7 +1341,10 @@ document.querySelector('#command').addEventListener('submit',async event=>{
     if(n===0)await new Promise(resolve=>setTimeout(resolve,10));
   }if(at!==bytes.length)throw new Error('write blocked; do not resend automatically');input.value='';if(attachment.session!==sshSession)localDrafts.delete(attachment.session);}
   catch(e){failed=true;if(ownsInput(attachment,queue)){pasteReview.reset();queue.locked=true;status.textContent=`${at} bytes accepted: ${String(e?.message??e)}. Input locked; close/reopen before retrying.`;}}
- finally{if(ownsInput(attachment,queue)&&!failed&&!queue.locked){send.disabled=false;input.disabled=false;input.focus();terminalFocus.refresh();}}
+ finally{if(ownsInput(attachment,queue)){
+   if(!failed&&!queue.locked){send.disabled=false;input.disabled=false;if(!commandPalette.isOpen())input.focus();terminalFocus.refresh();}
+   commandPalette.refreshAvailability();
+ }}
 });
 
 const colsInput=document.querySelector('#cols'),rowsInput=document.querySelector('#rows');
@@ -1502,6 +1505,7 @@ function enqueueLogical(command,payload,onReceipt){
   if (mouse && (!canReportMouse(owner) || queue.pending >= (payload.report.kind === 'release' ? 128 : 126))) return;
   if(queue.pending>=128){pasteReview.reset();queue.locked=true;status.textContent='Keyboard queue full; input locked. Close/reopen before retrying.';input.disabled=send.disabled=true;return;}
   const current=epoch,attachment=owner;queue.pending++;
+  if(queue.pending===1)commandPalette.refreshAvailability();
   queue.chain=queue.chain.then(async()=>{
     if(!ownsInput(attachment,queue)||queue.locked||mouse&&!canReportMouse(attachment))return;
     try{
@@ -1511,6 +1515,7 @@ function enqueueLogical(command,payload,onReceipt){
     catch(e){if(!mouse&&ownsInput(attachment,queue)){pasteReview.reset();queue.locked=true;input.disabled=send.disabled=true;renderTerminalStage();status.textContent=`Input not accepted: ${String(e?.message??e)}. Close/reopen before retrying.`;}}
   }).finally(()=>{
     queue.pending--;
+    if(queue.pending===0&&ownsInput(attachment,queue))commandPalette.refreshAvailability();
     if (queue.pending === 125) terminalFocus.refresh();
   });
   return queue.chain;
@@ -1887,7 +1892,7 @@ const availableActions=actions.map(action=>({...action,
 if(invoke)availableActions.push({
   label:'Terminal',enabled:()=>terminalPanel.hidden,run:()=>document.querySelector('#terminal-tab').click(),
 });
-installTerminalShell(document,{
+const commandPalette=installTerminalShell(document,{
   actions:availableActions,
   isComposing:()=>ime.isComposing(),
   paletteScope:target=>pasteReviewPanel.hidden&&(target===document.body||

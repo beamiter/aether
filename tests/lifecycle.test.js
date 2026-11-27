@@ -679,7 +679,7 @@ test('directional palette actions move the single writer by visible layout, not 
  {localStorage:{getItem:key=>key==='aether.preview-three-panes'?'1':null}});
  let focused=0;
  h.el('#ime-input').focus=()=>focused++;
- const choose=async(direction,active,reason)=>{
+ const choose=async(direction,active)=>{
   h.click('#command-palette-open');
   const query=h.el('#command-palette-query'), dialog=h.el('#command-palette');
   query.value='focus pane '+direction;query.handlers.input();
@@ -687,7 +687,6 @@ test('directional palette actions move the single writer by visible layout, not 
   assert.equal(results.length,1);
   const button=results[0].children[0];
   assert.equal(button.getAttribute('aria-disabled'),active?null:'true');
-  if(reason)assert.equal(button.children[0].children[0].textContent,reason);
   const count=activations.length, previous=focused;
   await button.click();await tick();
   assert.equal(activations.length,count+(active?1:0));
@@ -702,14 +701,35 @@ test('directional palette actions move the single writer by visible layout, not 
  input.value='write before switching from Shell 4';
  const receipt=h.submit();
  await tick();
- await choose('up',false,'Wait for the current terminal input to finish.');
+ const query=h.el('#command-palette-query'), dialog=h.el('#command-palette');
+ const list=h.el('#command-palette-results');
+ list.querySelectorAll=()=>list.options.map(item=>item.children[0]);
+ h.click('#command-palette-open');
+ query.value='focus pane up';query.handlers.input();
+ const button=list.querySelectorAll()[0];
+ let cursor=query;
+ button.focus=()=>{cursor=button;};
+ input.focus=()=>{cursor=input;};
+ button.focus();
+ assert.equal(button.getAttribute('aria-disabled'),'true');
+ assert.equal(button.children[0].children[0].textContent,'Wait for the current terminal input to finish.');
+ const enter=()=>dialog.handlers.keydown({key:'Enter',target:cursor,preventDefault(){}});
+ enter();await tick();
+ assert.equal(dialog.open,true);
  assert.equal(input.value,'write before switching from Shell 4');
  assert.equal(h.el('#active-pane').dataset.slot,'2');
  assert.deepEqual(writes,[4]);
  blockWrite=false;pending.resolve();await receipt;
  assert.equal(input.value,'');
+ assert.equal(dialog.open,true);
+ assert.equal(query.value,'focus pane up');
+ assert.equal(list.querySelectorAll()[0],button);
+ assert.ok(cursor===button,'write completion must not steal focus from the open palette');
+ assert.equal(button.getAttribute('aria-disabled'),null);
+ enter();await tick();
+ assert.equal(dialog.open,false);
+ assert.equal(activations.at(-1),2);
  await choose('right',false);
- await choose('up',true);assert.equal(activations.at(-1),2);
  await choose('left',true);assert.equal(activations.at(-1),1);
  await choose('down',false);
  await choose('right',true);assert.equal(activations.at(-1),2);

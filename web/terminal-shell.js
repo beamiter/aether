@@ -3,7 +3,7 @@ export function installTerminalShell(document, {actions, isComposing, keyboardSc
   const query = document.querySelector('#command-palette-query');
   const list = document.querySelector('#command-palette-results');
   const empty = document.querySelector('#command-palette-empty');
-  let paletteEnter = false;
+  let paletteEnter = false, rows = [];
   const bindings = new Map();
   for (const action of actions) {
     for (const key of action.keys ?? []) bindings.set(key, action);
@@ -15,25 +15,36 @@ export function installTerminalShell(document, {actions, isComposing, keyboardSc
     action.run();
   }
 
+  function updateAvailability({action, button, reason}) {
+    const unavailable = !!action.enabled && !action.enabled();
+    if (unavailable) {
+      if (button.getAttribute('aria-disabled') !== 'true') button.setAttribute('aria-disabled', 'true');
+      const message = action.unavailableReason?.() ?? 'Not available in this view.';
+      if (reason.textContent !== message) reason.textContent = message;
+    } else if (button.getAttribute('aria-disabled') !== null) button.removeAttribute('aria-disabled');
+    if (reason.hidden !== !unavailable) reason.hidden = !unavailable;
+  }
+
+  // Keep the current query, selected result and DOM focus on state changes.
+  function refreshAvailability() {
+    if (dialog.open) rows.forEach(updateAvailability);
+  }
+
   function render() {
     const words = query.value.toLowerCase().trim().split(/\s+/);
     const matches = actions.filter(action => {
       const label = [action.label, action.hint].join(' ').toLowerCase();
       return words.every(word => label.includes(word));
     });
-    list.replaceChildren(...matches.map(action => {
+    rows = matches.map(action => {
       const item = document.createElement('li');
       const button = document.createElement('button');
       const label = document.createElement('span');
       label.textContent = action.label;
       button.type = 'button';
       button.append(label);
-      if (action.enabled && !action.enabled()) {
-        button.setAttribute('aria-disabled', 'true');
-        const reason = document.createElement('small');
-        reason.textContent = action.unavailableReason?.() ?? 'Not available in this view.';
-        label.append(reason);
-      }
+      const reason = document.createElement('small');
+      label.append(reason);
       if (action.hint) {
         const hint = document.createElement('kbd');
         hint.textContent = action.hint;
@@ -43,8 +54,11 @@ export function installTerminalShell(document, {actions, isComposing, keyboardSc
         if (button.getAttribute('aria-disabled') !== 'true') run(action);
       });
       item.append(button);
-      return item;
-    }));
+      const row = {item, action, button, reason};
+      updateAvailability(row);
+      return row;
+    });
+    list.replaceChildren(...rows.map(row => row.item));
     empty.hidden = matches.length > 0;
     list.setAttribute('data-query-focus', '');
   }
@@ -108,4 +122,5 @@ export function installTerminalShell(document, {actions, isComposing, keyboardSc
   document.addEventListener('keyup', event => {
     if (event.key === 'Enter') paletteEnter = false;
   }, true);
+  return {refreshAvailability, isOpen: () => dialog.open};
 }
