@@ -1224,8 +1224,12 @@ fn projected_history_page(
     loop {
         let latest = layout.len().saturating_sub(limit);
         let first = start.map_or_else(|| latest.saturating_sub(offset), |start| start.min(latest));
-        let page = terminal.projected_history_viewport_page(&layout, first, limit)?;
-        if page.text.len() <= MAX_HISTORY_SNAPSHOT_BYTES {
+        if let Some(page) = terminal.projected_history_viewport_page_with_text_limit(
+            &layout,
+            first,
+            limit,
+            MAX_HISTORY_SNAPSHOT_BYTES,
+        )? {
             return Ok((layout, first, page));
         }
         if limit <= MIN_HISTORY_PAGE_ROWS {
@@ -1243,8 +1247,11 @@ fn bounded_history_page(terminal: &Terminal, offset: usize) -> Result<HistoryPag
     let mut limit = HISTORY_PAGE_ROWS;
     loop {
         let oldest_offset = rows.saturating_sub(limit);
-        let page = terminal.history_page(offset.min(oldest_offset), limit)?;
-        if page.text.len() <= MAX_HISTORY_SNAPSHOT_BYTES {
+        if let Some(page) = terminal.history_page_with_text_limit(
+            offset.min(oldest_offset),
+            limit,
+            MAX_HISTORY_SNAPSHOT_BYTES,
+        )? {
             return Ok(page);
         }
         if limit <= MIN_HISTORY_PAGE_ROWS {
@@ -1349,6 +1356,9 @@ mod tests {
         assert_eq!(newest.row_count, 32);
         assert!(newest.text.len() <= MAX_HISTORY_SNAPSHOT_BYTES);
         assert!(newest.text.ends_with(&body));
+        let (_, _, projected) = projected_history_page(&terminal, 0, None, 0).unwrap();
+        assert_eq!(projected.row_count, newest.row_count);
+        assert_eq!(projected.text, newest.text);
 
         let oldest = bounded_history_page(&terminal, MAX_HISTORY_OFFSET).unwrap();
         assert_eq!(oldest.offset + oldest.row_count, oldest.total_rows);
