@@ -5,9 +5,9 @@ edition = "2021"
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 [dependencies]
-jterm_core = { git = "https://github.com/beamiter/jterm_core", rev = "7739dbd46c4da65ddaf171ab6f83498180a6c8be" }
-jterm_engine = { git = "https://github.com/beamiter/jterm_core", rev = "7739dbd46c4da65ddaf171ab6f83498180a6c8be" }
-jterm_remote_client = { git = "https://github.com/beamiter/jterm_core", rev = "7739dbd46c4da65ddaf171ab6f83498180a6c8be" }
+jterm_core = { git = "https://github.com/beamiter/jterm_core", rev = "b41cafae09f99d24d8f03995d8ec88e61bc7575d" }
+jterm_engine = { git = "https://github.com/beamiter/jterm_core", rev = "b41cafae09f99d24d8f03995d8ec88e61bc7575d" }
+jterm_remote_client = { git = "https://github.com/beamiter/jterm_core", rev = "b41cafae09f99d24d8f03995d8ec88e61bc7575d" }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
