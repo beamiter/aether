@@ -112,6 +112,13 @@ impl ResizeRepaint {
 }
 
 #[derive(Default)]
+pub(crate) struct BackgroundActivity {
+    pub active: bool,
+    pub output_bytes: usize,
+    pub retry: bool,
+}
+
+#[derive(Default)]
 pub struct LiveBridge {
     session: Option<Session>,
     id: String,
@@ -176,7 +183,7 @@ impl LiveBridge {
         }
     }
 
-    /// Wake the desktop worker after the reader queues output or an exit.
+    /// Wake the parser owner after the reader queues output or an exit.
     pub fn notify_on_output(
         &self,
         notify: impl Fn() + Send + Sync + 'static,
@@ -617,26 +624,40 @@ impl LiveBridge {
     /// the last paint boundary across synchronized-output holds.
     pub fn pump_unpublished(&mut self) -> Result<bool, String> {
         self.pump_unpublished_with_activity()
-            .map(|(active, _)| active)
+            .map(|activity| activity.active)
     }
 
-    /// Report whether the PTY can still produce output and how many bytes were read.
-    pub(crate) fn pump_unpublished_with_activity(&mut self) -> Result<(bool, usize), String> {
+    pub(crate) fn needs_write_retry(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(Session::needs_write_retry)
+    }
+
+    /// Retain a paint boundary and report work that needs another pass even
+    /// if the PTY reader queues no further events.
+    pub(crate) fn pump_unpublished_with_activity(&mut self) -> Result<BackgroundActivity, String> {
         let Some(session) = self.session.as_ref() else {
-            return Ok((false, 0));
+            return Ok(BackgroundActivity::default());
         };
         if session.is_drained() {
-            return Ok((false, 0));
+            return Ok(BackgroundActivity::default());
         }
         self.unpublished_background = true;
         let output_bytes = self.poll_io(true)?;
         if self.resize_held(Instant::now()) {
-            return Ok((true, output_bytes));
+            return Ok(BackgroundActivity {
+                active: true,
+                output_bytes,
+                retry: true,
+            });
         }
         let completed = self.take_completed_frame();
         let session = self.session.as_ref().unwrap();
         let active = !session.is_drained();
-        let frame = if !active || !session.terminal().publication_held() {
+        let held = active && session.terminal().publication_held();
+        // A bounded read can leave output queued after its wake was consumed.
+        let retry = active && (held || output_bytes != 0 || session.needs_write_retry());
+        let frame = if !held {
             Some(session.terminal().frame()?)
         } else {
             completed
@@ -644,7 +665,11 @@ impl LiveBridge {
         if let Some(frame) = frame {
             self.record_stable(frame);
         }
-        Ok((active, output_bytes))
+        Ok(BackgroundActivity {
+            active,
+            output_bytes,
+            retry,
+        })
     }
 
     pub fn has_unacknowledged_frame(&self) -> bool {
@@ -2776,23 +2801,39 @@ os.write(1, b'\x1b[?2026l')
             epoch,
             b"printf '\\033[?2026h\\124\\111\\115\\105\\117\\125\\124'; read release; exit\n",
         );
-        loop {
+        let mut saw_held = false;
+        let retained_revision = loop {
             assert!(start.elapsed() < Duration::from_secs(3));
-            if let Some(frame) = bridge.poll(epoch).unwrap() {
-                bridge.acknowledge(epoch, frame.revision).unwrap();
-                if frame.rows.iter().any(|r| {
-                    r.iter()
-                        .map(|c| c.text.as_str())
-                        .collect::<String>()
-                        .contains("TIMEOUT")
-                }) {
-                    break;
-                }
+            let activity = bridge.pump_unpublished_with_activity().unwrap();
+            if bridge
+                .session
+                .as_ref()
+                .unwrap()
+                .terminal()
+                .publication_held()
+            {
+                saw_held = true;
+                assert!(activity.retry);
+            }
+            let stable = bridge.stable.as_ref().unwrap();
+            let frame = from_engine(stable, &bridge.id, epoch).unwrap();
+            if frame.rows.iter().any(|row| {
+                row.iter()
+                    .map(|cell| cell.text.as_str())
+                    .collect::<String>()
+                    .contains("TIMEOUT")
+            }) {
+                assert!(!activity.retry);
+                break frame.revision;
             }
             std::thread::sleep(Duration::from_millis(1));
-        }
+        };
+        assert!(saw_held);
         assert!(start.elapsed() >= Duration::from_millis(250));
         assert!(!bridge.status(epoch).unwrap().exited);
+        let frame = bridge.poll(epoch).unwrap().unwrap();
+        assert_eq!(frame.revision, retained_revision);
+        bridge.acknowledge(epoch, frame.revision).unwrap();
         bridge.close(epoch).unwrap();
     }
     #[test]

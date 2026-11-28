@@ -69,6 +69,13 @@ impl<T, const LIMIT: usize> SessionTable<T, LIMIT> {
             .retain(|_, owned| now.duration_since(owned.last_used) < inactivity);
     }
 
+    pub(super) fn next_expiry(&self, inactivity: Duration) -> Option<Instant> {
+        self.sessions
+            .values()
+            .map(|owned| owned.last_used + inactivity)
+            .min()
+    }
+
     #[cfg(test)]
     pub(super) fn is_empty(&self) -> bool {
         self.sessions.is_empty()
@@ -131,14 +138,20 @@ mod tests {
             Err("test error".into())
         );
         assert!(sessions.is_empty());
+        assert_eq!(sessions.next_expiry(Duration::from_secs(600)), None);
         sessions.admit(|| Ok(("a".into(), 1, ()))).unwrap();
         sessions.admit(|| Ok(("b".into(), 2, ()))).unwrap();
         let inactivity = Duration::from_secs(600);
         let now = Instant::now();
         sessions.touch("a", now);
         sessions.touch("b", now + Duration::from_secs(1));
+        assert_eq!(sessions.next_expiry(inactivity), Some(now + inactivity));
         sessions.expire(now + inactivity, inactivity);
         assert!(sessions.get_mut("a").is_none());
         assert_eq!(sessions.get_mut("b"), Some(&mut 2));
+        assert_eq!(
+            sessions.next_expiry(inactivity),
+            Some(now + inactivity + Duration::from_secs(1))
+        );
     }
 }

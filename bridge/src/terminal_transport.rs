@@ -13,12 +13,13 @@ use session_table::SessionTable;
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, Write},
-    os::fd::AsRawFd,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
     os::unix::{
         fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -30,8 +31,8 @@ const MAX_INPUT: usize = 16 * 1024;
 const MAX_SESSIONS: usize = 4;
 const INACTIVITY: Duration = Duration::from_secs(10 * 60);
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(3);
-const ACTIVE_IO_TICK: Duration = Duration::from_millis(25);
-const IDLE_OWNER_TICK: Duration = Duration::from_millis(1000);
+const IO_RETRY: Duration = Duration::from_millis(25);
+const FAILED_IO_RETRY: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -172,6 +173,51 @@ pub struct Reply<T = Value> {
 struct Host {
     identity: String,
     sessions: SessionTable<LiveBridge, MAX_SESSIONS>,
+    wake: Arc<OutputWake>,
+    retry_at: Option<Instant>,
+}
+
+struct OutputWake(OwnedFd);
+
+impl OutputWake {
+    fn new() -> io::Result<Self> {
+        // SAFETY: eventfd returns a new descriptor on success.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: transfer the new, uniquely owned descriptor.
+        Ok(Self(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+
+    fn notify(&self) {
+        loop {
+            // SAFETY: the descriptor is live for the duration of this call.
+            if unsafe { libc::eventfd_write(self.0.as_raw_fd(), 1) } == 0 {
+                return;
+            }
+            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                // A full counter is already readable.
+                return;
+            }
+        }
+    }
+
+    fn clear(&self) -> io::Result<()> {
+        let mut count = 0;
+        loop {
+            // SAFETY: count is writable and the descriptor stays live.
+            if unsafe { libc::eventfd_read(self.0.as_raw_fd(), &mut count) } == 0 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            match error.kind() {
+                io::ErrorKind::Interrupted => continue,
+                io::ErrorKind::WouldBlock => return Ok(()),
+                _ => return Err(error),
+            }
+        }
+    }
 }
 
 pub fn valid_identity(identity: &str) -> bool {
@@ -222,6 +268,10 @@ impl Host {
         Ok(Self {
             identity: crate::semantic::session_id()?,
             sessions: SessionTable::default(),
+            wake: Arc::new(
+                OutputWake::new().map_err(|error| format!("terminal owner wake: {error}"))?,
+            ),
+            retry_at: None,
         })
     }
 
@@ -229,17 +279,31 @@ impl Host {
         self.sessions.expire(now, INACTIVITY);
     }
 
-    fn pump(&mut self, now: Instant) -> bool {
-        let mut active = false;
+    fn next_deadline(&self) -> Option<Instant> {
+        self.retry_at
+            .into_iter()
+            .chain(self.sessions.next_expiry(INACTIVITY))
+            .min()
+    }
+
+    fn pump(&mut self, now: Instant) {
+        let mut retry = None;
         for (bridge, last_used) in self.sessions.activity_mut() {
-            if let Ok((running, output_bytes)) = bridge.pump_unpublished_with_activity() {
-                active |= running;
-                if output_bytes != 0 {
-                    *last_used = now;
+            match bridge.pump_unpublished_with_activity() {
+                Ok(activity) => {
+                    if activity.output_bytes != 0 {
+                        *last_used = now;
+                    }
+                    if activity.retry {
+                        retry = Some(IO_RETRY);
+                    }
+                }
+                Err(_) => {
+                    retry.get_or_insert(FAILED_IO_RETRY);
                 }
             }
         }
-        active
+        self.retry_at = retry.map(|delay| Instant::now() + delay);
     }
 
     fn reply(&mut self, request: Request) -> Reply {
@@ -260,7 +324,20 @@ impl Host {
         {
             Err(HOST_CHANGED.into())
         } else {
-            self.execute(request.command)
+            let resize = matches!(request.command, Command::Resize { .. });
+            let result = self.execute(request.command);
+            // RPCs can enqueue input or change geometry without producing a
+            // reader event. An already armed retry also services that work.
+            if self.retry_at.is_none()
+                && (resize && result.is_ok()
+                    || self
+                        .sessions
+                        .activity_mut()
+                        .any(|(bridge, _)| bridge.needs_write_retry()))
+            {
+                self.retry_at = Some(Instant::now());
+            }
+            result
         };
         Reply {
             protocol: VERSION,
@@ -274,9 +351,11 @@ impl Host {
             Command::Identify => return reply_value(&self.identity),
             Command::Open { rows, cols } => {
                 check_grid(rows, cols)?;
+                let wake = Arc::clone(&self.wake);
                 return self.sessions.admit(|| {
                     let mut bridge = LiveBridge::default();
                     let epoch = bridge.open_remote(rows, cols)?;
+                    bridge.notify_on_output(move || wake.notify())?;
                     let owner = bridge.attachment(epoch)?;
                     let result = reply_value(&owner)?;
                     Ok((owner.session, bridge, result))
@@ -583,23 +662,55 @@ fn limit_socket(socket: &UnixStream) -> io::Result<()> {
 pub fn serve(socket: &Path) -> io::Result<()> {
     let (listener, _socket_file) = bind(socket)?;
     let mut host = Host::new().map_err(io::Error::other)?;
-    let mut readiness = libc::pollfd {
-        fd: listener.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let mut next_tick = Instant::now();
+    let mut readiness = [
+        libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: host.wake.0.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
     loop {
+        let deadline = host.next_deadline();
+        let timeout = deadline.map_or(-1, |at| {
+            at.saturating_duration_since(Instant::now())
+                .as_nanos()
+                .div_ceil(1_000_000)
+                .min(i32::MAX as u128) as i32
+        });
+        // SAFETY: readiness contains both live descriptors and is writable.
+        if unsafe { libc::poll(readiness.as_mut_ptr(), readiness.len() as _, timeout) } < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if readiness
+            .iter()
+            .any(|fd| fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0)
+        {
+            return Err(io::Error::other(
+                "terminal owner readiness descriptor failed",
+            ));
+        }
         let now = Instant::now();
-        if now >= next_tick {
-            let active = host.pump(now);
+        let notified = readiness[1].revents & libc::POLLIN != 0;
+        if notified {
+            // Clear before draining PTYs so notifications arriving during the
+            // pass remain readable for the next iteration.
+            host.wake.clear()?;
+        }
+        if notified || deadline.is_some_and(|at| now >= at) {
+            host.pump(now);
             host.expire(now);
-            next_tick = now
-                + if active {
-                    ACTIVE_IO_TICK
-                } else {
-                    IDLE_OWNER_TICK
-                };
+        }
+        if readiness[0].revents & libc::POLLIN == 0 {
+            continue;
         }
         match listener.accept() {
             Ok((mut peer, _)) => {
@@ -608,25 +719,14 @@ pub fn serve(socket: &Path) -> io::Result<()> {
                     {
                         let reply = host.reply(request);
                         let _ = write_record(&mut peer, &reply, MAX_REPLY);
-                        next_tick = next_tick.min(Instant::now() + ACTIVE_IO_TICK);
                     }
                 }
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                // SAFETY: readiness is a valid writable pollfd for the owned listener.
-                // Wake for PTY reads and expiry even with no relay traffic.
-                let timeout = next_tick
-                    .saturating_duration_since(Instant::now())
-                    .as_millis()
-                    .max(1);
-                if unsafe { libc::poll(&mut readiness, 1, timeout as i32) } < 0 {
-                    let error = io::Error::last_os_error();
-                    if error.kind() != io::ErrorKind::Interrupted {
-                        return Err(error);
-                    }
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) => {}
             Err(error) => return Err(error),
         }
     }
@@ -1013,6 +1113,37 @@ expect(b'.')
             })
             .is_err());
         host.execute(Command::Close { owner: reader }).unwrap();
+    }
+
+    #[test]
+    fn quiet_owner_arms_io_for_queued_input_only_when_needed() {
+        let mut host = Host::new().unwrap();
+        let opened = host.execute(Command::Open { rows: 8, cols: 80 }).unwrap();
+        let owner: Attachment = serde_json::from_value(opened).unwrap();
+        let status = host.reply(Request {
+            protocol: VERSION,
+            request: 1,
+            host: None,
+            command: Command::Status {
+                owner: owner.clone(),
+            },
+        });
+        assert!(status.result.is_ok());
+        assert!(host.retry_at.is_none());
+
+        let input = host.reply(Request {
+            protocol: VERSION,
+            request: 2,
+            host: None,
+            command: Command::Text {
+                owner: owner.clone(),
+                text: "q".into(),
+            },
+        });
+        assert!(input.result.is_ok());
+        assert!(host.bridge(&owner.session).unwrap().needs_write_retry());
+        assert_eq!(host.next_deadline(), Some(host.retry_at.unwrap()));
+        host.execute(Command::Close { owner }).unwrap();
     }
 
     #[test]
@@ -1405,7 +1536,17 @@ os.write(1,b'RETIRED')
         );
         let deadline = Instant::now() + Duration::from_secs(5);
         let expires_without_output = Instant::now() + INACTIVITY;
-        while host.pump(expires_without_output) {
+        loop {
+            host.pump(expires_without_output);
+            if host
+                .bridge(&owner.session)
+                .unwrap()
+                .status(owner.epoch)
+                .unwrap()
+                .drained
+            {
+                break;
+            }
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(1));
         }

@@ -74,6 +74,24 @@ stat = pathlib.Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
 print(json.dumps([pid, stat[19]]))
 '''
 
+DETACHED_CURSOR_REPLY = r'''
+import os, select, termios, tty
+mode = termios.tcgetattr(0)
+try:
+    tty.setraw(0)
+    os.write(1, b'\x1b[6;2H\x1b[6n')
+    expected = b'\x1b[6;2R'
+    reply = b''
+    while len(reply) < len(expected):
+        assert select.select([0], [], [], 4)[0], 'PTY reply was not delivered while detached'
+        data = os.read(0, len(expected) - len(reply))
+        assert data, 'PTY closed before delivering the reply'
+        reply += data
+    assert reply == expected, reply
+finally:
+    termios.tcsetattr(0, termios.TCSANOW, mode)
+'''
+
 CONFIRM_REAPED = '''
 import pathlib, sys, time
 stat = pathlib.Path(f'/proc/{int(sys.argv[1])}/stat')
@@ -241,6 +259,7 @@ def exercise(destination, binary):
         write_line(first, original, "stty -echo; printf '\\033[2;1H\\033[2K%s\\r\\n' ECHO_DISABLED")
         wait_for_row(first, grid, 1, "ECHO_DISABLED")
         quote = shlex.quote
+        cursor_query = shlex.join(["python3", "-c", f"exec({DETACHED_CURSOR_REPLY.encode()!r})"])
         write_line(
             first, original,
             "SENTINEL=PTY_SURVIVED_SSH; "
@@ -250,8 +269,9 @@ def exercise(destination, binary):
             "do n=$((n+1)); sleep 0.05; done; "
             f"if [ -f {quote(str(root / 'proceed'))} ]; then "
             "awk 'BEGIN { for (i=0; i<8192; i++) printf \"%c[12;1H%64s\", 27, \"\" }' || exit; "
+            f"{cursor_query} || exit; "
             "printf '\\033[7;1H\\033[2K%s\\r\\n' DETACHED_OUTPUT; "
-            f"printf done > {quote(str(root / 'written'))}; fi) &",
+            f"printf done > {quote(str(root / 'written'))}; fi)",
         )
         kind, unacknowledged, delta_size = wait_for_row(
             first, grid, 2, "INITIAL_DELTA", acknowledge=False,
@@ -299,6 +319,7 @@ def exercise(destination, binary):
         return dict(
             ssh_transports=4, initial_snapshot_bytes=snapshot_size, lost_delta_bytes=delta_size,
             same_shell_after_network_cut=True, detached_output_recovered=True,
+            detached_device_reply_delivered=True,
             detached_output_bytes=8192 * (len("\x1b[12;1H") + 64),
             recovery_snapshot_retried=True, stale_ack_write_and_close_rejected=True,
             new_attachment_read_only=True, owned_pty_reaped=True,
