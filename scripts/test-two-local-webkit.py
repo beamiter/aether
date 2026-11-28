@@ -239,8 +239,86 @@ def write_from_current_tab(driver, pid_file, color=None):
     return shell_identity(pid_file)
 
 
-def click_tab(driver, number, *, three_pane=False):
+TAB_EVIDENCE_START = """
+window.__aetherTabEvidence?.();
+const epoch = arguments[0];
+const events = [];
+let clipped = false;
+const safeEpoch = value => /^[1-9][0-9]{0,9}$/.test(value ?? '') ? value : null;
+function snapshot() {
+  const list = document.querySelector('#local-tab-list');
+  const target = list?.querySelector(`button[data-epoch="${epoch}"]`);
+  const focus = document.activeElement;
+  const status = document.querySelector('#status')?.textContent ?? '';
+  return {
+    active: safeEpoch(list?.querySelector('button[aria-current]')?.dataset.epoch),
+    target_present: !!target, target_disabled: target?.disabled ?? null,
+    writable: document.querySelector('#input')?.disabled === false,
+    focus: target && focus === target ? 'target' : list?.contains(focus) ? 'other-tab'
+      : focus?.id === 'ime-input' ? 'terminal-input' : focus === document.body ? 'body' : 'other',
+    status: status === 'Wait for the current input request to finish before switching shells.' ||
+      status === 'Wait for the current shell input before switching tabs.' ? 'pending-input'
+      : /^Local shell [0-9]+ active[.]$/.test(status) ? 'local-active' : status ? 'other' : 'empty',
+  };
+}
+const initial = snapshot();
+function record(event) {
+  if (event.type !== 'click' && event.key !== 'Enter') return;
+  if (events.length === 12) { clipped = true; return; }
+  const hit = event.target?.closest?.('#local-tab-list button[data-epoch]');
+  events.push({type: event.type, trusted: event.isTrusted, hit_epoch: safeEpoch(hit?.dataset.epoch)});
+}
+const kinds = ['click', 'keydown', 'keyup'];
+for (const kind of kinds) document.addEventListener(kind, record, true);
+window.__aetherTabEvidence = () => {
+  for (const kind of kinds) document.removeEventListener(kind, record, true);
+  return {initial, final: snapshot(), events, clipped};
+};
+"""
+
+TAB_EVIDENCE_STOP = """
+const finish = window.__aetherTabEvidence;
+delete window.__aetherTabEvidence;
+if (finish) finish();
+"""
+TAB_EVIDENCE_READ = TAB_EVIDENCE_STOP.replace("if (finish) finish();", "return finish?.() ?? null;")
+
+
+def optional_tab_evidence(driver, script, args=()):
+    with contextlib.suppress(Exception):
+        if driver.session is not None:
+            return driver.request("POST", f"/session/{driver.session}/execute/sync",
+                                  {"script": script, "args": list(args)}, timeout=1)
+    return None
+
+
+def click_tab(driver, number, *, three_pane=False, phase=None):
     assert re.fullmatch(r"[1-9][0-9]{0,9}", number)
+    if phase is None:
+        return _click_tab(driver, number, three_pane=three_pane)
+
+    attempts = []
+    optional_tab_evidence(driver, TAB_EVIDENCE_START, (number,))
+
+    def note(gesture, outcome):
+        if len(attempts) < 12:
+            attempts.append({"gesture": gesture, "outcome": outcome})
+
+    try:
+        return _click_tab(driver, number, three_pane=three_pane, note=note)
+    except Exception:
+        evidence = optional_tab_evidence(driver, TAB_EVIDENCE_READ)
+        with contextlib.suppress(Exception):
+            print(json.dumps({"case": "AETHER.THREE_PANES.TAB_ACTIVATION_FAILURE",
+                              "phase": phase, "target": number, "requests": attempts,
+                              "dom": evidence}), flush=True)
+        raise
+    finally:
+        # Also clean up after a timed-out diagnostic RPC or successful switch.
+        optional_tab_evidence(driver, TAB_EVIDENCE_STOP)
+
+
+def _click_tab(driver, number, *, three_pane, note=lambda *_: None):
     selector = f'#local-tab-list [data-epoch="{number}"]'
     wait_messages = {
         "Wait for the current input request to finish before switching shells.",
@@ -266,7 +344,9 @@ def click_tab(driver, number, *, three_pane=False):
                 driver.click(selector, trace_hit=three_pane)
                 last_click = time.monotonic()
                 attempted_status = state["status"]
+                note("click", "returned")
             except ProtocolError as error:
+                note("click", "stale" if error.error == "stale element reference" else "webdriver_error")
                 if error.error != "stale element reference":
                     raise
         elif (number in state["available_tabs"] and state["current_tab"] != number
@@ -278,7 +358,9 @@ def click_tab(driver, number, *, three_pane=False):
             try:
                 driver.type(selector, "\ue007")
                 used_keyboard = True
+                note("enter", "returned")
             except ProtocolError as error:
+                note("enter", "stale" if error.error == "stale element reference" else "webdriver_error")
                 if error.error != "stale element reference":
                     raise
         time.sleep(.08)
@@ -4055,13 +4137,13 @@ def exercise_three_shells(driver, owned, backend, binary):
     assert visible == [f"Focus Shell {tab}" for tab in tabs], "restored slots included the parked tab"
     fresh = []
     for number, tab in enumerate([*tabs, parked]):
-        click_tab(driver, tab, three_pane=True)
+        click_tab(driver, tab, three_pane=True, phase="restored-identity-loop")
         assert state()["draft"] == ""
         fresh.append(write_from_current_tab(driver, owned / f"three-restored-{number}.pid"))
         wait_for(lambda: state()["draft"] == "", "restored shell command still pending")
     assert len(set([*prior, *fresh])) == 8 and not forbidden.exists()
     identities, parked_id = fresh[:3], fresh[3]
-    click_tab(driver, tabs[2], three_pane=True)
+    click_tab(driver, tabs[2], three_pane=True, phase="return-from-restored-parked")
     print(json.dumps({"case": "AETHER.THREE_PANES.RESTART_LAYOUT", "backend": backend,
                       "fresh_shells_after_explicit_restore": True, "visible_order_and_parked_tab_preserved": True,
                       "saved_active_size_and_draft_boundary_preserved": True}), flush=True)
