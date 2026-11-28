@@ -4154,6 +4154,10 @@ def exercise_three_shells(driver, owned, backend, binary):
     assert restored["writable"] and restored["current_tab"] == tabs[2]
     assert restored["draft"] == "" and not forbidden.exists(), "three-pane restore replayed a draft"
     assert restored["cursor"].startswith("84 × 12"), "third pane's saved terminal size was lost"
+    left_balance = split_balance(driver, left, top)
+    stack_balance = split_balance(driver, top, bottom, control="#split-stack-balance", axis="height")
+    assert left_balance["share"] == 61 and abs(left_balance["geometry"] - 61) < 1, left_balance
+    assert stack_balance["share"] == 40 and abs(stack_balance["geometry"] - 40) < 1, stack_balance
     visible = driver.execute("""
        const panes = document.querySelector('#terminal-panes');
        if (panes.dataset.triple !== 'true') return null;
@@ -4174,7 +4178,9 @@ def exercise_three_shells(driver, owned, backend, binary):
     click_tab(driver, tabs[2], three_pane=True, phase="return-from-restored-parked")
     print(json.dumps({"case": "AETHER.THREE_PANES.RESTART_LAYOUT", "backend": backend,
                       "fresh_shells_after_explicit_restore": True, "visible_order_and_parked_tab_preserved": True,
-                      "saved_active_size_and_draft_boundary_preserved": True}), flush=True)
+                      "saved_active_size_and_draft_boundary_preserved": True,
+                      "measured_restored_left_share": left_balance["share"],
+                      "measured_restored_top_right_share": stack_balance["share"]}), flush=True)
 
     if backend == "x11":
         tabs, parked, identities, parked_id = exercise_three_restore_fit_x11(

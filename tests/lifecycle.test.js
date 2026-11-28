@@ -632,6 +632,8 @@ test('three visible shells rotate a single writer and ACK a retired preview on t
  const raw=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
  const frame=(owner,revision=raw.revision)=>channelSnapshot({...raw,session:owner.session,epoch:owner.epoch,revision});
  const events=[],layouts=[],painted=[],acks=[],writes=[],preferences=[];
+ const prefs=new Map([['aether.preview-three-panes','1'],['aether.three-pane-share.columns.v1','57'],
+  ['aether.three-pane-share.rows.v1','901'],['aether.split-share.columns.v1','68']]);
  const opening=[b,c,d];
  const h=harness(async(name,args)=>{
   switch(name){
@@ -652,7 +654,7 @@ test('three visible shells rotate a single writer and ACK a retired preview on t
    }
    default:throw Error('unexpected local IPC '+name);
   }
- },undefined,undefined,(canvas,next)=>painted.push({canvas,epoch:next.epoch,rev:next.revision}),{},testChannel(),{localStorage:{getItem:key=>key==='aether.preview-three-panes'?'1':null,setItem:(...args)=>preferences.push(args)}});
+ },undefined,undefined,(canvas,next)=>painted.push({canvas,epoch:next.epoch,rev:next.revision}),{},testChannel(),{localStorage:{getItem:key=>prefs.get(key)??null,setItem:(key,value)=>{preferences.push([key,value]);prefs.set(key,value);}}});
  const event=(owner,seq,preview,active=null)=>({owner,kind:'update',sequence:String(seq),frame:active,preview,status:channelHealth(owner.epoch)});
  await h.click('#open');await h.click('#new-local-tab');await h.click('#new-local-tab');
  assert.equal(h.el('#split-three-local').disabled,false);
@@ -662,8 +664,15 @@ test('three visible shells rotate a single writer and ACK a retired preview on t
  const panes=h.el('#terminal-panes'), balance=h.el('#split-balance'), stack=h.el('#split-stack-balance');
  const before=layouts.length;
  assert.equal(h.el('#split-stack-control').hidden,false);
- balance.value='61';balance.handlers.input();balance.handlers.change();
+ assert.equal(balance.value,'57','stored three-pane width is restored');
+ assert.equal(stack.value,'50','invalid three-pane height is ignored');
+ balance.value='61';balance.handlers.input();
  stack.value='40';stack.handlers.input();
+ assert.equal(prefs.get('aether.three-pane-share.columns.v1'),'57');
+ assert.equal(prefs.get('aether.three-pane-share.rows.v1'),'901');
+ balance.handlers.change();stack.handlers.change();
+ assert.deepEqual(preferences,[['aether.three-pane-share.columns.v1','61'],['aether.three-pane-share.rows.v1','40']]);
+ assert.equal(prefs.get('aether.split-share.columns.v1'),'68');
  assert.equal(panes.style['--first-pane-share'],'61fr');
  assert.equal(panes.style['--top-stack-share'],'40fr');
  assert.equal(stack.getAttribute('aria-valuetext'),'40% top right, 60% bottom right');

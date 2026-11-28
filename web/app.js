@@ -30,8 +30,6 @@ const splitBalanceLabel=document.querySelector('#split-balance-label');
 const splitBalance=document.querySelector('#split-balance');
 const splitStackControl=document.querySelector('#split-stack-control');
 const splitStackBalance=document.querySelector('#split-stack-balance');
-// Preview-only ratios; never overwrite a saved two-pane preference.
-const tripleShares={columns:50,rows:50};
 
 const tripleToggle=document.querySelector('#split-three-local'),activePane=document.querySelector('#active-pane');
 const passivePanes=[1,2].map(index=>({
@@ -89,12 +87,17 @@ function writePreference(key,value){
 const threePanePreview=readPreference('aether.preview-three-panes')==='1';
 let splitAxis=readPreference('aether.split-axis')==='vertical'?'vertical':'horizontal';
 const splitShareKey=axis=>axis==='vertical'?'aether.split-share.rows.v1':'aether.split-share.columns.v1';
+const tripleShareKeys={columns:'aether.three-pane-share.columns.v1',rows:'aether.three-pane-share.rows.v1'};
 // Keep numeric preferences out of the saved shell roster and preview layout.
 // Older builds can ignore these keys without losing their saved PTY layout.
 const splitShareValue=value=>/^(?:[1-8][0-9]|90)$/.test(value??'')?Number(value):null;
 const splitShares={
   horizontal:splitShareValue(readPreference(splitShareKey('horizontal')))??50,
   vertical:splitShareValue(readPreference(splitShareKey('vertical')))??50,
+};
+const tripleShares={
+  columns:splitShareValue(readPreference(tripleShareKeys.columns))??50,
+  rows:splitShareValue(readPreference(tripleShareKeys.rows))??50,
 };
 const selectionOverlay = document.querySelector('#terminal-selection');
 const copySelection = document.querySelector('#copy-selection');
@@ -412,9 +415,17 @@ splitStackBalance.addEventListener('input',()=>{
 });
 splitBalance.addEventListener('change',()=>{
   // A drag may generate many input events. Persist only the committed value.
-  if(splitBalance.disabled||!observerTarget())return;
+  const triple=tripleIsVisible();
+  if(splitBalance.disabled||(!triple&&!observerTarget()))return;
   const share=splitShareValue(splitBalance.value);
-  if(share!==null&&share===splitShares[splitAxis])writePreference(splitShareKey(splitAxis),String(share));
+  const current=triple?tripleShares.columns:splitShares[splitAxis];
+  if(share!==null&&share===current)
+    writePreference(triple?tripleShareKeys.columns:splitShareKey(splitAxis),String(share));
+});
+splitStackBalance.addEventListener('change',()=>{
+  if(splitStackBalance.disabled||!tripleIsVisible())return;
+  const share=splitShareValue(splitStackBalance.value);
+  if(share!==null&&share===tripleShares.rows)writePreference(tripleShareKeys.rows,String(share));
 });
 let localTabButtons=[];
 function renderLocalTabs(focusActive=false) {

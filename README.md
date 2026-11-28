@@ -64,7 +64,8 @@ Click the other pane to transfer keyboard
 input and sizing to that shell. **Single pane** keeps both shells running.
 Closing the last shell clears the saved layout. In the opt-in **Three panes**
 preview, **Left pane width** and **Top-right pane height** adjust the fixed L
-layout for this window. They do not overwrite the saved two-pane proportions.
+layout. Those proportions survive a restart on this device and do not
+overwrite the saved two-pane proportions.
 
 For a remote PTY, run `aether-terminal-host serve` on the Linux host and use
 **Open SSH shell** with an OpenSSH host alias or `user@host`. The same terminal
