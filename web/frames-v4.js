@@ -22,6 +22,8 @@ const maxHyperlinkTargetBytes = 2048;
 const underlines = new Set(['single','double','curly','dotted','dashed']);
 const colors = /^#[a-fA-F0-9]{6}$/;
 const invalidCellText = /[\x00-\x1f\x7f-\x9f\ud800-\udfff]/u;
+const nonAscii = /[^\x00-\x7f]/;
+const wireBlockUnits = 8192;
 const supportsPackedRows = version => version === CHANNEL_PACKED_VERSION || version === CHANNEL_RENDITION_VERSION;
 const supportsRowMoves = version => version === CHANNEL_FRAME_VERSION ||
   version === SSH_DENSE_FRAME_VERSION || supportsPackedRows(version);
@@ -46,6 +48,21 @@ function utf8Bytes(text) {
     const point = text.codePointAt(i);
     if (point > 0xffff) { bytes += 4; i++; }
     else bytes += point < 0x80 ? 1 : point < 0x800 ? 2 : 3;
+  }
+  return bytes;
+}
+
+function encodedUtf8Bytes(text) {
+  let bytes = 0;
+  for (let start=0; start<text.length;) {
+    let end = Math.min(start+wireBlockUnits,text.length);
+    const last = text.charCodeAt(end-1);
+    // Keep a UTF-16 pair together when a block boundary falls inside one.
+    if (end < text.length && last >= 0xd800 && last <= 0xdbff) end--;
+    const block = text.slice(start,end);
+    const first = block.search(nonAscii);
+    bytes += first < 0 ? block.length : first + utf8Bytes(block.slice(first));
+    start = end;
   }
   return bytes;
 }
@@ -156,6 +173,17 @@ function decodedStyle(style, extended) {
 }
 
 const hexByte = Array.from({length:256}, (_, value) => value.toString(16).padStart(2, '0'));
+const hexStart = hexByte.map(value=>'#'+value);
+const emptyAttributes = Object.freeze({underline:undefined,underline_color:undefined,hyperlink_id:undefined});
+const hasBase64Bytes = typeof Uint8Array.fromBase64 === 'function';
+
+function denseRowBytes(encoded) {
+  if (hasBase64Bytes) return Uint8Array.fromBase64(encoded);
+  const text = atob(encoded);
+  const bytes = new Uint8Array(text.length);
+  for (let i=0; i<text.length; i++) bytes[i] = text.charCodeAt(i);
+  return bytes;
+}
 
 function validateDenseRow(row, cols, links, referenced, supportsImages) {
   const {wrapped, columns, cell_bytes, text, attributes = []} = row;
@@ -164,8 +192,8 @@ function validateDenseRow(row, cols, links, referenced, supportsImages) {
       cell_bytes.length !== cols * 12 || /[^a-zA-Z0-9+/]/.test(cell_bytes) ||
       typeof text !== 'string' || text.length > cols * maxClusterBytes ||
       !Array.isArray(attributes) || attributes.length > cols) throw new Error('invalid dense Channel row');
-  const bytes = atob(cell_bytes);
-  const styles = new Map();
+  const bytes = denseRowBytes(cell_bytes);
+  const styles = attributes.length ? new Map() : undefined;
   for (const attribute of attributes) {
     const {column, underline, underline_color, hyperlink_id} = attribute ?? {};
     if (!Number.isInteger(column) || column < 0 || column >= cols || styles.has(column) ||
@@ -180,26 +208,30 @@ function validateDenseRow(row, cols, links, referenced, supportsImages) {
   let previousBackground = -1, background;
   for (let column = 0; column < cols; column++) {
     const start = column * 9;
-    const r = bytes.charCodeAt(start), g = bytes.charCodeAt(start+1), b = bytes.charCodeAt(start+2);
-    const br = bytes.charCodeAt(start+3), bg = bytes.charCodeAt(start+4), bb = bytes.charCodeAt(start+5);
-    const foreground = '#' + hexByte[r] + hexByte[g] + hexByte[b];
+    const r = bytes[start], g = bytes[start+1], b = bytes[start+2];
+    const br = bytes[start+3], bg = bytes[start+4], bb = bytes[start+5];
+    const foreground = hexStart[r] + hexByte[g] + hexByte[b];
     const backgroundKey = (br << 16) | (bg << 8) | bb;
     if (backgroundKey !== previousBackground) {
-      background = '#' + hexByte[br] + hexByte[bg] + hexByte[bb];
+      background = hexStart[br] + hexByte[bg] + hexByte[bb];
       previousBackground = backgroundKey;
     }
-    const style = decodedStyle(bytes.charCodeAt(start+6),true);
-    const width = bytes.charCodeAt(start+7), units = bytes.charCodeAt(start+8);
+    const style = decodedStyle(bytes[start+6],true);
+    const width = bytes[start+7], units = bytes[start+8];
     if (width > 2 || units === 0 || units > maxClusterBytes || offset + units > text.length)
       throw new Error('invalid dense Channel cell');
-    const glyph = text.slice(offset,offset+units);
+    const glyph = units === 1 ? text[offset] : text.slice(offset,offset+units);
+    const code = units === 1 ? text.charCodeAt(offset) : 0;
     offset += units;
-    const size = utf8Bytes(glyph);
-    if (size > maxClusterBytes || invalidCellText.test(glyph)) throw new Error('invalid dense Channel text');
+    if (code >= 0x20 && code <= 0x7e) textBytes++;
+    else {
+      const size = utf8Bytes(glyph);
+      if (size > maxClusterBytes || invalidCellText.test(glyph)) throw new Error('invalid dense Channel text');
+      textBytes += size;
+    }
     if (lead !== (width === 0) || (width === 0 && glyph !== ' ')) throw new Error('invalid Channel wide span');
     lead = width === 2;
-    textBytes += size;
-    const {underline,underline_color,hyperlink_id} = styles.get(column) ?? {};
+    const {underline,underline_color,hyperlink_id} = styles?.get(column) ?? emptyAttributes;
     if (hyperlink_id !== undefined) {
       rowLinks.add(hyperlink_id);
       referenced.add(hyperlink_id);
@@ -211,6 +243,10 @@ function validateDenseRow(row, cols, links, referenced, supportsImages) {
   return Object.freeze(Object.assign(cells, {wrapped,textBytes,links:Object.freeze([...rowLinks]),imageSlices}));
 }
 
+function packedCell(text, width, {foreground,background,style,underline,underline_color,hyperlink_id}) {
+  return Object.freeze({text,foreground,background,width,style,underline,underline_color,hyperlink_id});
+}
+
 function validatePackedRow(row, cols, links, referenced, supportsImages, extended) {
   if (!row || typeof row.wrapped !== 'boolean' || row.columns !== cols || row.cells !== undefined ||
       !Array.isArray(row.styles) || row.styles.length > cols || !Array.isArray(row.runs) || row.runs.length > cols)
@@ -220,15 +256,14 @@ function validatePackedRow(row, cols, links, referenced, supportsImages, extende
     const {foreground,background,style,underline,underline_color,hyperlink_id} = paint;
     return {foreground,background,style:decodedStyle(style,extended),underline,underline_color,hyperlink_id};
   });
-  const cells = [], usedStyles = new Set(), rowLinks = new Set();
+  const cells = [], blanks = [], usedStyles = new Set(), rowLinks = new Set();
   let textBytes = 0, lead = false;
   const append = (text, width, paint) => {
     if (cells.length >= cols) throw new Error('packed Channel row width');
     if (lead !== (width === 0) || (width === 0 && text !== ' '))
       throw new Error('invalid Channel wide span');
     lead = width === 2;
-    const {foreground,background,style,underline,underline_color,hyperlink_id} = paint;
-    cells.push(Object.freeze({text,foreground,background,width,style,underline,underline_color,hyperlink_id}));
+    cells.push(packedCell(text,width,paint));
   };
   for (const run of row.runs) {
     if (!Array.isArray(run) || (run.length !== 2 && run.length !== 3)) throw new Error('invalid packed Channel run');
@@ -241,8 +276,16 @@ function validatePackedRow(row, cols, links, referenced, supportsImages, extende
     const paint = styles[index], size = utf8Bytes(text);
     if (explicit && size > maxClusterBytes) throw new Error('Channel cluster byte limit');
     textBytes += size;
-    if (explicit) append(text, width, paint);
-    else for (const scalar of text) append(scalar, 1, paint);
+    if (explicit || text.length === 1) append(text,explicit ? width : 1,paint);
+    else if (size === text.length) {
+      // The bytes and UTF-16 counts can only match for an ASCII run.
+      if (cells.length+text.length > cols) throw new Error('packed Channel row width');
+      if (lead) throw new Error('invalid Channel wide span');
+      for (let i=0; i<text.length; i++) {
+        const glyph = text[i];
+        cells.push(glyph === ' ' ? (blanks[index] ??= packedCell(glyph,1,paint)) : packedCell(glyph,1,paint));
+      }
+    } else for (const scalar of text) append(scalar,1,paint);
     usedStyles.add(index);
     if (paint.hyperlink_id !== undefined) {
       rowLinks.add(paint.hyperlink_id);
@@ -294,7 +337,7 @@ export function acceptChannelFrame(previous, encoded, expected, snapshotOnly = f
   const expectedVersion = expected.frameVersion ?? previous?.version;
   const limit = maxEncodedBytes + (supportsChannelImages(expectedVersion) ? maxEncodedImageBytes : 0);
   if (typeof encoded !== 'string' || encoded.length > limit) throw new Error('Channel frame byte limit');
-  const wireBytes = utf8Bytes(encoded);
+  const wireBytes = encodedUtf8Bytes(encoded);
   if (wireBytes > limit) throw new Error('Channel frame byte limit');
   return acceptChannelUpdate(previous,JSON.parse(encoded),expected,snapshotOnly,wireBytes);
 }
@@ -398,7 +441,7 @@ const historyBlank = Object.freeze({text:' ',foreground:'#d9e5ef',background:'#1
 export function acceptHistoryProjection(encoded, owner, search = false, expectedVersion) {
   const limit = maxEncodedBytes + maxEncodedImageBytes;
   if (typeof encoded !== 'string' || encoded.length > limit) throw new Error('history projection byte limit');
-  const wireBytes = utf8Bytes(encoded);
+  const wireBytes = encodedUtf8Bytes(encoded);
   if (wireBytes > limit) throw new Error('history projection byte limit');
   const view = JSON.parse(encoded);
   const packed = supportsPackedRows(view?.version);

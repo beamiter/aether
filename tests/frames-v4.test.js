@@ -70,6 +70,7 @@ test('dense rows preserve decorated wide glyphs and validate every cell boundary
 
   const applyRow = replacement => accept(null,{...denseSnapshot,rows:[replacement,second]});
   assert.throws(() => applyRow({...row,cell_bytes:row.cell_bytes.slice(1)}),/dense Channel row/);
+  assert.throws(() => applyRow({...row,cell_bytes:' '+row.cell_bytes.slice(1)}),/dense Channel row/);
   assert.throws(() => applyRow({...row,text:row.text+'a'}),/dense Channel row width/);
   assert.throws(() => applyRow({...row,attributes:[...row.attributes,...row.attributes]}),/dense Channel attributes/);
   assert.throws(() => applyRow({...row,runs:[]}),/dense Channel row/);
@@ -96,6 +97,17 @@ test('encoded, cluster, geometry, and accumulated text budgets reject before rep
   const base = accept(null,{...snapshot,cols:256,rows:[...Array(32).fill(longRow),extra],hyperlinks:[]});
   assert.throws(() => accept(base,{...delta,rows:[{index:0,row:extra}],hyperlinks:[]}),/text byte limit/);
   assert.equal(full.rows[0][0].underline,'double');
+});
+
+test('the wire byte limit counts an astral glyph across a scanning boundary as four bytes', () => {
+  const prefix = '{"padding":"';
+  const start = prefix + 'x'.repeat(8191-prefix.length) + '🙂';
+  const end = '",' + JSON.stringify(snapshot).slice(1);
+  const limit = 8*1024*1024;
+  const encoded = start + 'x'.repeat(limit-Buffer.byteLength(start)-Buffer.byteLength(end)) + end;
+  assert.equal(Buffer.byteLength(encoded),limit);
+  assert.equal(acceptChannelFrame(null,encoded,owner).revision,snapshot.stamp.revision);
+  assert.throws(() => acceptChannelFrame(null,encoded+' ',owner),/frame byte limit/);
 });
 
 test('Canvas draws the supplied underline colour and both lines across the full cluster span', () => {
