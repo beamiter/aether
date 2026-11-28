@@ -1,12 +1,14 @@
 //! Private Linux PTY owner and versioned RPC records for OpenSSH stdio.
+mod reply_forward;
 mod session_table;
 pub mod ssh;
 
 use crate::{
-    live::{KeyEvent, LiveBridge, NativeKeyState},
-    semantic::Attachment,
+    live::{HistorySnapshot, KeyEvent, LiveBridge, NativeKeyState},
+    semantic::{Attachment, Resume, Update},
 };
 use jterm_engine::input::KeyboardLocks;
+use reply_forward::forward_reply;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use session_table::SessionTable;
@@ -170,6 +172,32 @@ pub struct Reply<T = Value> {
     pub result: Result<T, String>,
 }
 
+// Keep cell-heavy replies typed until they are written to the socket.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum HostReply {
+    Json(Value),
+    Update(Option<Update>),
+    PollWithStatus {
+        update: Option<Update>,
+        status: Value,
+    },
+    Attached(Option<Resume>),
+    Recovered {
+        #[serde(flatten)]
+        view: Resume,
+        input_allowed: bool,
+        keyboard_events_enabled: bool,
+    },
+    History(HistorySnapshot),
+}
+
+impl HostReply {
+    fn json(value: impl Serialize) -> Result<Self, String> {
+        reply_value(value).map(Self::Json)
+    }
+}
+
 struct Host {
     identity: String,
     sessions: SessionTable<LiveBridge, MAX_SESSIONS>,
@@ -306,7 +334,7 @@ impl Host {
         self.retry_at = retry.map(|delay| Instant::now() + delay);
     }
 
-    fn reply(&mut self, request: Request) -> Reply {
+    fn reply(&mut self, request: Request) -> Reply<HostReply> {
         let result = if request.protocol != VERSION || request.request == 0 {
             Err("unsupported terminal transport version or request ID".into())
         } else if (matches!(
@@ -325,7 +353,7 @@ impl Host {
             Err(HOST_CHANGED.into())
         } else {
             let resize = matches!(request.command, Command::Resize { .. });
-            let result = self.execute(request.command);
+            let result = self.dispatch(request.command);
             // RPCs can enqueue input or change geometry without producing a
             // reader event. An already armed retry also services that work.
             if self.retry_at.is_none()
@@ -346,9 +374,9 @@ impl Host {
         }
     }
 
-    fn execute(&mut self, command: Command) -> Result<Value, String> {
+    fn dispatch(&mut self, command: Command) -> Result<HostReply, String> {
         let (id, result) = match command {
-            Command::Identify => return reply_value(&self.identity),
+            Command::Identify => return HostReply::json(&self.identity),
             Command::Open { rows, cols } => {
                 check_grid(rows, cols)?;
                 let wake = Arc::clone(&self.wake);
@@ -357,21 +385,21 @@ impl Host {
                     let epoch = bridge.open_remote(rows, cols)?;
                     bridge.notify_on_output(move || wake.notify())?;
                     let owner = bridge.attachment(epoch)?;
-                    let result = reply_value(&owner)?;
+                    let result = HostReply::json(&owner)?;
                     Ok((owner.session, bridge, result))
                 });
             }
             Command::Close { owner } => {
                 let bridge = self.bridge(&owner.session)?;
                 let epoch = bridge.validate_attachment(&owner)?;
-                let result = reply_value(bridge.close(epoch)?)?;
+                let result = HostReply::json(bridge.close(epoch)?)?;
                 self.sessions.remove(&owner.session);
                 return Ok(result);
             }
             Command::AttachReadOnly { session, epoch } => {
                 let bridge = self.bridge(&session)?;
                 bridge.attachment(epoch)?;
-                (session, reply_value(bridge.resume(None)?)?)
+                (session, HostReply::Attached(bridge.resume(None)?))
             }
             Command::Recover { owner } => {
                 let bridge = self.bridge(&owner.session)?;
@@ -379,18 +407,21 @@ impl Host {
                     .resume(Some(&owner))?
                     .ok_or("terminal session unavailable")?;
                 let input_allowed = bridge.recovered_input_allowed(&resume.owner);
-                let mut result = reply_value(resume)?;
-                result["input_allowed"] = Value::Bool(input_allowed);
-                result["keyboard_events_enabled"] =
-                    Value::Bool(bridge.remote_keyboard_events_enabled());
-                (owner.session, result)
+                (
+                    owner.session,
+                    HostReply::Recovered {
+                        view: resume,
+                        input_allowed,
+                        keyboard_events_enabled: bridge.remote_keyboard_events_enabled(),
+                    },
+                )
             }
             Command::Detach { owner } => {
                 self.bridge(&owner.session)?.detach(&owner)?;
-                (owner.session, Value::Null)
+                (owner.session, HostReply::Json(Value::Null))
             }
             Command::Poll { owner } => self.attached(owner, false, |bridge, epoch| {
-                reply_value(bridge.poll_update(epoch)?)
+                bridge.poll_update(epoch).map(HostReply::Update)
             })?,
             Command::PollWithStatus {
                 owner,
@@ -401,17 +432,17 @@ impl Host {
                 }
                 let update = bridge.poll_update(epoch)?;
                 let status = terminal_status(bridge, epoch)?;
-                Ok(serde_json::json!({ "update": update, "status": status }))
+                Ok(HostReply::PollWithStatus { update, status })
             })?,
             Command::Ack { owner, revision } => self.attached(owner, false, |bridge, epoch| {
-                reply_value(bridge.acknowledge(epoch, revision)?)
+                HostReply::json(bridge.acknowledge(epoch, revision)?)
             })?,
-            Command::Status { owner } => {
-                self.attached(owner, false, |bridge, epoch| terminal_status(bridge, epoch))?
-            }
+            Command::Status { owner } => self.attached(owner, false, |bridge, epoch| {
+                terminal_status(bridge, epoch).map(HostReply::Json)
+            })?,
             Command::History { owner, offset } => {
                 self.attached(owner, false, |bridge, epoch| {
-                    reply_value(bridge.history(epoch, offset)?)
+                    bridge.history(epoch, offset).map(HostReply::History)
                 })?
             }
             Command::Write { owner, bytes } => {
@@ -419,7 +450,7 @@ impl Host {
                 let result = self
                     .bridge(&owner.session)?
                     .write_owned_raw(owner.clone(), bytes)?;
-                (owner.session, reply_value(result)?)
+                (owner.session, HostReply::json(result)?)
             }
             Command::Key {
                 owner,
@@ -431,7 +462,7 @@ impl Host {
             } => {
                 check_input(name.len())?;
                 self.attached(owner, true, |bridge, epoch| {
-                    reply_value(bridge.key_with_keypad(
+                    HostReply::json(bridge.key_with_keypad(
                         epoch,
                         &name,
                         shift,
@@ -444,7 +475,7 @@ impl Host {
             Command::EnableKeyboardEvents { owner } => {
                 self.attached(owner, true, |bridge, epoch| {
                     bridge.enable_remote_keyboard_events(epoch)?;
-                    Ok(Value::Bool(true))
+                    Ok(HostReply::Json(Value::Bool(true)))
                 })?
             }
             Command::KeyEvent {
@@ -453,30 +484,30 @@ impl Host {
                 layout,
             } => self.attached(owner, true, |bridge, epoch| {
                 let native = layout.map(KeyboardLayout::into_native).transpose()?;
-                reply_value(bridge.key_event(epoch, &event, native)?)
+                HostReply::json(bridge.key_event(epoch, &event, native)?)
             })?,
             Command::Text { owner, text } => {
                 check_input(text.len())?;
                 self.attached(owner, true, |bridge, epoch| {
-                    reply_value(bridge.text(epoch, &text)?)
+                    HostReply::json(bridge.text(epoch, &text)?)
                 })?
             }
             Command::Paste { owner, text } => {
                 check_input(text.len())?;
                 self.attached(owner, true, |bridge, epoch| {
-                    reply_value(bridge.paste(epoch, &text)?)
+                    HostReply::json(bridge.paste(epoch, &text)?)
                 })?
             }
             Command::Mouse { owner, report } => self.attached(owner, true, |bridge, epoch| {
-                reply_value(bridge.mouse(epoch, report)?)
+                HostReply::json(bridge.mouse(epoch, report)?)
             })?,
             Command::Focus { owner, focused } => self.attached(owner, true, |bridge, epoch| {
-                reply_value(bridge.focus(epoch, focused)?)
+                HostReply::json(bridge.focus(epoch, focused)?)
             })?,
             Command::Resize { owner, rows, cols } => {
                 check_grid(rows, cols)?;
                 self.attached(owner, true, |bridge, epoch| {
-                    reply_value(bridge.resize(epoch, rows, cols)?)
+                    HostReply::json(bridge.resize(epoch, rows, cols)?)
                 })?
             }
         };
@@ -494,8 +525,8 @@ impl Host {
         &mut self,
         owner: Attachment,
         input: bool,
-        operation: impl FnOnce(&mut LiveBridge, u32) -> Result<Value, String>,
-    ) -> Result<(String, Value), String> {
+        operation: impl FnOnce(&mut LiveBridge, u32) -> Result<HostReply, String>,
+    ) -> Result<(String, HostReply), String> {
         let bridge = self.bridge(&owner.session)?;
         let epoch = if input {
             bridge.validate_logical_input(&owner)?
@@ -514,6 +545,12 @@ pub(crate) fn read_record<T: DeserializeOwned>(
     reader: &mut impl BufRead,
     limit: usize,
 ) -> io::Result<Option<T>> {
+    read_record_bytes(reader, limit)?
+        .map(|data| decode_record(&data))
+        .transpose()
+}
+
+fn read_record_bytes(reader: &mut impl BufRead, limit: usize) -> io::Result<Option<Vec<u8>>> {
     let mut data = Vec::new();
     io::Read::take(reader, (limit + 1) as u64).read_until(b'\n', &mut data)?;
     if data.is_empty() {
@@ -522,9 +559,11 @@ pub(crate) fn read_record<T: DeserializeOwned>(
     if data.len() > limit || data.last() != Some(&b'\n') {
         return Err(invalid("oversized or incomplete terminal transport record"));
     }
-    serde_json::from_slice(&data)
-        .map(Some)
-        .map_err(|_| invalid("malformed terminal transport JSON"))
+    Ok(Some(data))
+}
+
+fn decode_record<T: DeserializeOwned>(data: &[u8]) -> io::Result<T> {
+    serde_json::from_slice(data).map_err(|_| invalid("malformed terminal transport JSON"))
 }
 
 pub(crate) fn write_record(
@@ -746,16 +785,12 @@ pub fn stdio(socket: &Path, mut reader: impl BufRead, mut writer: impl Write) ->
         let mut peer = UnixStream::connect(socket)?;
         limit_socket(&peer)?;
         write_record(&mut peer, &request, MAX_REQUEST)?;
-        let reply: Reply = read_record(&mut BufReader::new(peer), MAX_REPLY)?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "terminal owner closed during request",
-            )
-        })?;
-        if reply.protocol != VERSION || reply.request != request.request {
-            return Err(invalid("terminal owner reply does not match request"));
-        }
-        write_record(&mut writer, &reply, MAX_REPLY)?;
+        forward_reply(
+            &mut BufReader::new(peer),
+            &mut writer,
+            request.request,
+            MAX_REPLY,
+        )?;
     }
     Ok(())
 }
@@ -763,6 +798,20 @@ pub fn stdio(socket: &Path, mut reader: impl BufRead, mut writer: impl Write) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl Host {
+        fn execute(&mut self, command: Command) -> Result<Value, String> {
+            reply_value(self.dispatch(command)?)
+        }
+
+        fn wire_reply(&mut self, request: Request) -> Reply<Value> {
+            let mut bytes = Vec::new();
+            write_record(&mut bytes, &self.reply(request), MAX_REPLY).unwrap();
+            read_record(&mut bytes.as_slice(), MAX_REPLY)
+                .unwrap()
+                .unwrap()
+        }
+    }
 
     fn run_with_private_pty_capacity() -> bool {
         let thread = std::thread::current();
@@ -841,13 +890,13 @@ mod tests {
             command,
         };
         let identity = first
-            .reply(request(None, Command::Identify))
+            .wire_reply(request(None, Command::Identify))
             .result
             .unwrap();
         assert!(valid_identity(identity.as_str().unwrap()));
         assert_ne!(
             replacement
-                .reply(request(None, Command::Identify))
+                .wire_reply(request(None, Command::Identify))
                 .result
                 .unwrap(),
             identity,
@@ -862,7 +911,7 @@ mod tests {
         ] {
             assert_eq!(
                 replacement
-                    .reply(request(Some(identity.clone()), command))
+                    .wire_reply(request(Some(identity.clone()), command))
                     .result,
                 Err(HOST_CHANGED.into()),
             );
@@ -870,7 +919,7 @@ mod tests {
         assert!(replacement.sessions.is_empty());
         assert_eq!(
             first
-                .reply(request(Some(identity.clone()), Command::Identify))
+                .wire_reply(request(Some(identity.clone()), Command::Identify))
                 .result,
             Ok(Value::String(identity)),
         );
@@ -946,7 +995,7 @@ os.read(0,1)
                     report,
                 },
             };
-            host.reply(request).result
+            host.wire_reply(request).result
         };
         assert_eq!(
             send(&mut host, report("press", Some("left"))).unwrap(),
@@ -1051,7 +1100,7 @@ expect(b'.')
                     report: serde_json::from_value(report(view, kind)).unwrap(),
                 },
             };
-            host.reply(request).result
+            host.wire_reply(request).result
         };
         wait(&mut host, "READY");
         let info = status(&mut host);
@@ -1059,7 +1108,7 @@ expect(b'.')
         let view = info["mouse"].clone();
         assert_eq!(view["tracking"], "drag");
         assert_eq!(
-            host.reply(Request {
+            host.wire_reply(Request {
                 protocol: VERSION,
                 request: 1,
                 host: None,
@@ -1152,7 +1201,7 @@ expect(b'.')
         let opened = host.execute(Command::Open { rows: 8, cols: 80 }).unwrap();
         let owner: Attachment = serde_json::from_value(opened).unwrap();
         let poll = |host: &mut Host, bound: bool, owner: &Attachment, ack_revision| {
-            host.reply(Request {
+            host.wire_reply(Request {
                 protocol: VERSION,
                 request: 1,
                 host: bound.then(|| host.identity.clone()),
@@ -1218,7 +1267,7 @@ expect(b'.')
             .unwrap();
         assert_eq!(status["keyboard_events_supported"], true);
         let send = |host: &mut Host, bound: bool, command| {
-            host.reply(Request {
+            host.wire_reply(Request {
                 protocol: VERSION,
                 request: 1,
                 host: bound.then(|| host.identity.clone()),
@@ -1329,7 +1378,7 @@ os.write(1,b'RETIRED')
         };
         wait(&mut host, "READY");
         assert_eq!(
-            host.reply(Request {
+            host.wire_reply(Request {
                 protocol: VERSION,
                 request: 1,
                 host: None,
