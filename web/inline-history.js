@@ -1,3 +1,4 @@
+import {cssColor} from './cell-colors.js';
 import {acceptHistoryProjection, CHANNEL_RENDITION_VERSION} from './frames-v4.js';
 import {CELL_HEIGHT, clearPaint, paint} from './frames.js';
 
@@ -40,7 +41,7 @@ export function installInlineHistory({canvas, viewport, getOwner, getFrame, fetc
             const archived = page.rows.slice(top - first, end - first);
             const rows = [...archived, ...frame.rows.slice(0, height - archived.length)];
             // Retained rows may still use the width at which they were written.
-            canvas.style.backgroundColor = frame.rows[0][0].background;
+            canvas.style.backgroundColor = cssColor(frame.rows[0][0].background);
             paint(canvas, {...frame, rows, cursor_visible: false, selection: undefined,
               images: {...frame.images, ...page.images}});
             canvas.hidden = false;

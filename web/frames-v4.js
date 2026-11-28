@@ -260,8 +260,6 @@ function decodedStyle(style, extended) {
   return extended && (style & 4) ? (style & ~4) | CELL_CONCEALED : style;
 }
 
-const hexByte = Array.from({length:256}, (_, value) => value.toString(16).padStart(2, '0'));
-const hexStart = hexByte.map(value=>'#'+value);
 const emptyAttributes = Object.freeze({underline:undefined,underline_color:undefined,hyperlink_id:undefined});
 const hasBase64Bytes = typeof Uint8Array.fromBase64 === 'function';
 
@@ -300,17 +298,12 @@ function validateDenseRow(row, cols, links, referenced, supportsImages, binary) 
   }
   const cells = [], rowLinks = new Set();
   let offset = 0, textBytes = 0, lead = false;
-  let previousBackground = -1, background;
   for (let column = 0; column < cols; column++) {
     const start = column * denseCellStride;
-    const r = bytes[start], g = bytes[start+1], b = bytes[start+2];
-    const br = bytes[start+3], bg = bytes[start+4], bb = bytes[start+5];
-    const foreground = hexStart[r] + hexByte[g] + hexByte[b];
-    const backgroundKey = (br << 16) | (bg << 8) | bb;
-    if (backgroundKey !== previousBackground) {
-      background = hexStart[br] + hexByte[bg] + hexByte[bb];
-      previousBackground = backgroundKey;
-    }
+    // Dense colors are already RGB bytes. Keep them as integers until a
+    // consumer needs CSS, and pass them directly to the raster painter.
+    const foreground = (bytes[start] << 16) | (bytes[start+1] << 8) | bytes[start+2];
+    const background = (bytes[start+3] << 16) | (bytes[start+4] << 8) | bytes[start+5];
     const style = decodedStyle(bytes[start+6],true);
     const width = bytes[start+7], units = bytes[start+8];
     if (width > 2 || units === 0 || units > maxClusterBytes || offset + units > text.length)

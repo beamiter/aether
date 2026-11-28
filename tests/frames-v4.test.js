@@ -62,7 +62,7 @@ test('dense rows preserve decorated wide glyphs and validate every cell boundary
   const denseSnapshot = {...snapshot,stamp:{...stamp,version:SSH_DENSE_FRAME_VERSION},rows:[row,second]};
   const frame = accept(null,denseSnapshot);
   assert.deepEqual(frame.rows[0][0], {
-    text:'🙂\u0301',width:2,style:CELL_CONCEALED,foreground:'#010203',background:'#040506',
+    text:'🙂\u0301',width:2,style:CELL_CONCEALED,foreground:0x010203,background:0x040506,
     underline:'curly',underline_color:'#070809',hyperlink_id:22,
   });
   assert.equal(frame.rows[0][1].width,0);
@@ -83,6 +83,45 @@ test('dense rows preserve decorated wide glyphs and validate every cell boundary
   badContinuation[16] = 1;
   assert.throws(() => applyRow({...row,cell_bytes:badContinuation.toString('base64')}),/wide span/);
   assert.throws(() => accept(null,{...denseSnapshot,stamp:{...stamp,version:CHANNEL_RENDITION_VERSION}}),/dense Channel row version/);
+});
+
+test('dense RGB reaches Canvas CSS paint and compares with a packed delta', () => {
+  const baseStamp = {...stamp, version:SSH_DENSE_FRAME_VERSION,cursor_row:0};
+  const cells = Buffer.from([0,0,0,1,2,3,0,1,1, 171,205,239,0,0,0,0,1,1]);
+  const dense = accept(null,{kind:'snapshot',stamp:baseStamp,cols:2,rows:[
+    {wrapped:false,columns:2,cell_bytes:cells.toString('base64'),text:'XY',
+      attributes:[{column:0,underline:'single'}]},
+  ]});
+  const fills=[], glyphs=[], clears=[];
+  const context = {
+    setTransform(){},save(){},restore(){},beginPath(){},rect(){},clip(){},
+    clearRect(...args){clears.push(args);},
+    fillRect(...args){fills.push([this.fillStyle,...args]);},
+    fillText(text){glyphs.push([this.fillStyle,text]);},
+  };
+  const canvas={style:{},getContext:()=>context};
+  paint(canvas,dense,1.25);
+  assert.deepEqual(fills.map(fill=>fill[0]),['#010203','#000000','#000000']);
+  assert.deepEqual(glyphs,[['#000000','X'],['#abcdef','Y']]);
+  assert.equal(clears.length,1);
+
+  const packed = {...delta,stamp:{...baseStamp,revision:'9007199254740993'},rows:[
+    {index:0,row:{wrapped:false,columns:2,runs:[[0,'X'],[1,'Y']],styles:[
+      {foreground:'#000000',background:'#010203',style:0,underline:'single'},
+      {foreground:'#ABCDEF',background:'#000000',style:0},
+    ]}},
+  ],hyperlinks:[]};
+  const unchanged = accept(dense,packed);
+  paint(canvas,unchanged,1.25);
+  assert.equal(clears.length,1,'changing the row encoding should not repaint equal colors');
+
+  packed.rows[0].row.styles[1].background='#224466';
+  const changed = accept(unchanged,{...packed,base_revision:unchanged.revision,
+    stamp:{...packed.stamp,revision:'9007199254740994'}});
+  paint(canvas,changed,1.25);
+  assert.deepEqual(clears[1],[15,0,15,30]);
+  assert.equal(fills.at(-1)[0],'#224466');
+  assert.deepEqual(glyphs.at(-1),['#ABCDEF','Y']);
 });
 
 test('encoded, cluster, geometry, and accumulated text budgets reject before replacing the frame', () => {
@@ -194,8 +233,8 @@ test('binary dense rows consume exactly their own cells before the pane raster',
     cells,raster,peerCells,peerRaster));
   const live = acceptChannelPayload(null,event,expected);
   const peer = acceptChannelPayload(null,event.preview,expected,true);
-  assert.equal(live.rows[0][0].foreground,'#010203');
-  assert.equal(peer.rows[0][0].foreground,'#270203');
+  assert.equal(live.rows[0][0].foreground,0x010203);
+  assert.equal(peer.rows[0][0].foreground,0x270203);
   assert.equal(live.rows[0][0].text,'🙂\u0301');
   assert.equal(live.rows[0][0].style,CELL_CONCEALED);
   assert.equal(live.rows[0][1].width,0);

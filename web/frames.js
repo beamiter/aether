@@ -1,3 +1,4 @@
+import {cssColor,sameCellColor} from './cell-colors.js';
 import {createRasterCanvasCache} from './raster-canvas-cache.js';
 import {CELL_CONCEALED, CELL_OVERLINE, rowMoveForBase} from './frames-v4.js';
 import {canRasterizeInk, createTruecolorPainter} from './truecolor-raster.js';
@@ -115,7 +116,7 @@ export function clearPaint(canvas) {
 function paintUnderline(g, cell, x, y, width) {
   const kind = cell.underline ?? (cell.style & 4 || cell.hyperlink_id ? 'single' : null);
   if (!kind) return;
-  g.fillStyle = cell.underline_color ?? cell.foreground;
+  g.fillStyle = cssColor(cell.underline_color ?? cell.foreground);
   if (kind === 'curly') {
     g.strokeStyle = g.fillStyle;
     g.lineWidth = 1;
@@ -143,7 +144,7 @@ function paintCellInk(g, cell, x, y) {
   try {
     g.beginPath();g.rect(x,y,width,CELL_HEIGHT);g.clip();
     g.globalAlpha = cell.style & 16 ? 0.5 : 1;
-    g.fillStyle = cell.foreground;
+    g.fillStyle = cssColor(cell.foreground);
     if (!space) {
       g.font = `${cell.style&2?'italic ':''}${cell.style&1?'bold ':''}18px monospace`;
       g.fillText(cell.text,x,y+CELL_TEXT_TOP);
@@ -179,7 +180,7 @@ function buildGlyphAtlas(canvas, g, frame, damage, scale) {
       // sequences, wide glyphs and decorations directly on the terminal.
       if (cell.width !== 1 || (cell.style & ~(1 | 2 | 16)) || cell.underline || cell.hyperlink_id ||
           cell.text.length !== 1 || cell.text < '!' || cell.text > '~') continue;
-      const key = `${cell.foreground}${cell.background}:${cell.style}:${cell.text}`;
+      const key = `${cell.foreground},${cell.background}:${cell.style}:${cell.text}`;
       let slot = keys.get(key);
       if (slot !== undefined) repeated++;
       else {
@@ -214,7 +215,7 @@ function buildGlyphAtlas(canvas, g, frame, damage, scale) {
   for (const [slot,cell] of tiles.entries()) {
     const x = slot % GLYPH_ATLAS_COLUMNS * CELL_WIDTH;
     const y = Math.floor(slot / GLYPH_ATLAS_COLUMNS) * CELL_HEIGHT;
-    texture.fillStyle = cell.background;
+    texture.fillStyle = cssColor(cell.background);
     texture.fillRect(x,y,CELL_WIDTH,CELL_HEIGHT);
     paintCellInk(texture,cell,x,y);
   }
@@ -223,7 +224,7 @@ function buildGlyphAtlas(canvas, g, frame, damage, scale) {
 
 function sameCellPaint(before, after) {
   return before === after || (before.text === after.text && before.width === after.width &&
-    before.background === after.background && before.foreground === after.foreground &&
+    sameCellColor(before.background,after.background) && sameCellColor(before.foreground,after.foreground) &&
     before.style === after.style && before.underline === after.underline &&
     before.underline_color === after.underline_color && before.hyperlink_id === after.hyperlink_id);
 }
@@ -283,7 +284,7 @@ function paintBackgrounds(g, frame, damage, merge) {
       const background = row[start].background;
       let end = start+1;
       if (merge) while (end<limit && row[end].background === background) end++;
-      g.fillStyle = background;
+      g.fillStyle = cssColor(background);
       g.fillRect(start*cw,y*ch,(end-start)*cw,ch);
       start = end;
     }

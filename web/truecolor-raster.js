@@ -1,3 +1,4 @@
+import {rgbValue} from './cell-colors.js';
 const FIRST_GLYPH = 32, LAST_GLYPH = 126;
 const GLYPHS = LAST_GLYPH - FIRST_GLYPH + 1, LEVELS = 8;
 const ATLAS_COLUMNS = 16, PROBES = 48;
@@ -10,7 +11,6 @@ export function canRasterizeInk(cell) {
     cell.text.length === 1 && cell.text >= ' ' && cell.text <= '~';
 }
 
-function rgb(color) { return Number.parseInt(color.slice(1),16); }
 function rgba(r,g,b) {
   return littleEndian ? (0xff000000 | b<<16 | g<<8 | r) >>> 0 : (r<<24 | g<<16 | b<<8 | 255) >>> 0;
 }
@@ -49,7 +49,7 @@ function wantsRaster(frame, damage) {
         compatible++;
         if (cell.text !== ' ') ink++;
       }
-      pairs.add(cell.foreground+cell.background);
+      pairs.add(rgbValue(cell.foreground)*0x1000000+rgbValue(cell.background));
       if (++checked === SAMPLE_CELLS) return compatible*5 >= checked*4 && ink >= 64 && pairs.size >= 64;
     }
   }
@@ -175,7 +175,7 @@ export function createTruecolorPainter(cellWidth, cellHeight, textTop) {
       for (let i=start; i<end; i++) {
         const row = frame.rows[damage[i].y], line = (i-start)*ch*width;
         for (let x=first; x<last; x++) {
-          const color = rgb(row[x].background), left = line+x*cw;
+          const color = rgbValue(row[x].background), left = line+x*cw;
           pixels.fill(rgba(color>>>16,color>>8&255,color&255),left,left+cw);
         }
         for (let copy=1; copy<ch; copy*=2) {
@@ -184,7 +184,7 @@ export function createTruecolorPainter(cellWidth, cellHeight, textTop) {
         for (let x=first; x<last; x++) {
           const cell = row[x];
           if (!canRasterizeInk(cell) || cell.text === ' ') continue;
-          const foreground = rgb(cell.foreground), background = rgb(cell.background);
+          const foreground = rgbValue(cell.foreground), background = rgbValue(cell.background);
           const points = masks[maskIndex(foreground,cell.text.charCodeAt(0))];
           const left = line+x*cw;
           for (let p=0; p<points.length; p+=3) {
