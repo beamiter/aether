@@ -1435,6 +1435,49 @@ finally:
     print(json.dumps({proof: True, "pty_bytes_verified": len(actual)}), flush=True)
 
 
+SPLIT_SHORTCUT_EVIDENCE = """
+window.__aetherSplitShortcutEvidence?.();
+const observed = [];
+function snapshot() {
+  const focus = document.activeElement;
+  const split = document.querySelector('#terminal-panes')?.dataset.split;
+  const status = document.querySelector('#status')?.textContent ?? '';
+  return {
+    status: status.startsWith('Wait for the current') ? 'pending-input'
+      : status.startsWith('Local shell ') ? 'local-shell' : status ? 'other' : 'empty',
+    focus: focus?.id === 'ime-input' ? 'terminal-input' : focus === document.body ? 'body' : 'other',
+    writable: document.querySelector('#input')?.disabled === false,
+    split_enabled: document.querySelector('#split-local')?.disabled === false,
+    orientation: ['right', 'bottom'].includes(split) ? split : 'other',
+    tab_count: Math.min(16, document.querySelector('#local-tab-list')?.childElementCount ?? 0),
+  };
+}
+const initial = snapshot();
+let clipped = false;
+function record(event) {
+  if (event.key !== 'Enter' && event.code !== 'KeyD' && !/^[dD]$/.test(event.key)) return;
+  if (observed.length === 12) { clipped = true; return; }
+  const receipt = {kind: event.key === 'Enter' ? 'enter' : 'split-key', type: event.type,
+    trusted: event.isTrusted, ctrl: event.ctrlKey, shift: event.shiftKey, alt: event.altKey,
+    meta: event.metaKey, composing: event.isComposing || event.keyCode === 229, repeat: event.repeat,
+    prevented: event.defaultPrevented, ...snapshot()};
+  observed.push(receipt);
+  setTimeout(() => { receipt.prevented = event.defaultPrevented; }, 0);
+}
+for (const kind of ['keydown', 'keyup']) window.addEventListener(kind, record, true);
+window.__aetherSplitShortcutEvidence = () => {
+  for (const kind of ['keydown', 'keyup']) window.removeEventListener(kind, record, true);
+  return {initial, final: snapshot(), observed, clipped};
+};
+"""
+
+SPLIT_SHORTCUT_EVIDENCE_FINISH = """
+const finish = window.__aetherSplitShortcutEvidence;
+delete window.__aetherSplitShortcutEvidence;
+return finish?.() ?? null;
+"""
+
+
 def exercise_terminal_shell(driver, owned):
     def state():
         return driver.execute(READ)
@@ -1526,11 +1569,18 @@ def exercise_terminal_shell(driver, owned):
     keys(ctrl, shift, "C")
     wait_for(lambda: state()["status"] == "Terminal selection copied.", "copy shortcut did not write to the clipboard")
     assert subprocess.check_output(["xclip", "-selection", "clipboard", "-o"], timeout=4) == b"AETHER_COPY"
-    keys("\ue007")
-
-    keys(ctrl, shift, "D")
-    second = wait_for(lambda: (tab if (tab := session()) != first and state()["split"] == "bottom" else None),
-                      "top/bottom shortcut did not open a second pane")
+    optional_tab_evidence(driver, SPLIT_SHORTCUT_EVIDENCE)
+    try:
+        keys("\ue007")
+        keys(ctrl, shift, "D")
+        second = wait_for(lambda: (tab if (tab := session()) != first and state()["split"] == "bottom" else None),
+                          "top/bottom shortcut did not open a second pane")
+    except Exception:
+        evidence = optional_tab_evidence(driver, SPLIT_SHORTCUT_EVIDENCE_FINISH)
+        print(json.dumps({"case": "AETHER.SHELL.SPLIT_SHORTCUT_FAILURE", "evidence": evidence}), flush=True)
+        raise
+    finally:
+        optional_tab_evidence(driver, SPLIT_SHORTCUT_EVIDENCE_FINISH)
     keys(ctrl, shift, "E")
     wait_for(lambda: state()["split"] == "right", "left/right shortcut did not reorient the same panes")
     assert len(state()["tabs"]) == 2
