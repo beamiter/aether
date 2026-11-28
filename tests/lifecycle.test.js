@@ -17,8 +17,8 @@ import {installTerminalChat,validateChatStatus} from '../web/terminal-chat.js';
 import {installWorkflows} from '../web/workflows.js';
 import {plainLocalTab,readLocalShellLayout,saveLocalShellLayout,readThreePaneLayout,saveThreePaneLayout,MAX_LOCAL_SHELLS,validLocalGeometry,localSplitPair} from '../web/local-layout.js';
 import {acceptFull,acceptUpdate,backingGeometry,clearPaint,paint as paintFrame} from '../web/frames.js'; import {installIme} from '../web/ime.js';
-import {acceptChannelFrame,acceptChannelPayload,acceptChannelUpdate,channelCounter,CHANNEL_RENDITION_VERSION,CHANNEL_DENSE_VERSION,SSH_DENSE_FRAME_VERSION,supportsChannelRendition} from '../web/frames-v4.js';
-import {packedRow} from './fixtures/packed-channel.js';
+import {acceptChannelFrame,acceptChannelPayload,acceptChannelUpdate,channelCounter,CHANNEL_RENDITION_VERSION,CHANNEL_DENSE_VERSION,SSH_DENSE_FRAME_VERSION,channelRasterBytes,decodeLocalChannelEvent,supportsChannelRendition} from '../web/frames-v4.js';
+import {binaryChannelEvent,packedRow} from './fixtures/packed-channel.js';
 const tick=()=>new Promise(r=>setImmediate(r));
 const deferred=()=>{let resolve,reject;const promise=new Promise((a,b)=>{resolve=a;reject=b});return {promise,resolve,reject};};
 function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsupported:"0"}), Encoder=TextEncoder, paint=()=>{},storage={},Channel,animation={}){
@@ -60,7 +60,7 @@ function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsuppo
  const listen=events=>(name,fn)=>events.set(name,[...(events.get(name)??[]),fn]);
  const fire=(events,name)=>{for(const fn of events.get(name)??[])fn({target:document.activeElement});};
  const document={querySelector:el,querySelectorAll:()=>[],createElement:element,body:element(),activeElement:null,hidden:false,hasFocus:()=>true,addEventListener:listen(pageEvents)};
- const context={paneInputIntent,directionalPaneNeighbor,retainedPaneTree,makePassiveSurfaces,validateReloadView,retainedReloadView,saveReloadTicket,takeReloadTicket,installFilePreviewPanel:()=>({dismiss(){}}),document,addEventListener:listen(windowEvents),__TAURI__:{core:{invoke,Channel}},acceptFull,acceptUpdate,backingGeometry,clearPaint,acceptChannelFrame,acceptChannelPayload,acceptChannelUpdate,channelCounter,CHANNEL_RENDITION_VERSION,CHANNEL_DENSE_VERSION,SSH_DENSE_FRAME_VERSION,supportsChannelRendition,installIme,installTerminalKeys,modifierKey,installHistory,installCommandBlocks,installTerminalChat,installTerminalShell,installWorkflows,validateChatStatus,installPasteReview,installTerminalFocus,installTerminalMouse,installTerminalSelection,dimensions,resizeQueue,cursorTarget,terminalCellAt,viewportDimensions,windowPixelQueue,paint,TextEncoder:Encoder,TextDecoder,
+ const context={paneInputIntent,directionalPaneNeighbor,retainedPaneTree,makePassiveSurfaces,validateReloadView,retainedReloadView,saveReloadTicket,takeReloadTicket,installFilePreviewPanel:()=>({dismiss(){}}),document,addEventListener:listen(windowEvents),__TAURI__:{core:{invoke,Channel}},acceptFull,acceptUpdate,backingGeometry,clearPaint,acceptChannelFrame,acceptChannelPayload,acceptChannelUpdate,channelCounter,CHANNEL_RENDITION_VERSION,CHANNEL_DENSE_VERSION,SSH_DENSE_FRAME_VERSION,decodeLocalChannelEvent,supportsChannelRendition,installIme,installTerminalKeys,modifierKey,installHistory,installCommandBlocks,installTerminalChat,installTerminalShell,installWorkflows,validateChatStatus,installPasteReview,installTerminalFocus,installTerminalMouse,installTerminalSelection,dimensions,resizeQueue,cursorTarget,terminalCellAt,viewportDimensions,windowPixelQueue,paint,TextEncoder:Encoder,TextDecoder,
  installInlineHistory,
  plainLocalTab,MAX_LOCAL_SHELLS,validLocalGeometry,localSplitPair,readLocalShellLayout:()=>readLocalShellLayout(storage),saveLocalShellLayout:value=>saveLocalShellLayout(value,storage),readThreePaneLayout:()=>readThreePaneLayout(storage),saveThreePaneLayout:value=>saveThreePaneLayout(value,storage),
  setInterval(fn){timers.set(++id,fn);return id},clearInterval(i){timers.delete(i)},setTimeout,...animation};
@@ -416,6 +416,35 @@ function testChannel(){
  return class {constructor(){this.id=++number;}};
 }
 
+test('local binary image delivery paints before ACK and a truncated packet pauses output',async()=>{
+ const owner={session:'e'.repeat(32),epoch:1,generation:1};
+ const raw=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+ const frame=JSON.parse(channelSnapshot({...raw,session:owner.session,epoch:1}));
+ frame.images=[{id:'1',width:1,height:1,columns:1,rows:1}];
+ frame.rows[0].image_slices=[{id:'1',column:0,slice:0}];
+ const header={kind:'update',sequence:'1',owner,frame,frame_bytes:Buffer.byteLength(JSON.stringify(frame)),
+  image_bytes:4,status:channelHealth(1)};
+ let receive;
+ const events=[];
+ const h=harness(async(name,args)=>{
+  switch(name){
+   case 'open_shell':return owner;
+   case 'subscribe_local_shell':receive=args.stream.onmessage;return null;
+   case 'ack_local_stream':events.push(['ack',args.sequence,args.revision]);return null;
+   default:throw Error(name);
+  }
+ },undefined,undefined,(_canvas,frame)=>{
+  if(frame.images?.['1'])events.push(['paint',...channelRasterBytes(frame.images['1'])]);
+ },{},testChannel());
+ await h.click('#open');
+ await receive(binaryChannelEvent(header,Uint8Array.of(31,151,219,255)));
+ assert.deepEqual(events,[['paint',31,151,219,255],['ack','1',frame.stamp.revision]]);
+ await receive(binaryChannelEvent({...header,sequence:'2'},Uint8Array.of(31,151,219)));
+ assert.equal(events.length,2);
+ assert.equal(h.el('#input').disabled,true);
+ assert.match(h.el('#status').textContent,/binary Channel image ranges/);
+});
+
 test('OSC8 hover remains current across a new frame without synthesizing a click',async()=>{
  const owner={session:'a'.repeat(32),epoch:1,generation:1};
  const raw=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
@@ -493,7 +522,7 @@ test('local Channel paints and acknowledges exact revisions, fencing a retired a
  const h=harness(async(name,args)=>{
   switch(name){
    case 'open_shell':return first;
-   case 'subscribe_local_shell':assert.equal(args.frameVersion,CHANNEL_DENSE_VERSION);assert.equal(args.directFrames,true);receivers.push(args.stream.onmessage);return null;
+   case 'subscribe_local_shell':assert.equal(args.frameVersion,CHANNEL_DENSE_VERSION);assert.equal(args.directFrames,true);assert.equal(args.binaryRasters,true);receivers.push(args.stream.onmessage);return null;
    case 'ack_local_stream':sent.push(args);return null;
    case 'detach_shell':case 'ack_shell':return null;
    case 'attach_shell':assert.equal(args.frameVersion,CHANNEL_DENSE_VERSION);return {owner:next,frame:channelSnapshot(frame)};

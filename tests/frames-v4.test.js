@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {acceptChannelFrame, acceptChannelPayload, acceptHistoryProjection, channelCounter, CHANNEL_FRAME_VERSION,
+import {acceptChannelFrame, acceptChannelPayload, acceptHistoryProjection, channelCounter, channelRasterBytes,
+  decodeLocalChannelEvent, CHANNEL_FRAME_VERSION,
   CHANNEL_RENDITION_VERSION, CELL_CONCEALED, SSH_DENSE_FRAME_VERSION} from '../web/frames-v4.js';
 import {paint} from '../web/frames.js';
+import {binaryChannelEvent} from './fixtures/packed-channel.js';
 
 const owner = {session:'isolated', epoch:7};
 const stamp = {version:4, session:owner.session, epoch:'7', revision:'9007199254740992',
@@ -138,6 +140,37 @@ const imageRow = (row, slice, column=1, id=imageId) => ({...row,image_slices:[{c
 const imageSnapshot = {...snapshot,stamp:{...stamp,version:5},rows:[imageRow(first,0),imageRow(second,1)],images:[image]};
 const imageDelta = {...delta,stamp:{...delta.stamp,version:5},rows:[{index:0,row:changed}]};
 const acceptImage = (previous,value) => acceptChannelFrame(previous,JSON.stringify(value),imageOwner);
+
+test('binary Channel rasters are bounded, isolated per pane, and retain image identity', () => {
+  const {rgba,...descriptor} = image;
+  const frame = {...imageSnapshot,images:[descriptor]};
+  const pixels = Buffer.from(rgba,'base64');
+  const other = Uint8Array.of(10,20,30,255,40,50,60,255);
+  const active = {frame,frame_bytes:Buffer.byteLength(JSON.stringify(frame)),image_bytes:pixels.length};
+  const preview = {...active,layout:7};
+  const metadata = {kind:'update',...active,preview};
+  const packet = binaryChannelEvent(metadata,pixels,other);
+  const event = decodeLocalChannelEvent(packet);
+  const live = acceptChannelPayload(null,event,imageOwner);
+  const peer = acceptChannelPayload(null,event.preview,imageOwner,true);
+  assert.deepEqual([...channelRasterBytes(live.images[imageId])],[...pixels]);
+  assert.deepEqual([...channelRasterBytes(peer.images[imageId])],[...other]);
+  assert.ok(Object.isFrozen(live.images[imageId]));
+  new Uint8Array(packet)[0] = 0;
+  assert.equal(channelRasterBytes(live.images[imageId])[0],255);
+
+  const follow = {...imageSnapshot,stamp:{...imageSnapshot.stamp,revision:'9007199254740993'}};
+  assert.equal(acceptImage(live,follow).images[imageId],live.images[imageId]);
+  assert.throws(() => acceptImage(live,{...follow,
+    images:[{...image,rgba:'AAAAAAAAAAA='}]}),/changed Channel image identity/);
+
+  assert.throws(() => decodeLocalChannelEvent(binaryChannelEvent(metadata,pixels)),/image ranges/);
+  const truncatedImage = decodeLocalChannelEvent(binaryChannelEvent({...metadata,image_bytes:4},pixels.subarray(0,4),other));
+  assert.throws(() => acceptChannelPayload(null,truncatedImage,imageOwner),/binary Channel image/);
+  const invalidTrailer = binaryChannelEvent(metadata,pixels,other);
+  new Uint8Array(invalidTrailer)[invalidTrailer.byteLength-1] = 0;
+  assert.throws(() => decodeLocalChannelEvent(invalidTrailer),/trailer/);
+});
 
 test('Channel row moves copy immutable base rows and retain images and links at their new positions', () => {
   const baseStamp = {...stamp,version:CHANNEL_FRAME_VERSION};

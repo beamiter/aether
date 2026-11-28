@@ -1,3 +1,5 @@
+import {channelRasterBytes} from './frames-v4.js';
+
 // Shared by the active, split, and history canvases in this WebView.
 export function createRasterCanvasCache(byteLimit, entryLimit = 64) {
   const entries = new Map();
@@ -10,8 +12,9 @@ export function createRasterCanvasCache(byteLimit, entryLimit = 64) {
       return cached.canvas;
     }
 
-    // Count decoded pixels, the retained source string, and entry overhead.
-    const bytes = resource.width * resource.height * 4 + resource.rgba.length * 2 + 256;
+    const raw = channelRasterBytes(resource);
+    // Count decoded pixels, retained source bytes, and entry overhead.
+    const bytes = resource.width * resource.height * 4 + (raw?.byteLength ?? resource.rgba.length * 2) + 256;
     const retain = bytes <= byteLimit && entryLimit > 0;
     if (retain) {
       while (retainedBytes + bytes > byteLimit || entries.size >= entryLimit) {
@@ -27,9 +30,17 @@ export function createRasterCanvasCache(byteLimit, entryLimit = 64) {
     canvas.width = resource.width;
     canvas.height = resource.height;
     const context = canvas.getContext('2d');
-    const pixels = context.createImageData(resource.width, resource.height);
-    const rgba = globalThis.atob(resource.rgba);
-    for (let i = 0; i < rgba.length; i++) pixels.data[i] = rgba.charCodeAt(i);
+    let pixels;
+    if (raw && typeof globalThis.ImageData === 'function') {
+      pixels = new ImageData(raw, resource.width, resource.height);
+    } else {
+      pixels = context.createImageData(resource.width, resource.height);
+      if (raw) pixels.data.set(raw);
+      else {
+        const rgba = globalThis.atob(resource.rgba);
+        for (let i = 0; i < rgba.length; i++) pixels.data[i] = rgba.charCodeAt(i);
+      }
+    }
     context.putImageData(pixels, 0, 0);
     if (retain) {
       entries.set(resource, {canvas, bytes});

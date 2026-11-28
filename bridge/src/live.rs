@@ -823,7 +823,7 @@ impl LiveBridge {
         snapshot: bool,
         format: impl Into<LiveFrameFormat>,
     ) -> Result<Option<(crate::protocol_v4::Counter, String)>, String> {
-        self.poll_encoded_channel_frame(epoch, snapshot, format)
+        self.poll_encoded_channel_frame(epoch, snapshot, format, false)
             .map(|update| update.map(|(revision, frame)| (revision, frame.into_json())))
     }
 
@@ -832,11 +832,13 @@ impl LiveBridge {
         epoch: u32,
         snapshot: bool,
         format: impl Into<LiveFrameFormat>,
+        binary_rasters: bool,
     ) -> Result<Option<(crate::protocol_v4::Counter, EncodedChannelFrame)>, String> {
         self.poll_channel_with_scratch(
             epoch,
             snapshot,
             format,
+            binary_rasters,
             crate::semantic_v4::FrameScratch::acquire(),
         )
     }
@@ -846,13 +848,14 @@ impl LiveBridge {
         epoch: u32,
         snapshot: bool,
         format: impl Into<LiveFrameFormat>,
+        binary_rasters: bool,
         scratch: Option<crate::semantic_v4::FrameScratch>,
     ) -> Result<Option<(crate::protocol_v4::Counter, EncodedChannelFrame)>, String> {
         let version = format
             .into()
             .channel_version()
             .ok_or("terminal Channel version required")?;
-        self.poll_channel_with_version(epoch, snapshot, version, scratch)
+        self.poll_channel_with_version(epoch, snapshot, version, binary_rasters, scratch)
     }
 
     pub(crate) fn poll_ssh_frame(
@@ -865,6 +868,7 @@ impl LiveBridge {
             epoch,
             snapshot,
             version,
+            false,
             crate::semantic_v4::FrameScratch::acquire(),
         )
         .map(|update| update.map(|(revision, frame)| (revision, frame.into_json())))
@@ -875,6 +879,7 @@ impl LiveBridge {
         epoch: u32,
         snapshot: bool,
         version: u8,
+        binary_rasters: bool,
         scratch: Option<crate::semantic_v4::FrameScratch>,
     ) -> Result<Option<(crate::protocol_v4::Counter, EncodedChannelFrame)>, String> {
         let Some(scratch) = scratch else {
@@ -896,7 +901,7 @@ impl LiveBridge {
         } else {
             self.accepted.as_deref()
         };
-        let update = scratch.encode_frame(previous, &frame, &self.id, version)?;
+        let update = scratch.encode_frame(previous, &frame, &self.id, version, binary_rasters)?;
         self.publish(frame);
         Ok(Some(update))
     }
@@ -941,7 +946,7 @@ impl LiveBridge {
         revision: Option<crate::protocol_v4::Counter>,
         format: impl Into<LiveFrameFormat>,
     ) -> Result<Option<(crate::protocol_v4::Counter, String)>, String> {
-        self.observe_encoded_channel_frame(epoch, revision, format)
+        self.observe_encoded_channel_frame(epoch, revision, format, false)
             .map(|update| update.map(|(revision, frame)| (revision, frame.into_json())))
     }
 
@@ -950,6 +955,7 @@ impl LiveBridge {
         epoch: u32,
         revision: Option<crate::protocol_v4::Counter>,
         format: impl Into<LiveFrameFormat>,
+        binary_rasters: bool,
     ) -> Result<Option<(crate::protocol_v4::Counter, EncodedChannelFrame)>, String> {
         let version = format
             .into()
@@ -964,7 +970,7 @@ impl LiveBridge {
             return Ok(None);
         }
         scratch
-            .encode_frame(None, &frame, &self.id, version)
+            .encode_frame(None, &frame, &self.id, version, binary_rasters)
             .map(Some)
     }
 
@@ -1684,7 +1690,7 @@ mod tests {
         let timeout = Instant::now() + Duration::from_secs(3);
         loop {
             assert!(bridge
-                .poll_channel_with_scratch(epoch, true, SnapshotFormat::Channel, None)
+                .poll_channel_with_scratch(epoch, true, SnapshotFormat::Channel, false, None)
                 .unwrap()
                 .is_none());
             assert!(!bridge.has_unacknowledged_frame());

@@ -10,7 +10,7 @@ use std::{
     collections::{btree_map::Entry, BTreeMap},
     sync::{Mutex, Weak},
 };
-pub(crate) use stream::{Counter, ObserverTarget, StreamEvent};
+pub(crate) use stream::{Counter, FrameDelivery, ObserverTarget, StreamEvent};
 use stream::{Delivery, LocalStream, Receipt, MAX_OBSERVERS};
 use tauri::ipc::Channel;
 use tauri_terminal_frame_bridge::{
@@ -590,7 +590,7 @@ impl LocalSessions {
         sink: Channel<StreamEvent>,
         observer: Option<ObserverTarget>,
         format: LiveFrameFormat,
-        direct_frames: bool,
+        frame_delivery: FrameDelivery,
         shared: Weak<Mutex<Self>>,
     ) -> Result<(), String> {
         let bridge = &self.registry.reader(&owner.session)?.bridge;
@@ -604,7 +604,7 @@ impl LocalSessions {
             .reader(&owner.session)?
             .bridge
             .enable_inline_graphics(format);
-        let mut stream = LocalStream::new(owner, sink, format, direct_frames);
+        let mut stream = LocalStream::new(owner, sink, format, frame_delivery);
         stream.set_observers(observer.as_slice());
         self.stream = Some(stream);
         self.worker.as_ref().unwrap().wake();
@@ -638,7 +638,12 @@ impl LocalSessions {
             stream.observations().find_map(|(target, revision)| {
                 self.retained_bridge(target.epoch)
                     .and_then(|bridge| {
-                        bridge.observe_encoded_channel_frame(target.epoch, revision, stream.format)
+                        bridge.observe_encoded_channel_frame(
+                            target.epoch,
+                            revision,
+                            stream.format,
+                            stream.frame_delivery.binary_rasters(),
+                        )
                     })
                     .ok()
                     .flatten()

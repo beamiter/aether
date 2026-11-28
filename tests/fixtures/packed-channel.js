@@ -14,3 +14,18 @@ export function packedRow({wrapped, cells, image_slices}) {
   }
   return {wrapped,columns:cells.length,styles,runs,image_slices};
 }
+export function binaryChannelEvent(metadata, ...pixels) {
+  const json = new TextEncoder().encode(JSON.stringify(metadata));
+  const rasterBytes = pixels.reduce((length,pixels)=>length+pixels.length,0);
+  const bytes = new Uint8Array(rasterBytes+json.length+8);
+  let offset = 0;
+  for (const raster of pixels) {
+    bytes.set(raster,offset);
+    offset += raster.length;
+  }
+  bytes.set(json,rasterBytes);
+  const footer = new DataView(bytes.buffer);
+  footer.setUint32(bytes.length-8,json.length,true);
+  footer.setUint32(bytes.length-4,0x3152544a,true);
+  return bytes.buffer;
+}

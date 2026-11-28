@@ -20,6 +20,19 @@ use tauri_terminal_frame_bridge::{
 type QuotedEvent = protocol_v4::StreamEvent<LocalShellStatus>;
 pub(crate) struct StreamEvent(StreamBody);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrameDelivery {
+    Quoted,
+    Structured,
+    BinaryRasters,
+}
+
+impl FrameDelivery {
+    pub(super) fn binary_rasters(self) -> bool {
+        self == Self::BinaryRasters
+    }
+}
+
 enum StreamBody {
     Quoted(QuotedEvent),
     Direct(DirectUpdate),
@@ -41,10 +54,12 @@ struct DirectHeader<'a> {
     status: &'a LocalShellStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     frame_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_bytes: Option<usize>,
 }
 
 impl DirectUpdate {
-    fn into_json(self) -> serde_json::Result<String> {
+    fn json(&self) -> serde_json::Result<String> {
         let active = self
             .frame
             .as_ref()
@@ -55,6 +70,11 @@ impl DirectUpdate {
             sequence: self.sequence,
             status: &self.status,
             frame_bytes: self.frame.as_ref().map(|frame| frame.as_json().len()),
+            image_bytes: self
+                .frame
+                .as_ref()
+                .map(EncodedChannelFrame::image_bytes)
+                .filter(|bytes| *bytes != 0),
         })?;
         json.reserve_exact(
             active.len()
@@ -62,26 +82,59 @@ impl DirectUpdate {
                     .preview
                     .as_ref()
                     .map_or(0, |(_, frame)| frame.as_json().len())
-                + 80,
+                + 128,
         );
         // The header is a serialized object. Append only JSON from the
         // bounded frame encoder and numeric preview metadata.
         json.pop();
         json.push_str(",\"frame\":");
         json.push_str(active);
-        if let Some((layout, frame)) = self.preview {
-            let frame = frame.as_json();
+        if let Some((layout, frame)) = &self.preview {
             write!(
                 json,
-                ",\"preview\":{{\"layout\":{layout},\"frame_bytes\":{},\"frame\":",
-                frame.len()
+                ",\"preview\":{{\"layout\":{layout},\"frame_bytes\":{}",
+                frame.as_json().len()
             )
             .expect("writing numbers to a String succeeds");
-            json.push_str(frame);
+            if frame.image_bytes() != 0 {
+                write!(json, ",\"image_bytes\":{}", frame.image_bytes())
+                    .expect("writing numbers to a String succeeds");
+            }
+            json.push_str(",\"frame\":");
+            json.push_str(frame.as_json());
             json.push('}');
         }
         json.push('}');
         Ok(json)
+    }
+
+    fn into_body(self) -> tauri::Result<InvokeResponseBody> {
+        let json = self.json()?;
+        let mut active = self
+            .frame
+            .map(EncodedChannelFrame::into_image_bytes)
+            .unwrap_or_default();
+        let peer = self
+            .preview
+            .map(|(_, frame)| frame.into_image_bytes())
+            .unwrap_or_default();
+        let mut bytes = if active.is_empty() {
+            peer
+        } else {
+            active.extend_from_slice(&peer);
+            active
+        };
+        if bytes.is_empty() {
+            return Ok(InvokeResponseBody::Json(json));
+        }
+        let metadata_len = u32::try_from(json.len())
+            .map_err(|_| std::io::Error::other("binary Channel metadata too large"))?;
+        // Active then passive RGBA8, structured event JSON, and a fixed
+        // trailer containing the metadata length and format version.
+        bytes.extend_from_slice(json.as_bytes());
+        bytes.extend_from_slice(&metadata_len.to_le_bytes());
+        bytes.extend_from_slice(b"JTR1");
+        Ok(InvokeResponseBody::Raw(bytes))
     }
 }
 
@@ -89,10 +142,7 @@ impl IpcResponse for StreamEvent {
     fn body(self) -> tauri::Result<InvokeResponseBody> {
         match self.0 {
             StreamBody::Quoted(event) => event.body(),
-            StreamBody::Direct(update) => update
-                .into_json()
-                .map(InvokeResponseBody::Json)
-                .map_err(Into::into),
+            StreamBody::Direct(update) => update.into_body(),
         }
     }
 }
@@ -164,7 +214,7 @@ impl Delivery {
 pub(super) struct LocalStream {
     pub(super) owner: Attachment,
     pub(super) format: LiveFrameFormat,
-    direct_frames: bool,
+    pub(super) frame_delivery: FrameDelivery,
     sink: Channel<StreamEvent>,
     failed: Arc<AtomicBool>,
     sequence: u64,
@@ -182,12 +232,12 @@ impl LocalStream {
         owner: Attachment,
         sink: Channel<StreamEvent>,
         format: LiveFrameFormat,
-        direct_frames: bool,
+        frame_delivery: FrameDelivery,
     ) -> Self {
         Self {
             owner,
             format,
-            direct_frames,
+            frame_delivery,
             sink,
             failed: Arc::new(AtomicBool::new(false)),
             sequence: 0,
@@ -274,8 +324,12 @@ impl LocalStream {
         bridge: &mut LiveBridge,
         preview: Option<Preview>,
     ) -> Result<(bool, Option<Delivery>), String> {
-        let frame =
-            bridge.poll_encoded_channel_frame(self.owner.epoch, self.sequence == 0, self.format)?;
+        let frame = bridge.poll_encoded_channel_frame(
+            self.owner.epoch,
+            self.sequence == 0,
+            self.format,
+            self.frame_delivery.binary_rasters(),
+        )?;
         // An initial publication can be deferred under encoder pressure. Do
         // not let a status-only update consume the sequence for the full base.
         if self.sequence == 0 && frame.is_none() {
@@ -309,7 +363,7 @@ impl LocalStream {
         let owner = self.owner.clone();
         let frame = frame.map(|(_, frame)| frame);
         let preview = preview.map(|(target, _, frame)| (target.layout, frame));
-        let body = if self.direct_frames {
+        let body = if self.frame_delivery != FrameDelivery::Quoted {
             StreamBody::Direct(DirectUpdate {
                 owner,
                 sequence,
@@ -363,6 +417,71 @@ mod tests {
     use serde_json::Value;
     use std::sync::{mpsc, Mutex};
     use tauri_terminal_frame_bridge::SnapshotFormat;
+
+    #[test]
+    fn binary_delivery_places_active_pixels_before_preview_pixels() {
+        fn image_frame(rgb: &str) -> (Attachment, EncodedChannelFrame, LocalShellStatus) {
+            let mut bridge = LiveBridge::local_desktop();
+            bridge.enable_inline_graphics(LiveFrameFormat::Dense);
+            let epoch = bridge.open(8, 32).unwrap();
+            let owner = bridge.attachment(epoch).unwrap();
+            let mut command = format!(
+                r"printf '\033[2J\033[H\033_Ga=T,i=3,f=24,s=1,v=1,c=1,r=1,C=1;{rgb}\033\\'; read -r _"
+            );
+            command.push('\n');
+            bridge
+                .write_owned_raw(owner.clone(), command.into_bytes())
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                bridge.pump_attached_io(epoch).unwrap();
+                if let Some((_, frame)) = bridge
+                    .observe_encoded_channel_frame(epoch, None, LiveFrameFormat::Dense, true)
+                    .unwrap()
+                {
+                    if frame.image_bytes() == 4 {
+                        let status = LocalShellStatus::read(&bridge, epoch).unwrap();
+                        bridge.close(epoch).unwrap();
+                        return (owner, frame, status);
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "inline image never reached the Channel"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        let (owner, active, status) = image_frame("/wAA");
+        let (_, preview, _) = image_frame("AAD/");
+        let body = DirectUpdate {
+            owner,
+            sequence: Counter::new(1).unwrap(),
+            frame: Some(active),
+            preview: Some((7, preview)),
+            status,
+        }
+        .into_body()
+        .unwrap();
+        let InvokeResponseBody::Raw(body) = body else {
+            panic!("an image-bearing delivery must be binary");
+        };
+        let trailer = body.len() - 8;
+        assert_eq!(&body[trailer + 4..], b"JTR1");
+        let metadata_size =
+            u32::from_le_bytes(body[trailer..trailer + 4].try_into().unwrap()) as usize;
+        assert_eq!(trailer - metadata_size, 8);
+        assert_eq!(&body[..8], &[255, 0, 0, 255, 0, 0, 255, 255]);
+        let metadata: Value = serde_json::from_slice(&body[8..trailer]).unwrap();
+        assert_eq!(metadata["image_bytes"], 4);
+        assert_eq!(metadata["preview"]["image_bytes"], 4);
+        assert_eq!(metadata["preview"]["layout"], 7);
+        assert!(metadata["frame"]["images"][0].get("rgba").is_none());
+        assert!(metadata["preview"]["frame"]["images"][0]
+            .get("rgba")
+            .is_none());
+    }
 
     #[test]
     fn observers_rotate_fairly_and_keep_independent_publication_revisions() {
@@ -488,7 +607,18 @@ mod tests {
         });
         let id = channel.id();
         sessions
-            .subscribe(active.clone(), channel, None, format, direct_frames, shared)
+            .subscribe(
+                active.clone(),
+                channel,
+                None,
+                format,
+                if direct_frames {
+                    FrameDelivery::Structured
+                } else {
+                    FrameDelivery::Quoted
+                },
+                shared,
+            )
             .unwrap();
         sessions
             .set_observers(&active, id, &[first_target, second_target])
@@ -604,7 +734,7 @@ mod tests {
                 channel,
                 None,
                 SnapshotFormat::Channel.into(),
-                false,
+                FrameDelivery::Quoted,
                 Arc::downgrade(&local),
             )
             .unwrap();

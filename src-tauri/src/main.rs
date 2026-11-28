@@ -182,6 +182,7 @@ async fn poll_shell(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri binds the top-level IPC fields separately.
 async fn subscribe_local_shell<R: tauri::Runtime>(
     window: tauri::WebviewWindow<R>,
     owner: Attachment,
@@ -189,6 +190,7 @@ async fn subscribe_local_shell<R: tauri::Runtime>(
     observer: Option<local_sessions::ObserverTarget>,
     frame_version: u8,
     direct_frames: Option<bool>,
+    binary_rasters: Option<bool>,
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<(), String> {
     require_terminal_window(&window)?;
@@ -198,15 +200,15 @@ async fn subscribe_local_shell<R: tauri::Runtime>(
     }
     let shared = bridge.inner().clone();
     let weak = Arc::downgrade(&shared);
+    let delivery = if binary_rasters.unwrap_or(false) {
+        local_sessions::FrameDelivery::BinaryRasters
+    } else if direct_frames.unwrap_or(false) {
+        local_sessions::FrameDelivery::Structured
+    } else {
+        local_sessions::FrameDelivery::Quoted
+    };
     run_bridge(shared, move |bridge| {
-        bridge.subscribe(
-            owner,
-            stream,
-            observer,
-            format,
-            direct_frames.unwrap_or(false),
-            weak,
-        )
+        bridge.subscribe(owner, stream, observer, format, delivery, weak)
     })
     .await
 }

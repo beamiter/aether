@@ -31,6 +31,43 @@ const supportsRowMoves = version => version === CHANNEL_FRAME_VERSION ||
 const supportsChannelImages = version => version === CHANNEL_IMAGE_VERSION || supportsRowMoves(version);
 export const supportsChannelRendition = version => version === CHANNEL_RENDITION_VERSION || version === CHANNEL_DENSE_VERSION;
 const frameMoves = new WeakMap();
+const incomingRasters = new WeakMap();
+const retainedRasters = new WeakMap();
+const binaryDecoder = new TextDecoder('utf-8',{fatal:true});
+
+function packetImageBytes(packet) {
+  const size = packet?.image_bytes;
+  if (size === undefined) return 0;
+  if (!Number.isInteger(size) || size < 4 || size > maxImageBytes || size % 4 !== 0 ||
+      !packet.frame || typeof packet.frame !== 'object' || Array.isArray(packet.frame))
+    throw new Error('invalid binary Channel image length');
+  return size;
+}
+
+export function decodeLocalChannelEvent(message) {
+  if (!(message instanceof ArrayBuffer)) return message;
+  // Active and preview RGBA8, event JSON, then its LE length and "JTR1".
+  const trailer = message.byteLength - 8;
+  const view = new DataView(message);
+  if (trailer < 0 || view.getUint32(trailer+4,true) !== 0x3152544a)
+    throw new Error('invalid binary Channel trailer');
+  const metadataBytes = view.getUint32(trailer,true);
+  const pixels = trailer - metadataBytes;
+  if (metadataBytes === 0 || metadataBytes > 2*(maxEncodedBytes+maxEncodedImageBytes) ||
+      pixels < 1 || pixels > 2*maxImageBytes)
+    throw new Error('binary Channel byte limit');
+  const event = JSON.parse(binaryDecoder.decode(new Uint8Array(message,pixels,metadataBytes)));
+  const active = packetImageBytes(event), preview = packetImageBytes(event?.preview);
+  if (event?.kind !== 'update' || active + preview !== pixels)
+    throw new Error('invalid binary Channel image ranges');
+  if (active) incomingRasters.set(event.frame,new Uint8Array(message,0,active));
+  if (preview) incomingRasters.set(event.preview.frame,new Uint8Array(message,active,preview));
+  return event;
+}
+
+export function channelRasterBytes(resource) {
+  return retainedRasters.get(resource);
+}
 
 export function rowMoveForBase(frame, revision) {
   const move = frameMoves.get(frame);
@@ -92,9 +129,22 @@ function validatedHyperlinks(entries, previous) {
   return links;
 }
 
-function validatedImages(entries, supportsImages, base, previous) {
+function sameRaster(prior, rgba, raster) {
+  const retained = retainedRasters.get(prior);
+  if (!retained && !raster) return prior.rgba === rgba;
+  const a = retained ?? decodeBase64Bytes(prior.rgba);
+  const b = raster ?? decodeBase64Bytes(rgba);
+  if (a.length !== b.length) return false;
+  // Raster ranges start on RGBA pixel boundaries.
+  const left = new Uint32Array(a.buffer,a.byteOffset,a.byteLength/4);
+  const right = new Uint32Array(b.buffer,b.byteOffset,b.byteLength/4);
+  for (let i=0; i<left.length; i++) if (left[i] !== right[i]) return false;
+  return true;
+}
+
+function validatedImages(entries, supportsImages, base, previous, pixels) {
   const images = new Map();
-  if (entries === undefined) return {images, encodedBytes: 0};
+  if (entries === undefined && !pixels) return {images, encodedBytes: 0};
   if (!supportsImages || !Array.isArray(entries) || entries.length > maxImages)
     throw new Error('Channel image count or version');
   let bytes = 0, encodedBytes = 0;
@@ -108,20 +158,34 @@ function validatedImages(entries, supportsImages, base, previous) {
         !Number.isInteger(columns) || columns < 1 || columns > 256 ||
         !Number.isInteger(rows) || rows < 1 || rows > 128) throw new Error('invalid Channel image geometry or identity');
     const size = width * height * 4;
+    const start = bytes;
     bytes += size;
-    if (bytes > maxImageBytes || typeof rgba !== 'string' || rgba.length !== 4 * Math.ceil(size / 3))
-      throw new Error('Channel image byte limit');
-    const padding = (3 - size % 3) % 3;
-    const end = rgba.length - padding;
-    const last = base64Alphabet.indexOf(rgba[end - 1]);
-    if (/[^a-zA-Z0-9+/]/.test(rgba.slice(0,end)) || rgba.slice(end) !== '='.repeat(padding) ||
-        (padding && (last & (padding === 1 ? 3 : 15)))) throw new Error('invalid Channel RGBA base64');
-    encodedBytes += rgba.length;
+    if (bytes > maxImageBytes) throw new Error('Channel image byte limit');
+    let raster;
+    if (pixels) {
+      if (rgba !== undefined || bytes > pixels.length) throw new Error('invalid binary Channel image');
+      raster = pixels.subarray(start,bytes);
+    } else {
+      if (typeof rgba !== 'string' || rgba.length !== 4 * Math.ceil(size / 3))
+        throw new Error('Channel image byte limit');
+      const padding = (3 - size % 3) % 3;
+      const end = rgba.length - padding;
+      const last = base64Alphabet.indexOf(rgba[end - 1]);
+      if (/[^a-zA-Z0-9+/]/.test(rgba.slice(0,end)) || rgba.slice(end) !== '='.repeat(padding) ||
+          (padding && (last & (padding === 1 ? 3 : 15)))) throw new Error('invalid Channel RGBA base64');
+      encodedBytes += rgba.length;
+    }
     const prior = previous?.images[id];
     if (prior && (prior.width !== width || prior.height !== height || prior.columns !== columns ||
-        prior.rows !== rows || prior.rgba !== rgba)) throw new Error('changed Channel image identity');
-    images.set(id,prior ?? Object.freeze({id,width,height,columns,rows,rgba,bytes:size}));
+        prior.rows !== rows || !sameRaster(prior,rgba,raster))) throw new Error('changed Channel image identity');
+    const image = prior ?? Object.freeze({id,width,height,columns,rows,rgba,bytes:size});
+    if (raster && !prior) {
+      // Detach the retained image from the IPC envelope and the other pane's bytes.
+      retainedRasters.set(image,new Uint8ClampedArray(raster));
+    }
+    images.set(id,image);
   }
+  if (pixels && bytes !== pixels.length) throw new Error('invalid binary Channel image length');
   return {images, encodedBytes};
 }
 
@@ -179,7 +243,7 @@ const hexStart = hexByte.map(value=>'#'+value);
 const emptyAttributes = Object.freeze({underline:undefined,underline_color:undefined,hyperlink_id:undefined});
 const hasBase64Bytes = typeof Uint8Array.fromBase64 === 'function';
 
-function denseRowBytes(encoded) {
+function decodeBase64Bytes(encoded) {
   if (hasBase64Bytes) return Uint8Array.fromBase64(encoded);
   const text = atob(encoded);
   const bytes = new Uint8Array(text.length);
@@ -194,7 +258,7 @@ function validateDenseRow(row, cols, links, referenced, supportsImages) {
       cell_bytes.length !== cols * 12 || /[^a-zA-Z0-9+/]/.test(cell_bytes) ||
       typeof text !== 'string' || text.length > cols * maxClusterBytes ||
       !Array.isArray(attributes) || attributes.length > cols) throw new Error('invalid dense Channel row');
-  const bytes = denseRowBytes(cell_bytes);
+  const bytes = decodeBase64Bytes(cell_bytes);
   const styles = attributes.length ? new Map() : undefined;
   for (const attribute of attributes) {
     const {column, underline, underline_color, hyperlink_id} = attribute ?? {};
@@ -370,7 +434,8 @@ export function acceptChannelUpdate(previous, update, expected, snapshotOnly, wi
       !Array.isArray(moves) || moves.length > 128)) throw new Error('invalid Channel row moves');
   const supportsImages = supportsChannelImages(stamp.version);
   const imageBase = update.kind === 'delta' ? previous : null;
-  const {images: newImages, encodedBytes} = validatedImages(update.images, supportsImages && stamp.screen === 'primary', imageBase, previous);
+  const {images: newImages, encodedBytes} = validatedImages(update.images,
+    supportsImages && stamp.screen === 'primary', imageBase, previous, incomingRasters.get(update));
   if (wireBytes > maxEncodedBytes + encodedBytes) throw new Error('Channel frame byte limit');
   const links = validatedHyperlinks(update.hyperlinks, previous), referenced = new Set();
 

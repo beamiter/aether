@@ -27,18 +27,29 @@ const JSON_WORKSPACE_BYTES: usize = wire::MAX_ENCODED_FRAME_BYTES + wire::MAX_EN
 const PROCESS_JSON_WORKSPACE_BYTES: usize = 4 * JSON_WORKSPACE_BYTES;
 const ENCODERS_BUSY: &str = "terminal channel encoders are temporarily busy";
 
-/// A bounded JSON frame produced by the encoder. Its contents can be
-/// embedded in another JSON value without escaping or re-parsing them.
+/// A bounded JSON frame from the encoder, with optional RGBA8 bytes carried
+/// separately in resource order for the native Channel.
 #[derive(Debug)]
-pub struct EncodedChannelFrame(String);
+pub struct EncodedChannelFrame {
+    json: String,
+    rgba: Vec<u8>,
+}
 
 impl EncodedChannelFrame {
     pub fn as_json(&self) -> &str {
-        &self.0
+        &self.json
     }
 
     pub fn into_json(self) -> String {
-        self.0
+        self.json
+    }
+
+    pub fn image_bytes(&self) -> usize {
+        self.rgba.len()
+    }
+
+    pub fn into_image_bytes(self) -> Vec<u8> {
+        self.rgba
     }
 }
 
@@ -67,7 +78,7 @@ impl FrameScratch {
         session: &str,
         version: u8,
     ) -> Result<(wire::Counter, String), String> {
-        self.encode_frame(previous, frame, session, version)
+        self.encode_frame(previous, frame, session, version, false)
             .map(|(revision, frame)| (revision, frame.into_json()))
     }
 
@@ -77,6 +88,7 @@ impl FrameScratch {
         frame: &CellFrame,
         session: &str,
         version: u8,
+        binary_rasters: bool,
     ) -> Result<(wire::Counter, EncodedChannelFrame), String> {
         if version == DENSE_FRAME_VERSION {
             encode_update(project_update(
@@ -84,16 +96,25 @@ impl FrameScratch {
                 frame,
                 session,
                 version,
+                binary_rasters,
                 pack_dense_row,
             )?)
         } else if wire::supports_packed_rows(version) {
-            encode_update(project_update(previous, frame, session, version, pack_row)?)
+            encode_update(project_update(
+                previous,
+                frame,
+                session,
+                version,
+                binary_rasters,
+                pack_row,
+            )?)
         } else {
             encode_update(project_update(
                 previous,
                 frame,
                 session,
                 version,
+                binary_rasters,
                 std::convert::identity,
             )?)
         }
@@ -101,17 +122,43 @@ impl FrameScratch {
 }
 
 fn encode_update<R: serde::Serialize>(
-    update: wire::UpdateRows<R>,
+    projected: ProjectedUpdate<'_, R>,
 ) -> Result<(wire::Counter, EncodedChannelFrame), String> {
+    let ProjectedUpdate { update, rasters } = projected;
+    let revision = update.revision();
     let images = match &update {
         wire::UpdateRows::Snapshot { images, .. } | wire::UpdateRows::Delta { images, .. } => {
             images
         }
     };
-    Ok((
-        update.revision(),
-        EncodedChannelFrame(encode_json(&update, images)?),
-    ))
+    if rasters.is_empty() {
+        return Ok((
+            revision,
+            EncodedChannelFrame {
+                json: encode_json(&update, images)?,
+                rgba: Vec::new(),
+            },
+        ));
+    }
+    #[derive(serde::Serialize)]
+    struct BinaryMetadata<'a, R> {
+        #[serde(flatten)]
+        update: &'a wire::UpdateRows<R>,
+        images: Vec<&'a RasterMetadata>,
+    }
+    let metadata = BinaryMetadata {
+        update: &update,
+        images: rasters.iter().map(|image| &image.metadata).collect(),
+    };
+    let json = encode_bounded_json(&metadata, wire::MAX_ENCODED_FRAME_BYTES)?;
+    let bytes = rasters.iter().map(|image| image.rgba.len()).sum::<usize>();
+    // Reserve space for the frame metadata and Channel envelope so delivery
+    // can reuse this allocation when there is a single image-bearing frame.
+    let mut rgba = Vec::with_capacity(bytes + json.len() + 1024);
+    for image in rasters {
+        rgba.extend_from_slice(image.rgba);
+    }
+    Ok((revision, EncodedChannelFrame { json, rgba }))
 }
 
 pub(crate) fn encode(
@@ -134,6 +181,10 @@ fn encode_json(
     if limit > JSON_WORKSPACE_BYTES {
         return Err("terminal frame exceeds its encoding workspace".into());
     }
+    encode_bounded_json(value, limit)
+}
+
+fn encode_bounded_json(value: &impl serde::Serialize, limit: usize) -> Result<String, String> {
     let mut data = BoundedJson {
         bytes: Vec::new(),
         limit,
@@ -250,7 +301,8 @@ fn encode_history_rows<'a, R: serde::Serialize>(
             })
         })
         .collect::<Result<_, String>>()?;
-    let (hyperlinks, images) = projection.into_resources();
+    let (hyperlinks, rasters) = projection.into_resources();
+    let images = rasters.into_iter().map(ProjectedRaster::base64).collect();
     let view = wire::HistoryViewRows {
         owner,
         revision: counter(revision)?,
@@ -269,13 +321,19 @@ fn encode_history_rows<'a, R: serde::Serialize>(
     encode_json(&view, &view.images)
 }
 
+struct ProjectedUpdate<'a, R> {
+    update: wire::UpdateRows<R>,
+    rasters: Vec<ProjectedRaster<'a>>,
+}
+
 fn project_update<'a, R>(
     previous: Option<&CellFrame>,
     frame: &'a CellFrame,
     session: &str,
     version: u8,
+    binary_rasters: bool,
     mut encode_row: impl FnMut(wire::RowData<EncodedCell<'a>>) -> R,
-) -> Result<wire::UpdateRows<R>, String> {
+) -> Result<ProjectedUpdate<'a, R>, String> {
     validate_grid(frame)?;
     let engine_stamp = frame.stamp();
     let cursor = frame.cursor();
@@ -338,27 +396,33 @@ fn project_update<'a, R>(
                     })
                 })
                 .collect::<Result<_, String>>()?;
-            let (hyperlinks, images) = projection.into_resources();
-            return Ok(wire::UpdateRows::Delta {
-                stamp,
-                base_revision: counter(base.stamp().revision)?,
-                rows,
-                moves,
-                hyperlinks,
-                images,
+            let (hyperlinks, images, rasters) = projection.into_update_resources(binary_rasters);
+            return Ok(ProjectedUpdate {
+                update: wire::UpdateRows::Delta {
+                    stamp,
+                    base_revision: counter(base.stamp().revision)?,
+                    rows,
+                    moves,
+                    hyperlinks,
+                    images,
+                },
+                rasters,
             });
         }
     }
     let rows = (0..frame.rows().len())
         .map(|index| wire_row(frame, index, &mut projection).map(&mut encode_row))
         .collect::<Result<_, _>>()?;
-    let (hyperlinks, images) = projection.into_resources();
-    Ok(wire::UpdateRows::Snapshot {
-        stamp,
-        cols: frame.cols() as u16,
-        rows,
-        hyperlinks,
-        images,
+    let (hyperlinks, images, rasters) = projection.into_update_resources(binary_rasters);
+    Ok(ProjectedUpdate {
+        update: wire::UpdateRows::Snapshot {
+            stamp,
+            cols: frame.cols() as u16,
+            rows,
+            hyperlinks,
+            images,
+        },
+        rasters,
     })
 }
 
@@ -636,6 +700,40 @@ fn pack_row(row: wire::RowData<EncodedCell<'_>>) -> EncodedRow<'_> {
     })
 }
 
+#[derive(serde::Serialize)]
+struct RasterMetadata {
+    id: wire::Counter,
+    width: u32,
+    height: u32,
+    columns: u16,
+    rows: u16,
+}
+
+struct ProjectedRaster<'a> {
+    metadata: RasterMetadata,
+    rgba: &'a [u8],
+}
+
+impl ProjectedRaster<'_> {
+    fn base64(self) -> wire::ImageResource {
+        let RasterMetadata {
+            id,
+            width,
+            height,
+            columns,
+            rows,
+        } = self.metadata;
+        wire::ImageResource {
+            id,
+            width,
+            height,
+            columns,
+            rows,
+            rgba: STANDARD.encode(self.rgba),
+        }
+    }
+}
+
 #[derive(Default)]
 struct Projection<'a> {
     colors: Option<&'a ColorState>,
@@ -647,11 +745,11 @@ struct Projection<'a> {
     extended_rendition: bool,
     image_bytes: usize,
     base_images: BTreeSet<u64>,
-    images: BTreeMap<u64, wire::ImageResource>,
+    images: BTreeMap<u64, ProjectedRaster<'a>>,
 }
 
 impl<'a> Projection<'a> {
-    fn into_resources(self) -> (Vec<wire::Hyperlink>, Vec<wire::ImageResource>) {
+    fn into_resources(self) -> (Vec<wire::Hyperlink>, Vec<ProjectedRaster<'a>>) {
         let hyperlinks = self
             .hyperlinks
             .into_iter()
@@ -661,6 +759,26 @@ impl<'a> Projection<'a> {
             })
             .collect();
         (hyperlinks, self.images.into_values().collect())
+    }
+
+    fn into_update_resources(
+        self,
+        binary_rasters: bool,
+    ) -> (
+        Vec<wire::Hyperlink>,
+        Vec<wire::ImageResource>,
+        Vec<ProjectedRaster<'a>>,
+    ) {
+        let (links, rasters) = self.into_resources();
+        if binary_rasters {
+            (links, Vec::new(), rasters)
+        } else {
+            (
+                links,
+                rasters.into_iter().map(ProjectedRaster::base64).collect(),
+                Vec::new(),
+            )
+        }
     }
 
     fn image_slices(
@@ -686,13 +804,15 @@ impl<'a> Projection<'a> {
                     }
                     self.images.insert(
                         key,
-                        wire::ImageResource {
-                            id,
-                            width: raster.width(),
-                            height: raster.height(),
-                            columns: image.columns(),
-                            rows: image.rows(),
-                            rgba: STANDARD.encode(raster.rgba()),
+                        ProjectedRaster {
+                            metadata: RasterMetadata {
+                                id,
+                                width: raster.width(),
+                                height: raster.height(),
+                                columns: image.columns(),
+                                rows: image.rows(),
+                            },
+                            rgba: raster.rgba(),
                         },
                     );
                 }
@@ -876,8 +996,15 @@ mod tests {
         session: &str,
         version: u8,
     ) -> Result<wire::Update, String> {
-        let projected = project_update(previous, frame, session, version, std::convert::identity)?;
-        let data = serde_json::to_vec(&projected).map_err(|error| error.to_string())?;
+        let projected = project_update(
+            previous,
+            frame,
+            session,
+            version,
+            false,
+            std::convert::identity,
+        )?;
+        let data = serde_json::to_vec(&projected.update).map_err(|error| error.to_string())?;
         serde_json::from_slice(&data).map_err(|error| error.to_string())
     }
 
@@ -1192,8 +1319,24 @@ mod tests {
         assert_eq!(images.len(), 1);
         assert_eq!(rows[0].row.image_slices[0].id, images[0].id);
         assert_eq!(images[0].rgba, "/wAA/w==");
+        let (_, binary) = scratch
+            .encode_frame(Some(&before), &displayed, "test", wire::IMAGE_VERSION, true)
+            .unwrap();
+        let metadata: serde_json::Value = serde_json::from_str(binary.as_json()).unwrap();
+        assert_eq!(metadata["kind"], "delta");
+        assert_eq!(metadata["images"][0]["id"], images[0].id.get().to_string());
+        assert!(metadata["images"][0].get("rgba").is_none());
+        assert_eq!(binary.into_image_bytes(), [255, 0, 0, 255]);
         terminal.feed(b"\x1b[1S").unwrap();
         let moved = terminal.frame().unwrap();
+        assert_eq!(
+            scratch
+                .encode_frame(Some(&displayed), &moved, "test", wire::IMAGE_VERSION, true)
+                .unwrap()
+                .1
+                .image_bytes(),
+            0,
+        );
         let wire::Update::Delta { rows, images, .. } =
             update(Some(&displayed), &moved, "test", wire::IMAGE_VERSION).unwrap()
         else {

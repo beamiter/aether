@@ -18,7 +18,7 @@ import {installTerminalChat,validateChatStatus} from './terminal-chat.js';
 import {installWorkflows} from './workflows.js';
 import {plainLocalTab,readLocalShellLayout,saveLocalShellLayout,readThreePaneLayout,saveThreePaneLayout,validPaneId,MAX_LOCAL_SHELLS,validLocalGeometry,localSplitPair} from './local-layout.js';
 import {backingGeometry,acceptFull,acceptUpdate,clearPaint,paint} from './frames.js'; import {installIme} from './ime.js';
-import {acceptChannelFrame,acceptChannelPayload,acceptChannelUpdate,channelCounter,CHANNEL_DENSE_VERSION,supportsChannelRendition} from './frames-v4.js';
+import {acceptChannelFrame,acceptChannelPayload,acceptChannelUpdate,channelCounter,CHANNEL_DENSE_VERSION,decodeLocalChannelEvent,supportsChannelRendition} from './frames-v4.js';
 const canvas=document.querySelector('canvas'),status=document.querySelector('#status'),button=document.querySelector('#demo');
 const open=document.querySelector('#open'),attach=document.querySelector('#attach'),detach=document.querySelector('#detach'),close=document.querySelector('#close'),input=document.querySelector('#input'),send=document.querySelector('#send');
 const openIntegrated=document.querySelector('#open-integrated');
@@ -1025,13 +1025,17 @@ async function startTransport(onFirstPoll){
   }
   const stream={owner,channel,frameVersion:CHANNEL_DENSE_VERSION,sequence:0n,frame:null,lastSeen:Date.now(),animation:null,observers:{multi:false,targets:[observerTarget(),null]},ready:false,adjusting:null};
   localStream=stream;
-  stream.channel.onmessage=event=>queueLocalStream(stream,event);
+  stream.channel.onmessage=event=>{
+    if(localStream!==stream||owner!==stream.owner)return;
+    try{return queueLocalStream(stream,decodeLocalChannelEvent(event));}
+    catch(error){failLocalStream(stream,error,true);}
+  };
   timer=setInterval(()=>{
     if(localStream===stream&&!document.hidden&&Date.now()-stream.lastSeen>10000)
       failLocalStream(stream,new Error('no local output heartbeat'));
   },1000);
   try{await invoke('subscribe_local_shell',{owner:stream.owner,stream:stream.channel,observer:stream.observers.targets[0],
-    frameVersion:stream.frameVersion,directFrames:true});}
+    frameVersion:stream.frameVersion,directFrames:true,binaryRasters:true});}
   catch(error){failLocalStream(stream,error);}
   if(localStream===stream){
     stream.ready=true;renderSplit();
