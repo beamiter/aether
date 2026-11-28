@@ -257,6 +257,56 @@ test('binary dense rows consume exactly their own cells before the pane raster',
   assert.throws(()=>acceptChannelPayload(null,overBudget,expected),/frame byte limit/);
 });
 
+test('binary dense delta spans merge immutable cells without splitting wide glyphs or losing resources', () => {
+  const columns = 6;
+  const baseStamp = {...imageSnapshot.stamp,version:SSH_DENSE_FRAME_VERSION,cursor_row:0};
+  const expected = {...imageOwner,frameVersion:SSH_DENSE_FRAME_VERSION};
+  const original = Buffer.from([
+    1,2,3,4,5,6,0,1,1, 11,12,13,4,5,6,0,2,1, 14,15,16,4,5,6,0,0,1,
+    21,22,23,4,5,6,0,1,1, 31,32,33,4,5,6,0,2,1, 34,35,36,4,5,6,0,0,1,
+  ]);
+  const row = {wrapped:false,columns,text:'A中 C界 ',cell_bytes:original.toString('base64'),
+    attributes:[{column:0,hyperlink_id:22}],image_slices:[{column:4,id:imageId,slice:0}]};
+  const snapshot = {...imageSnapshot,cols:columns,stamp:baseStamp,rows:[row],hyperlinks};
+  const base = acceptChannelFrame(null,JSON.stringify(snapshot),expected);
+  const changed = Uint8Array.of(51,52,53,4,5,6,4,2,3, 54,55,56,4,5,6,0,0,1);
+  const attr = {column:1,underline:'curly',underline_color:'#abcdef',hyperlink_id:23};
+  const patch = {...row,wrapped:true,cell_bytes:null,cell_span:[1,2],text:'🙂\u0301 ',attributes:[attr]};
+  const updatedLinks = [...hyperlinks,{id:23,target:'https://example.test/new'}];
+  const stamp = {...baseStamp,revision:String(BigInt(baseStamp.revision)+1n)};
+  const frame = {kind:'delta',stamp,base_revision:base.revision,hyperlinks:updatedLinks,rows:[{index:0,row:patch}]};
+  const packet = (frame, bytes) => decodeLocalChannelEvent(binaryChannelEvent({
+    kind:'update', frame, frame_bytes:Buffer.byteLength(JSON.stringify(frame)), cell_bytes:bytes.length,
+  },bytes));
+  const apply = (row, bytes = changed, metadata = frame) => acceptChannelPayload(base,
+    packet({...metadata,rows:[{index:0,row}]},bytes),expected);
+  const next = apply(patch);
+  const equivalent = acceptChannelFrame(null,JSON.stringify({...snapshot,stamp,hyperlinks:updatedLinks,rows:[{
+    ...row,wrapped:true,text:'A🙂\u0301 C界 ',attributes:[...row.attributes,attr],
+    cell_bytes:Buffer.concat([original.subarray(0,9),changed,original.subarray(27)]).toString('base64'),
+  }]}),expected);
+  assert.deepEqual(next,equivalent);
+  assert.equal(next.rows[0].textBytes,base.rows[0].textBytes+3);
+  for (const column of [0,3,4,5]) assert.equal(next.rows[0][column],base.rows[0][column]);
+  assert.equal(next.images[imageId],base.images[imageId]);
+  assert.deepEqual(next.rows[0].links,[22,23]);
+  assert.equal(base.rows[0][1].text,'中');
+  assert.ok(Object.isFrozen(next.rows[0]) && Object.isFrozen(next.rows[0][1]));
+
+  for (const cell_span of [[-1,2],[1,0],[5,2],[1,0.5],[1,2,3]])
+    assert.throws(() => apply({...patch,cell_span}),/invalid dense Channel cell span/);
+  for (const cell_span of [[2,1],[1,1]])
+    assert.throws(() => apply({...patch,cell_span}),/splits a base wide glyph/);
+  assert.throws(() => apply({...patch,attributes:[{...attr,column:0}]}),/dense Channel attributes/);
+  assert.throws(() => apply(patch,changed,{...frame,hyperlinks:updatedLinks.slice(1)}),/unresolved dense Channel hyperlink/);
+  assert.throws(() => apply(patch,changed,{...frame,base_revision:stamp.revision}),/delta base/);
+  assert.throws(() => apply(patch,changed.subarray(0,9)),/truncated dense Channel cell bytes/);
+  assert.throws(() => acceptChannelPayload(null,packet({...snapshot,rows:[patch]},changed),expected),/dense Channel cell span/);
+  assert.throws(() => acceptChannelFrame(base,JSON.stringify({...frame,rows:[{
+    index:0,row:{...patch,cell_bytes:Buffer.from(changed).toString('base64')},
+  }]}),expected),/dense Channel cell span/);
+});
+
 test('Channel row moves copy immutable base rows and retain images and links at their new positions', () => {
   const baseStamp = {...stamp,version:CHANNEL_FRAME_VERSION};
   const newest = {...second,cells:[{...cell,text:'Z'},cell]};

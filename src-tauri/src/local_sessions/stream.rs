@@ -480,6 +480,7 @@ mod tests {
                         BinaryChannelParts {
                             rasters: true,
                             cells,
+                            ..BinaryChannelParts::default()
                         },
                     )
                     .unwrap()

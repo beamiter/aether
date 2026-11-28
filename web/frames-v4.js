@@ -271,17 +271,32 @@ function decodeBase64Bytes(encoded) {
   return bytes;
 }
 
-function validateDenseRow(row, cols, links, referenced, supportsImages, binary) {
-  const {wrapped, columns, cell_bytes, text, attributes = []} = row;
+function validateDenseRow(row, cols, links, referenced, supportsImages, binary, previous) {
+  const {wrapped, columns, cell_bytes, cell_span, text, attributes = []} = row;
+  let first = 0, last = cols, base;
+  if (cell_span !== undefined) {
+    if (!binary || !previous || !Array.isArray(cell_span) || cell_span.length !== 2)
+      throw new Error('invalid dense Channel cell span');
+    const [start,count] = cell_span;
+    if (!Number.isInteger(start) || start < 0 || start >= cols ||
+        !Number.isInteger(count) || count < 1 || count > cols-start)
+      throw new Error('invalid dense Channel cell span');
+    first = start;
+    last = start+count;
+    if (previous[first].width === 0 || previous[last]?.width === 0)
+      throw new Error('dense Channel cell span splits a base wide glyph');
+    base = previous;
+  }
+  const count = last-first;
   if (typeof wrapped !== 'boolean' || columns !== cols || row.cells !== undefined ||
       row.styles !== undefined || row.runs !== undefined ||
       (binary ? cell_bytes !== null : typeof cell_bytes !== 'string' ||
         cell_bytes.length !== cols * 12 || /[^a-zA-Z0-9+/]/.test(cell_bytes)) ||
-      typeof text !== 'string' || text.length > cols * maxClusterBytes ||
-      !Array.isArray(attributes) || attributes.length > cols) throw new Error('invalid dense Channel row');
+      typeof text !== 'string' || text.length > count * maxClusterBytes ||
+      !Array.isArray(attributes) || attributes.length > count) throw new Error('invalid dense Channel row');
   let bytes;
   if (binary) {
-    const end = binary.offset + cols*denseCellStride;
+    const end = binary.offset + count*denseCellStride;
     if (end > binary.data.length) throw new Error('truncated dense Channel cell bytes');
     bytes = binary.data.subarray(binary.offset,end);
     binary.offset = end;
@@ -289,17 +304,16 @@ function validateDenseRow(row, cols, links, referenced, supportsImages, binary) 
   const styles = attributes.length ? new Map() : undefined;
   for (const attribute of attributes) {
     const {column, underline, underline_color, hyperlink_id} = attribute ?? {};
-    if (!Number.isInteger(column) || column < 0 || column >= cols || styles.has(column) ||
+    if (!Number.isInteger(column) || column < first || column >= last || styles.has(column) ||
         (underline === undefined && underline_color === undefined && hyperlink_id === undefined) ||
         (underline !== undefined && !underlines.has(underline)) ||
         (underline_color !== undefined && (typeof underline_color !== 'string' || !colors.test(underline_color))) ||
         (hyperlink_id !== undefined && !links.has(hyperlink_id))) throw new Error('invalid dense Channel attributes');
     styles.set(column, {underline,underline_color,hyperlink_id});
   }
-  const cells = [], rowLinks = new Set();
+  const decoded = [], rowLinks = new Set();
   let offset = 0, textBytes = 0, lead = false;
-  for (let column = 0; column < cols; column++) {
-    const start = column * denseCellStride;
+  for (let column = first, start = 0; column < last; column++, start += denseCellStride) {
     // Dense colors are already RGB bytes. Keep them as integers until a
     // consumer needs CSS, and pass them directly to the raster painter.
     const foreground = (bytes[start] << 16) | (bytes[start+1] << 8) | bytes[start+2];
@@ -324,9 +338,29 @@ function validateDenseRow(row, cols, links, referenced, supportsImages, binary) 
       rowLinks.add(hyperlink_id);
       referenced.add(hyperlink_id);
     }
-    cells.push(Object.freeze({text:glyph,width,style,foreground,background,underline,underline_color,hyperlink_id}));
+    decoded.push(Object.freeze({text:glyph,width,style,foreground,background,underline,underline_color,hyperlink_id}));
   }
   if (lead || offset !== text.length) throw new Error('invalid dense Channel row width');
+  let cells = decoded;
+  if (base) {
+    cells = base.slice();
+    textBytes += base.textBytes;
+    for (let column = first; column < last; column++) {
+      textBytes -= utf8Bytes(base[column].text);
+      cells[column] = decoded[column-first];
+    }
+    if (base.links.length) {
+      // An edited row still advertises every link it references. Include
+      // retained cells in column order just as for a complete row.
+      rowLinks.clear();
+      for (const {hyperlink_id} of cells) {
+        if (hyperlink_id === undefined) continue;
+        if (!links.has(hyperlink_id)) throw new Error('unresolved dense Channel hyperlink');
+        rowLinks.add(hyperlink_id);
+        referenced.add(hyperlink_id);
+      }
+    }
+  }
   const imageSlices = validateSlices(row.image_slices, cols, supportsImages);
   return Object.freeze(Object.assign(cells, {wrapped,textBytes,links:Object.freeze([...rowLinks]),imageSlices}));
 }
@@ -386,11 +420,11 @@ function validatePackedRow(row, cols, links, referenced, supportsImages, extende
   return Object.freeze(Object.assign(cells, {wrapped: row.wrapped, textBytes, links:Object.freeze([...rowLinks]), imageSlices}));
 }
 
-function validateRow(row, cols, links, referenced, supportsImages, version, binary) {
+function validateRow(row, cols, links, referenced, supportsImages, version, binary, previous) {
   const dense = version === CHANNEL_DENSE_VERSION;
-  if (row?.cell_bytes !== undefined) {
+  if (row?.cell_bytes !== undefined || row?.cell_span !== undefined) {
     if (!dense) throw new Error('dense Channel row version');
-    return validateDenseRow(row, cols, links, referenced, supportsImages, binary);
+    return validateDenseRow(row, cols, links, referenced, supportsImages, binary, previous);
   }
   const packed = dense || supportsPackedRows(version), extended = supportsChannelRendition(version);
   if (packed && row?.cells === undefined) return validatePackedRow(row, cols, links, referenced, supportsImages, extended);
@@ -494,7 +528,7 @@ export function acceptChannelUpdate(previous, update, expected, snapshotOnly, wi
       const index = edit?.index;
       if (!Number.isInteger(index) || index < 0 || index >= rows.length || seen.has(index))
         throw new Error('invalid Channel row index');
-      rows[index] = validateRow(edit.row, cols, links, referenced, allowSlices, stamp.version,binary);
+      rows[index] = validateRow(edit.row, cols, links, referenced, allowSlices, stamp.version,binary,previous.rows[index]);
       seen.add(index);
     }
   }

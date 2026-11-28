@@ -20,6 +20,7 @@ use jterm_protocol::{
 use std::{
     collections::{btree_map::Entry, BTreeMap, BTreeSet},
     io::{self, Write},
+    ops::Range,
     sync::{Arc, OnceLock},
 };
 
@@ -32,6 +33,8 @@ const ENCODERS_BUSY: &str = "terminal channel encoders are temporarily busy";
 pub struct BinaryChannelParts {
     pub cells: bool,
     pub rasters: bool,
+    /// Allow binary dense deltas to point at a smaller span in their base row.
+    pub cell_spans: bool,
 }
 
 /// A bounded JSON frame and its separately carried cell and image bytes.
@@ -113,14 +116,30 @@ impl FrameScratch {
     ) -> Result<(wire::Counter, EncodedChannelFrame), String> {
         if version == DENSE_FRAME_VERSION {
             let mut cells = Vec::new();
-            let projected =
-                project_update(previous, frame, session, version, binary.rasters, |row| {
-                    pack_dense_row(row, binary.cells.then_some(&mut cells))
-                })?;
+            let projected = project_update(
+                previous,
+                frame,
+                session,
+                version,
+                binary.rasters,
+                |row, delta| {
+                    pack_dense_row(row, binary.cells.then_some(&mut cells), || {
+                        let (base, index) = delta.filter(|_| binary.cell_spans)?;
+                        changed_cell_span(base, frame, index)
+                    })
+                },
+            )?;
             encode_update(projected, cells)
         } else if wire::supports_packed_rows(version) {
             encode_update(
-                project_update(previous, frame, session, version, binary.rasters, pack_row)?,
+                project_update(
+                    previous,
+                    frame,
+                    session,
+                    version,
+                    binary.rasters,
+                    |row, _| pack_row(row),
+                )?,
                 Vec::new(),
             )
         } else {
@@ -131,7 +150,7 @@ impl FrameScratch {
                     session,
                     version,
                     binary.rasters,
-                    std::convert::identity,
+                    |row, _| row,
                 )?,
                 Vec::new(),
             )
@@ -355,7 +374,7 @@ fn project_update<'a, R>(
     session: &str,
     version: u8,
     binary_rasters: bool,
-    mut encode_row: impl FnMut(wire::RowData<EncodedCell<'a>>) -> R,
+    mut encode_row: impl FnMut(wire::RowData<EncodedCell<'a>>, Option<(&CellFrame, usize)>) -> R,
 ) -> Result<ProjectedUpdate<'a, R>, String> {
     validate_grid(frame)?;
     let engine_stamp = frame.stamp();
@@ -415,7 +434,10 @@ fn project_update<'a, R>(
                 .map(|index| {
                     Ok(wire::ChangedRowWith {
                         index: index as u16,
-                        row: encode_row(wire_row(frame, index, &mut projection)?),
+                        row: encode_row(
+                            wire_row(frame, index, &mut projection)?,
+                            Some((base, index)),
+                        ),
                     })
                 })
                 .collect::<Result<_, String>>()?;
@@ -434,7 +456,7 @@ fn project_update<'a, R>(
         }
     }
     let rows = (0..frame.rows().len())
-        .map(|index| wire_row(frame, index, &mut projection).map(&mut encode_row))
+        .map(|index| wire_row(frame, index, &mut projection).map(|row| encode_row(row, None)))
         .collect::<Result<_, _>>()?;
     let (hyperlinks, images, rasters) = projection.into_update_resources(binary_rasters);
     Ok(ProjectedUpdate {
@@ -554,6 +576,9 @@ struct DenseRow {
     columns: u16,
     // Null on a binary row. Its bytes appear in row order in the Channel.
     cell_bytes: Option<String>,
+    // Local delta only. An absent span carries the complete row as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cell_span: Option<[u16; 2]>,
     text: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     attributes: Vec<DenseAttributes>,
@@ -572,9 +597,42 @@ struct DenseAttributes {
     hyperlink_id: Option<u16>,
 }
 
+fn changed_cell_span(base: &CellFrame, next: &CellFrame, row: usize) -> Option<Range<usize>> {
+    let before = &base.rows()[row].cells;
+    let after = &next.rows()[row].cells;
+    let same_underlines = base.underline_color_runs(row) == next.underline_color_runs(row);
+    let differs = |column: usize| {
+        let cell = &before[column];
+        cell != &after[column]
+            || base.cluster_text(row, column) != next.cluster_text(row, column)
+            || (!same_underlines
+                && base.underline_color(row, column) != next.underline_color(row, column))
+            || (!cell.hyperlink_id.is_none()
+                && base.hyperlink_target(cell.hyperlink_id)
+                    != next.hyperlink_target(cell.hyperlink_id))
+    };
+    let columns = after.len();
+    let mut first = (0..columns).find(|&column| differs(column))?;
+    let mut end = (first + 1..columns)
+        .rfind(|&column| differs(column))
+        .map_or(first + 1, |column| column + 1);
+    let continues_wide = |column: usize| {
+        before[column].flags.wide_continuation() || after[column].flags.wide_continuation()
+    };
+    while first > 0 && continues_wide(first) {
+        first -= 1;
+    }
+    while end < columns && continues_wide(end) {
+        end += 1;
+    }
+    // Omitting eight cells saves at least 72 bytes, even before their text.
+    (end - first + 8 <= columns).then_some(first..end)
+}
+
 fn pack_dense_row<'a>(
     row: wire::RowData<EncodedCell<'a>>,
     binary_cells: Option<&mut Vec<u8>>,
+    sparse_span: impl FnOnce() -> Option<Range<usize>>,
 ) -> EncodedRow<'a> {
     let row = match pack_row(row) {
         EncodedRow::Cells(row) => row,
@@ -582,12 +640,20 @@ fn pack_dense_row<'a>(
     };
     let columns = row.cells.len();
     let binary = binary_cells.is_some();
+    let cell_span = if binary { sparse_span() } else { None };
+    let span = cell_span.clone().unwrap_or(0..columns);
     let mut base64_input = Vec::new();
     let bytes = binary_cells.unwrap_or(&mut base64_input);
-    bytes.reserve(9 * columns);
-    let mut text = String::with_capacity(columns);
+    bytes.reserve(9 * span.len());
+    let mut text = String::with_capacity(span.len());
     let mut attributes = Vec::new();
-    for (column, cell) in row.cells.into_iter().enumerate() {
+    for (column, cell) in row
+        .cells
+        .into_iter()
+        .enumerate()
+        .skip(span.start)
+        .take(span.len())
+    {
         let text_units = match cell.text {
             EncodedText::Scalar(character) => {
                 text.push(character);
@@ -627,6 +693,7 @@ fn pack_dense_row<'a>(
         wrapped: row.wrapped,
         columns: columns as u16,
         cell_bytes: (!binary).then(|| STANDARD.encode(base64_input)),
+        cell_span: cell_span.map(|span| [span.start as u16, span.len() as u16]),
         text,
         attributes,
         image_slices: row.image_slices,
@@ -1018,7 +1085,7 @@ mod tests {
         frame::{Cursor, Limits, Row, Stamp},
         CursorShape, TerminalCell,
     };
-    use std::sync::Arc;
+    use std::{fmt::Write as _, sync::Arc};
 
     fn update(
         previous: Option<&CellFrame>,
@@ -1026,14 +1093,7 @@ mod tests {
         session: &str,
         version: u8,
     ) -> Result<wire::Update, String> {
-        let projected = project_update(
-            previous,
-            frame,
-            session,
-            version,
-            false,
-            std::convert::identity,
-        )?;
+        let projected = project_update(previous, frame, session, version, false, |row, _| row)?;
         let data = serde_json::to_vec(&projected.update).map_err(|error| error.to_string())?;
         serde_json::from_slice(&data).map_err(|error| error.to_string())
     }
@@ -1187,7 +1247,7 @@ mod tests {
             ],
             image_slices: Vec::new(),
         };
-        let encoded = serde_json::to_value(pack_dense_row(row(), None)).unwrap();
+        let encoded = serde_json::to_value(pack_dense_row(row(), None, || None)).unwrap();
         let bytes = STANDARD
             .decode(encoded["cell_bytes"].as_str().unwrap())
             .unwrap();
@@ -1222,7 +1282,7 @@ mod tests {
             serde_json::json!([{"column":0,"underline":"curly","underline_color":"#070809","hyperlink_id":17}])
         );
         let mut raw = Vec::new();
-        let direct = serde_json::to_value(pack_dense_row(row(), Some(&mut raw))).unwrap();
+        let direct = serde_json::to_value(pack_dense_row(row(), Some(&mut raw), || None)).unwrap();
         assert_eq!(raw, bytes);
         let mut expected = encoded;
         expected["cell_bytes"] = serde_json::Value::Null;
@@ -1363,7 +1423,7 @@ mod tests {
                 wire::IMAGE_VERSION,
                 BinaryChannelParts {
                     rasters: true,
-                    cells: false,
+                    ..BinaryChannelParts::default()
                 },
             )
             .unwrap();
@@ -1383,7 +1443,7 @@ mod tests {
                     wire::IMAGE_VERSION,
                     BinaryChannelParts {
                         rasters: true,
-                        cells: false
+                        ..BinaryChannelParts::default()
                     }
                 )
                 .unwrap()
@@ -1715,6 +1775,68 @@ mod tests {
         assert_eq!(hyperlinks.len(), 1);
         assert_eq!(hyperlinks[0].target, "https://second.test");
         assert_eq!(rows[0].row.cells[0].hyperlink_id, Some(hyperlinks[0].id));
+    }
+
+    #[test]
+    fn binary_dense_delta_spans_preserve_wide_clusters_and_require_opt_in() {
+        let budget = Arc::new(RetainedBytesBudget::new(JSON_WORKSPACE_BYTES));
+        let scratch = FrameScratch::reserve_from(&budget).unwrap();
+        let mut terminal = jterm_engine::terminal::Terminal::new(2, 64).unwrap();
+        terminal.enable_grapheme_clusters();
+        let mut output = String::new();
+        for column in 0..64 {
+            write!(output, "\x1b[38;2;{column};9;17mX").unwrap();
+        }
+        output.push_str("\x1b[1;9H\x1b[38;2;8;9;17m中");
+        terminal.feed(output.as_bytes()).unwrap();
+        let before = terminal.frame().unwrap();
+        terminal.feed("\u{0301}".as_bytes()).unwrap();
+        let after = terminal.frame().unwrap();
+        assert_eq!(before.rows(), after.rows(), "only the wide cluster changed");
+
+        let encode = |base, binary| {
+            let (_, frame) = scratch
+                .encode_frame(base, &after, "test", DENSE_FRAME_VERSION, binary)
+                .unwrap();
+            let meta: serde_json::Value = serde_json::from_str(frame.as_json()).unwrap();
+            (meta, frame.into_binary_parts().0)
+        };
+        let options = BinaryChannelParts {
+            cell_spans: true,
+            cells: true,
+            ..BinaryChannelParts::default()
+        };
+        let (snapshot, snapshot_cells) = encode(None, options);
+        assert_eq!(snapshot["kind"], "snapshot");
+        assert!(snapshot["rows"][0].get("cell_span").is_none());
+        let (delta, cells) = encode(Some(&before), options);
+        assert_eq!(delta["kind"], "delta");
+        assert_eq!(delta["rows"][0]["index"], 0);
+        let row = &delta["rows"][0]["row"];
+        assert_eq!(row["columns"], 64);
+        assert_eq!(row["cell_span"], serde_json::json!([8, 2]));
+        assert_eq!(row["text"], "中\u{0301} ");
+        assert_eq!(cells, snapshot_cells[8 * 9..10 * 9]);
+
+        let (unnegotiated, full_row) = encode(
+            Some(&before),
+            BinaryChannelParts {
+                cell_spans: false,
+                ..options
+            },
+        );
+        assert!(unnegotiated["rows"][0]["row"].get("cell_span").is_none());
+        assert_eq!(full_row, snapshot_cells);
+        let (json, no_cells) = encode(
+            Some(&before),
+            BinaryChannelParts {
+                cells: false,
+                ..options
+            },
+        );
+        assert!(json["rows"][0]["row"].get("cell_span").is_none());
+        assert!(json["rows"][0]["row"]["cell_bytes"].is_string());
+        assert!(no_cells.is_empty());
     }
 
     #[test]

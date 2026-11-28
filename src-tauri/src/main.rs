@@ -192,6 +192,7 @@ async fn subscribe_local_shell<R: tauri::Runtime>(
     direct_frames: Option<bool>,
     binary_rasters: Option<bool>,
     binary_cells: Option<bool>,
+    cell_spans: Option<bool>,
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<(), String> {
     require_terminal_window(&window)?;
@@ -204,6 +205,7 @@ async fn subscribe_local_shell<R: tauri::Runtime>(
     let binary = tauri_terminal_frame_bridge::BinaryChannelParts {
         cells: binary_cells.unwrap_or(false),
         rasters: binary_rasters.unwrap_or(false),
+        cell_spans: cell_spans.unwrap_or(false),
     };
     let delivery = if direct_frames.unwrap_or(false) || binary.cells || binary.rasters {
         local_sessions::FrameDelivery::Structured(binary)

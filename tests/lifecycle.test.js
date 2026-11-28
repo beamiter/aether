@@ -524,7 +524,7 @@ test('local Channel paints and acknowledges exact revisions, fencing a retired a
  const h=harness(async(name,args)=>{
   switch(name){
    case 'open_shell':return first;
-   case 'subscribe_local_shell':assert.equal(args.frameVersion,CHANNEL_DENSE_VERSION);assert.equal(args.directFrames,true);assert.equal(args.binaryRasters,true);assert.equal(args.binaryCells,true);receivers.push(args.stream.onmessage);return null;
+   case 'subscribe_local_shell':assert.equal(args.frameVersion,CHANNEL_DENSE_VERSION);assert.equal(args.directFrames,true);assert.equal(args.binaryRasters,true);assert.equal(args.binaryCells,true);assert.equal(args.cellSpans,true);receivers.push(args.stream.onmessage);return null;
    case 'ack_local_stream':sent.push(args);return null;
    case 'detach_shell':case 'ack_shell':return null;
    case 'attach_shell':assert.equal(args.frameVersion,CHANNEL_DENSE_VERSION);return {owner:next,frame:channelSnapshot(frame)};
