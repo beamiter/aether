@@ -14,7 +14,8 @@ use tauri::ipc::{Channel, InvokeResponseBody, IpcResponse};
 pub(crate) use tauri_terminal_frame_bridge::protocol::ObserverTarget;
 pub(crate) use tauri_terminal_frame_bridge::protocol_v4::{Counter, Receipt};
 use tauri_terminal_frame_bridge::{
-    live::LiveBridge, protocol_v4, semantic::Attachment, EncodedChannelFrame, LiveFrameFormat,
+    live::LiveBridge, protocol_v4, semantic::Attachment, BinaryChannelParts, EncodedChannelFrame,
+    LiveFrameFormat,
 };
 
 type QuotedEvent = protocol_v4::StreamEvent<LocalShellStatus>;
@@ -23,13 +24,15 @@ pub(crate) struct StreamEvent(StreamBody);
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FrameDelivery {
     Quoted,
-    Structured,
-    BinaryRasters,
+    Structured(BinaryChannelParts),
 }
 
 impl FrameDelivery {
-    pub(super) fn binary_rasters(self) -> bool {
-        self == Self::BinaryRasters
+    pub(super) fn binary(self) -> BinaryChannelParts {
+        match self {
+            Self::Quoted => BinaryChannelParts::default(),
+            Self::Structured(binary) => binary,
+        }
     }
 }
 
@@ -55,6 +58,8 @@ struct DirectHeader<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     frame_bytes: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    cell_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     image_bytes: Option<usize>,
 }
 
@@ -70,6 +75,11 @@ impl DirectUpdate {
             sequence: self.sequence,
             status: &self.status,
             frame_bytes: self.frame.as_ref().map(|frame| frame.as_json().len()),
+            cell_bytes: self
+                .frame
+                .as_ref()
+                .map(EncodedChannelFrame::cell_bytes)
+                .filter(|bytes| *bytes != 0),
             image_bytes: self
                 .frame
                 .as_ref()
@@ -96,6 +106,10 @@ impl DirectUpdate {
                 frame.as_json().len()
             )
             .expect("writing numbers to a String succeeds");
+            if frame.cell_bytes() != 0 {
+                write!(json, ",\"cell_bytes\":{}", frame.cell_bytes())
+                    .expect("writing numbers to a String succeeds");
+            }
             if frame.image_bytes() != 0 {
                 write!(json, ",\"image_bytes\":{}", frame.image_bytes())
                     .expect("writing numbers to a String succeeds");
@@ -110,30 +124,32 @@ impl DirectUpdate {
 
     fn into_body(self) -> tauri::Result<InvokeResponseBody> {
         let json = self.json()?;
-        let mut active = self
+        let (active_cells, active_images) = self
             .frame
-            .map(EncodedChannelFrame::into_image_bytes)
+            .map(EncodedChannelFrame::into_binary_parts)
             .unwrap_or_default();
-        let peer = self
+        let (peer_cells, peer_images) = self
             .preview
-            .map(|(_, frame)| frame.into_image_bytes())
+            .map(|(_, frame)| frame.into_binary_parts())
             .unwrap_or_default();
-        let mut bytes = if active.is_empty() {
-            peer
-        } else {
-            active.extend_from_slice(&peer);
-            active
-        };
-        if bytes.is_empty() {
+        let has_cells = !(active_cells.is_empty() && peer_cells.is_empty());
+        let parts = [active_cells, active_images, peer_cells, peer_images];
+        let total = parts.iter().map(Vec::len).sum::<usize>();
+        let mut parts = parts.into_iter().filter(|part| !part.is_empty());
+        let Some(mut bytes) = parts.next() else {
             return Ok(InvokeResponseBody::Json(json));
-        }
+        };
         let metadata_len = u32::try_from(json.len())
             .map_err(|_| std::io::Error::other("binary Channel metadata too large"))?;
-        // Active then passive RGBA8, structured event JSON, and a fixed
-        // trailer containing the metadata length and format version.
+        bytes.reserve_exact(total - bytes.len() + json.len() + 8);
+        for part in parts {
+            bytes.extend_from_slice(&part);
+        }
+        // Active then passive, cells before RGBA8 in each frame, followed
+        // by JSON and its trailer. Raster-only events keep their v1 layout.
         bytes.extend_from_slice(json.as_bytes());
         bytes.extend_from_slice(&metadata_len.to_le_bytes());
-        bytes.extend_from_slice(b"JTR1");
+        bytes.extend_from_slice(if has_cells { b"JTR2" } else { b"JTR1" });
         Ok(InvokeResponseBody::Raw(bytes))
     }
 }
@@ -328,7 +344,7 @@ impl LocalStream {
             self.owner.epoch,
             self.sequence == 0,
             self.format,
-            self.frame_delivery.binary_rasters(),
+            self.frame_delivery.binary(),
         )?;
         // An initial publication can be deferred under encoder pressure. Do
         // not let a status-only update consume the sequence for the full base.
@@ -420,15 +436,36 @@ mod tests {
 
     #[test]
     fn binary_delivery_places_active_pixels_before_preview_pixels() {
-        fn image_frame(rgb: &str) -> (Attachment, EncodedChannelFrame, LocalShellStatus) {
+        exercise_binary_delivery(false);
+    }
+
+    #[test]
+    fn binary_delivery_orders_cells_and_pixels_for_each_pane() {
+        exercise_binary_delivery(true);
+    }
+
+    fn exercise_binary_delivery(cells: bool) {
+        fn image_frame(
+            rgb: &str,
+            cells: bool,
+        ) -> (Attachment, EncodedChannelFrame, LocalShellStatus) {
             let mut bridge = LiveBridge::local_desktop();
             bridge.enable_inline_graphics(LiveFrameFormat::Dense);
             let epoch = bridge.open(8, 32).unwrap();
             let owner = bridge.attachment(epoch).unwrap();
-            let mut command = format!(
-                r"printf '\033[2J\033[H\033_Ga=T,i=3,f=24,s=1,v=1,c=1,r=1,C=1;{rgb}\033\\'; read -r _"
-            );
-            command.push('\n');
+            let mut output = String::from(r"\033[2J");
+            if cells {
+                output.push_str(r"\033[2;1H");
+                for column in 0..32 {
+                    write!(output, r"\033[38;2;17;{column};23mX").unwrap();
+                }
+            }
+            write!(
+                output,
+                r"\033[H\033_Ga=T,i=3,f=24,s=1,v=1,c=1,r=1,C=1;{rgb}\033\\"
+            )
+            .unwrap();
+            let command = format!("printf '{output}'; read -r _\n");
             bridge
                 .write_owned_raw(owner.clone(), command.into_bytes())
                 .unwrap();
@@ -436,7 +473,15 @@ mod tests {
             loop {
                 bridge.pump_attached_io(epoch).unwrap();
                 if let Some((_, frame)) = bridge
-                    .observe_encoded_channel_frame(epoch, None, LiveFrameFormat::Dense, true)
+                    .observe_encoded_channel_frame(
+                        epoch,
+                        None,
+                        LiveFrameFormat::Dense,
+                        BinaryChannelParts {
+                            rasters: true,
+                            cells,
+                        },
+                    )
                     .unwrap()
                 {
                     if frame.image_bytes() == 4 {
@@ -453,8 +498,8 @@ mod tests {
             }
         }
 
-        let (owner, active, status) = image_frame("/wAA");
-        let (_, preview, _) = image_frame("AAD/");
+        let (owner, active, status) = image_frame("/wAA", cells);
+        let (_, preview, _) = image_frame("AAD/", cells);
         let body = DirectUpdate {
             owner,
             sequence: Counter::new(1).unwrap(),
@@ -468,15 +513,27 @@ mod tests {
             panic!("an image-bearing delivery must be binary");
         };
         let trailer = body.len() - 8;
-        assert_eq!(&body[trailer + 4..], b"JTR1");
+        assert_eq!(&body[trailer + 4..], if cells { b"JTR2" } else { b"JTR1" });
         let metadata_size =
             u32::from_le_bytes(body[trailer..trailer + 4].try_into().unwrap()) as usize;
-        assert_eq!(trailer - metadata_size, 8);
-        assert_eq!(&body[..8], &[255, 0, 0, 255, 0, 0, 255, 255]);
-        let metadata: Value = serde_json::from_slice(&body[8..trailer]).unwrap();
+        let cell_bytes = if cells { 32 * 9 } else { 0 };
+        let pane_bytes = cell_bytes + 4;
+        assert_eq!(trailer - metadata_size, 2 * pane_bytes);
+        assert_eq!(&body[cell_bytes..pane_bytes], &[255, 0, 0, 255]);
+        assert_eq!(
+            &body[pane_bytes + cell_bytes..2 * pane_bytes],
+            &[0, 0, 255, 255]
+        );
+        let metadata: Value = serde_json::from_slice(&body[2 * pane_bytes..trailer]).unwrap();
         assert_eq!(metadata["image_bytes"], 4);
         assert_eq!(metadata["preview"]["image_bytes"], 4);
         assert_eq!(metadata["preview"]["layout"], 7);
+        if cells {
+            assert_eq!(metadata["cell_bytes"], cell_bytes);
+            assert_eq!(metadata["preview"]["cell_bytes"], cell_bytes);
+            assert_eq!(&body[..3], &[17, 0, 23]);
+            assert_eq!(&body[pane_bytes..pane_bytes + 3], &[17, 0, 23]);
+        }
         assert!(metadata["frame"]["images"][0].get("rgba").is_none());
         assert!(metadata["preview"]["frame"]["images"][0]
             .get("rgba")
@@ -613,7 +670,7 @@ mod tests {
                 None,
                 format,
                 if direct_frames {
-                    FrameDelivery::Structured
+                    FrameDelivery::Structured(BinaryChannelParts::default())
                 } else {
                     FrameDelivery::Quoted
                 },

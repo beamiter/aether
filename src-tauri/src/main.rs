@@ -191,6 +191,7 @@ async fn subscribe_local_shell<R: tauri::Runtime>(
     frame_version: u8,
     direct_frames: Option<bool>,
     binary_rasters: Option<bool>,
+    binary_cells: Option<bool>,
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<(), String> {
     require_terminal_window(&window)?;
@@ -200,10 +201,12 @@ async fn subscribe_local_shell<R: tauri::Runtime>(
     }
     let shared = bridge.inner().clone();
     let weak = Arc::downgrade(&shared);
-    let delivery = if binary_rasters.unwrap_or(false) {
-        local_sessions::FrameDelivery::BinaryRasters
-    } else if direct_frames.unwrap_or(false) {
-        local_sessions::FrameDelivery::Structured
+    let binary = tauri_terminal_frame_bridge::BinaryChannelParts {
+        cells: binary_cells.unwrap_or(false),
+        rasters: binary_rasters.unwrap_or(false),
+    };
+    let delivery = if direct_frames.unwrap_or(false) || binary.cells || binary.rasters {
+        local_sessions::FrameDelivery::Structured(binary)
     } else {
         local_sessions::FrameDelivery::Quoted
     };

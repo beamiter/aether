@@ -27,11 +27,18 @@ const JSON_WORKSPACE_BYTES: usize = wire::MAX_ENCODED_FRAME_BYTES + wire::MAX_EN
 const PROCESS_JSON_WORKSPACE_BYTES: usize = 4 * JSON_WORKSPACE_BYTES;
 const ENCODERS_BUSY: &str = "terminal channel encoders are temporarily busy";
 
-/// A bounded JSON frame from the encoder, with optional RGBA8 bytes carried
-/// separately in resource order for the native Channel.
+/// Parts the native Channel can carry outside a frame's JSON.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BinaryChannelParts {
+    pub cells: bool,
+    pub rasters: bool,
+}
+
+/// A bounded JSON frame and its separately carried cell and image bytes.
 #[derive(Debug)]
 pub struct EncodedChannelFrame {
     json: String,
+    cells: Vec<u8>,
     rgba: Vec<u8>,
 }
 
@@ -46,6 +53,14 @@ impl EncodedChannelFrame {
 
     pub fn image_bytes(&self) -> usize {
         self.rgba.len()
+    }
+
+    pub fn cell_bytes(&self) -> usize {
+        self.cells.len()
+    }
+
+    pub fn into_binary_parts(self) -> (Vec<u8>, Vec<u8>) {
+        (self.cells, self.rgba)
     }
 
     pub fn into_image_bytes(self) -> Vec<u8> {
@@ -78,8 +93,14 @@ impl FrameScratch {
         session: &str,
         version: u8,
     ) -> Result<(wire::Counter, String), String> {
-        self.encode_frame(previous, frame, session, version, false)
-            .map(|(revision, frame)| (revision, frame.into_json()))
+        self.encode_frame(
+            previous,
+            frame,
+            session,
+            version,
+            BinaryChannelParts::default(),
+        )
+        .map(|(revision, frame)| (revision, frame.into_json()))
     }
 
     pub(crate) fn encode_frame(
@@ -88,44 +109,45 @@ impl FrameScratch {
         frame: &CellFrame,
         session: &str,
         version: u8,
-        binary_rasters: bool,
+        binary: BinaryChannelParts,
     ) -> Result<(wire::Counter, EncodedChannelFrame), String> {
         if version == DENSE_FRAME_VERSION {
-            encode_update(project_update(
-                previous,
-                frame,
-                session,
-                version,
-                binary_rasters,
-                pack_dense_row,
-            )?)
+            let mut cells = Vec::new();
+            let projected =
+                project_update(previous, frame, session, version, binary.rasters, |row| {
+                    pack_dense_row(row, binary.cells.then_some(&mut cells))
+                })?;
+            encode_update(projected, cells)
         } else if wire::supports_packed_rows(version) {
-            encode_update(project_update(
-                previous,
-                frame,
-                session,
-                version,
-                binary_rasters,
-                pack_row,
-            )?)
+            encode_update(
+                project_update(previous, frame, session, version, binary.rasters, pack_row)?,
+                Vec::new(),
+            )
         } else {
-            encode_update(project_update(
-                previous,
-                frame,
-                session,
-                version,
-                binary_rasters,
-                std::convert::identity,
-            )?)
+            encode_update(
+                project_update(
+                    previous,
+                    frame,
+                    session,
+                    version,
+                    binary.rasters,
+                    std::convert::identity,
+                )?,
+                Vec::new(),
+            )
         }
     }
 }
 
 fn encode_update<R: serde::Serialize>(
     projected: ProjectedUpdate<'_, R>,
+    cells: Vec<u8>,
 ) -> Result<(wire::Counter, EncodedChannelFrame), String> {
     let ProjectedUpdate { update, rasters } = projected;
     let revision = update.revision();
+    let frame_budget = wire::MAX_ENCODED_FRAME_BYTES
+        .checked_sub(cells.len())
+        .ok_or("terminal frame exceeds packed cell byte limit")?;
     let images = match &update {
         wire::UpdateRows::Snapshot { images, .. } | wire::UpdateRows::Delta { images, .. } => {
             images
@@ -135,7 +157,8 @@ fn encode_update<R: serde::Serialize>(
         return Ok((
             revision,
             EncodedChannelFrame {
-                json: encode_json(&update, images)?,
+                json: encode_json(&update, images, frame_budget)?,
+                cells,
                 rgba: Vec::new(),
             },
         ));
@@ -150,7 +173,7 @@ fn encode_update<R: serde::Serialize>(
         update: &update,
         images: rasters.iter().map(|image| &image.metadata).collect(),
     };
-    let json = encode_bounded_json(&metadata, wire::MAX_ENCODED_FRAME_BYTES)?;
+    let json = encode_bounded_json(&metadata, frame_budget)?;
     let bytes = rasters.iter().map(|image| image.rgba.len()).sum::<usize>();
     // Reserve space for the frame metadata and Channel envelope so delivery
     // can reuse this allocation when there is a single image-bearing frame.
@@ -158,7 +181,7 @@ fn encode_update<R: serde::Serialize>(
     for image in rasters {
         rgba.extend_from_slice(image.rgba);
     }
-    Ok((revision, EncodedChannelFrame { json, rgba }))
+    Ok((revision, EncodedChannelFrame { json, cells, rgba }))
 }
 
 pub(crate) fn encode(
@@ -175,9 +198,9 @@ pub(crate) fn encode(
 fn encode_json(
     value: &impl serde::Serialize,
     images: &[wire::ImageResource],
+    frame_budget: usize,
 ) -> Result<String, String> {
-    let limit =
-        wire::MAX_ENCODED_FRAME_BYTES + images.iter().map(|image| image.rgba.len()).sum::<usize>();
+    let limit = frame_budget + images.iter().map(|image| image.rgba.len()).sum::<usize>();
     if limit > JSON_WORKSPACE_BYTES {
         return Err("terminal frame exceeds its encoding workspace".into());
     }
@@ -318,7 +341,7 @@ fn encode_history_rows<'a, R: serde::Serialize>(
             .paint_colors()
             .map(|colors| colors.effective_background().into()),
     };
-    encode_json(&view, &view.images)
+    encode_json(&view, &view.images, wire::MAX_ENCODED_FRAME_BYTES)
 }
 
 struct ProjectedUpdate<'a, R> {
@@ -529,7 +552,8 @@ enum EncodedRow<'a> {
 struct DenseRow {
     wrapped: bool,
     columns: u16,
-    cell_bytes: String,
+    // Null on a binary row. Its bytes appear in row order in the Channel.
+    cell_bytes: Option<String>,
     text: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     attributes: Vec<DenseAttributes>,
@@ -548,13 +572,19 @@ struct DenseAttributes {
     hyperlink_id: Option<u16>,
 }
 
-fn pack_dense_row(row: wire::RowData<EncodedCell<'_>>) -> EncodedRow<'_> {
+fn pack_dense_row<'a>(
+    row: wire::RowData<EncodedCell<'a>>,
+    binary_cells: Option<&mut Vec<u8>>,
+) -> EncodedRow<'a> {
     let row = match pack_row(row) {
         EncodedRow::Cells(row) => row,
         packed => return packed,
     };
     let columns = row.cells.len();
-    let mut bytes = Vec::with_capacity(9 * columns);
+    let binary = binary_cells.is_some();
+    let mut base64_input = Vec::new();
+    let bytes = binary_cells.unwrap_or(&mut base64_input);
+    bytes.reserve(9 * columns);
     let mut text = String::with_capacity(columns);
     let mut attributes = Vec::new();
     for (column, cell) in row.cells.into_iter().enumerate() {
@@ -596,7 +626,7 @@ fn pack_dense_row(row: wire::RowData<EncodedCell<'_>>) -> EncodedRow<'_> {
     EncodedRow::Dense(DenseRow {
         wrapped: row.wrapped,
         columns: columns as u16,
-        cell_bytes: STANDARD.encode(bytes),
+        cell_bytes: (!binary).then(|| STANDARD.encode(base64_input)),
         text,
         attributes,
         image_slices: row.image_slices,
@@ -1131,7 +1161,7 @@ mod tests {
 
     #[test]
     fn dense_rows_preserve_glyph_boundaries_colors_and_attributes() {
-        let row = wire::RowData {
+        let row = || wire::RowData {
             wrapped: true,
             cells: vec![
                 EncodedCell {
@@ -1157,7 +1187,7 @@ mod tests {
             ],
             image_slices: Vec::new(),
         };
-        let encoded = serde_json::to_value(pack_dense_row(row)).unwrap();
+        let encoded = serde_json::to_value(pack_dense_row(row(), None)).unwrap();
         let bytes = STANDARD
             .decode(encoded["cell_bytes"].as_str().unwrap())
             .unwrap();
@@ -1191,6 +1221,12 @@ mod tests {
             encoded["attributes"],
             serde_json::json!([{"column":0,"underline":"curly","underline_color":"#070809","hyperlink_id":17}])
         );
+        let mut raw = Vec::new();
+        let direct = serde_json::to_value(pack_dense_row(row(), Some(&mut raw))).unwrap();
+        assert_eq!(raw, bytes);
+        let mut expected = encoded;
+        expected["cell_bytes"] = serde_json::Value::Null;
+        assert_eq!(direct, expected);
     }
 
     #[test]
@@ -1320,7 +1356,16 @@ mod tests {
         assert_eq!(rows[0].row.image_slices[0].id, images[0].id);
         assert_eq!(images[0].rgba, "/wAA/w==");
         let (_, binary) = scratch
-            .encode_frame(Some(&before), &displayed, "test", wire::IMAGE_VERSION, true)
+            .encode_frame(
+                Some(&before),
+                &displayed,
+                "test",
+                wire::IMAGE_VERSION,
+                BinaryChannelParts {
+                    rasters: true,
+                    cells: false,
+                },
+            )
             .unwrap();
         let metadata: serde_json::Value = serde_json::from_str(binary.as_json()).unwrap();
         assert_eq!(metadata["kind"], "delta");
@@ -1331,7 +1376,16 @@ mod tests {
         let moved = terminal.frame().unwrap();
         assert_eq!(
             scratch
-                .encode_frame(Some(&displayed), &moved, "test", wire::IMAGE_VERSION, true)
+                .encode_frame(
+                    Some(&displayed),
+                    &moved,
+                    "test",
+                    wire::IMAGE_VERSION,
+                    BinaryChannelParts {
+                        rasters: true,
+                        cells: false
+                    }
+                )
                 .unwrap()
                 .1
                 .image_bytes(),

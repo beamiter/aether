@@ -642,7 +642,7 @@ impl LocalSessions {
                             target.epoch,
                             revision,
                             stream.format,
-                            stream.frame_delivery.binary_rasters(),
+                            stream.frame_delivery.binary(),
                         )
                     })
                     .ok()

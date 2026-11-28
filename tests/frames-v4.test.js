@@ -172,6 +172,52 @@ test('binary Channel rasters are bounded, isolated per pane, and retain image id
   assert.throws(() => decodeLocalChannelEvent(invalidTrailer),/trailer/);
 });
 
+test('binary dense rows consume exactly their own cells before the pane raster', () => {
+  const wide = {...imageSnapshot,cols:3,stamp:{...imageSnapshot.stamp,version:SSH_DENSE_FRAME_VERSION}};
+  const expected = {...imageOwner,frameVersion:SSH_DENSE_FRAME_VERSION};
+  const {rgba,...resource} = image;
+  const cells = Uint8Array.of(
+    1,2,3,4,5,6,4,2,3, 10,11,12,4,5,6,0,0,1, 20,21,22,4,5,6,0,1,1,
+  );
+  const peerCells = cells.slice();
+  peerCells[0] = 39;
+  const raster = Buffer.from(rgba,'base64');
+  const peerRaster = Uint8Array.of(10,20,30,255,40,50,60,255);
+  const frame = {...wide,images:[resource],rows:[
+    {wrapped:true,columns:3,cell_bytes:null,text:'🙂\u0301 X',
+      attributes:[{column:0,underline:'curly',hyperlink_id:22}],
+      image_slices:[{column:2,id:imageId,slice:0}]},
+    {wrapped:false,columns:3,styles:[{foreground:'#ffffff',background:'#000000',style:0}],runs:[[0,'abc']]},
+  ]};
+  const payload = {frame,frame_bytes:Buffer.byteLength(JSON.stringify(frame)),cell_bytes:cells.length,image_bytes:raster.length};
+  const event = decodeLocalChannelEvent(binaryChannelEvent({kind:'update',...payload,preview:{layout:8,...payload}},
+    cells,raster,peerCells,peerRaster));
+  const live = acceptChannelPayload(null,event,expected);
+  const peer = acceptChannelPayload(null,event.preview,expected,true);
+  assert.equal(live.rows[0][0].foreground,'#010203');
+  assert.equal(peer.rows[0][0].foreground,'#270203');
+  assert.equal(live.rows[0][0].text,'🙂\u0301');
+  assert.equal(live.rows[0][0].style,CELL_CONCEALED);
+  assert.equal(live.rows[0][1].width,0);
+  assert.equal(live.rows[1][1].text,'b');
+  assert.deepEqual([...channelRasterBytes(live.images[imageId])],[...raster]);
+  assert.deepEqual([...channelRasterBytes(peer.images[imageId])],[...peerRaster]);
+
+  const later = {...frame,stamp:{...frame.stamp,revision:'9007199254740993'}};
+  const next = decodeLocalChannelEvent(binaryChannelEvent({kind:'update',...payload,frame:later},cells,raster));
+  assert.equal(acceptChannelPayload(live,next,expected).images[imageId],live.images[imageId]);
+
+  const incomplete = decodeLocalChannelEvent(binaryChannelEvent({kind:'update',...payload,cell_bytes:18},
+    cells.subarray(0,18),raster));
+  assert.throws(()=>acceptChannelPayload(null,incomplete,expected),/truncated dense Channel cell bytes/);
+  const unused = decodeLocalChannelEvent(binaryChannelEvent({kind:'update',...payload,cell_bytes:36},
+    cells,Uint8Array.of(0,0,0,0,0,0,0,0,0),raster));
+  assert.throws(()=>acceptChannelPayload(null,unused,expected),/unused dense Channel cell bytes/);
+  const overBudget = decodeLocalChannelEvent(binaryChannelEvent({...payload,kind:'update',
+    frame_bytes:8*1024*1024-cells.length+1},cells,raster));
+  assert.throws(()=>acceptChannelPayload(null,overBudget,expected),/frame byte limit/);
+});
+
 test('Channel row moves copy immutable base rows and retain images and links at their new positions', () => {
   const baseStamp = {...stamp,version:CHANNEL_FRAME_VERSION};
   const newest = {...second,cells:[{...cell,text:'Z'},cell]};

@@ -416,14 +416,16 @@ function testChannel(){
  return class {constructor(){this.id=++number;}};
 }
 
-test('local binary image delivery paints before ACK and a truncated packet pauses output',async()=>{
+test('local binary cell and image delivery paints before ACK and a truncated packet pauses output',async()=>{
  const owner={session:'e'.repeat(32),epoch:1,generation:1};
  const raw=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
- const frame=JSON.parse(channelSnapshot({...raw,session:owner.session,epoch:1}));
+ const frame=JSON.parse(channelSnapshot({...raw,session:owner.session,epoch:1},true));
+ const cells=Buffer.from(frame.rows[0].cell_bytes,'base64');
+ frame.rows[0].cell_bytes=null;
  frame.images=[{id:'1',width:1,height:1,columns:1,rows:1}];
  frame.rows[0].image_slices=[{id:'1',column:0,slice:0}];
  const header={kind:'update',sequence:'1',owner,frame,frame_bytes:Buffer.byteLength(JSON.stringify(frame)),
-  image_bytes:4,status:channelHealth(1)};
+  cell_bytes:cells.length,image_bytes:4,status:channelHealth(1)};
  let receive;
  const events=[];
  const h=harness(async(name,args)=>{
@@ -437,12 +439,12 @@ test('local binary image delivery paints before ACK and a truncated packet pause
   if(frame.images?.['1'])events.push(['paint',...channelRasterBytes(frame.images['1'])]);
  },{},testChannel());
  await h.click('#open');
- await receive(binaryChannelEvent(header,Uint8Array.of(31,151,219,255)));
+ await receive(binaryChannelEvent(header,cells,Uint8Array.of(31,151,219,255)));
  assert.deepEqual(events,[['paint',31,151,219,255],['ack','1',frame.stamp.revision]]);
- await receive(binaryChannelEvent({...header,sequence:'2'},Uint8Array.of(31,151,219)));
+ await receive(binaryChannelEvent({...header,sequence:'2'},cells,Uint8Array.of(31,151,219)));
  assert.equal(events.length,2);
  assert.equal(h.el('#input').disabled,true);
- assert.match(h.el('#status').textContent,/binary Channel image ranges/);
+ assert.match(h.el('#status').textContent,/binary Channel payload ranges/);
 });
 
 test('OSC8 hover remains current across a new frame without synthesizing a click',async()=>{
@@ -522,7 +524,7 @@ test('local Channel paints and acknowledges exact revisions, fencing a retired a
  const h=harness(async(name,args)=>{
   switch(name){
    case 'open_shell':return first;
-   case 'subscribe_local_shell':assert.equal(args.frameVersion,CHANNEL_DENSE_VERSION);assert.equal(args.directFrames,true);assert.equal(args.binaryRasters,true);receivers.push(args.stream.onmessage);return null;
+   case 'subscribe_local_shell':assert.equal(args.frameVersion,CHANNEL_DENSE_VERSION);assert.equal(args.directFrames,true);assert.equal(args.binaryRasters,true);assert.equal(args.binaryCells,true);receivers.push(args.stream.onmessage);return null;
    case 'ack_local_stream':sent.push(args);return null;
    case 'detach_shell':case 'ack_shell':return null;
    case 'attach_shell':assert.equal(args.frameVersion,CHANNEL_DENSE_VERSION);return {owner:next,frame:channelSnapshot(frame)};

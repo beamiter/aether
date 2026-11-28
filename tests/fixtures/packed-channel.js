@@ -26,6 +26,6 @@ export function binaryChannelEvent(metadata, ...pixels) {
   bytes.set(json,rasterBytes);
   const footer = new DataView(bytes.buffer);
   footer.setUint32(bytes.length-8,json.length,true);
-  footer.setUint32(bytes.length-4,0x3152544a,true);
+  footer.setUint32(bytes.length-4,metadata.cell_bytes || metadata.preview?.cell_bytes ? 0x3252544a : 0x3152544a,true);
   return bytes.buffer;
 }

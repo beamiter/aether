@@ -15,6 +15,8 @@ const maxEncodedImageBytes = 4 * Math.ceil((maxImageBytes + 2 * maxImages) / 3);
 const base64Alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 const maxCounter = 18446744073709551615n;
 const maxEncodedBytes = 8 * 1024 * 1024;
+const denseCellStride = 9;
+const maxDenseBytes = 32768 * denseCellStride;
 const maxTextBytes = 512 * 1024;
 const maxClusterBytes = 64;
 const maxHyperlinks = 4096;
@@ -31,37 +33,51 @@ const supportsRowMoves = version => version === CHANNEL_FRAME_VERSION ||
 const supportsChannelImages = version => version === CHANNEL_IMAGE_VERSION || supportsRowMoves(version);
 export const supportsChannelRendition = version => version === CHANNEL_RENDITION_VERSION || version === CHANNEL_DENSE_VERSION;
 const frameMoves = new WeakMap();
+const incomingCells = new WeakMap();
 const incomingRasters = new WeakMap();
 const retainedRasters = new WeakMap();
 const binaryDecoder = new TextDecoder('utf-8',{fatal:true});
 
-function packetImageBytes(packet) {
-  const size = packet?.image_bytes;
+function packetPartBytes(packet, field, limit, stride) {
+  const size = packet?.[field];
   if (size === undefined) return 0;
-  if (!Number.isInteger(size) || size < 4 || size > maxImageBytes || size % 4 !== 0 ||
+  if (!Number.isInteger(size) || size < stride || size > limit || size % stride !== 0 ||
       !packet.frame || typeof packet.frame !== 'object' || Array.isArray(packet.frame))
-    throw new Error('invalid binary Channel image length');
+    throw new Error(field === 'image_bytes' ? 'invalid binary Channel image length' : 'invalid binary Channel cell length');
   return size;
 }
 
 export function decodeLocalChannelEvent(message) {
   if (!(message instanceof ArrayBuffer)) return message;
-  // Active and preview RGBA8, event JSON, then its LE length and "JTR1".
+  // Active then preview, with cells before RGBA8 in each frame. Event JSON
+  // is followed by its LE length and "JTR2". "JTR1" allows raster bytes only.
   const trailer = message.byteLength - 8;
   const view = new DataView(message);
-  if (trailer < 0 || view.getUint32(trailer+4,true) !== 0x3152544a)
+  const magic = trailer < 0 ? 0 : view.getUint32(trailer+4,true);
+  const withCells = magic === 0x3252544a;
+  if (!withCells && magic !== 0x3152544a)
     throw new Error('invalid binary Channel trailer');
   const metadataBytes = view.getUint32(trailer,true);
-  const pixels = trailer - metadataBytes;
+  const binaryBytes = trailer - metadataBytes;
   if (metadataBytes === 0 || metadataBytes > 2*(maxEncodedBytes+maxEncodedImageBytes) ||
-      pixels < 1 || pixels > 2*maxImageBytes)
+      binaryBytes < 1 || binaryBytes > 2*(maxImageBytes+(withCells?maxDenseBytes:0)))
     throw new Error('binary Channel byte limit');
-  const event = JSON.parse(binaryDecoder.decode(new Uint8Array(message,pixels,metadataBytes)));
-  const active = packetImageBytes(event), preview = packetImageBytes(event?.preview);
-  if (event?.kind !== 'update' || active + preview !== pixels)
-    throw new Error('invalid binary Channel image ranges');
-  if (active) incomingRasters.set(event.frame,new Uint8Array(message,0,active));
-  if (preview) incomingRasters.set(event.preview.frame,new Uint8Array(message,active,preview));
+  const event = JSON.parse(binaryDecoder.decode(new Uint8Array(message,binaryBytes,metadataBytes)));
+  const parts = [event,event?.preview].map(packet=>({
+    packet,
+    cells:packetPartBytes(packet,'cell_bytes',maxDenseBytes,denseCellStride),
+    rasters:packetPartBytes(packet,'image_bytes',maxImageBytes,4),
+  }));
+  if (event?.kind !== 'update' || parts.reduce((total,part)=>total+part.cells+part.rasters,0) !== binaryBytes ||
+      withCells !== parts.some(part=>part.cells !== 0))
+    throw new Error(withCells ? 'invalid binary Channel payload ranges' : 'invalid binary Channel image ranges');
+  let offset = 0;
+  for (const {packet,cells,rasters} of parts) {
+    if (cells) incomingCells.set(packet.frame,new Uint8Array(message,offset,cells));
+    offset += cells;
+    if (rasters) incomingRasters.set(packet.frame,new Uint8Array(message,offset,rasters));
+    offset += rasters;
+  }
   return event;
 }
 
@@ -135,7 +151,13 @@ function sameRaster(prior, rgba, raster) {
   const a = retained ?? decodeBase64Bytes(prior.rgba);
   const b = raster ?? decodeBase64Bytes(rgba);
   if (a.length !== b.length) return false;
-  // Raster ranges start on RGBA pixel boundaries.
+  // A preceding dense row can leave a raster at an unaligned offset.
+  if ((a.byteOffset | b.byteOffset) & 3) {
+    const left = new DataView(a.buffer,a.byteOffset,a.byteLength);
+    const right = new DataView(b.buffer,b.byteOffset,b.byteLength);
+    for (let i=0; i<a.byteLength; i+=4) if (left.getUint32(i) !== right.getUint32(i)) return false;
+    return true;
+  }
   const left = new Uint32Array(a.buffer,a.byteOffset,a.byteLength/4);
   const right = new Uint32Array(b.buffer,b.byteOffset,b.byteLength/4);
   for (let i=0; i<left.length; i++) if (left[i] !== right[i]) return false;
@@ -251,14 +273,21 @@ function decodeBase64Bytes(encoded) {
   return bytes;
 }
 
-function validateDenseRow(row, cols, links, referenced, supportsImages) {
+function validateDenseRow(row, cols, links, referenced, supportsImages, binary) {
   const {wrapped, columns, cell_bytes, text, attributes = []} = row;
   if (typeof wrapped !== 'boolean' || columns !== cols || row.cells !== undefined ||
-      row.styles !== undefined || row.runs !== undefined || typeof cell_bytes !== 'string' ||
-      cell_bytes.length !== cols * 12 || /[^a-zA-Z0-9+/]/.test(cell_bytes) ||
+      row.styles !== undefined || row.runs !== undefined ||
+      (binary ? cell_bytes !== null : typeof cell_bytes !== 'string' ||
+        cell_bytes.length !== cols * 12 || /[^a-zA-Z0-9+/]/.test(cell_bytes)) ||
       typeof text !== 'string' || text.length > cols * maxClusterBytes ||
       !Array.isArray(attributes) || attributes.length > cols) throw new Error('invalid dense Channel row');
-  const bytes = decodeBase64Bytes(cell_bytes);
+  let bytes;
+  if (binary) {
+    const end = binary.offset + cols*denseCellStride;
+    if (end > binary.data.length) throw new Error('truncated dense Channel cell bytes');
+    bytes = binary.data.subarray(binary.offset,end);
+    binary.offset = end;
+  } else bytes = decodeBase64Bytes(cell_bytes);
   const styles = attributes.length ? new Map() : undefined;
   for (const attribute of attributes) {
     const {column, underline, underline_color, hyperlink_id} = attribute ?? {};
@@ -273,7 +302,7 @@ function validateDenseRow(row, cols, links, referenced, supportsImages) {
   let offset = 0, textBytes = 0, lead = false;
   let previousBackground = -1, background;
   for (let column = 0; column < cols; column++) {
-    const start = column * 9;
+    const start = column * denseCellStride;
     const r = bytes[start], g = bytes[start+1], b = bytes[start+2];
     const br = bytes[start+3], bg = bytes[start+4], bb = bytes[start+5];
     const foreground = hexStart[r] + hexByte[g] + hexByte[b];
@@ -364,11 +393,11 @@ function validatePackedRow(row, cols, links, referenced, supportsImages, extende
   return Object.freeze(Object.assign(cells, {wrapped: row.wrapped, textBytes, links:Object.freeze([...rowLinks]), imageSlices}));
 }
 
-function validateRow(row, cols, links, referenced, supportsImages, version) {
+function validateRow(row, cols, links, referenced, supportsImages, version, binary) {
   const dense = version === CHANNEL_DENSE_VERSION;
   if (row?.cell_bytes !== undefined) {
     if (!dense) throw new Error('dense Channel row version');
-    return validateDenseRow(row, cols, links, referenced, supportsImages);
+    return validateDenseRow(row, cols, links, referenced, supportsImages, binary);
   }
   const packed = dense || supportsPackedRows(version), extended = supportsChannelRendition(version);
   if (packed && row?.cells === undefined) return validatePackedRow(row, cols, links, referenced, supportsImages, extended);
@@ -436,7 +465,9 @@ export function acceptChannelUpdate(previous, update, expected, snapshotOnly, wi
   const imageBase = update.kind === 'delta' ? previous : null;
   const {images: newImages, encodedBytes} = validatedImages(update.images,
     supportsImages && stamp.screen === 'primary', imageBase, previous, incomingRasters.get(update));
-  if (wireBytes > maxEncodedBytes + encodedBytes) throw new Error('Channel frame byte limit');
+  const cellData = incomingCells.get(update);
+  if (wireBytes > maxEncodedBytes + encodedBytes - (cellData?.byteLength ?? 0)) throw new Error('Channel frame byte limit');
+  const binary = cellData ? {data:cellData,offset:0} : undefined;
   const links = validatedHyperlinks(update.hyperlinks, previous), referenced = new Set();
 
   const allowSlices = supportsImages && stamp.screen === 'primary';
@@ -447,7 +478,7 @@ export function acceptChannelUpdate(previous, update, expected, snapshotOnly, wi
       throw new Error('Channel dimension limit');
     if (previous && previous.layout === stamp.layout && (cols !== previous.cols || update.rows.length !== previous.rows.length))
       throw new Error('Channel geometry requires new layout');
-    rows = update.rows.map(row => validateRow(row, cols, links, referenced, allowSlices, stamp.version));
+    rows = update.rows.map(row => validateRow(row, cols, links, referenced, allowSlices, stamp.version,binary));
   } else {
     if (snapshotOnly || update.kind !== 'delta' || !previous ||
         update.base_revision !== previous.revision || stamp.layout !== previous.layout || stamp.screen !== previous.screen ||
@@ -470,10 +501,11 @@ export function acceptChannelUpdate(previous, update, expected, snapshotOnly, wi
       const index = edit?.index;
       if (!Number.isInteger(index) || index < 0 || index >= rows.length || seen.has(index))
         throw new Error('invalid Channel row index');
-      rows[index] = validateRow(edit.row, cols, links, referenced, allowSlices, stamp.version);
+      rows[index] = validateRow(edit.row, cols, links, referenced, allowSlices, stamp.version,binary);
       seen.add(index);
     }
   }
+  if (binary && binary.offset !== binary.data.length) throw new Error('unused dense Channel cell bytes');
   if (links.size !== referenced.size) throw new Error('unreferenced Channel hyperlinks');
   if (rows.reduce((bytes, row) => bytes + row.textBytes, 0) > maxTextBytes) throw new Error('Channel text byte limit');
   const hyperlinks = Object.create(null);

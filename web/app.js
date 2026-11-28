@@ -1092,7 +1092,7 @@ async function startTransport(onFirstPoll){
       failLocalStream(stream,new Error('no local output heartbeat'));
   },1000);
   try{await invoke('subscribe_local_shell',{owner:stream.owner,stream:stream.channel,observer:stream.observers.targets[0],
-    frameVersion:stream.frameVersion,directFrames:true,binaryRasters:true});}
+    frameVersion:stream.frameVersion,directFrames:true,binaryRasters:true,binaryCells:true});}
   catch(error){failLocalStream(stream,error);}
   if(localStream===stream){
     stream.ready=true;renderSplit();
