@@ -28,6 +28,7 @@ const tabs=document.querySelector('#local-tabs'),tabList=document.querySelector(
 const newJshTab=document.querySelector('#new-jsh-tab');
 const splitToggle=document.querySelector('#split-local'),panes=document.querySelector('#terminal-panes'),peerPane=document.querySelector('#peer-pane'),peerCanvas=document.querySelector('#peer-canvas'),focusPeer=document.querySelector('#focus-peer-pane');
 const maximizePane=document.querySelector('#maximize-active-pane');
+const paneDivider=document.querySelector('#pane-divider');
 const splitBalanceControl=document.querySelector('#split-balance-control');
 const splitBalanceLabel=document.querySelector('#split-balance-label');
 const splitBalance=document.querySelector('#split-balance');
@@ -65,6 +66,7 @@ const showSavedSsh=document.querySelector('#show-saved-ssh'),savedSshPanel=docum
 const savedSshSelect=document.querySelector('#saved-ssh-shell'),resumeSavedSsh=document.querySelector('#resume-saved-ssh'),forgetSavedSsh=document.querySelector('#forget-saved-ssh');
 let savedSshShells=[],savedSshRequest=0;
 let localStream=null,localTransport='channel',localInputSuspended=false,localFrameRecovery=false;
+let dividerDrag=null;
 let maximizedPane=null;
 let splitEnabled=false,splitEpochs=[],splitLayout=1,layoutSerial=1,settingSplit=false,peerState=null;
 let tripleEpochs=[],passiveTargets=[null,null];
@@ -444,6 +446,8 @@ function renderSplit(){
   splitBalance.disabled=splitBalanceControl.hidden||splitToggle.disabled;
   splitStackControl.hidden=!!maximizedPane||!triple;
   splitStackBalance.disabled=splitStackControl.hidden||splitToggle.disabled;
+  paneDivider.hidden=!target||triple||!!maximizedPane||splitToggle.disabled;
+  if(dividerDrag&&!dividerCurrent(dividerDrag))finishDivider();
   if(target||triple)renderSplitBalance(triple);
   focusPeer.disabled=splitToggle.disabled;
   if(target)focusPeer.textContent=`Focus Shell ${target.epoch}`;
@@ -452,7 +456,7 @@ function renderSplit(){
   }
 }
 function renderSplitBalance(triple=false){
-  const share=triple?tripleShares.columns:splitShares[splitAxis];
+  const share=triple?tripleShares.columns:dividerDrag?.share??splitShares[splitAxis];
   const rows=!triple&&splitAxis==='vertical';
   splitBalanceLabel.textContent=rows?'Top pane height':'Left pane width';
   splitBalance.value=String(share);
@@ -461,6 +465,10 @@ function renderSplitBalance(triple=false){
     : `${share}% left, ${100-share}% right`);
   panes.style.setProperty('--first-pane-share',`${share}fr`);
   panes.style.setProperty('--second-pane-share',`${100-share}fr`);
+  paneDivider.dataset.axis=rows?'rows':'columns';
+  // The grid divides track space after subtracting the 6px gap. Center
+  // the handle in that gap, rather than overlaying either terminal.
+  panes.style.setProperty('--pane-divider-offset',`calc(${share}% + ${(3-share*0.06).toFixed(2)}px)`);
   if(triple){
     const top=tripleShares.rows;
     splitStackBalance.value=String(top);
@@ -469,11 +477,60 @@ function renderSplitBalance(triple=false){
     panes.style.setProperty('--bottom-stack-share',`${100-top}fr`);
   }
 }
+function dividerCurrent(drag){
+  return !paneDivider.hidden&&owner===drag.owner&&splitLayout===drag.layout&&splitAxis===drag.axis;
+}
+function finishDivider(event, commit=false){
+  const drag=dividerDrag;
+  if(!drag||event&&event.pointerId!==drag.pointerId)return;
+  if(commit&&dividerCurrent(drag)){
+    const share=dividerShare(event,drag);
+    if(share!==null&&share!==splitShares[drag.axis]){
+      splitShares[drag.axis]=share;
+      writePreference(splitShareKey(drag.axis),String(share));
+    }
+  }
+  dividerDrag=null;
+  delete paneDivider.dataset.dragging;
+  if(paneDivider.hasPointerCapture?.(drag.pointerId))paneDivider.releasePointerCapture(drag.pointerId);
+  if(!splitBalanceControl.hidden)renderSplitBalance(tripleIsVisible());
+}
+function dividerShare(event,drag){
+  const point=drag.axis==='vertical'?event.clientY:event.clientX;
+  return Number.isFinite(point)?Math.min(90,Math.max(10,
+    Math.round(drag.initial+(point-drag.origin)*100/drag.span))):null;
+}
+paneDivider.addEventListener('pointerdown',event=>{
+  if(dividerDrag||paneDivider.hidden||!event.isPrimary||event.button!==0)return;
+  const rows=splitAxis==='vertical', box=panes.getBoundingClientRect();
+  const span=(rows?box.height:box.width)-6, origin=rows?event.clientY:event.clientX;
+  if(!Number.isFinite(origin)||!Number.isFinite(span)||span<=0)return;
+  try{paneDivider.setPointerCapture(event.pointerId);}catch{return;}
+  event.preventDefault();
+  const initial=splitShares[splitAxis];
+  dividerDrag={owner,layout:splitLayout,axis:splitAxis,pointerId:event.pointerId,origin,span,initial,share:initial};
+  paneDivider.dataset.dragging='true';
+});
+paneDivider.addEventListener('pointermove',event=>{
+  if(!dividerDrag||event.pointerId!==dividerDrag.pointerId)return;
+  if(!dividerCurrent(dividerDrag)){finishDivider(event);return;}
+  const share=dividerShare(event,dividerDrag);
+  if(share!==null&&share!==dividerDrag.share){
+    dividerDrag.share=share;
+    renderSplitBalance();
+  }
+});
+paneDivider.addEventListener('pointerup',event=>finishDivider(event,true));
+paneDivider.addEventListener('pointercancel',event=>finishDivider(event));
+paneDivider.addEventListener('lostpointercapture',event=>finishDivider(event));
+globalThis.addEventListener?.('blur',()=>finishDivider());
+
 splitBalance.addEventListener('input',()=>{
   const triple=tripleIsVisible();
   if(splitBalance.disabled||(!triple&&!observerTarget()))return;
   const share=splitShareValue(splitBalance.value);
   if(share===null)return;
+  finishDivider();
   if(triple)tripleShares.columns=share;
   else splitShares[splitAxis]=share;
   renderSplitBalance(triple);

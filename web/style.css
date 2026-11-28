@@ -258,12 +258,28 @@ kbd {color: var(--muted); font: 11px monospace; white-space: nowrap;}
 #split-balance-control, #split-stack-control {display: inline-flex; align-items: center; gap: .4rem; color: var(--muted);}
 #split-balance, #split-stack-balance {width: 5rem; padding: 0; accent-color: var(--accent);}
 #terminal-panes {
+  position: relative;
   display: grid;
   grid-template: minmax(0, 1fr) / minmax(0, 1fr);
   flex: 1 1 auto;
   height: max(17rem, calc(100vh - 137px));
   gap: 6px;
 }
+/* Mouse/touch handle only; the labeled range remains the keyboard control. */
+#pane-divider {
+  position: absolute;
+  touch-action: none;
+  z-index: 1;
+}
+#pane-divider[data-axis="columns"] {
+  top: 0; bottom: 0; left: var(--pane-divider-offset);
+  width: 6px; transform: translateX(-50%); cursor: col-resize;
+}
+#pane-divider[data-axis="rows"] {
+  left: 0; right: 0; top: var(--pane-divider-offset);
+  height: 6px; transform: translateY(-50%); cursor: row-resize;
+}
+#pane-divider:hover, #pane-divider[data-dragging="true"] {background: var(--accent);}
 #terminal-panes[data-split="left"], #terminal-panes[data-split="right"] {
   grid-template-columns: minmax(0, var(--first-pane-share, 1fr)) minmax(0, var(--second-pane-share, 1fr));
 }

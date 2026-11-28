@@ -762,6 +762,31 @@ def exercise(driver, owned):
     wait_for(split_with_b_active, "two native panes did not show their separate canvases")
     balance = split_balance(driver, "#peer-pane", "#active-pane")
     assert balance["share"] == 50 and abs(balance["geometry"] - 50) < 1, balance
+    # Drag the actual divider without changing the writable shell or its
+    # draft. Keep the keyboard slider case below as a separate assertion.
+    driver.execute("document.body.scrollTop = 0;")
+    x, y, distance = driver.execute("""
+      const handle = document.querySelector('#pane-divider');
+      const r = handle.getBoundingClientRect();
+      const w = document.querySelector('#terminal-panes').getBoundingClientRect().width;
+      return [Math.round(r.left + r.width/2), Math.round(r.top + r.height/2), Math.round((w-6)*.12)];
+    """)
+    driver.command("POST", "/actions", {"actions": [{
+        "type": "pointer", "id": "pane-divider", "parameters": {"pointerType": "mouse"},
+        "actions": [
+            {"type": "pointerMove", "duration": 0, "x": x, "y": y},
+            {"type": "pointerDown", "button": 0},
+            {"type": "pointerMove", "duration": 160, "x": x + distance, "y": y},
+            {"type": "pointerUp", "button": 0},
+        ],
+    }]})
+    dragged = split_balance(driver, "#peer-pane", "#active-pane")
+    assert dragged["share"] == 62 and abs(dragged["geometry"] - 62) < 1, dragged
+    assert state()["current_tab"] == b_tab and state()["draft"] == draft_b and state()["writable"]
+    assert state()["peer_geometry"] == "80x24"
+    assert driver.execute("return localStorage.getItem('aether.split-share.columns.v1');") == "62"
+    print(json.dumps({"case": "AETHER.TWO_PANES.POINTER_DIVIDER", "left_share": dragged["share"],
+                      "draft_and_writer_retained": True}), flush=True)
     set_split_balance_with_keys(driver, "#peer-pane", "#active-pane", 62)
     assert state()["current_tab"] == b_tab and state()["writable"]
     assert state()["draft"] == draft_b and state()["peer_geometry"] == "80x24"
