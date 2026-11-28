@@ -38,3 +38,19 @@ test('geometry rejects duplicates, unbounded recursion and shares outside core b
   for(const share of [99,901,NaN,100.5]){tree.share=share;assert.equal(paneRectangles(tree),null);}
   tree.share=500;tree.first=tree;assert.equal(paneRectangles(tree),null);
 });
+
+test('at equal forward gaps greater shared edge wins before closer centers',()=>{
+  const row=(share,first,second)=>({arrangement:'rows',share,first,second});
+  const leaf=epoch=>({epoch});
+  const tree={arrangement:'columns',share:500,
+    first:row(250,leaf(1),row(500,leaf(2),leaf(3))),
+    second:row(500,leaf(4),row(200,leaf(5),leaf(6))),
+  };
+  const panes=paneRectangles(tree);
+  assert.equal(panes.get(2).height,.375);
+  assert.equal(panes.get(4).y,0);
+  assert.equal(panes.get(5).y,.5);
+  // 4 touches .25 of the anchor edge despite having a farther center;
+  // 5 touches only .10. Both have the same forward gap.
+  assert.equal(neighbor(tree,2,'right'),4);
+});

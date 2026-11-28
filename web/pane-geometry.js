@@ -59,9 +59,12 @@ export function directionalPaneNeighbor(tree, active, direction) {
     const tolerance = 1e-9;
     if (gap < -tolerance || overlap <= tolerance) continue;
     const offset = Math.abs(center(rect)-center(anchor));
+    // Like the shared layout core: nearest edge, greatest shared edge,
+    // then nearest perpendicular center. The fixed L retains its top tie.
     if (!selected || gap < selected.gap-tolerance ||
-        (Math.abs(gap-selected.gap)<=tolerance && offset < selected.offset-tolerance)) {
-      selected = {epoch,gap,offset};
+        (Math.abs(gap-selected.gap)<=tolerance && (overlap > selected.overlap+tolerance ||
+         (Math.abs(overlap-selected.overlap)<=tolerance && offset < selected.offset-tolerance)))) {
+      selected = {epoch,gap,overlap,offset};
     }
   }
   // Equal candidates retain first child order (top-right wins from the
