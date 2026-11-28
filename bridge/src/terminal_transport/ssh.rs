@@ -1,8 +1,10 @@
 //! One authenticated OpenSSH relay, with an absolute deadline per RPC.
 use super::{
     invalid, read_record, reply_forward::read_validated_reply, valid_identity, write_record,
-    Command, Reply, Request, HOST_CHANGED, MAX_REPLY, MAX_REQUEST, VERSION,
+    Command, Reply, Request, HOST_CHANGED, IDENTIFY_CAPABILITIES_REQUEST, MAX_REPLY, MAX_REQUEST,
+    VERSION,
 };
+use crate::SSH_DENSE_FRAME_VERSION;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use std::{
@@ -119,6 +121,7 @@ impl Endpoint {
             }),
             next_request: 1,
             host: None,
+            packed_snapshots: false,
         })
     }
 }
@@ -172,6 +175,7 @@ pub struct Relay {
     channel: BufReader<DeadlineStream>,
     next_request: u32,
     host: Option<String>,
+    packed_snapshots: bool,
 }
 
 impl Relay {
@@ -179,18 +183,36 @@ impl Relay {
     /// subsequent requests as stdio can reach a replacement Unix socket even
     /// on the same authenticated SSH connection.
     pub fn bind_host(&mut self, expected: Option<&str>) -> Result<String, String> {
-        let reply = self
-            .call(Command::Identify)
+        let reply: Value = self
+            .exchange_with_id(
+                IDENTIFY_CAPABILITIES_REQUEST,
+                Command::Identify,
+                MAX_REQUEST,
+                MAX_REPLY,
+                read_record,
+            )
             .map_err(|_| "SSH terminal owner identity is unavailable.")??;
         let identity = reply
             .as_str()
+            .or_else(|| reply.get("instance").and_then(Value::as_str))
             .filter(|identity| valid_identity(identity))
             .ok_or("Invalid SSH terminal owner identity.")?;
         if expected.is_some_and(|expected| expected != identity) {
             return Err(HOST_CHANGED.into());
         }
         self.host = Some(identity.to_owned());
+        let version = Some(u64::from(SSH_DENSE_FRAME_VERSION));
+        self.packed_snapshots = reply.get("packed_snapshot_version").and_then(Value::as_u64)
+            == version
+            && reply
+                .get("packed_snapshot_relay_version")
+                .and_then(Value::as_u64)
+                == version;
         Ok(identity.to_owned())
+    }
+
+    pub fn supports_packed_snapshots(&self) -> bool {
+        self.packed_snapshots
     }
 
     /// An I/O error ends the relay. The caller can recover the known session
@@ -227,6 +249,17 @@ impl Relay {
         self.next_request = request
             .checked_add(1)
             .ok_or_else(|| invalid("SSH terminal request IDs exhausted"))?;
+        self.exchange_with_id(request, command, request_limit, response_limit, read_reply)
+    }
+
+    fn exchange_with_id<C: Serialize, T>(
+        &mut self,
+        request: u32,
+        command: C,
+        request_limit: usize,
+        response_limit: usize,
+        read_reply: impl FnOnce(&mut BufReader<DeadlineStream>, usize) -> io::Result<Option<Reply<T>>>,
+    ) -> io::Result<Result<T, String>> {
         self.channel.get_mut().deadline = Instant::now() + REQUEST_TIMEOUT;
         write_record(
             self.channel.get_mut(),

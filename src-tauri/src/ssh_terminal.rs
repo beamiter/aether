@@ -12,11 +12,13 @@ use std::{
 };
 use tauri::Manager;
 use tauri_terminal_frame_bridge::{
-    protocol_v4::{MAX_ENCODED_FRAME_BYTES, MAX_ENCODED_IMAGE_BYTES, RENDITION_VERSION},
+    protocol_v4::{
+        Counter, Stamp, MAX_ENCODED_FRAME_BYTES, MAX_ENCODED_IMAGE_BYTES, RENDITION_VERSION,
+    },
     semantic::{Attachment, SessionSelector},
     terminal_transport::{
         ssh::{Endpoint, Relay},
-        valid_identity, Command, RawPollReply, HOST_CHANGED,
+        valid_identity, Command, RawPackedResume, RawPollReply, HOST_CHANGED,
     },
     SSH_DENSE_FRAME_VERSION,
 };
@@ -62,6 +64,29 @@ pub(crate) enum Response {
         poll: RawPollReply,
         frame_bytes: usize,
     },
+    Snapshot(SnapshotReply),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotReceipt {
+    Compatibility(u32),
+    Packed(Counter),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub(crate) enum SnapshotReply {
+    Compatibility(Value),
+    Packed {
+        #[serde(flatten)]
+        receipt: RawPackedResume,
+        frame_version: u8,
+        frame_bytes: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        keyboard_event_reporting: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        view: Option<Value>,
+    },
 }
 
 #[derive(Default)]
@@ -81,7 +106,7 @@ struct RemoteSession {
     read_only: bool,
     input_uncertain: bool,
     recovered_from: Option<Attachment>,
-    pending_snapshot: Option<u32>,
+    pending_snapshot: Option<SnapshotReceipt>,
     focus_reporting: bool,
     mouse_reporting: bool,
     keypad_reporting: bool,
@@ -163,6 +188,137 @@ fn validate_snapshot(
     Ok((next, revision))
 }
 
+impl SnapshotReply {
+    fn packed(receipt: RawPackedResume) -> Result<Self, String> {
+        let frame_bytes = receipt.frame.get().len();
+        if frame_bytes > MAX_ENCODED_FRAME_BYTES + MAX_ENCODED_IMAGE_BYTES {
+            return Err("SSH terminal frame exceeds its byte limit.".into());
+        }
+        Ok(Self::Packed {
+            receipt,
+            frame_version: SSH_DENSE_FRAME_VERSION,
+            frame_bytes,
+            keyboard_event_reporting: None,
+            view: None,
+        })
+    }
+
+    fn validate(
+        &self,
+        target: &SessionSelector,
+        previous_generation: u32,
+    ) -> Result<(Attachment, SnapshotReceipt), String> {
+        match self {
+            Self::Compatibility(result) => validate_snapshot(result, target, previous_generation)
+                .map(|(owner, revision)| (owner, SnapshotReceipt::Compatibility(revision))),
+            Self::Packed { receipt, .. } => {
+                #[derive(Deserialize)]
+                struct Header {
+                    kind: String,
+                    stamp: Stamp,
+                }
+                let invalid = "Invalid SSH terminal recovery snapshot.";
+                let header: Header =
+                    serde_json::from_str(receipt.frame.get()).map_err(|_| invalid)?;
+                let next = &receipt.owner;
+                if header.kind != "snapshot"
+                    || header.stamp.version != SSH_DENSE_FRAME_VERSION
+                    || header.stamp.session != target.session
+                    || header.stamp.epoch.get() != u64::from(target.epoch)
+                    || header.stamp.resource_generation != header.stamp.epoch
+                    || next.session != target.session
+                    || next.epoch != target.epoch
+                    || next.generation <= previous_generation
+                {
+                    return Err(invalid.into());
+                }
+                Ok((next.clone(), SnapshotReceipt::Packed(header.stamp.revision)))
+            }
+        }
+    }
+
+    fn frame_version(&self) -> Option<u8> {
+        match self {
+            Self::Compatibility(_) => None,
+            Self::Packed { frame_version, .. } => Some(*frame_version),
+        }
+    }
+
+    fn input_grant(&self, explicit: bool) -> Result<bool, String> {
+        match self {
+            Self::Compatibility(result) => input_grant(result, explicit),
+            Self::Packed { receipt, .. } => receipt
+                .input_allowed
+                .ok_or_else(|| "The SSH host did not explicitly grant input permission.".into()),
+        }
+    }
+
+    fn keyboard_events_enabled(&self) -> bool {
+        match self {
+            Self::Compatibility(result) => {
+                result.get("keyboard_events_enabled") == Some(&Value::Bool(true))
+            }
+            Self::Packed { receipt, .. } => receipt.keyboard_events_enabled == Some(true),
+        }
+    }
+
+    fn set_recovery_grant(&mut self, allowed: bool, keyboard: bool) -> Result<(), String> {
+        match self {
+            Self::Compatibility(value) => {
+                let receipt = value
+                    .as_object_mut()
+                    .ok_or("Invalid SSH terminal recovery result.")?;
+                receipt.insert("input_allowed".into(), Value::Bool(allowed));
+                receipt.insert("keyboard_event_reporting".into(), Value::Bool(keyboard));
+            }
+            Self::Packed {
+                receipt,
+                keyboard_event_reporting,
+                ..
+            } => {
+                receipt.input_allowed = Some(allowed);
+                *keyboard_event_reporting = Some(keyboard);
+            }
+        }
+        Ok(())
+    }
+
+    fn set_view(&mut self, view: reload::View) -> Result<(), String> {
+        let value = serde_json::to_value(view).map_err(|_| "Invalid retained layout.")?;
+        match self {
+            Self::Compatibility(result) => {
+                result
+                    .as_object_mut()
+                    .ok_or("Invalid SSH handoff snapshot.")?
+                    .insert("view".into(), value);
+            }
+            Self::Packed { view, .. } => *view = Some(value),
+        }
+        Ok(())
+    }
+}
+
+fn attach_command(target: &SessionSelector, packed: bool) -> Command {
+    let session = target.session.clone();
+    let epoch = target.epoch;
+    if packed {
+        Command::AttachReadOnlyPacked { session, epoch }
+    } else {
+        Command::AttachReadOnly { session, epoch }
+    }
+}
+
+fn read_snapshot(relay: &mut Relay, command: Command) -> io::Result<Result<SnapshotReply, String>> {
+    if matches!(
+        command,
+        Command::RecoverPacked { .. } | Command::AttachReadOnlyPacked { .. }
+    ) {
+        Ok(relay.call_frame(command)?.and_then(SnapshotReply::packed))
+    } else {
+        Ok(relay.call(command)?.map(SnapshotReply::Compatibility))
+    }
+}
+
 impl SshTerminal {
     fn dispatch(
         &mut self,
@@ -184,7 +340,7 @@ impl SshTerminal {
             }
         }
         if let Action::ClaimReload { ticket } = action {
-            return self.claim_reload(&ticket, window).map(Response::Json);
+            return self.claim_reload(&ticket, window).map(Response::Snapshot);
         }
         if matches!(action, Action::RecoverReloadLayout) {
             return self.recover_reload_layout(window).map(Response::Json);
@@ -257,7 +413,11 @@ impl SshTerminal {
                 Ok(result)
             }
             Action::ListSaved => store.ok_or(NO_STORE)?.list(),
-            Action::RestoreSaved { id } => self.restore_saved(&id, store.ok_or(NO_STORE)?),
+            Action::RestoreSaved { id } => {
+                return self
+                    .restore_saved(&id, store.ok_or(NO_STORE)?)
+                    .map(Response::Snapshot);
+            }
             Action::ForgetSaved { id } => {
                 store.ok_or(NO_STORE)?.forget(&id)?;
                 if let Some(session) = self.session.as_mut() {
@@ -275,13 +435,13 @@ impl SshTerminal {
                     return Err("Detach the current SSH view first.".into());
                 }
                 let previous = session.owner.clone();
-                let result = match session.exchange(
-                    Command::AttachReadOnly {
-                        session: previous.session.clone(),
-                        epoch: previous.epoch,
-                    },
-                    true,
-                ) {
+                let target = SessionSelector {
+                    session: previous.session.clone(),
+                    epoch: previous.epoch,
+                };
+                let result = match session
+                    .exchange_snapshot(|packed| attach_command(&target, packed))
+                {
                     Err(reason) if reason == SESSION_UNAVAILABLE => {
                         let warning = session.forget_saved(store).err();
                         self.session = None;
@@ -305,7 +465,7 @@ impl SshTerminal {
                 session.detached = false;
                 session.read_only = true;
                 session.recovered_from = None;
-                Ok(result)
+                return Ok(Response::Snapshot(result));
             }
             Action::Request { command } => {
                 let session = self
@@ -316,20 +476,29 @@ impl SshTerminal {
                     return Err("The SSH terminal view is detached.".into());
                 }
                 let owner = match &command {
-                    Command::Identify | Command::Open { .. } | Command::AttachReadOnly { .. } => {
+                    Command::Identify
+                    | Command::Open { .. }
+                    | Command::AttachReadOnly { .. }
+                    | Command::AttachReadOnlyPacked { .. } => {
                         return Err("Use the SSH terminal's open or attach action.".into());
                     }
                     Command::EnableKeyboardEvents { .. } => {
                         return Err("The SSH desktop negotiates keyboard reporting on open.".into());
                     }
                     Command::Recover { owner } => {
-                        return session.recover(owner.clone()).map(Response::Json)
+                        return session.recover(owner.clone()).map(Response::Snapshot);
+                    }
+                    Command::RecoverPacked { .. } => {
+                        return Err(
+                            "The SSH desktop negotiates the recovery snapshot format.".into()
+                        );
                     }
                     Command::Detach { owner }
                     | Command::Poll { owner }
                     | Command::PollWithStatus { owner, .. }
                     | Command::PollPacked { owner, .. }
                     | Command::Ack { owner, .. }
+                    | Command::AckPacked { owner, .. }
                     | Command::Status { owner }
                     | Command::History { owner, .. }
                     | Command::Write { owner, .. }
@@ -381,12 +550,10 @@ impl SshTerminal {
                         Ok(result)
                     }
                     Command::Ack { revision, .. } => {
-                        let result = session.exchange(command, false)?;
-                        if session.pending_snapshot == Some(revision) {
-                            session.pending_snapshot = None;
-                            session.recovered_from = None;
-                        }
-                        Ok(result)
+                        session.acknowledge(command, SnapshotReceipt::Compatibility(revision))
+                    }
+                    Command::AckPacked { revision, .. } => {
+                        session.acknowledge(command, SnapshotReceipt::Packed(revision))
                     }
                     Command::Poll { .. } => {
                         let frame = session
@@ -444,7 +611,7 @@ impl SshTerminal {
                 return Err(error);
             }
         };
-        if recovered.get("input_allowed") != Some(&Value::Bool(true)) {
+        if recovered.input_grant(true) != Ok(true) {
             session.read_only = true;
             return Err("The SSH host did not renew input permission.".into());
         }
@@ -460,7 +627,7 @@ impl SshTerminal {
         Ok(result)
     }
 
-    fn claim_reload(&mut self, ticket: &str, window: &str) -> Result<Value, String> {
+    fn claim_reload(&mut self, ticket: &str, window: &str) -> Result<SnapshotReply, String> {
         // Take before any network operation; failures and duplicate claims never
         // replay a writer grant. Saved-session restore remains a separate reader.
         let pending = self
@@ -486,14 +653,7 @@ impl SshTerminal {
         self.retained_reload = Some(pending.retained_layout());
         match session.recover_with_grant(pending.owner, true) {
             Ok(mut result) => {
-                result
-                    .as_object_mut()
-                    .ok_or("Invalid SSH handoff snapshot.")?
-                    .insert(
-                        "view".into(),
-                        serde_json::to_value(pending.view)
-                            .map_err(|_| "Invalid retained layout.")?,
-                    );
+                result.set_view(pending.view)?;
                 Ok(result)
             }
             Err(error) => {
@@ -533,7 +693,7 @@ impl SshTerminal {
         Ok(json!({"view": view}))
     }
 
-    fn restore_saved(&mut self, id: &str, store: &Store) -> Result<Value, String> {
+    fn restore_saved(&mut self, id: &str, store: &Store) -> Result<SnapshotReply, String> {
         if self
             .session
             .as_ref()
@@ -545,11 +705,8 @@ impl SshTerminal {
         let endpoint = endpoint(&saved.destination)?;
         let attempt = (|| {
             let mut relay = connect(&endpoint, Some(&saved.instance))?;
-            let result = relay
-                .call(Command::AttachReadOnly {
-                    session: saved.target.session.clone(),
-                    epoch: saved.target.epoch,
-                })
+            let command = attach_command(&saved.target, relay.supports_packed_snapshots());
+            let result = read_snapshot(&mut relay, command)
                 .map_err(|_| "SSH terminal reconnection did not respond. Try again.")??;
             Ok::<_, String>((relay, result))
         })();
@@ -565,10 +722,10 @@ impl SshTerminal {
                     Ok(()) => message.to_owned(),
                     Err(reason) => format!("{message} {reason}"),
                 };
-                return Ok(json!({
+                return Ok(SnapshotReply::Compatibility(json!({
                     "ended": true,
                     "message": message,
-                }));
+                })));
             }
             other => other?,
         };
@@ -577,7 +734,8 @@ impl SshTerminal {
             .as_ref()
             .filter(|current| current.saved_id.as_deref() == Some(id))
             .map_or(1, |current| current.owner.generation);
-        let (owner, revision) = validate_snapshot(&result, &saved.target, generation)?;
+        let (owner, revision) = result.validate(&saved.target, generation)?;
+        let packed_frame_version = result.frame_version();
         self.session = Some(RemoteSession {
             endpoint,
             instance: Some(saved.instance),
@@ -593,8 +751,8 @@ impl SshTerminal {
             mouse_reporting: false,
             keypad_reporting: false,
             keyboard_event_reporting: false,
-            poll_with_status: false,
-            packed_frame_version: None,
+            poll_with_status: packed_frame_version.is_some(),
+            packed_frame_version,
         });
         Ok(result)
     }
@@ -644,27 +802,28 @@ impl RemoteSession {
                 == Ok(Value::Bool(true));
     }
 
-    fn install_snapshot(&mut self, result: &Value, previous: &Attachment) -> Result<(), String> {
+    fn install_snapshot(
+        &mut self,
+        result: &SnapshotReply,
+        previous: &Attachment,
+    ) -> Result<(), String> {
         let target = SessionSelector {
             session: previous.session.clone(),
             epoch: previous.epoch,
         };
-        let (next, revision) = validate_snapshot(result, &target, previous.generation)?;
+        let (next, revision) = result.validate(&target, previous.generation)?;
         if next.generation < self.owner.generation {
             return Err("Invalid SSH terminal recovery snapshot.".into());
         }
         self.owner = next;
-        self.focus_reporting = false;
-        self.mouse_reporting = false;
-        self.keypad_reporting = false;
-        self.keyboard_event_reporting = false;
-        self.poll_with_status = false;
-        self.packed_frame_version = None;
+        self.clear_capabilities();
+        self.packed_frame_version = result.frame_version();
+        self.poll_with_status = self.packed_frame_version.is_some();
         self.pending_snapshot = Some(revision);
         Ok(())
     }
 
-    fn recover(&mut self, previous: Attachment) -> Result<Value, String> {
+    fn recover(&mut self, previous: Attachment) -> Result<SnapshotReply, String> {
         self.recover_with_grant(previous, false)
     }
 
@@ -672,33 +831,81 @@ impl RemoteSession {
         &mut self,
         previous: Attachment,
         explicit: bool,
-    ) -> Result<Value, String> {
+    ) -> Result<SnapshotReply, String> {
         if previous != self.owner && self.recovered_from.as_ref() != Some(&previous) {
             return Err("The SSH terminal attachment changed.".into());
         }
-        let mut result = self.exchange(
-            Command::Recover {
-                owner: previous.clone(),
-            },
-            true,
-        )?;
-        let host_allowed = input_grant(&result, explicit)?;
+        let mut result = self.exchange_snapshot(|packed| {
+            let owner = previous.clone();
+            if packed {
+                Command::RecoverPacked { owner }
+            } else {
+                Command::Recover { owner }
+            }
+        })?;
+        let host_allowed = result.input_grant(explicit)?;
         self.install_snapshot(&result, &previous)?;
         self.recovered_from = Some(previous);
         self.input_uncertain |= !host_allowed;
         let allowed = !self.read_only && !self.input_uncertain;
         self.keyboard_event_reporting = allowed
             && self.instance.as_deref().is_some_and(valid_identity)
-            && result.get("keyboard_events_enabled") == Some(&Value::Bool(true));
-        let receipt = result
-            .as_object_mut()
-            .ok_or("Invalid SSH terminal recovery result.")?;
-        receipt.insert("input_allowed".into(), Value::Bool(allowed));
-        receipt.insert(
-            "keyboard_event_reporting".into(),
-            Value::Bool(self.keyboard_event_reporting),
-        );
+            && result.keyboard_events_enabled();
+        result.set_recovery_grant(allowed, self.keyboard_event_reporting)?;
         Ok(result)
+    }
+
+    fn acknowledge(&mut self, command: Command, receipt: SnapshotReceipt) -> Result<Value, String> {
+        if self
+            .pending_snapshot
+            .is_some_and(|pending| pending != receipt)
+        {
+            return Err("SSH terminal snapshot acknowledgment does not match.".into());
+        }
+        if matches!(receipt, SnapshotReceipt::Packed(_))
+            && !self
+                .relay
+                .as_ref()
+                .is_some_and(Relay::supports_packed_snapshots)
+        {
+            return Err("SSH terminal packed snapshot acknowledgment is unavailable.".into());
+        }
+        let result = self.exchange(command, false)?;
+        if self.pending_snapshot == Some(receipt) {
+            self.pending_snapshot = None;
+            self.recovered_from = None;
+        }
+        Ok(result)
+    }
+
+    fn clear_capabilities(&mut self) {
+        self.focus_reporting = false;
+        self.mouse_reporting = false;
+        self.keypad_reporting = false;
+        self.keyboard_event_reporting = false;
+        self.poll_with_status = false;
+        self.packed_frame_version = None;
+    }
+
+    fn ensure_relay(&mut self) -> Result<(), String> {
+        if self.relay.is_none() {
+            self.clear_capabilities();
+            self.relay = Some(connect(&self.endpoint, self.instance.as_deref())?);
+        }
+        Ok(())
+    }
+
+    fn exchange_snapshot(
+        &mut self,
+        command: impl FnOnce(bool) -> Command,
+    ) -> Result<SnapshotReply, String> {
+        self.ensure_relay()?;
+        let packed = self
+            .relay
+            .as_ref()
+            .is_some_and(Relay::supports_packed_snapshots);
+        self.exchange_with(command(packed), false, read_snapshot)?
+            .ok_or_else(|| "Invalid SSH terminal recovery result.".into())
     }
 
     fn exchange(&mut self, command: Command, reconnect: bool) -> Result<Value, String> {
@@ -720,12 +927,7 @@ impl RemoteSession {
         call: impl FnOnce(&mut Relay, Command) -> io::Result<Result<T, String>>,
     ) -> Result<Option<T>, String> {
         if self.relay.is_none() {
-            self.focus_reporting = false;
-            self.mouse_reporting = false;
-            self.keypad_reporting = false;
-            self.keyboard_event_reporting = false;
-            self.poll_with_status = false;
-            self.packed_frame_version = None;
+            self.clear_capabilities();
         }
         // Optional input commands require capability from this bound host
         // and a current writer attachment.
@@ -766,11 +968,16 @@ impl RemoteSession {
             }
         }
 
-        if reconnect && self.relay.is_none() {
-            self.focus_reporting = false;
-            self.mouse_reporting = false;
-            self.keypad_reporting = false;
-            self.relay = Some(connect(&self.endpoint, self.instance.as_deref())?);
+        if reconnect {
+            self.ensure_relay()?;
+        }
+        let input =
+            is_input(&command) && !matches!(command, Command::Focus { .. } | Command::Mouse { .. });
+        if matches!(
+            command,
+            Command::Recover { .. } | Command::RecoverPacked { .. } | Command::Detach { .. }
+        ) {
+            self.clear_capabilities();
         }
         let relay = self
             .relay
@@ -778,17 +985,6 @@ impl RemoteSession {
             .ok_or("SSH terminal connection ended.")?;
         if !self.keypad_reporting && !strip_unavailable_keypad(&mut command) {
             return Ok(None);
-        }
-        let input =
-            is_input(&command) && !matches!(command, Command::Focus { .. } | Command::Mouse { .. });
-        let retiring = matches!(command, Command::Recover { .. } | Command::Detach { .. });
-        if retiring {
-            self.focus_reporting = false;
-            self.mouse_reporting = false;
-            self.keypad_reporting = false;
-            self.keyboard_event_reporting = false;
-            self.poll_with_status = false;
-            self.packed_frame_version = None;
         }
         match call(relay, command) {
             Ok(Ok(reply)) => Ok(Some(reply)),
@@ -800,12 +996,7 @@ impl RemoteSession {
             }
             Err(_) => {
                 self.relay = None;
-                self.focus_reporting = false;
-                self.mouse_reporting = false;
-                self.keypad_reporting = false;
-                self.keyboard_event_reporting = false;
-                self.poll_with_status = false;
-                self.packed_frame_version = None;
+                self.clear_capabilities();
                 self.input_uncertain |= input;
                 Err("SSH terminal connection ended.".into())
             }
@@ -925,6 +1116,59 @@ mod reload_tests {
             let reply = self.dispatch(action, store, window)?;
             serde_json::to_value(reply).map_err(|error| error.to_string())
         }
+    }
+
+    #[test]
+    fn packed_snapshot_validation_keeps_the_full_receipt_and_blocks_compatibility_ack() {
+        let mut terminal = terminal(Duration::ZERO);
+        let session = terminal.session.as_mut().unwrap();
+        let old = session.owner.clone();
+        let next = Attachment {
+            generation: old.generation + 1,
+            ..old.clone()
+        };
+        let revision = Counter::new(9_007_199_254_740_993).unwrap();
+        let snapshot = |kind| {
+            let frame = serde_json::value::to_raw_value(&json!({
+                "kind":kind,"stamp":{
+                    "version":SSH_DENSE_FRAME_VERSION,"session":&old.session,"epoch":old.epoch.to_string(),
+                    "revision":revision,"layout":"1","screen":"primary","resource_generation":old.epoch.to_string(),
+                    "cursor_row":0,"cursor_col":0,"cursor_visible":true,"cursor_shape":"block","pending_wrap":false
+                }
+            })).unwrap();
+            SnapshotReply::packed(RawPackedResume {
+                owner: next.clone(),
+                frame,
+                input_allowed: Some(true),
+                keyboard_events_enabled: None,
+            })
+            .unwrap()
+        };
+        assert!(session.install_snapshot(&snapshot("delta"), &old).is_err());
+        assert_eq!(session.owner, old);
+        session
+            .install_snapshot(&snapshot("snapshot"), &old)
+            .unwrap();
+        assert_eq!(
+            session.pending_snapshot,
+            Some(SnapshotReceipt::Packed(revision))
+        );
+        assert_eq!(session.packed_frame_version, Some(SSH_DENSE_FRAME_VERSION));
+        assert!(!session.input_allowed());
+        let bad_ack = Command::Ack {
+            owner: next,
+            revision: 1,
+        };
+        assert_eq!(
+            session
+                .acknowledge(bad_ack, SnapshotReceipt::Compatibility(1))
+                .unwrap_err(),
+            "SSH terminal snapshot acknowledgment does not match."
+        );
+        assert_eq!(
+            session.pending_snapshot,
+            Some(SnapshotReceipt::Packed(revision))
+        );
     }
 
     #[test]
@@ -1208,7 +1452,7 @@ mod reload_tests {
             .unwrap_err()
             .contains("focus reporting"));
         session.read_only = false;
-        session.pending_snapshot = Some(1);
+        session.pending_snapshot = Some(SnapshotReceipt::Compatibility(1));
         assert!(session
             .exchange(command(), false)
             .unwrap_err()

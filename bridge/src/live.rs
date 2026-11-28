@@ -505,6 +505,16 @@ impl LiveBridge {
         self.resume_with(expected, from_engine)
     }
 
+    pub(crate) fn resume_ssh_packed(
+        &mut self,
+        expected: Option<&Attachment>,
+    ) -> Result<Option<Resume<String>>, String> {
+        self.resume_with(expected, |frame, session, _| {
+            crate::semantic_v4::encode(None, frame, session, crate::SSH_DENSE_FRAME_VERSION)
+                .map(|(_, snapshot)| snapshot)
+        })
+    }
+
     pub fn resume_with<F>(
         &mut self,
         expected: Option<&Attachment>,

@@ -241,6 +241,18 @@ function sshPollFor(attachment,info){
   const frameVersion=version===CHANNEL_RENDITION_VERSION||version===SSH_DENSE_FRAME_VERSION?version:null;
   return {owner:attachment,ackRevision:null,frameVersion};
 }
+function acceptSshSnapshot(result,attachment){
+  if(result.frame_version===SSH_DENSE_FRAME_VERSION){
+    return acceptChannelUpdate(null,result.frame,{...attachment,frameVersion:SSH_DENSE_FRAME_VERSION},
+      true,result.frame_bytes);
+  }
+  return acceptFull(null,result.frame,attachment);
+}
+function sshPollAfterSnapshot(attachment,frame){
+  return frame.version===SSH_DENSE_FRAME_VERSION
+    ? {owner:attachment,ackRevision:null,frameVersion:frame.version}
+    : null;
+}
 function setOpenDisabled(disabled) {
   open.disabled=openIntegrated.disabled=openSsh.disabled=sshHost.disabled=disabled||!invoke;
   sshConnect.disabled=openSsh.disabled;
@@ -699,7 +711,7 @@ localSelection.addEventListener('change',updateLocalSelection);
 function invokeAttached(command,{epoch:target,...args},attachment=owner) {
   if(!attachment||attachment.epoch!==target) return Promise.reject(new Error('terminal session changed'));
   if(attachment.session===sshSession){
-    const kind=sshCommands[command];
+    const kind=command==='ack_shell'&&typeof args.revision==='string'?'ack_packed':sshCommands[command];
     if(!kind)return Promise.reject(new Error('Unknown SSH terminal command'));
     return invoke('ssh_terminal',{action:{operation:'request',command:{kind,owner:attachment,...args}}});
   }
@@ -1355,7 +1367,7 @@ async function reconnect(selected=null,saved=null){
     if(selected&&nextOwner.epoch!==selected)throw new Error('Selected local shell did not match the reconnect response.');
     if(expected&&(nextOwner.session!==expected.session||nextOwner.epoch!==expected.epoch||
         nextOwner.generation<=expected.generation))throw new Error('Retained local session did not match the reconnect response.');
-    const next=acceptAttachedSnapshot(result.frame,nextOwner,options);
+    const next=remote?acceptSshSnapshot(result,nextOwner):acceptAttachedSnapshot(result.frame,nextOwner,options);
     if(saved)sshSession=nextOwner.session;
     if(!remote){detachedLocal=null;restoreLocalDraft(nextOwner);rememberLocalTab(nextOwner);}
     const previousEpoch=epoch;owner=nextOwner;epoch=owner.epoch;updateSplitPair(previousEpoch);keyQueue={chain:Promise.resolve(),pending:0,locked:true};
@@ -1364,6 +1376,7 @@ async function reconnect(selected=null,saved=null){
     paintLiveFrame(next);state=next;describeCursor();
     await invokeAttached('ack_shell',{epoch:nextOwner.epoch,revision:next.revision},nextOwner);
     if(owner!==nextOwner)return;
+    if(remote)sshPoll=sshPollAfterSnapshot(nextOwner,next);
     status.textContent=saved?'Reconnected to the saved SSH shell on '+saved.destination+' in view-only mode.'
       :sshSession===null?'Reconnected to the existing shell in view-only mode.':'Reconnected to the SSH shell in view-only mode.';
     if(sshSession===null){
@@ -1772,7 +1785,7 @@ async function recoverOutput(previousStatus=null){
     const nextOwner=acceptOwner(result.owner);
     if(nextOwner.session!==attachment.session||nextOwner.epoch!==current||
         nextOwner.generation<=attachment.generation) throw new Error('foreign terminal recovery');
-    const next=acceptAttachedSnapshot(result.frame,nextOwner,options);
+    const next=isLocal?acceptAttachedSnapshot(result.frame,nextOwner,options):acceptSshSnapshot(result,nextOwner);
     if(keyQueue.pending||(!keyQueue.locked&&input.disabled&&!restoringLocalLayout)){
       pasteReview.reset();keyQueue.locked=true;input.disabled=send.disabled=true;
     }
@@ -1782,6 +1795,7 @@ async function recoverOutput(previousStatus=null){
     await invokeAttached('ack_shell',{epoch:current,revision:next.revision});
     if(epoch!==current||transport!==ticket)return;
     if(nextOwner.session===sshSession){
+      sshPoll=sshPollAfterSnapshot(nextOwner,next);
       sshKeyboardOwner=result.input_allowed===true&&result.keyboard_event_reporting===true?nextOwner:null;
       if(result.input_allowed!==true){pasteReview.reset();keyQueue.locked=true;input.disabled=send.disabled=resize.disabled=true;}
       else if(sshInputSuspended&&!keyQueue.pending){keyQueue.locked=false;input.disabled=send.disabled=resize.disabled=false;}
@@ -1834,7 +1848,7 @@ async function claimSshReload(){
     const view=validateReloadView(result?.view),nextOwner=acceptOwner(result?.owner);
     if(typeof result.input_allowed!=='boolean')throw new Error('Missing SSH host input grant.');
     grant=result.input_allowed;
-    const next=acceptFull(null,result.frame,nextOwner);
+    const next=acceptSshSnapshot(result,nextOwner);
     restoreSshReloadView(view);
     owner=nextOwner;epoch=nextOwner.epoch;sshSession=nextOwner.session;state=next;
     sshKeyboardOwner=grant&&result.keyboard_event_reporting===true?nextOwner:null;
@@ -1843,6 +1857,7 @@ async function claimSshReload(){
     paintLiveFrame(next);describeCursor();renderLocalTabs();
     await invokeAttached('ack_shell',{epoch:nextOwner.epoch,revision:next.revision},nextOwner);
     if(owner!==nextOwner)return;
+    sshPoll=sshPollAfterSnapshot(nextOwner,next);
     if(result.input_allowed){keyQueue.locked=false;input.disabled=send.disabled=resize.disabled=false;}
     status.textContent=result.input_allowed?'SSH output recovered in a fresh input view.':'SSH view recovered. Input remains disabled.';
     await startTransport();

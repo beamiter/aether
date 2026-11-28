@@ -10,7 +10,7 @@ use crate::{
     SSH_DENSE_FRAME_VERSION,
 };
 use jterm_engine::input::KeyboardLocks;
-use reply_forward::{forward_reply, forward_status_reply};
+use reply_forward::{forward_identify_reply, forward_reply, forward_status_reply};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{value::RawValue, Value};
 use session_table::SessionTable;
@@ -28,6 +28,9 @@ use std::{
 };
 
 pub const VERSION: u8 = 1;
+// Ordinary relay IDs require a successor, leaving this ID available for an
+// identity request that accepts capability metadata as well as the legacy ID.
+const IDENTIFY_CAPABILITIES_REQUEST: u32 = u32::MAX;
 pub const HOST_CHANGED: &str = "terminal host instance changed";
 const MAX_REQUEST: usize = 128 * 1024;
 const MAX_REPLY: usize = 16 * 1024 * 1024;
@@ -60,7 +63,14 @@ pub enum Command {
         session: String,
         epoch: u32,
     },
+    AttachReadOnlyPacked {
+        session: String,
+        epoch: u32,
+    },
     Recover {
+        owner: Attachment,
+    },
+    RecoverPacked {
         owner: Attachment,
     },
     Detach {
@@ -85,6 +95,10 @@ pub enum Command {
     Ack {
         owner: Attachment,
         revision: u32,
+    },
+    AckPacked {
+        owner: Attachment,
+        revision: Counter,
     },
     Status {
         owner: Attachment,
@@ -190,6 +204,18 @@ pub struct PollReply<U> {
 
 pub type RawPollReply = PollReply<Box<RawValue>>;
 
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PackedResume<F> {
+    pub owner: Attachment,
+    pub frame: F,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_allowed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyboard_events_enabled: Option<bool>,
+}
+
+pub type RawPackedResume = PackedResume<Box<RawValue>>;
+
 // Keep cell-heavy replies typed until they are written to the socket.
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
@@ -199,6 +225,8 @@ enum HostReply {
     PollWithStatus(PollReply<Option<Update>>),
     #[serde(skip_serializing)]
     PollPacked(PollReply<Option<String>>),
+    #[serde(skip_serializing)]
+    PackedResume(PackedResume<String>),
     Attached(Option<Resume>),
     Recovered {
         #[serde(flatten)]
@@ -364,6 +392,9 @@ impl Host {
                 | Command::KeyEvent { .. }
                 | Command::PollWithStatus { .. }
                 | Command::PollPacked { .. }
+                | Command::RecoverPacked { .. }
+                | Command::AttachReadOnlyPacked { .. }
+                | Command::AckPacked { .. }
         ) && request.host.as_ref() != Some(&self.identity))
             || request
                 .host
@@ -371,6 +402,13 @@ impl Host {
                 .is_some_and(|host| host != &self.identity)
         {
             Err(HOST_CHANGED.into())
+        } else if request.request == IDENTIFY_CAPABILITIES_REQUEST
+            && matches!(request.command, Command::Identify)
+        {
+            HostReply::json(serde_json::json!({
+                "instance": &self.identity,
+                "packed_snapshot_version": SSH_DENSE_FRAME_VERSION,
+            }))
         } else {
             let resize = matches!(request.command, Command::Resize { .. });
             let result = self.dispatch(request.command);
@@ -421,6 +459,22 @@ impl Host {
                 bridge.attachment(epoch)?;
                 (session, HostReply::Attached(bridge.resume(None)?))
             }
+            Command::AttachReadOnlyPacked { session, epoch } => {
+                let bridge = self.bridge(&session)?;
+                bridge.attachment(epoch)?;
+                let view = bridge
+                    .resume_ssh_packed(None)?
+                    .ok_or("terminal session unavailable")?;
+                (
+                    session,
+                    HostReply::PackedResume(PackedResume {
+                        owner: view.owner,
+                        frame: view.frame,
+                        input_allowed: None,
+                        keyboard_events_enabled: None,
+                    }),
+                )
+            }
             Command::Recover { owner } => {
                 let bridge = self.bridge(&owner.session)?;
                 let resume = bridge
@@ -434,6 +488,22 @@ impl Host {
                         input_allowed,
                         keyboard_events_enabled: bridge.remote_keyboard_events_enabled(),
                     },
+                )
+            }
+            Command::RecoverPacked { owner } => {
+                let bridge = self.bridge(&owner.session)?;
+                let view = bridge
+                    .resume_ssh_packed(Some(&owner))?
+                    .ok_or("terminal session unavailable")?;
+                let input_allowed = bridge.recovered_input_allowed(&view.owner);
+                (
+                    owner.session,
+                    HostReply::PackedResume(PackedResume {
+                        owner: view.owner,
+                        frame: view.frame,
+                        input_allowed: Some(input_allowed),
+                        keyboard_events_enabled: Some(bridge.remote_keyboard_events_enabled()),
+                    }),
                 )
             }
             Command::Detach { owner } => {
@@ -476,6 +546,11 @@ impl Host {
             Command::Ack { owner, revision } => self.attached(owner, false, |bridge, epoch| {
                 HostReply::json(bridge.acknowledge(epoch, revision)?)
             })?,
+            Command::AckPacked { owner, revision } => {
+                self.attached(owner, false, |bridge, epoch| {
+                    HostReply::json(bridge.acknowledge_publication(epoch, revision.get())?)
+                })?
+            }
             Command::Status { owner } => self.attached(owner, false, |bridge, epoch| {
                 terminal_status(bridge, epoch).map(HostReply::Json)
             })?,
@@ -625,24 +700,37 @@ fn write_owner_reply(
     reply: &Reply<HostReply>,
     limit: usize,
 ) -> io::Result<()> {
-    let Ok(HostReply::PollPacked(poll)) = &reply.result else {
-        return write_record(writer, reply, limit);
+    let (field, frame, metadata) = match &reply.result {
+        Ok(HostReply::PollPacked(poll)) => (
+            "update",
+            poll.update.as_deref().unwrap_or("null"),
+            serde_json::json!({ "status": &poll.status }),
+        ),
+        Ok(HostReply::PackedResume(resume)) => (
+            "frame",
+            resume.frame.as_str(),
+            serde_json::json!({
+                "owner": &resume.owner,
+                "input_allowed": resume.input_allowed,
+                "keyboard_events_enabled": resume.keyboard_events_enabled,
+            }),
+        ),
+        _ => return write_record(writer, reply, limit),
     };
     // The Channel encoder supplies bounded JSON. Write its bytes directly
-    // into the reply alongside the typed header and serialized status.
+    // into the reply. The final brace of the metadata object closes Ok.
     let header = format!(
-        r#"{{"protocol":{},"request":{},"result":{{"Ok":{{"update":"#,
+        r#"{{"protocol":{},"request":{},"result":{{"Ok":{{"{field}":"#,
         reply.protocol, reply.request,
     );
-    let frame = poll.update.as_deref().unwrap_or("null");
-    let status = serde_json::to_vec(&poll.status)
+    let metadata = serde_json::to_vec(&metadata)
         .map_err(|_| invalid("terminal transport serialization failed"))?;
     let parts = [
         header.as_bytes(),
         frame.as_bytes(),
-        br#","status":"#.as_slice(),
-        &status,
-        b"}}}\n",
+        b",".as_slice(),
+        &metadata[1..],
+        b"}}\n",
     ];
     if parts.iter().map(|part| part.len()).sum::<usize>() > limit {
         return Err(invalid("terminal transport record exceeds byte limit"));
@@ -858,10 +946,14 @@ pub fn stdio(socket: &Path, mut reader: impl BufRead, mut writer: impl Write) ->
         limit_socket(&peer)?;
         write_record(&mut peer, &request, MAX_REQUEST)?;
         let mut owner = BufReader::new(peer);
-        if matches!(request.command, Command::Status { .. }) {
-            forward_status_reply(&mut owner, &mut writer, request.request, MAX_REPLY)?;
-        } else {
-            forward_reply(&mut owner, &mut writer, request.request, MAX_REPLY)?;
+        match request.command {
+            Command::Status { .. } => {
+                forward_status_reply(&mut owner, &mut writer, request.request, MAX_REPLY)?;
+            }
+            Command::Identify if request.request == IDENTIFY_CAPABILITIES_REQUEST => {
+                forward_identify_reply(&mut owner, &mut writer, request.request, MAX_REPLY)?;
+            }
+            _ => forward_reply(&mut owner, &mut writer, request.request, MAX_REPLY)?,
         }
     }
     Ok(())
@@ -1265,6 +1357,113 @@ expect(b'.')
         assert!(host.bridge(&owner.session).unwrap().needs_write_retry());
         assert_eq!(host.next_deadline(), Some(host.retry_at.unwrap()));
         host.execute(Command::Close { owner }).unwrap();
+    }
+
+    #[test]
+    fn identity_capabilities_preserve_the_ordinary_identity_reply() {
+        let mut host = Host::new().unwrap();
+        let identify = |host: &mut Host, request| {
+            host.wire_reply(Request {
+                protocol: VERSION,
+                request,
+                host: None,
+                command: Command::Identify,
+            })
+            .result
+            .unwrap()
+        };
+        assert_eq!(identify(&mut host, 1), host.identity);
+        let reply = identify(&mut host, IDENTIFY_CAPABILITIES_REQUEST);
+        assert_eq!(reply["instance"], host.identity);
+        assert_eq!(reply["packed_snapshot_version"], SSH_DENSE_FRAME_VERSION);
+        assert!(reply.get("packed_snapshot_relay_version").is_none());
+    }
+
+    #[test]
+    fn packed_resume_retries_the_same_snapshot_and_rotates_the_input_lease() {
+        let mut host = Host::new().unwrap();
+        let opened = host.execute(Command::Open { rows: 8, cols: 80 }).unwrap();
+        let owner: Attachment = serde_json::from_value(opened).unwrap();
+        let call = |host: &mut Host, command| {
+            host.wire_reply(Request {
+                protocol: VERSION,
+                request: 1,
+                host: Some(host.identity.clone()),
+                command,
+            })
+            .result
+        };
+        let first = call(
+            &mut host,
+            Command::RecoverPacked {
+                owner: owner.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(first["frame"]["kind"], "snapshot");
+        assert_eq!(first["frame"]["stamp"]["version"], SSH_DENSE_FRAME_VERSION);
+        assert_eq!(first["input_allowed"], true);
+        let next: Attachment = serde_json::from_value(first["owner"].clone()).unwrap();
+        assert_eq!(next.generation, owner.generation + 1);
+        assert_eq!(
+            call(
+                &mut host,
+                Command::RecoverPacked {
+                    owner: owner.clone()
+                }
+            )
+            .unwrap(),
+            first
+        );
+        let revision: Counter =
+            serde_json::from_value(first["frame"]["stamp"]["revision"].clone()).unwrap();
+        assert!(call(&mut host, Command::AckPacked { owner, revision }).is_err());
+        assert!(call(
+            &mut host,
+            Command::AckPacked {
+                owner: next.clone(),
+                revision: Counter::new(u64::MAX).unwrap(),
+            }
+        )
+        .is_err());
+        assert_eq!(
+            call(
+                &mut host,
+                Command::AckPacked {
+                    owner: next.clone(),
+                    revision
+                }
+            )
+            .unwrap(),
+            Value::Null
+        );
+
+        let resumed = call(
+            &mut host,
+            Command::AttachReadOnlyPacked {
+                session: next.session.clone(),
+                epoch: next.epoch,
+            },
+        )
+        .unwrap();
+        let reader: Attachment = serde_json::from_value(resumed["owner"].clone()).unwrap();
+        assert_eq!(reader.generation, next.generation + 1);
+        assert_eq!(
+            resumed["frame"]["stamp"]["version"],
+            SSH_DENSE_FRAME_VERSION
+        );
+        assert_eq!(
+            call(
+                &mut host,
+                Command::Text {
+                    owner: reader.clone(),
+                    text: "x".into()
+                }
+            )
+            .unwrap_err(),
+            "reconnected terminal view is read-only"
+        );
+        host.execute(Command::Close { owner: reader }).unwrap();
     }
 
     #[test]

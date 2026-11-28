@@ -1073,6 +1073,45 @@ test(`SSH v${version} polling restarts with a snapshot after acknowledging recov
 });
 }
 
+function sshPackedSnapshot(owner,revision){
+ const stamp={version:SSH_DENSE_FRAME_VERSION,session:owner.session,epoch:String(owner.epoch),
+  revision,layout:'1',resource_generation:String(owner.epoch),screen:'primary',cursor_row:0,cursor_col:0,
+  cursor_visible:true,cursor_shape:'block',pending_wrap:false};
+ const row=packedRow({wrapped:false,cells:[{text:'X',width:1,style:0,foreground:'#ffffff',background:'#000000'}]});
+ const frame={kind:'snapshot',stamp,cols:1,rows:[row]};
+ return {owner,frame,frame_version:SSH_DENSE_FRAME_VERSION,frame_bytes:JSON.stringify(frame).length};
+}
+
+test('SSH continues from packed recovery and read-only snapshots after the exact acknowledgment',async()=>{
+ const first={session:'a'.repeat(32),epoch:1,generation:1},recovered={...first,generation:2};
+ const reader={...first,generation:4},revision='9007199254740993';
+ const requests=[];
+ const h=harness(async(_name,{action})=>{
+  if(action.operation==='open')return {owner:first};
+  if(action.operation==='attach')return sshPackedSnapshot(reader,revision);
+  const command=action.command;
+  requests.push([command.kind,command.owner.generation,command.revision,command.snapshot]);
+  switch(command.kind){
+   case 'recover':return {...sshPackedSnapshot(recovered,revision),input_allowed:true};
+   case 'poll':case 'ack_packed':case 'detach':return null;
+   case 'status':return channelHealth(1);
+   case 'poll_packed':return {update:null,status:{...channelHealth(1),
+    poll_with_status:true,packed_frame_version:SSH_DENSE_FRAME_VERSION}};
+   default:throw Error(command.kind);
+  }
+ });
+ h.el('#ssh-terminal-host').value='lab';await h.submitSsh();
+ await h.click('#recover');
+ assert.equal(h.el('#input').disabled,false);
+ await h.click('#detach');await h.click('#attach');
+ assert.equal(h.el('#input').disabled,true);
+ assert.deepEqual(requests,[
+  ['poll',1,undefined,undefined],['status',1,undefined,undefined],
+  ['recover',1,undefined,undefined],['ack_packed',2,revision,undefined],['poll_packed',2,undefined,false],
+  ['detach',2,undefined,undefined],['ack_packed',4,revision,undefined],['poll_packed',4,undefined,false],
+ ]);
+});
+
 test('SSH polling rejects a delta from the wrong base',async()=>{
  const owner={session:'a'.repeat(32),epoch:1,generation:1};
  const frame={...JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8')),
@@ -2418,21 +2457,31 @@ test('ordinary SSH link loss retains recovery and rejects an unowned late commit
  assert.equal(sent.length,1);assert.equal(sent[0][0].generation,2);assert.equal(sent[0][1],'世界');
 });
 
-test('composing SSH link loss uses one native reload ticket and fresh granted generation without launching',async()=>{
+for(const packed of [false,true]){
+test(`composing SSH link loss uses one native reload ticket for ${packed?'packed':'compatibility'} recovery`,async()=>{
  const old={session:'a'.repeat(32),epoch:1,generation:1},next={...old,generation:3};
  const frame={...JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8')),session:old.session,epoch:1};
+ const revision='9007199254740993';
+ const snapshot=packed?sshPackedSnapshot(next,revision):{owner:next,frame};
  const items=new Map(),sessionStorage={getItem:k=>items.get(k),setItem:(k,v)=>items.set(k,v),removeItem:k=>items.delete(k)};
  let lost=false,reloads=0,view,prepared=0,claimed=0;const sent=[];
  const reply=async(name,{action})=>{
   assert.equal(name,'ssh_terminal');
   if(action.operation==='open')return old;
   if(action.operation==='prepare_reload'){prepared++;assert.deepEqual(action.owner,old);view=action.view;return {ticket:'f'.repeat(32)};}
-  if(action.operation==='claim_reload'){claimed++;assert.equal(items.size,0);return {owner:next,frame,input_allowed:true,view};}
+  if(action.operation==='claim_reload'){claimed++;assert.equal(items.size,0);return {...snapshot,input_allowed:true,view};}
   const c=action.command;
   if(c.kind==='poll'){if(lost)throw Error('owned SSH link lost');return null;}
   if(c.kind==='status')return {epoch:1,exited:false,drained:false,write_error:null,unsupported:'0',dropped_reply_bytes:'0'};
   if(c.kind==='text'){sent.push([c.owner,c.text]);return null;}
-  if(c.kind==='ack')return null;
+  if(c.kind===(packed?'ack_packed':'ack')){
+   assert.equal(c.revision,packed?revision:frame.revision);
+   return null;
+  }
+  if(c.kind==='poll_packed'){
+   assert.equal(c.snapshot,false);
+   return {update:null,status:{...channelHealth(1),poll_with_status:true,packed_frame_version:SSH_DENSE_FRAME_VERSION}};
+  }
   throw Error('unexpected '+c.kind);
  };
  const h=harness(reply,undefined,TextEncoder,()=>{},{},undefined,{sessionStorage,location:{reload(){reloads++;}}});
@@ -2447,6 +2496,7 @@ test('composing SSH link loss uses one native reload ticket and fresh granted ge
  const field=restored.el('#ime-input');field.handlers.compositionstart();field.handlers.compositionend({data:'世界'});await tick();
  assert.equal(sent.length,1);assert.equal(sent[0][0].generation,3);assert.equal(sent[0][1],'世界');
 });
+}
 
 test('expired SSH claim recovers only retained local metadata, keeps input closed, and never launches',async()=>{
  const local={session:'b'.repeat(32),epoch:4,generation:2};

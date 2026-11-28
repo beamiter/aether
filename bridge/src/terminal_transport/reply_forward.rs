@@ -4,7 +4,7 @@ use serde::{
     de::{DeserializeOwned, MapAccess, SeqAccess, Visitor},
     Deserialize, Deserializer,
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::{
     fmt,
     io::{self, BufRead, Write},
@@ -29,9 +29,7 @@ pub(super) fn forward_status_reply(
     request: u32,
     limit: usize,
 ) -> io::Result<()> {
-    let mut reply: Reply = read_record(reader, limit)?.ok_or_else(owner_closed)?;
-    check_reply(&reply, request)?;
-    if let Ok(Value::Object(status)) = &mut reply.result {
+    forward_metadata_reply(reader, writer, request, limit, |status| {
         // A current owner and an older stdio helper can share the same socket.
         // Advertise the command through a relay that can also decode it.
         status.insert("packed_frame_relay".into(), Value::Bool(true));
@@ -39,6 +37,34 @@ pub(super) fn forward_status_reply(
             "packed_frame_relay_version".into(),
             SSH_DENSE_FRAME_VERSION.into(),
         );
+    })
+}
+
+pub(super) fn forward_identify_reply(
+    reader: &mut impl BufRead,
+    writer: &mut impl Write,
+    request: u32,
+    limit: usize,
+) -> io::Result<()> {
+    forward_metadata_reply(reader, writer, request, limit, |identity| {
+        identity.insert(
+            "packed_snapshot_relay_version".into(),
+            SSH_DENSE_FRAME_VERSION.into(),
+        );
+    })
+}
+
+fn forward_metadata_reply(
+    reader: &mut impl BufRead,
+    writer: &mut impl Write,
+    request: u32,
+    limit: usize,
+    annotate: impl FnOnce(&mut Map<String, Value>),
+) -> io::Result<()> {
+    let mut reply: Reply = read_record(reader, limit)?.ok_or_else(owner_closed)?;
+    check_reply(&reply, request)?;
+    if let Ok(Value::Object(metadata)) = &mut reply.result {
+        annotate(metadata);
     }
     write_record(writer, &reply, limit)
 }
@@ -127,6 +153,43 @@ mod tests {
     use super::*;
     use crate::terminal_transport::RawPollReply;
     use serde_json::Value;
+
+    #[test]
+    fn identify_capabilities_accept_legacy_ids_and_mark_current_relays() {
+        let identity = "a".repeat(32);
+        for result in [
+            Value::String(identity.clone()),
+            serde_json::json!({"instance":identity,"packed_snapshot_version":SSH_DENSE_FRAME_VERSION}),
+        ] {
+            let is_legacy = result.is_string();
+            let probe = super::super::IDENTIFY_CAPABILITIES_REQUEST;
+            let mut owner_reply = Vec::new();
+            write_record(
+                &mut owner_reply,
+                &Reply {
+                    protocol: VERSION,
+                    request: probe,
+                    result: Ok(result),
+                },
+                1024,
+            )
+            .unwrap();
+            let mut response = Vec::new();
+            forward_identify_reply(&mut owner_reply.as_slice(), &mut response, probe, 1024)
+                .unwrap();
+            let received: Reply = decode_record(&response).unwrap();
+            let value = received.result.unwrap();
+            if is_legacy {
+                assert_eq!(value, identity);
+            } else {
+                assert_eq!(value["instance"], identity);
+                assert_eq!(
+                    value["packed_snapshot_relay_version"],
+                    SSH_DENSE_FRAME_VERSION
+                );
+            }
+        }
+    }
 
     #[test]
     fn status_reply_advertises_the_stdio_helper_capability() {
