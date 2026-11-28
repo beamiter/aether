@@ -4,6 +4,8 @@ const GLYPHS = LAST_GLYPH - FIRST_GLYPH + 1, LEVELS = 8;
 const ATLAS_COLUMNS = 16, PROBES = 48;
 const MIN_DAMAGE = 1536, SAMPLE_CELLS = 256;
 const BAND_PIXELS = 256 * 1024;
+const MASK_PITCHES = 3;
+const redBlueLanes = 0xff00ff, greenLane = 0x00ff00;
 const littleEndian = new Uint8Array(Uint32Array.of(1).buffer)[0] === 1;
 
 export function canRasterizeInk(cell) {
@@ -31,6 +33,23 @@ function blend(foreground, background, alpha) {
   const g = ((foreground>>8&255)*a>>8) + ((background>>8&255)*b>>8);
   const blue = ((foreground&255)*a>>8) + ((background&255)*b>>8);
   return rgba(r,g,blue);
+}
+
+function nativeRgb(rgb) {
+  return littleEndian ? (rgb>>>16) | (rgb&greenLane) | ((rgb&255)<<16) : rgb;
+}
+
+function opaqueRgb(rgb) {
+  return littleEndian ? rgb | 0xff000000 : (rgb<<8) | 255;
+}
+
+function blendRgbLanes(fgRB, bgRB, fgGreen, bgGreen, alpha) {
+  const a=alpha+1, b=256-alpha;
+  // The gap between red and blue keeps their 16-bit products independent.
+  // Truncate source and destination separately, as in the calibration blend.
+  const rb=((Math.imul(fgRB,a)>>>8)&redBlueLanes)+((Math.imul(bgRB,b)>>>8)&redBlueLanes);
+  const green=((Math.imul(fgGreen,a)>>>8)&greenLane)+((Math.imul(bgGreen,b)>>>8)&greenLane);
+  return opaqueRgb(rb|green);
 }
 
 function wantsRaster(frame, damage) {
@@ -135,6 +154,31 @@ function readMasks(document, {language,font,scale}, cellWidth, cellHeight, textT
   return masks;
 }
 
+function masksForPitch(atlas, width) {
+  let packed = atlas.pitches.get(width);
+  if (packed) atlas.pitches.delete(width);
+  else {
+    packed = atlas.masks.map(points=>{
+      let opaque = 0;
+      for (let i=2; i<points.length; i+=3) if (points[i] === 255) opaque++;
+      const mask = new Uint32Array(points.length/3+1);
+      const firstPartial = opaque+1;
+      mask[0] = firstPartial;
+      // Opaque pixel offsets come first. The partial samples carry coverage
+      // in their low byte and the pixel offset in the remaining bits.
+      for (let i=0,solid=1,partial=firstPartial; i<points.length; i+=3) {
+        const offset = points[i]*width+points[i+1], alpha = points[i+2];
+        if (alpha === 255) mask[solid++] = offset;
+        else mask[partial++] = (offset<<8)|alpha;
+      }
+      return mask;
+    });
+    if (atlas.pitches.size === MASK_PITCHES) atlas.pitches.delete(atlas.pitches.keys().next().value);
+  }
+  atlas.pitches.set(width,packed);
+  return packed;
+}
+
 export function createTruecolorPainter(cellWidth, cellHeight, textTop) {
   const documents = new WeakMap();
   return (canvas, g, frame, damage, scale) => {
@@ -154,12 +198,12 @@ export function createTruecolorPainter(cellWidth, cellHeight, textTop) {
     const font = g.font;
     if (cache.atlas?.language !== language || cache.atlas.font !== font || cache.atlas.scale !== scale) {
       const attrs = {language,font,scale};
-      cache.atlas = {...attrs,masks:readMasks(document,attrs,cellWidth,cellHeight,textTop)};
+      cache.atlas = {...attrs,masks:readMasks(document,attrs,cellWidth,cellHeight,textTop),pitches:new Map()};
     }
-    const masks = cache.atlas.masks;
-    if (!masks) return false;
+    if (!cache.atlas.masks) return false;
 
     const cw = cellWidth*scale, ch = cellHeight*scale, width = frame.cols*cw;
+    const masks = masksForPitch(cache.atlas,width);
     const rowsPerBand = Math.max(1,Math.floor(BAND_PIXELS/(width*ch)));
     const height = Math.min(rowsPerBand,frame.rows.length)*ch;
     if (cache.band?.data.width !== width || cache.band.data.height !== height) {
@@ -184,11 +228,18 @@ export function createTruecolorPainter(cellWidth, cellHeight, textTop) {
         for (let x=first; x<last; x++) {
           const cell = row[x];
           if (!canRasterizeInk(cell) || cell.text === ' ') continue;
-          const foreground = rgbValue(cell.foreground), background = rgbValue(cell.background);
+          const foreground = rgbValue(cell.foreground);
           const points = masks[maskIndex(foreground,cell.text.charCodeAt(0))];
           const left = line+x*cw;
-          for (let p=0; p<points.length; p+=3) {
-            pixels[left+points[p]*width+points[p+1]] = blend(foreground,background,points[p+2]);
+          // Earlier glyphs stay in their own cells, so this pixel still
+          // holds the cell's opaque background in native byte order.
+          const fg = nativeRgb(foreground), bg = littleEndian ? pixels[left]&0xffffff : pixels[left]>>>8;
+          const fgRB=fg&redBlueLanes, bgRB=bg&redBlueLanes, fgGreen=fg&greenLane, bgGreen=bg&greenLane;
+          const color = opaqueRgb(fg), partial = points[0];
+          for (let p=1; p<partial; p++) pixels[left+points[p]] = color;
+          for (let p=partial; p<points.length; p++) {
+            const point = points[p];
+            pixels[left+(point>>>8)] = blendRgbLanes(fgRB,bgRB,fgGreen,bgGreen,point&255);
           }
         }
       }

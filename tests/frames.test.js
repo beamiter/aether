@@ -223,6 +223,50 @@ test('a failed truecolor pixel probe keeps drawing through Canvas2D without repe
  }
 });
 
+test('truecolor bands overwrite opaque backgrounds and blend partial glyph pixels exactly',()=>{
+ const {canvas,g}=observedCanvas();
+ const rects=[], ink=[];
+ const channels=color=>color.slice(1).match(/../g).map(part=>parseInt(part,16));
+ const blend=(fg,bg,alpha)=>Math.floor(fg*(alpha+1)/256)+Math.floor(bg*(256-alpha)/256);
+ const texture={
+  setTransform(){},save(){},beginPath(){},rect(){},clip(){},restore(){},
+  fillRect(x,y,w,h){rects.push([x,y,w,h,channels(this.fillStyle)]);},
+  fillText(_text,x,y){ink.push([x,y-2,channels(this.fillStyle)]);},
+  getImageData(_x,_y,width,height){
+   const data=new Uint8ClampedArray(width*height*4);
+   for(const [x,y,w,h,color] of rects) {
+    for(let dy=0;dy<h;dy++)for(let dx=0;dx<w;dx++)data.set([...color,255],((y+dy)*width+x+dx)*4);
+   }
+   for(const [x,y,color] of ink) for(const [dx,alpha] of [[0,255],[1,67]]) {
+    const at=(y*width+x+dx)*4;
+    if(data[at+3]) {
+     for(let i=0;i<3;i++)data[at+i]=blend(color[i],data[at+i],alpha);
+    } else data.set([...color,alpha],at);
+   }
+   return {data};
+  },
+ };
+ canvas.ownerDocument={createElement:()=>({getContext:()=>texture})};
+ Object.assign(g,{globalAlpha:1,globalCompositeOperation:'source-over',direction:'ltr',textAlign:'start'});
+ g.clearRect=()=>assert.fail('successful opaque raster writes already cover the damage');
+ g.createImageData=(width,height)=>({data:new Uint8ClampedArray(width*height*4),width,height});
+ let firstPixels;
+ g.putImageData=(image,x,y,left,top,width,height)=>{
+  if(y===0) {
+   assert.deepEqual([x,left,top,width],[0,0,0,canvas.width]);
+   assert.ok(height>=24);
+   firstPixels=[...image.data.subarray(0,12)];
+  }
+ };
+ const raw=smallPaintFrame({cols:80,rows:24,cursor_visible:false});
+ const rows=raw.rows.map((row,y)=>row.map((cell,x)=>({
+  ...cell,foreground:'#1f7bd3',background:'#'+(0x234567+y*raw.cols+x).toString(16),
+ })));
+ paint(canvas,acceptFull(null,{...raw,rows}),1);
+ const fg=[31,123,211], bg=[35,69,103];
+ assert.deepEqual(firstPixels,[...fg,255,...fg.map((value,i)=>blend(value,bg[i],67)),255,...bg,255]);
+});
+
 function paintCalls(frame,scale) {
  const backgrounds=[],glyphs=[],clears=[];
  let drawingText=false,transform=1;

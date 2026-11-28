@@ -359,17 +359,21 @@ export function paint(canvas, frame, deviceScale = globalThis.devicePixelRatio |
     g.drawImage(canvas,0,move.from*rowPixels,width,move.count*rowPixels,
       0,move.to*rowPixels,width,move.count*rowPixels);
   }
-  if (damage.length === frame.rows.length && damage.every(span => span.first === 0 && span.last === frame.cols)) {
-    g.clearRect(0, 0, width, height);
-  } else for (const {y,first,last} of damage) {
-    const left = first * cellPixels, right = last === frame.cols ? width : last * cellPixels;
-    g.clearRect(left, y * rowPixels, right - left, rowPixels);
-  }
-  g.setTransform(scale, 0, 0, scale, 0, 0);
   g.font = '18px monospace'; g.textBaseline = 'top';
   // Integer backing pixels allow a pixel-for-pixel copy of an opaque tile.
   const atlas = mergeBackgrounds ? buildGlyphAtlas(canvas,g,frame,damage,scale) : null;
   const rasterized = mergeBackgrounds && !atlas && paintTruecolor(canvas,g,frame,damage,scale);
+  // putImageData already overwrote each damaged pixel with an opaque
+  // background. Canvas fallback needs the clear in backing coordinates.
+  if (!rasterized) {
+    if (damage.length === frame.rows.length && damage.every(span => span.first === 0 && span.last === frame.cols)) {
+      g.clearRect(0, 0, width, height);
+    } else for (const {y,first,last} of damage) {
+      const left = first * cellPixels, right = last === frame.cols ? width : last * cellPixels;
+      g.clearRect(left, y * rowPixels, right - left, rowPixels);
+    }
+  }
+  g.setTransform(scale, 0, 0, scale, 0, 0);
   // A wide glyph can cover its trailing cell, so its background goes down first.
   if (!rasterized) paintBackgrounds(g,frame,damage,mergeBackgrounds);
   for (const {y,first,last} of damage) {
