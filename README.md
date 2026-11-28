@@ -58,8 +58,9 @@ and the split layout. **Split** shows two local shells side by side. The split
 shortcuts open a second shell of the same type when needed and can change the
 orientation of an existing pair. Use **Left pane width** or **Top pane height**
 to resize the two visible panes with the pointer or arrow keys. The balance
-stays on the same physical side when you switch panes; it resets when you
-restart Aether. Click the other pane to transfer keyboard
+stays on the same physical side when you switch panes. Width and height are
+remembered separately on this device, including after restarting Aether.
+Click the other pane to transfer keyboard
 input and sizing to that shell. **Single pane** keeps both shells running.
 Closing the last shell clears the saved layout.
 

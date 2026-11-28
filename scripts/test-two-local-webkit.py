@@ -490,6 +490,15 @@ def close_without_stale_presentation(driver, state, selected, peer, reap_label):
         optional_close_evidence(driver, CLOSE_EVIDENCE_STOP)
 
 
+def split_balance(driver, left, right):
+    return driver.execute("""
+        const range = document.querySelector('#split-balance');
+        const left = document.querySelector(arguments[0]).getBoundingClientRect().width;
+        const right = document.querySelector(arguments[1]).getBoundingClientRect().width;
+        return {share: Number(range.value), geometry: 100 * left / (left + right)};
+    """, [left, right])
+
+
 def exercise(driver, owned):
     def state():
         return driver.execute(READ)
@@ -728,22 +737,14 @@ def exercise(driver, owned):
         return s["split"] == "right" and s["peer_x"] < s["active_x"] and s["pixel"] == blue and s["peer_pixel"] == red
 
     wait_for(split_with_b_active, "two native panes did not show their separate canvases")
-    def split_balance(left, right):
-        return driver.execute("""
-            const range = document.querySelector('#split-balance');
-            const left = document.querySelector(arguments[0]).getBoundingClientRect().width;
-            const right = document.querySelector(arguments[1]).getBoundingClientRect().width;
-            return {share: Number(range.value), geometry: 100 * left / (left + right)};
-        """, [left, right])
-
-    balance = split_balance("#peer-pane", "#active-pane")
+    balance = split_balance(driver, "#peer-pane", "#active-pane")
     assert balance["share"] == 50 and abs(balance["geometry"] - 50) < 1, balance
     driver.click("#split-balance")
     assert driver.execute("return document.activeElement.id") == "split-balance"
     keys = []
     # The click may set a value. Move one step away first so the native
     # keyboard must perform the last adjustment even if the click hit 62.
-    current = split_balance("#peer-pane", "#active-pane")["share"]
+    current = split_balance(driver, "#peer-pane", "#active-pane")["share"]
     if current == 62:
         keys.append("\ue012")  # ArrowLeft
         current -= 1
@@ -753,7 +754,7 @@ def exercise(driver, owned):
     driver.command("POST", "/actions", {"actions": [{"type": "key", "id": "split-balance-keys", "actions": actions}]})
 
     def resized_split():
-        value = split_balance("#peer-pane", "#active-pane")
+        value = split_balance(driver, "#peer-pane", "#active-pane")
         return value if value["share"] == 62 and abs(value["geometry"] - 62) < 1 else None
 
     wait_for(resized_split, "native range keys did not resize both visible panes")
@@ -778,7 +779,7 @@ def exercise(driver, owned):
                 and s["split"] == "left" and s["active_x"] < s["peer_x"] and s["peer_geometry"] == "84x12")
 
     wait_for(split_with_a_active, "clicking the inactive pane did not transfer input and focus")
-    balance = split_balance("#active-pane", "#peer-pane")
+    balance = split_balance(driver, "#active-pane", "#peer-pane")
     assert balance["share"] == 62 and abs(balance["geometry"] - 62) < 1, balance
     print(json.dumps({"case": "AETHER.TWO_PANES.KEYBOARD_BALANCE", "left_share": balance["share"],
                       "held_when_writer_changed": True}), flush=True)
@@ -1622,6 +1623,8 @@ def exercise_restart(driver, owned, binary, integrated=False):
     assert restored["writable"] and restored["current_tab"] == first, "saved active position was lost"
     assert driver.execute("return !document.querySelector('#command').hidden;"), "the plain tab inherited Terminal Chat"
     wait_for(lambda: state()["split"] == "left" and state()["peer_geometry"] == "80x24", "saved split layout was lost")
+    balance = split_balance(driver, "#active-pane", "#peer-pane")
+    assert balance["share"] == 62 and abs(balance["geometry"] - 62) < 1, balance
     assert restored["draft"] == "" and not forbidden.exists(), "old command draft survived restart"
     first_after = write_from_current_tab(driver, owned / "after-restart-a.pid")
     wait_for(lambda: state()["writable"] and state()["draft"] == "", "first restored shell write is pending")
@@ -1645,6 +1648,7 @@ def exercise_restart(driver, owned, binary, integrated=False):
     assert not forbidden.exists()
     result = {"native_restart_restores_tab_count_and_active_position": True,
               "native_restart_restores_split_panes": True,
+              "native_restart_restores_measured_split_balance": balance["share"],
               "restore_starts_fresh_pty_identities_without_replay": True}
     if integrated:
         result["native_restart_restores_jsh_terminal_chat_and_workflows"] = True

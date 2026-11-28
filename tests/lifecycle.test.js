@@ -559,6 +559,9 @@ test('split observations paint the inactive shell and cannot claim live input',a
  const raw=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
  const frame=owner=>({...raw,session:owner.session,epoch:owner.epoch});
  const events=[],observers=[],painted=[],adopted=[],writes=[];
+ const prefs=new Map([['aether.split-share.columns.v1','58'],['aether.split-share.rows.v1','09'],
+  ['aether.local-shell-layout','keep an old roster byte for byte']]);
+ const localStorage={getItem:key=>prefs.get(key)??null,setItem:(key,value)=>prefs.set(key,value)};
  const h=harness(async(name,args)=>{
   switch(name){
    case 'open_shell':return a;
@@ -574,21 +577,26 @@ test('split observations paint the inactive shell and cannot claim live input',a
    case 'write_shell':writes.push(args.epoch);return args.bytes.length;
    default:throw Error('unexpected local IPC '+name);
   }
- },undefined,undefined,(canvas,frame)=>painted.push({canvas,epoch:frame.epoch}),{},testChannel());
+ },undefined,undefined,(canvas,frame)=>painted.push({canvas,epoch:frame.epoch}),{},testChannel(),{localStorage});
  await h.click('#open');await h.click('#new-local-tab');await h.click('#split-local');
  const layout=observers[0].layout;
  const panes=h.el('#terminal-panes'),balance=h.el('#split-balance');
  assert.equal(observers[0].epoch,1);assert.equal(panes.dataset.split,'right');
  assert.equal(h.el('#split-balance-control').hidden,false);
  assert.equal(balance.disabled,false);
+ assert.equal(balance.value,'58','a saved width applies when the pair first renders');
  balance.value='64';balance.handlers.input();
+ assert.equal(prefs.get('aether.split-share.columns.v1'),'58','drag preview does not write storage');
+ balance.handlers.change();
+ assert.equal(prefs.get('aether.split-share.columns.v1'),'64');
  assert.equal(panes.style['--first-pane-share'],'64fr');
  assert.equal(panes.style['--second-pane-share'],'36fr');
  assert.equal(balance.getAttribute('aria-valuetext'),'64% left, 36% right');
  assert.equal(observers.length,1,'resizing the display must not replace its observer');
  assert.deepEqual(writes,[],'changing balance must not send terminal input');
- balance.value='91';balance.handlers.input();
+ balance.value='91';balance.handlers.input();balance.handlers.change();
  assert.equal(panes.style['--first-pane-share'],'64fr');
+ assert.equal(prefs.get('aether.split-share.columns.v1'),'64','invalid input cannot replace saved width');
  await events[1]({owner:b,kind:'update',sequence:'1',frame:null,preview:{layout,frame:channelSnapshot(frame(a))},status:channelHealth(2)});
  assert.equal(painted.at(-1).canvas,h.el('#peer-canvas'));assert.equal(painted.at(-1).epoch,1);
  assert.deepEqual(adopted,[2]);
@@ -606,10 +614,13 @@ test('split observations paint the inactive shell and cannot claim live input',a
  h.keydown({key:'D',ctrlKey:true,shiftKey:true,target:{closest:()=>true},preventDefault(){}});
  await tick();
  assert.equal(panes.dataset.split,'top');
- assert.equal(balance.value,'50','the other axis starts balanced');
+ assert.equal(balance.value,'50','a corrupt saved height falls back to equal panes');
  assert.equal(h.el('#split-balance-label').textContent,'Top pane height');
- balance.value='10';balance.handlers.input();
+ balance.value='10';balance.handlers.input();balance.handlers.change();
  assert.equal(balance.getAttribute('aria-valuetext'),'10% top, 90% bottom');
+ assert.equal(prefs.get('aether.split-share.rows.v1'),'10');
+ assert.equal(prefs.get('aether.split-share.columns.v1'),'64');
+ assert.equal(prefs.get('aether.local-shell-layout'),'keep an old roster byte for byte');
  await h.click('#split-local');
  assert.equal(h.el('#split-balance-control').hidden,true);
  assert.equal(balance.disabled,true);

@@ -28,7 +28,7 @@ const splitToggle=document.querySelector('#split-local'),panes=document.querySel
 const splitBalanceControl=document.querySelector('#split-balance-control');
 const splitBalanceLabel=document.querySelector('#split-balance-label');
 const splitBalance=document.querySelector('#split-balance');
-const splitShares={horizontal:50,vertical:50};
+
 const tripleToggle=document.querySelector('#split-three-local'),activePane=document.querySelector('#active-pane');
 const passivePanes=[1,2].map(index=>({
   section:document.querySelector(`#preview-pane-${index}`),
@@ -84,6 +84,14 @@ function writePreference(key,value){
 // prove isolation and the saved recursive layout is ready.
 const threePanePreview=readPreference('aether.preview-three-panes')==='1';
 let splitAxis=readPreference('aether.split-axis')==='vertical'?'vertical':'horizontal';
+const splitShareKey=axis=>axis==='vertical'?'aether.split-share.rows.v1':'aether.split-share.columns.v1';
+// Keep numeric preferences out of the saved shell roster and preview layout.
+// Older builds can ignore these keys without losing their saved PTY layout.
+const splitShareValue=value=>/^(?:[1-8][0-9]|90)$/.test(value??'')?Number(value):null;
+const splitShares={
+  horizontal:splitShareValue(readPreference(splitShareKey('horizontal')))??50,
+  vertical:splitShareValue(readPreference(splitShareKey('vertical')))??50,
+};
 const selectionOverlay = document.querySelector('#terminal-selection');
 const copySelection = document.querySelector('#copy-selection');
 const liveSelection = selectionOverlay && typeof canvas.setPointerCapture === 'function'
@@ -372,11 +380,17 @@ function renderSplitBalance(){
 }
 splitBalance.addEventListener('input',()=>{
   if(splitBalance.disabled||!observerTarget())return;
-  const share=Number(splitBalance.value);
-  if(!Number.isInteger(share)||share<10||share>90)return;
+  const share=splitShareValue(splitBalance.value);
+  if(share===null)return;
   splitShares[splitAxis]=share;
   renderSplitBalance();
   // The existing viewport observer fits only the current writable PTY.
+});
+splitBalance.addEventListener('change',()=>{
+  // A drag may generate many input events. Persist only the committed value.
+  if(splitBalance.disabled||!observerTarget())return;
+  const share=splitShareValue(splitBalance.value);
+  if(share!==null&&share===splitShares[splitAxis])writePreference(splitShareKey(splitAxis),String(share));
 });
 let localTabButtons=[];
 function renderLocalTabs(focusActive=false) {
