@@ -1,3 +1,4 @@
+import {paneInputIntent} from '../web/pane-input-intent.js';
 import {installTerminalKeys,modifierKey} from '../web/terminal-keys.js';
 import {directionalPaneNeighbor,retainedPaneTree} from '../web/pane-geometry.js';
 import {makePassiveSurfaces} from '../web/passive-surfaces.js';
@@ -59,7 +60,7 @@ function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsuppo
  const listen=events=>(name,fn)=>events.set(name,[...(events.get(name)??[]),fn]);
  const fire=(events,name)=>{for(const fn of events.get(name)??[])fn({target:document.activeElement});};
  const document={querySelector:el,querySelectorAll:()=>[],createElement:element,body:element(),activeElement:null,hidden:false,hasFocus:()=>true,addEventListener:listen(pageEvents)};
- const context={directionalPaneNeighbor,retainedPaneTree,makePassiveSurfaces,validateReloadView,retainedReloadView,saveReloadTicket,takeReloadTicket,installFilePreviewPanel:()=>({dismiss(){}}),document,addEventListener:listen(windowEvents),__TAURI__:{core:{invoke,Channel}},acceptFull,acceptUpdate,backingGeometry,clearPaint,acceptChannelFrame,acceptChannelUpdate,channelCounter,CHANNEL_RENDITION_VERSION,SSH_DENSE_FRAME_VERSION,installIme,installTerminalKeys,modifierKey,installHistory,installCommandBlocks,installTerminalChat,installTerminalShell,installWorkflows,validateChatStatus,installPasteReview,installTerminalFocus,installTerminalMouse,installTerminalSelection,dimensions,resizeQueue,cursorTarget,terminalCellAt,viewportDimensions,windowPixelQueue,paint,TextEncoder:Encoder,TextDecoder,
+ const context={paneInputIntent,directionalPaneNeighbor,retainedPaneTree,makePassiveSurfaces,validateReloadView,retainedReloadView,saveReloadTicket,takeReloadTicket,installFilePreviewPanel:()=>({dismiss(){}}),document,addEventListener:listen(windowEvents),__TAURI__:{core:{invoke,Channel}},acceptFull,acceptUpdate,backingGeometry,clearPaint,acceptChannelFrame,acceptChannelUpdate,channelCounter,CHANNEL_RENDITION_VERSION,SSH_DENSE_FRAME_VERSION,installIme,installTerminalKeys,modifierKey,installHistory,installCommandBlocks,installTerminalChat,installTerminalShell,installWorkflows,validateChatStatus,installPasteReview,installTerminalFocus,installTerminalMouse,installTerminalSelection,dimensions,resizeQueue,cursorTarget,terminalCellAt,viewportDimensions,windowPixelQueue,paint,TextEncoder:Encoder,TextDecoder,
  installInlineHistory,
  plainLocalTab,MAX_LOCAL_SHELLS,validLocalGeometry,localSplitPair,readLocalShellLayout:()=>readLocalShellLayout(storage),saveLocalShellLayout:value=>saveLocalShellLayout(value,storage),readThreePaneLayout:()=>readThreePaneLayout(storage),saveThreePaneLayout:value=>saveThreePaneLayout(value,storage),
  setInterval(fn){timers.set(++id,fn);return id},clearInterval(i){timers.delete(i)},setTimeout,...animation};
@@ -1273,6 +1274,49 @@ test('detach and reconnect restores the same shell only as a view',async()=>{
  assert.ok(seen.includes('detach_shell')&&seen.includes('ack_shell'));
  assert.ok(!seen.includes('key_event_shell')&&!seen.includes('close_shell'));
 });
+
+for (const cancel of [null,'new input','focus change','input failure']) {
+ test(`first split waits for Enter receipt${cancel?` and cancels on ${cancel}`:''}`,async()=>{
+  const enter=deferred(), log=[];
+  const first={session:'a'.repeat(32),epoch:1,generation:1};
+  const next={session:'b'.repeat(32),epoch:2,generation:2};
+  const raw=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
+  const h=harness(async(name,args)=>{
+   if(name==='open_shell')return first;
+   if(name==='key_event_shell'){
+    log.push([args.event.name,args.event.phase,args.epoch]);
+    return args.event.name==='Enter'&&args.event.phase==='press'?enter.promise:false;
+   }
+   if(name==='activate_local_tab'){
+    log.push(['activate',args.owner.epoch,args.targetEpoch]);
+    return {Ok:{owner:next,input_allowed:true,frame:{...raw,session:next.session,epoch:2}}};
+   }
+   return null;
+  });
+  h.el('#paste-review').hidden=true;
+  await h.click('#open');
+  h.focus('#ime-input');
+  const ime=h.el('#ime-input');
+  const terminalKey=(key,code)=>({key,code,currentTarget:ime,preventDefault(){}});
+  ime.handlers.keydown(terminalKey('Enter','Enter'));
+  ime.handlers.keyup(terminalKey('Enter','Enter'));
+  const chord={key:'D',code:'KeyD',ctrlKey:true,shiftKey:true,target:{closest:()=>true},
+   preventDefault(){this.defaultPrevented=true;}};
+  h.keydown(chord);
+  assert.equal(chord.defaultPrevented,true);
+  await tick();
+  assert.deepEqual(log,[['Enter','press',1]]);
+  if(cancel==='new input')ime.handlers.keydown(terminalKey('ArrowUp','ArrowUp'));
+  if(cancel==='focus change')h.focus('#history-find-query');
+  if(cancel==='input failure')enter.reject(Error('no receipt'));
+  else enter.resolve(true);
+  await tick();await tick();
+  assert.deepEqual(log,cancel==='input failure'?[['Enter','press',1]]:
+   [['Enter','press',1],['Enter','release',1],...(cancel==='new input'?[['ArrowUp','press',1]]:
+     cancel===null?[['activate',1,null]]:[])]);
+  assert.equal(h.el('#terminal-panes').dataset.split,cancel?'':'bottom');
+ });
+}
 
 test('logical key events are serialized and never ANSI encoded in JS',async()=>{
  const seen=[];const h=harness(async(name,args)=>{if(name==='open_shell')return 1;if(name==='key_event_shell')seen.push(args);return null;});await h.click('#open');

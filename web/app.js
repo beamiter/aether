@@ -1,4 +1,5 @@
 import { installTerminalKeys, modifierKey } from './terminal-keys.js';
+import {paneInputIntent} from './pane-input-intent.js';
 import {directionalPaneNeighbor,retainedPaneTree} from './pane-geometry.js';
 import {makePassiveSurfaces} from './passive-surfaces.js';
 import {installTerminalMouse} from './terminal-mouse.js';
@@ -192,10 +193,10 @@ terminalChatSend.addEventListener('mousedown',event=>event.preventDefault());
 document.addEventListener?.('keydown',event=>{
   if(event.key==='Tab'&&!event.isComposing&&event.keyCode!==229&&ime.isComposing())ime.reset();
 },true);
-globalThis.addEventListener?.('blur',()=>{ime.reset();terminalKeys.reset();});
+globalThis.addEventListener?.('blur',()=>{ime.reset();terminalKeys.reset();splitIntent.cancel();});
 imeInput.addEventListener('blur',terminalKeys.reset);
 canvas.addEventListener('blur',terminalKeys.reset);
-document.addEventListener?.('visibilitychange',()=>{if(document.hidden)terminalKeys.reset();});
+document.addEventListener?.('visibilitychange',()=>{if(document.hidden){terminalKeys.reset();splitIntent.cancel();}});
 canvas.addEventListener('click',event=>{if(!event.defaultPrevented&&!event.ctrlKey)imeInput.focus();});
 const resize=document.querySelector('#resize');
 const invoke=globalThis.__TAURI__?.core?.invoke;
@@ -563,11 +564,26 @@ passivePanes.forEach(({focus,canvas:surface},index)=>{
   focus.addEventListener('click',select);
   surface.addEventListener('click',select);
 });
+const splitIntent=paneInputIntent();
 async function setSplit(axis){
+  splitIntent.cancel();
   if(splitToggle.disabled)return;
   if(axis&&localTabEpochs.size<2){
     const configuration=localShellKinds.get(owner.session)==='jsh'?jshLocalTab:plainLocalTab;
-    return startLocalTab(null,{configuration,focusTerminal:true,splitOnActivate:axis});
+    const start=()=>startLocalTab(null,{configuration,focusTerminal:true,splitOnActivate:axis});
+    const queue=keyQueue, attachment=owner, focus=document.activeElement, layout=splitLayout;
+    // Ctrl+Shift+D can arrive while Enter (or its release) still has a PTY
+    // receipt outstanding. Respect the existing no-switch-before-ACK gate.
+    if(queue.pending>0&&!queue.locked&&!input.disabled){
+      splitIntent.defer(queue,
+        ()=>ownsInput(attachment,queue)&&!queue.locked&&!input.disabled&&!splitToggle.disabled&&
+          !document.hidden&&!terminalPanel.hidden&&pasteReviewPanel.hidden&&!commandPalette.isOpen()&&
+          !ime.isComposing()&&document.activeElement===focus&&splitLayout===layout&&localTabEpochs.size===1,
+        ()=>void start(),
+        ()=>{status.textContent='Input is still finishing. Try splitting again.';});
+      return;
+    }
+    return start();
   }
   if(axis&&splitEnabled&&splitAxis===axis&&!tripleIsVisible())return;
   tripleEpochs=[];
@@ -1045,6 +1061,7 @@ function startLocalTab(targetEpoch,{fromRestore=false,focusTerminal=false,config
     return;
   }
   const preserveInput=owner!==null&&!keyQueue.locked&&(fromRestore||!input.disabled);
+  splitIntent.cancel();
   changingTab={source:owner,targetEpoch,preserveInput,resizeDisabled:resize.disabled,hadChannel:localStream!==null||localTransport==='recovery',focusTerminal,configuration,
     previousFrame:state,busy:false,view:null,splitOnActivate};
   if(owner)rememberLocalDraft(owner);
@@ -1460,6 +1477,7 @@ document.querySelector('#command').addEventListener('submit',async event=>{
   // jsh's interactive line editor consumes the physical Enter byte.
   const enter=localShellKinds.get(owner?.session)==='jsh'?'\r':'\n';
   const bytes=new TextEncoder().encode(input.value+enter);if(bytes.length>4096){status.textContent='Input exceeds 4096-byte bound';return;}
+  splitIntent.cancel();
   send.disabled=true;input.disabled=true;const current=epoch,attachment=owner,queue=keyQueue;let at=0;let failed=false;
   try{await queue.chain;if(!ownsInput(attachment,queue))return;if(queue.locked)throw new Error('input unavailable');for(let attempts=0;at<bytes.length&&attempts<128;attempts++){
     if(!ownsInput(attachment,queue))return;
@@ -1635,6 +1653,7 @@ function enqueueLogical(command,payload,onReceipt,permit){
   const mouse=command==='mouse_shell';
   const advisoryKey=command==='key_event_shell' &&
     (payload.event.phase==='release'||modifierKey(payload.event.name));
+  if(!advisoryKey)splitIntent.cancel();
   if(!mouse&&!advisoryKey)inlineHistory.reset();
   if (mouse && (!canReportMouse(owner) || queue.pending >= (payload.report.kind === 'release' ? 128 : 126))) return;
   if(queue.pending>=128){pasteReview.reset();queue.locked=true;status.textContent='Keyboard queue full; input locked. Close/reopen before retrying.';input.disabled=send.disabled=true;return;}
@@ -1650,6 +1669,7 @@ function enqueueLogical(command,payload,onReceipt,permit){
   }).finally(()=>{
     queue.pending--;
     if(queue.pending===0&&ownsInput(attachment,queue))commandPalette.refreshAvailability();
+    splitIntent.settle(queue);
     if (queue.pending === 125) terminalFocus.refresh();
   });
   return queue.chain;
