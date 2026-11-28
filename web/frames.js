@@ -82,6 +82,8 @@ export function acceptUpdate(previous, update, expected = {session:'frame-demo',
 }
 const painted = new WeakMap();
 const rasterCanvas = createRasterCanvasCache(32 * 1024 * 1024);
+const MIN_CELL_DAMAGE_GAP = 4;
+const CELL_DECORATIONS = 4 | 8 | CELL_OVERLINE;
 
 function paintImages(canvas, g, frame, damage, cw, ch) {
   for (const {y} of damage) for (const {id,column,slice} of frame.rows[y].imageSlices ?? []) {
@@ -136,31 +138,32 @@ function cursorWidth(frame) {
   return frame.rows[frame.cursor_row][frame.cursor_col].width === 2 ? 2 : 1;
 }
 
-function cellDamage(previous, frame, y, oldCursorRow, newCursorRow) {
+function appendCellDamage(damage, previous, frame, y, oldCursorRow, newCursorRow) {
   const before = previous.rows[y], after = frame.rows[y], cols = frame.cols;
-  let first = cols, last = 0;
-  if (before !== after) {
-    first = 0;
-    while (first < cols && sameCellPaint(before[first], after[first])) first++;
-    if (first < cols) {
-      last = cols;
-      while (last > first && sameCellPaint(before[last-1], after[last-1])) last--;
+  const oldCol = y === oldCursorRow ? previous.cursor_col : -1;
+  const newCol = y === newCursorRow ? frame.cursor_col : -1;
+  const start = before !== after ? 0 : Math.min(oldCol < 0 ? cols : oldCol, newCol < 0 ? cols : newCol);
+  const end = before !== after ? cols : Math.max(oldCol, newCol) + 1;
+  let first = -1, last = 0;
+  for (let x = start; x < end;) {
+    if (x !== oldCol && x !== newCol && sameCellPaint(before[x], after[x])) {
+      x++;
+      continue;
     }
+    // A boundary that bisects an old or new wide glyph cannot separate paints.
+    let left = x, right = x + 1;
+    while (left > last && (before[left].width === 0 || after[left].width === 0)) left--;
+    while (right < cols && (before[right].width === 0 || after[right].width === 0)) right++;
+    // Amortize the extra Canvas operations over a sufficiently large unchanged gap.
+    if (first === -1) first = left;
+    else if (left - last >= MIN_CELL_DAMAGE_GAP) {
+      damage.push({y, first, last});
+      first = left;
+    }
+    last = right;
+    x = right;
   }
-  if (y === oldCursorRow) {
-    first = Math.min(first, previous.cursor_col);
-    last = Math.max(last, previous.cursor_col + cursorWidth(previous));
-  }
-  if (y === newCursorRow) {
-    first = Math.min(first, frame.cursor_col);
-    last = Math.max(last, frame.cursor_col + cursorWidth(frame));
-  }
-  if (first >= last) return;
-  // A continuation can have its own background. Restore the complete
-  // clipped glyph if either frame has a wide cell crossing a damage edge.
-  while (first > 0 && (before[first].width === 0 || after[first].width === 0)) first--;
-  while (last < cols && (before[last].width === 0 || after[last].width === 0)) last++;
-  return {y, first, last};
+  if (first !== -1) damage.push({y, first, last});
 }
 
 export function backingGeometry(rows, cols, scale = globalThis.devicePixelRatio || 1) {
@@ -221,8 +224,7 @@ export function paint(canvas, frame, deviceScale = globalThis.devicePixelRatio |
     } else if (!changed) continue;
     if (canPaintCells && !inMove && before.length === frame.cols && after.length === frame.cols &&
         !before.imageSlices?.length && !after.imageSlices?.length) {
-      const span = cellDamage(previous, frame, y, oldCursorRow, newCursorRow);
-      if (span) damage.push(span);
+      appendCellDamage(damage, previous, frame, y, oldCursorRow, newCursorRow);
     } else {
       damage.push({y, first: 0, last: frame.cols});
     }
@@ -279,11 +281,16 @@ export function paint(canvas, frame, deviceScale = globalThis.devicePixelRatio |
     for (let x = first, limit = Math.min(last, row.length); x < limit; x++) {
       const c = row[x];
       if (c.width === 0 || (c.style & CELL_CONCEALED)) continue;
+      const space = c.text === ' ';
+      if (space && !(c.style & CELL_DECORATIONS) && !c.underline && !c.hyperlink_id) continue;
       g.save();
       try {
         g.beginPath();g.rect(x*cw,y*ch,cw*c.width,ch);g.clip();
-        g.font=`${c.style&2?'italic ':''}${c.style&1?'bold ':''}18px monospace`;
-        g.globalAlpha=c.style&16?0.5:1;g.fillStyle=c.foreground;g.fillText(c.text,x*cw,y*ch+2);
+        g.globalAlpha=c.style&16?0.5:1;g.fillStyle=c.foreground;
+        if (!space) {
+          g.font=`${c.style&2?'italic ':''}${c.style&1?'bold ':''}18px monospace`;
+          g.fillText(c.text,x*cw,y*ch+2);
+        }
         if(c.style&CELL_OVERLINE)g.fillRect(x*cw,y*ch+1,cw*c.width,1);
         if(c.style&8)g.fillRect(x*cw,y*ch+ch/2,cw*c.width,1);
         paintUnderline(g,c,x*cw,y*ch+ch-3,cw*c.width);

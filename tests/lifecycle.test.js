@@ -1698,6 +1698,7 @@ test('live paint failure is not ACKed; same-geometry recovery and detach retain 
   if(name==='detach_shell')return;
   if(name==='ack_shell'){
    assert.equal(clip,0);assert.equal(pixels.length,initial.rows.length*initial.cols);
+   assert.equal(pixels.includes(undefined),false);
    acknowledgements.push([args.revision,pixels[0]]);
    return;
   }
@@ -1710,9 +1711,16 @@ test('live paint failure is not ACKed; same-geometry recovery and detach retain 
  });
  canvas.getContext=()=>({
   setTransform(){},scale(){},clearRect(){assert.equal(clip,0);pixels=[];},
-  fillRect(){},beginPath(){},rect(){},clip(){},strokeRect(){},
+  fillRect(x,y,w,h){
+   if(clip||h!==24)return;
+   for(let offset=0;offset+12<=w;offset+=12) pixels[y/24*initial.cols+(x+offset)/12]=' ';
+  },
+  beginPath(){},rect(){},clip(){},strokeRect(){},
   save(){clip++;},restore(){clip--;},
-  fillText(text){if(fail)throw Error('paint interrupted');pixels.push(text);},
+  fillText(text,x,y){
+   if(fail)throw Error('paint interrupted');
+   pixels[Math.floor(y/24)*initial.cols+x/12]=text;
+  },
  });
  await h.click('#open');
  assert.deepEqual(acknowledgements,[[1,initial.rows[0][0].text]]);

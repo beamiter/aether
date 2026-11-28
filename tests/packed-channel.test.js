@@ -91,6 +91,35 @@ test('version 8 suppresses concealed glyphs and decorations and extends an overl
   assert.equal(history.rows[0][0].style,CELL_CONCEALED|CELL_OVERLINE|8);
 });
 
+test('packed blank cells retain backgrounds and decorations without drawing a space glyph',()=>{
+  const blank = {...cell,text:' '};
+  const line = {wrapped:false,cells:[
+    blank, {...blank,style:1|2|16}, {...blank,style:8|16|128},
+    {...blank,underline:'double',underline_color:'#987654'}, {...blank,hyperlink_id:23},
+    {...blank,text:' \u0301'}, {...blank,style:4|8},
+  ]};
+  const frame = accept(null,{...snapshot,cols:line.cells.length,images:[],
+    stamp:{...stamp,version:CHANNEL_RENDITION_VERSION,cursor_visible:false},rows:[packedRow(line)]});
+  const glyphs = [], clips = [], fills = [], backgrounds = [];
+  let clipped = false;
+  const context = {
+    setTransform(){},save(){},beginPath(){},rect(...area){clips.push(area);},clip(){clipped=true;},
+    restore(){clipped=false;},clearRect(){},fillText(...glyph){glyphs.push(glyph);},
+    fillRect(...area){
+      if (clipped) fills.push([this.fillStyle,this.globalAlpha,...area]);
+      else backgrounds.push([this.fillStyle,...area]);
+    },
+  };
+  paint({style:{},getContext:()=>context},frame,1);
+  assert.deepEqual(backgrounds,[['#222222',0,0,84,24]]);
+  assert.deepEqual(clips,[[24,0,12,24],[36,0,12,24],[48,0,12,24],[60,0,12,24]]);
+  assert.deepEqual(glyphs,[[' \u0301',60,2]]);
+  assert.deepEqual(fills,[
+    ['#abcdef',0.5,24,1,12,1],['#abcdef',0.5,24,12,12,1],
+    ['#987654',1,36,21,12,1],['#987654',1,36,23,12,1],['#abcdef',1,48,21,12,1],
+  ]);
+});
+
 test('compatibility rendition is optional and keeps the legacy underline flag distinct',()=>{
   const legacy = {version:3,session:owner.session,epoch:owner.epoch,revision:1,layout:1,cols:2,
     cursor_row:0,cursor_col:0,cursor_visible:false,cursor_shape:'block',pending_wrap:false,

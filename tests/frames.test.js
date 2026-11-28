@@ -27,7 +27,11 @@ test('semantic deltas update only validated rows and require the exact base',()=
 });
 test('reject foreign session/epoch, stale revisions and invalid sizes atomically',()=>{const old=acceptFull(null,demo());for(const change of [{session:'other'},{epoch:2},{revision:0},{revision:1},{revision:2,cols:0},{revision:2,cursor_col:999}]){assert.throws(()=>acceptFull(old,{...demo(),...change}));assert.equal(old.revision,1);}});
 test('reject malformed cells and non-advanced layout resize',()=>{for(const text of ['\x1b','xx','']){const f=demo();f.rows[0][0].text=text;assert.throws(()=>acceptFull(null,f));}const f=demo();f.revision=2;f.rows.pop();assert.throws(()=>acceptFull(acceptFull(null,demo()),f));});
-test('paint uses cell-local canvas operations, no terminal interpretation',()=>{let texts=0;const g={setTransform(){},clearRect(){},scale(){},fillRect(){},save(){},beginPath(){},rect(){},clip(){},fillText(){texts++},restore(){},strokeRect(){}};const canvas={style:{},getContext:()=>g};paint(canvas,acceptFull(null,demo()),2);assert.equal(texts,512);assert.equal(canvas.width,1536);});
+test('paint uses cell-local canvas operations, no terminal interpretation',()=>{
+ const {canvas,glyphs}=paintCalls(acceptFull(null,demo()),2);
+ assert.equal(glyphs.length,144);
+ assert.equal(canvas.width,1536);
+});
 
 test('Rust-owned hidden cursor is not painted',()=>{let cursors=0;const g={setTransform(){},clearRect(){},scale(){},fillRect(){},save(){},beginPath(){},rect(){},clip(){},fillText(){},restore(){},strokeRect(){cursors++}};const canvas={style:{},getContext:()=>g};paint(canvas,acceptFull(null,{...demo(),cursor_visible:false}));assert.equal(cursors,0);assert.throws(()=>acceptFull(null,{...demo(),cursor_visible:0}));});
 
@@ -194,7 +198,7 @@ test('Rust demo and PTY frames reduce fillRect calls from cells to rows without 
   const {backgrounds,glyphs,clears}=paintCalls(frame,1);
   assert.equal(frame.cols*frame.rows.length,oldCalls);
   assert.equal(backgrounds.length,spans);
-  const visibleGlyphs=frame.rows.flat().filter(c=>c.width>0).length;
+  const visibleGlyphs=frame.rows.flat().filter(c=>c.width>0&&c.text!==' ').length;
   assert.equal(glyphs.length,visibleGlyphs);
   assert.deepEqual(clears,[[1,0,0,frame.cols*12,frame.rows.length*24]]);
   assert.ok(backgrounds.every(([,,x,,w,h])=>x===0&&w===frame.cols*12&&h===24));
@@ -246,6 +250,37 @@ test('validated row deltas repaint changed cells and the old and new cursor foot
  paint(canvas,deltaFrom(hidden,{pending_wrap:true,cursor_row:1}),1.25);
  assert.deepEqual([clears,texts,cursors],[[],[],[]]);
  assert.deepEqual(writes,[['width',30],['height',120]]);
+});
+
+test('distant edits and cursor moves preserve large gaps and repaint complete wide cells',()=>{
+ const demoFrame=smallPaintFrame({cols:28,rows:1});
+ const row=demoFrame.rows[0].slice();
+ row[6]={...row[6],text:'界',width:2};
+ row[7]={...row[7],text:' ',width:0};
+ const initial=acceptFull(null,{...demoFrame,rows:[row],cursor_col:22});
+ const {canvas,g}=observedCanvas();
+ paint(canvas,initial,1.25);
+ const clears=[],glyphs=[],cursors=[];
+ g.clearRect=(...area)=>clears.push(area);
+ g.fillText=(text,x)=>glyphs.push([text,x]);
+ g.strokeRect=(...area)=>cursors.push(area);
+
+ const changed=row.slice();
+ changed[2]={...row[2],text:'Y'};
+ changed[7]={...row[7],background:'#445566'};
+ const next=deltaFrom(initial,{cursor_col:26,rows:[{index:0,cells:changed}]});
+ paint(canvas,next,1.25);
+ assert.deepEqual(clears.splice(0),[[30,0,90,30],[330,0,75,30]]);
+ assert.deepEqual(glyphs.splice(0),[
+  ['Y',24],['X',36],['X',48],['X',60],['界',72],
+  ['X',264],['X',276],['X',288],['X',300],['X',312],
+ ]);
+ assert.deepEqual(cursors.splice(0),[[312.5,.5,11,23]]);
+
+ paint(canvas,deltaFrom(next,{cursor_col:7}),1.25);
+ assert.deepEqual(clears,[[90,0,30,30],[390,0,15,30]]);
+ assert.deepEqual(glyphs,[['界',72],['X',312]]);
+ assert.deepEqual(cursors,[[84.5,.5,11,23]]);
 });
 
 test('horizontal cell damage requires aligned backing pixels',()=>{
