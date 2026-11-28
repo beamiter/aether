@@ -38,7 +38,7 @@ function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsuppo
   return result;
  };
  const elements=new Map(),timers=new Map();let id=0;
- const element=()=>({children:[],disabled:false,value:'',textContent:'',style:{},dataset:{},handlers:{},classList:{toggle(){}},focus(){},append(child){this.children.push(child);},showModal(){this.open=true;},close(){this.open=false;},click(){return this.handlers.click?.();},getAttribute(name){return this.attributes.get(name)??null;},scrollTo(){},attributes:new Map(),setAttribute(name,value){this.attributes.set(name,String(value));},removeAttribute(name){this.attributes.delete(name);},replaceChildren(...options){this.options=options;},addEventListener(name,fn){this.handlers[name]=fn}});
+ const element=()=>({children:[],disabled:false,value:'',textContent:'',style:{setProperty(name,value){this[name]=value;}},dataset:{},handlers:{},classList:{toggle(){}},focus(){},append(child){this.children.push(child);},showModal(){this.open=true;},close(){this.open=false;},click(){return this.handlers.click?.();},getAttribute(name){return this.attributes.get(name)??null;},scrollTo(){},attributes:new Map(),setAttribute(name,value){this.attributes.set(name,String(value));},removeAttribute(name){this.attributes.delete(name);},replaceChildren(...options){this.options=options;},addEventListener(name,fn){this.handlers[name]=fn}});
  const el=selector=>{if(!elements.has(selector))elements.set(selector,element());return elements.get(selector)};
  const canvasEvents=new Map();
  if (animation.mouseCanvas) {
@@ -577,13 +577,25 @@ test('split observations paint the inactive shell and cannot claim live input',a
  },undefined,undefined,(canvas,frame)=>painted.push({canvas,epoch:frame.epoch}),{},testChannel());
  await h.click('#open');await h.click('#new-local-tab');await h.click('#split-local');
  const layout=observers[0].layout;
- assert.equal(observers[0].epoch,1);assert.equal(h.el('#terminal-panes').dataset.split,'right');
+ const panes=h.el('#terminal-panes'),balance=h.el('#split-balance');
+ assert.equal(observers[0].epoch,1);assert.equal(panes.dataset.split,'right');
+ assert.equal(h.el('#split-balance-control').hidden,false);
+ assert.equal(balance.disabled,false);
+ balance.value='64';balance.handlers.input();
+ assert.equal(panes.style['--first-pane-share'],'64fr');
+ assert.equal(panes.style['--second-pane-share'],'36fr');
+ assert.equal(balance.getAttribute('aria-valuetext'),'64% left, 36% right');
+ assert.equal(observers.length,1,'resizing the display must not replace its observer');
+ assert.deepEqual(writes,[],'changing balance must not send terminal input');
+ balance.value='91';balance.handlers.input();
+ assert.equal(panes.style['--first-pane-share'],'64fr');
  await events[1]({owner:b,kind:'update',sequence:'1',frame:null,preview:{layout,frame:channelSnapshot(frame(a))},status:channelHealth(2)});
  assert.equal(painted.at(-1).canvas,h.el('#peer-canvas'));assert.equal(painted.at(-1).epoch,1);
  assert.deepEqual(adopted,[2]);
  h.el('#input').value='send B';await h.submit();
  await h.click('#focus-peer-pane');
- assert.equal(h.el('#terminal-panes').dataset.split,'left');
+ assert.equal(panes.dataset.split,'left');
+ assert.equal(balance.value,'64','balance belongs to the physical side, not the writer');
  assert.equal(h.el('#peer-canvas').dataset.geometry,undefined);
  await events[1]({owner:b,kind:'update',sequence:'2',frame:null,preview:{layout,frame:channelSnapshot(frame(a))},status:channelHealth(2)});
  assert.equal(h.el('#peer-canvas').dataset.geometry,undefined);
@@ -591,6 +603,16 @@ test('split observations paint the inactive shell and cannot claim live input',a
  assert.equal(painted.at(-1).canvas,h.el('#peer-canvas'));assert.equal(painted.at(-1).epoch,2);
  h.el('#input').value='send A';await h.submit();
  assert.deepEqual(adopted,[2,1]);assert.deepEqual(writes,[2,1]);
+ h.keydown({key:'D',ctrlKey:true,shiftKey:true,target:{closest:()=>true},preventDefault(){}});
+ await tick();
+ assert.equal(panes.dataset.split,'top');
+ assert.equal(balance.value,'50','the other axis starts balanced');
+ assert.equal(h.el('#split-balance-label').textContent,'Top pane height');
+ balance.value='10';balance.handlers.input();
+ assert.equal(balance.getAttribute('aria-valuetext'),'10% top, 90% bottom');
+ await h.click('#split-local');
+ assert.equal(h.el('#split-balance-control').hidden,true);
+ assert.equal(balance.disabled,true);
 });
 
 test('three visible shells rotate a single writer and ACK a retired preview on the same stream',async()=>{

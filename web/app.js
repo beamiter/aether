@@ -25,6 +25,10 @@ const localTools=document.querySelector('#local-shells'),showLocal=document.quer
 const tabs=document.querySelector('#local-tabs'),tabList=document.querySelector('#local-tab-list'),newTab=document.querySelector('#new-local-tab'),retryTab=document.querySelector('#retry-local-tab');
 const newJshTab=document.querySelector('#new-jsh-tab');
 const splitToggle=document.querySelector('#split-local'),panes=document.querySelector('#terminal-panes'),peerPane=document.querySelector('#peer-pane'),peerCanvas=document.querySelector('#peer-canvas'),focusPeer=document.querySelector('#focus-peer-pane');
+const splitBalanceControl=document.querySelector('#split-balance-control');
+const splitBalanceLabel=document.querySelector('#split-balance-label');
+const splitBalance=document.querySelector('#split-balance');
+const splitShares={horizontal:50,vertical:50};
 const tripleToggle=document.querySelector('#split-three-local'),activePane=document.querySelector('#active-pane');
 const passivePanes=[1,2].map(index=>({
   section:document.querySelector(`#preview-pane-${index}`),
@@ -346,12 +350,34 @@ function renderSplit(){
   const first=splitEpochs[0]===epoch;
   panes.dataset.split=target?(splitAxis==='vertical'?(first?'top':'bottom'):(first?'left':'right')):'';
   peerPane.hidden=!target;
+  splitBalanceControl.hidden=!target;
+  splitBalance.disabled=!target||splitToggle.disabled;
+  if(target)renderSplitBalance();
   focusPeer.disabled=splitToggle.disabled;
   if(target)focusPeer.textContent=`Focus Shell ${target.epoch}`;
   if(peerState&&peerState.epoch!==target?.epoch){
     peerState=null;clearPaint(peerCanvas);delete peerCanvas.dataset.geometry;
   }
 }
+function renderSplitBalance(){
+  const share=splitShares[splitAxis];
+  const rows=splitAxis==='vertical';
+  splitBalanceLabel.textContent=rows?'Top pane height':'Left pane width';
+  splitBalance.value=String(share);
+  splitBalance.setAttribute('aria-valuetext',rows
+    ? `${share}% top, ${100-share}% bottom`
+    : `${share}% left, ${100-share}% right`);
+  panes.style.setProperty('--first-pane-share',`${share}fr`);
+  panes.style.setProperty('--second-pane-share',`${100-share}fr`);
+}
+splitBalance.addEventListener('input',()=>{
+  if(splitBalance.disabled||!observerTarget())return;
+  const share=Number(splitBalance.value);
+  if(!Number.isInteger(share)||share<10||share>90)return;
+  splitShares[splitAxis]=share;
+  renderSplitBalance();
+  // The existing viewport observer fits only the current writable PTY.
+});
 let localTabButtons=[];
 function renderLocalTabs(focusActive=false) {
   renderTerminalStage();

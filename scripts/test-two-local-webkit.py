@@ -646,6 +646,37 @@ def exercise(driver, owned):
         return s["split"] == "right" and s["peer_x"] < s["active_x"] and s["pixel"] == blue and s["peer_pixel"] == red
 
     wait_for(split_with_b_active, "two native panes did not show their separate canvases")
+    def split_balance(left, right):
+        return driver.execute("""
+            const range = document.querySelector('#split-balance');
+            const left = document.querySelector(arguments[0]).getBoundingClientRect().width;
+            const right = document.querySelector(arguments[1]).getBoundingClientRect().width;
+            return {share: Number(range.value), geometry: 100 * left / (left + right)};
+        """, [left, right])
+
+    balance = split_balance("#peer-pane", "#active-pane")
+    assert balance["share"] == 50 and abs(balance["geometry"] - 50) < 1, balance
+    driver.click("#split-balance")
+    assert driver.execute("return document.activeElement.id") == "split-balance"
+    keys = []
+    # The click may set a value. Move one step away first so the native
+    # keyboard must perform the last adjustment even if the click hit 62.
+    current = split_balance("#peer-pane", "#active-pane")["share"]
+    if current == 62:
+        keys.append("\ue012")  # ArrowLeft
+        current -= 1
+    key = "\ue014" if current < 62 else "\ue012"
+    keys.extend([key] * abs(current - 62))
+    actions = [{"type": kind, "value": key} for key in keys for kind in ("keyDown", "keyUp")]
+    driver.command("POST", "/actions", {"actions": [{"type": "key", "id": "split-balance-keys", "actions": actions}]})
+
+    def resized_split():
+        value = split_balance("#peer-pane", "#active-pane")
+        return value if value["share"] == 62 and abs(value["geometry"] - 62) < 1 else None
+
+    wait_for(resized_split, "native range keys did not resize both visible panes")
+    assert state()["current_tab"] == b_tab and state()["writable"]
+    assert state()["draft"] == draft_b and state()["peer_geometry"] == "80x24"
     assert state()["peer_fifth_row_pixel"] != green
     split_gate.touch()
     wait_for(lambda: state()["peer_fifth_row_pixel"] == green, "inactive pane did not present new PTY output")
@@ -665,6 +696,10 @@ def exercise(driver, owned):
                 and s["split"] == "left" and s["active_x"] < s["peer_x"] and s["peer_geometry"] == "84x12")
 
     wait_for(split_with_a_active, "clicking the inactive pane did not transfer input and focus")
+    balance = split_balance("#active-pane", "#peer-pane")
+    assert balance["share"] == 62 and abs(balance["geometry"] - 62) < 1, balance
+    print(json.dumps({"case": "AETHER.TWO_PANES.KEYBOARD_BALANCE", "left_share": balance["share"],
+                      "held_when_writer_changed": True}), flush=True)
     assert state()["cursor"].startswith("80 × 24")
     assert state()["resize"] and state()["draft"] == draft_a
     assert write_from_current_tab(driver, owned / "tab-a-return.pid") == a_identity

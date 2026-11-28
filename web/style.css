@@ -255,6 +255,8 @@ kbd {color: var(--muted); font: 11px monospace; white-space: nowrap;}
 .primary-action, .primary-action:hover:enabled {background: var(--accent); color: #132724; border-color: transparent;}
 .primary-action:hover:enabled {background: #c0f4e4;}
 .terminal-actions {justify-content: flex-end;}
+#split-balance-control {display: inline-flex; align-items: center; gap: .4rem; color: var(--muted);}
+#split-balance {width: 5rem; padding: 0; accent-color: var(--accent);}
 #terminal-panes {
   display: grid;
   grid-template: minmax(0, 1fr) / minmax(0, 1fr);
@@ -263,10 +265,10 @@ kbd {color: var(--muted); font: 11px monospace; white-space: nowrap;}
   gap: 6px;
 }
 #terminal-panes[data-split="left"], #terminal-panes[data-split="right"] {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, var(--first-pane-share, 1fr)) minmax(0, var(--second-pane-share, 1fr));
 }
 #terminal-panes[data-split="top"], #terminal-panes[data-split="bottom"] {
-  grid-template-rows: repeat(2, minmax(0, 1fr));
+  grid-template-rows: minmax(0, var(--first-pane-share, 1fr)) minmax(0, var(--second-pane-share, 1fr));
 }
 #terminal-panes:is([data-split="right"],[data-split="bottom"]) #active-pane {order: 1;}
 #terminal-panes > section {
