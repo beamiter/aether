@@ -4209,6 +4209,34 @@ def exercise_three_shells(driver, owned, backend, binary):
                       "left_share": 61, "top_right_share": 40, "owner_and_parked_retained": True,
                       "owned_pty_grids_unchanged_with_fit_off": True}), flush=True)
 
+    def visible_pane_boxes():
+        return driver.execute("""
+          return Array.from(document.querySelectorAll('#terminal-panes > section:not([hidden])'))
+            .filter(pane => pane.getClientRects().length > 0)
+            .map(pane => {
+              const rect = pane.getBoundingClientRect();
+              return [pane.id, rect.width, rect.height];
+            });
+        """)
+
+    driver.execute("document.body.scrollTop = 0;")
+    tiled = visible_pane_boxes()
+    assert len(tiled) == 3
+    _, width, height = next(box for box in tiled if box[0] == "active-pane")
+    driver.click("#maximize-active-pane", trace_hit=True)
+    maximized = wait_for(lambda: boxes if len(boxes := visible_pane_boxes()) == 1 else None,
+                         "maximizing did not show exactly one native pane")
+    assert maximized[0][0] == "active-pane" and maximized[0][1] > width and maximized[0][2] > height
+    assert state()["current_tab"] == tabs[2] and state()["writable"]
+    assert [pty_size(identity) for identity in prior] == before_sizes
+    driver.click("#maximize-active-pane", trace_hit=True)
+    wait_for(lambda: visible_pane_boxes() == tiled, "restore did not return the exact pane geometry")
+    assert state()["current_tab"] == tabs[2] and state()["writable"]
+    assert [pty_size(identity) for identity in prior] == before_sizes
+    print(json.dumps({"case": "AETHER.THREE_PANES.MAXIMIZE_RESTORE", "backend": backend,
+                      "active_view_enlarged": True, "original_boxes_restored": True,
+                      "all_four_pty_grids_and_writer_retained": True}), flush=True)
+
     forbidden = owned / "three-restore-must-not-run"
     driver.type("#input", f"printf replayed > {shlex.quote(str(forbidden))}")
     driver.close()

@@ -27,6 +27,7 @@ const localTools=document.querySelector('#local-shells'),showLocal=document.quer
 const tabs=document.querySelector('#local-tabs'),tabList=document.querySelector('#local-tab-list'),newTab=document.querySelector('#new-local-tab'),retryTab=document.querySelector('#retry-local-tab');
 const newJshTab=document.querySelector('#new-jsh-tab');
 const splitToggle=document.querySelector('#split-local'),panes=document.querySelector('#terminal-panes'),peerPane=document.querySelector('#peer-pane'),peerCanvas=document.querySelector('#peer-canvas'),focusPeer=document.querySelector('#focus-peer-pane');
+const maximizePane=document.querySelector('#maximize-active-pane');
 const splitBalanceControl=document.querySelector('#split-balance-control');
 const splitBalanceLabel=document.querySelector('#split-balance-label');
 const splitBalance=document.querySelector('#split-balance');
@@ -64,6 +65,7 @@ const showSavedSsh=document.querySelector('#show-saved-ssh'),savedSshPanel=docum
 const savedSshSelect=document.querySelector('#saved-ssh-shell'),resumeSavedSsh=document.querySelector('#resume-saved-ssh'),forgetSavedSsh=document.querySelector('#forget-saved-ssh');
 let savedSshShells=[],savedSshRequest=0;
 let localStream=null,localTransport='channel',localInputSuspended=false,localFrameRecovery=false;
+let maximizedPane=null;
 let splitEnabled=false,splitEpochs=[],splitLayout=1,layoutSerial=1,settingSplit=false,peerState=null;
 let tripleEpochs=[],passiveTargets=[null,null];
 function allocateLayoutToken(){
@@ -408,6 +410,25 @@ function renderTriple(disabled){
     if(peer)focus.textContent=`Focus Shell ${peer.value}`;
   });
 }
+function renderPaneMaximize(hasPeers){
+  if(!hasPeers||owner!==maximizedPane?.owner||splitLayout!==maximizedPane?.layout||changingTab||recovery)
+    maximizedPane=null;
+  const zoomed=maximizedPane!==null;
+  panes.dataset.maximized=zoomed?'true':'';
+  maximizePane.hidden=!hasPeers;
+  maximizePane.disabled=!hasPeers||splitToggle.disabled;
+  maximizePane.setAttribute('aria-pressed',String(zoomed));
+  maximizePane.textContent=zoomed?'Restore split':'Maximize pane';
+}
+function togglePaneMaximize(){
+  if(maximizePane.disabled||maximizePane.hidden)return;
+  // The live tree and passive observers stay in place. Changing the
+  // writer or replacing the layout automatically leaves the zoomed view.
+  maximizedPane=maximizedPane?null:{owner,layout:splitLayout};
+  renderSplit();
+  commandPalette.refreshAvailability();
+}
+maximizePane.addEventListener('click',togglePaneMaximize);
 function renderSplit(){
   const target=observerTarget();
   splitToggle.disabled=!owner||sshSession!==null||!!changingTab||!!recovery||restoringLocalLayout||settingSplit;
@@ -418,10 +439,11 @@ function renderSplit(){
   panes.dataset.split=target?(splitAxis==='vertical'?(first?'top':'bottom'):(first?'left':'right')):'';
   peerPane.hidden=!target;
   const triple=tripleIsVisible();
-  splitBalanceControl.hidden=!target&&!triple;
+  renderPaneMaximize(Boolean(target||triple));
+  splitBalanceControl.hidden=!!maximizedPane||(!target&&!triple);
   splitBalance.disabled=splitBalanceControl.hidden||splitToggle.disabled;
-  splitStackControl.hidden=!triple;
-  splitStackBalance.disabled=!triple||splitToggle.disabled;
+  splitStackControl.hidden=!!maximizedPane||!triple;
+  splitStackBalance.disabled=splitStackControl.hidden||splitToggle.disabled;
   if(target||triple)renderSplitBalance(triple);
   focusPeer.disabled=splitToggle.disabled;
   if(target)focusPeer.textContent=`Focus Shell ${target.epoch}`;
@@ -2025,7 +2047,7 @@ async function copyTerminalSelection(){
 }
 // Resolve the visible neighbor, never the next tab in the parked roster.
 function directionalPane(direction){
-  if(splitToggle.disabled)return null;
+  if(splitToggle.disabled||maximizedPane)return null;
   const three=tripleIsVisible();
   if(!three&&!observerTarget())return null;
   const tree=retainedPaneTree(three?tripleEpochs:splitEpochs,splitAxis,three);
@@ -2059,6 +2081,9 @@ const actions=[
   {label:'Split left and right',hint:'Ctrl+Shift+E',keys:['Shift+e'],enabled:()=>!splitToggle.disabled,unavailableReason:()=> 'Requires two available local shell tabs.',run:()=>setSplit('horizontal')},
   {label:'Split top and bottom',hint:'Ctrl+Shift+D',keys:['Shift+d'],enabled:()=>!splitToggle.disabled,unavailableReason:()=> 'Requires two available local shell tabs.',run:()=>setSplit('vertical')},
   clickAction('Toggle three panes','#split-three-local'),
+  {label:'Maximize active pane',enabled:()=>!maximizedPane&&!maximizePane.hidden&&!maximizePane.disabled,
+    unavailableReason:()=> 'Requires a visible split layout.',run:togglePaneMaximize},
+  {label:'Restore split layout',enabled:()=>!!maximizedPane&&!maximizePane.disabled,run:togglePaneMaximize},
   ...directionalPaneActions,
   {label:'Return to one pane',enabled:()=>(splitEnabled||tripleIsVisible())&&!splitToggle.disabled,run:()=>setSplit(null)},
   {label:'Search terminal history',hint:'Ctrl+Shift+F',keys:['Shift+f'],enabled:canUseHistory,unavailableReason:()=> 'Requires a local terminal with searchable history.',run:()=>showHistory(true)},

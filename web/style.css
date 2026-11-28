@@ -297,6 +297,11 @@ kbd {color: var(--muted); font: 11px monospace; white-space: nowrap;}
 #terminal-panes[data-triple="true"] > [data-slot="1"] {grid-area: 1 / 2 / 2 / 3;}
 #terminal-panes[data-triple="true"] > [data-slot="2"] {grid-area: 2 / 2 / 3 / 3;}
 #terminal-panes[data-triple="true"] #active-pane {border-color: #55786d;}
+#terminal-panes[data-maximized="true"] {
+  grid-template: minmax(0, 1fr) / minmax(0, 1fr);
+}
+#terminal-panes[data-maximized="true"] > section:not(#active-pane) {display: none;}
+#terminal-panes[data-maximized="true"] > #active-pane {grid-area: 1 / 1 / 2 / 2; order: 0;}
 .focus-preview-pane {align-self: flex-start; margin: 5px 8px 0;}
 #terminal-empty {
   position: absolute;
