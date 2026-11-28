@@ -64,6 +64,11 @@ pub enum Command {
     Poll {
         owner: Attachment,
     },
+    PollWithStatus {
+        owner: Attachment,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ack_revision: Option<u32>,
+    },
     Ack {
         owner: Attachment,
         revision: u32,
@@ -180,6 +185,22 @@ fn reply_value(value: impl Serialize) -> Result<Value, String> {
     serde_json::to_value(value).map_err(|_| "terminal reply serialization failed".into())
 }
 
+fn terminal_status(bridge: &LiveBridge, epoch: u32) -> Result<Value, String> {
+    let mut status = reply_value(bridge.status(epoch)?)?;
+    status["focus_reporting"] = Value::Bool(true);
+    status["mouse_reporting"] = Value::Bool(true);
+    status["keypad_reporting"] = Value::Bool(true);
+    status["keyboard_events_supported"] = Value::Bool(true);
+    status["poll_with_status"] = Value::Bool(true);
+    if let Some(mouse) = bridge.mouse_view(epoch)? {
+        status["mouse"] = reply_value(mouse)?;
+    }
+    if let Some(alternate) = bridge.alternate_scroll_view(epoch)? {
+        status["alternate_scroll"] = reply_value(alternate)?;
+    }
+    Ok(status)
+}
+
 fn check_grid(rows: usize, cols: usize) -> Result<(), String> {
     if (1..=128).contains(&rows) && (1..=256).contains(&cols) {
         Ok(())
@@ -230,6 +251,7 @@ impl Host {
                 | Command::Mouse { .. }
                 | Command::EnableKeyboardEvents { .. }
                 | Command::KeyEvent { .. }
+                | Command::PollWithStatus { .. }
         ) && request.host.as_ref() != Some(&self.identity))
             || request
                 .host
@@ -291,23 +313,23 @@ impl Host {
             Command::Poll { owner } => self.attached(owner, false, |bridge, epoch| {
                 reply_value(bridge.poll_update(epoch)?)
             })?,
+            Command::PollWithStatus {
+                owner,
+                ack_revision,
+            } => self.attached(owner, false, |bridge, epoch| {
+                if let Some(revision) = ack_revision {
+                    bridge.acknowledge(epoch, revision)?;
+                }
+                let update = bridge.poll_update(epoch)?;
+                let status = terminal_status(bridge, epoch)?;
+                Ok(serde_json::json!({ "update": update, "status": status }))
+            })?,
             Command::Ack { owner, revision } => self.attached(owner, false, |bridge, epoch| {
                 reply_value(bridge.acknowledge(epoch, revision)?)
             })?,
-            Command::Status { owner } => self.attached(owner, false, |bridge, epoch| {
-                let mut status = reply_value(bridge.status(epoch)?)?;
-                status["focus_reporting"] = Value::Bool(true);
-                status["mouse_reporting"] = Value::Bool(true);
-                status["keypad_reporting"] = Value::Bool(true);
-                status["keyboard_events_supported"] = Value::Bool(true);
-                if let Some(mouse) = bridge.mouse_view(epoch)? {
-                    status["mouse"] = reply_value(mouse)?;
-                }
-                if let Some(alternate) = bridge.alternate_scroll_view(epoch)? {
-                    status["alternate_scroll"] = reply_value(alternate)?;
-                }
-                Ok(status)
-            })?,
+            Command::Status { owner } => {
+                self.attached(owner, false, |bridge, epoch| terminal_status(bridge, epoch))?
+            }
             Command::History { owner, offset } => {
                 self.attached(owner, false, |bridge, epoch| {
                     reply_value(bridge.history(epoch, offset)?)
@@ -990,6 +1012,66 @@ expect(b'.')
                 report: serde_json::from_value(report(&fresh, "press")).unwrap()
             })
             .is_err());
+        host.execute(Command::Close { owner: reader }).unwrap();
+    }
+
+    #[test]
+    fn batched_poll_checks_the_host_and_applies_only_the_current_frame_receipt() {
+        let mut host = Host::new().unwrap();
+        let opened = host.execute(Command::Open { rows: 8, cols: 80 }).unwrap();
+        let owner: Attachment = serde_json::from_value(opened).unwrap();
+        let poll = |host: &mut Host, bound: bool, owner: &Attachment, ack_revision| {
+            host.reply(Request {
+                protocol: VERSION,
+                request: 1,
+                host: bound.then(|| host.identity.clone()),
+                command: Command::PollWithStatus {
+                    owner: owner.clone(),
+                    ack_revision,
+                },
+            })
+            .result
+        };
+        assert_eq!(
+            poll(&mut host, false, &owner, None).unwrap_err(),
+            HOST_CHANGED
+        );
+        let first = poll(&mut host, true, &owner, None).unwrap();
+        assert_eq!(first["status"]["epoch"], owner.epoch);
+        assert_eq!(first["status"]["poll_with_status"], true);
+        assert_eq!(first["update"]["kind"], "snapshot");
+        let revision: u32 =
+            serde_json::from_value(first["update"]["frame"]["revision"].clone()).unwrap();
+        assert_eq!(
+            poll(&mut host, true, &owner, Some(0)).unwrap_err(),
+            "wrong frame ACK"
+        );
+        host.execute(Command::Resize {
+            owner: owner.clone(),
+            rows: 9,
+            cols: 81,
+        })
+        .unwrap();
+        assert_eq!(
+            poll(&mut host, true, &owner, None).unwrap()["update"],
+            Value::Null
+        );
+        let next = poll(&mut host, true, &owner, Some(revision)).unwrap();
+        assert_eq!(next["update"]["frame"]["cols"], 81);
+        let next_revision: u32 =
+            serde_json::from_value(next["update"]["frame"]["revision"].clone()).unwrap();
+        assert!(next_revision > revision);
+
+        let recovered = host
+            .execute(Command::Recover {
+                owner: owner.clone(),
+            })
+            .unwrap();
+        assert_eq!(
+            poll(&mut host, true, &owner, Some(next_revision)).unwrap_err(),
+            "stale terminal attachment"
+        );
+        let reader = serde_json::from_value(recovered["owner"].clone()).unwrap();
         host.execute(Command::Close { owner: reader }).unwrap();
     }
 

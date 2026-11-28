@@ -70,6 +70,7 @@ struct RemoteSession {
     mouse_reporting: bool,
     keypad_reporting: bool,
     keyboard_event_reporting: bool,
+    poll_with_status: bool,
 }
 
 #[tauri::command]
@@ -224,15 +225,17 @@ impl SshTerminal {
                     mouse_reporting: false,
                     keypad_reporting: false,
                     keyboard_event_reporting: false,
+                    poll_with_status: false,
                 };
-                session.negotiate_keyboard_events();
-                let keyboard_event_reporting = session.keyboard_event_reporting;
-                self.session = Some(session);
-                Ok(json!({
+                session.negotiate_capabilities();
+                let result = json!({
                     "owner": opened,
                     "save_warning": remembered.err(),
-                    "keyboard_event_reporting": keyboard_event_reporting,
-                }))
+                    "keyboard_event_reporting": session.keyboard_event_reporting,
+                    "poll_with_status": session.poll_with_status,
+                });
+                self.session = Some(session);
+                Ok(result)
             }
             Action::ListSaved => store.ok_or(NO_STORE)?.list(),
             Action::RestoreSaved { id } => self.restore_saved(&id, store.ok_or(NO_STORE)?),
@@ -303,6 +306,7 @@ impl SshTerminal {
                     Command::Recover { owner } => return session.recover(owner.clone()),
                     Command::Detach { owner }
                     | Command::Poll { owner }
+                    | Command::PollWithStatus { owner, .. }
                     | Command::Ack { owner, .. }
                     | Command::Status { owner }
                     | Command::History { owner, .. }
@@ -542,6 +546,7 @@ impl SshTerminal {
             mouse_reporting: false,
             keypad_reporting: false,
             keyboard_event_reporting: false,
+            poll_with_status: false,
         });
         Ok(result)
     }
@@ -571,7 +576,7 @@ impl RemoteSession {
         !self.read_only && !self.input_uncertain && self.pending_snapshot.is_none()
     }
 
-    fn negotiate_keyboard_events(&mut self) {
+    fn negotiate_capabilities(&mut self) {
         if !self.instance.as_deref().is_some_and(valid_identity) {
             return;
         }
@@ -605,6 +610,7 @@ impl RemoteSession {
         self.mouse_reporting = false;
         self.keypad_reporting = false;
         self.keyboard_event_reporting = false;
+        self.poll_with_status = false;
         self.pending_snapshot = Some(revision);
         Ok(())
     }
@@ -652,6 +658,7 @@ impl RemoteSession {
             self.mouse_reporting = false;
             self.keypad_reporting = false;
             self.keyboard_event_reporting = false;
+            self.poll_with_status = false;
         }
         // Optional input commands require capability from this bound host
         // and a current writer attachment.
@@ -677,6 +684,11 @@ impl RemoteSession {
             return Err("SSH terminal physical keyboard reporting is unavailable.".into());
         }
 
+        let batched_poll = matches!(command, Command::PollWithStatus { .. });
+        if batched_poll && (!self.poll_with_status || self.pending_snapshot.is_some()) {
+            return Err("SSH terminal batched polling is unavailable for this attachment.".into());
+        }
+
         if reconnect && self.relay.is_none() {
             self.focus_reporting = false;
             self.mouse_reporting = false;
@@ -699,43 +711,24 @@ impl RemoteSession {
             self.mouse_reporting = false;
             self.keypad_reporting = false;
             self.keyboard_event_reporting = false;
+            self.poll_with_status = false;
         }
         match relay.call(command) {
             Ok(mut reply) => {
-                if reply.is_err() {
-                    self.focus_reporting = false;
-                    self.mouse_reporting = false;
-                    self.keypad_reporting = false;
-                }
-                if status {
-                    self.focus_reporting = reply
-                        .as_ref()
-                        .ok()
-                        .is_some_and(|value| focus_capability(self.instance.as_deref(), value));
-                    self.mouse_reporting = reply
-                        .as_ref()
-                        .ok()
-                        .is_some_and(|value| mouse_capability(self.instance.as_deref(), value));
-                    self.keypad_reporting = reply
-                        .as_ref()
-                        .ok()
-                        .is_some_and(|value| keypad_capability(self.instance.as_deref(), value));
-                    if let Ok(value) = &mut reply {
-                        if let Some(object) = value.as_object_mut() {
-                            object.insert(
-                                "focus_reporting".into(),
-                                Value::Bool(self.focus_reporting),
-                            );
-                            object.insert(
-                                "mouse_reporting".into(),
-                                Value::Bool(self.mouse_reporting),
-                            );
-                            if !self.mouse_reporting {
-                                object.remove("mouse");
-                                object.remove("alternate_scroll");
-                            }
-                        }
+                match &mut reply {
+                    Ok(value) if batched_poll => {
+                        let status = value
+                            .get_mut("status")
+                            .ok_or("Invalid SSH terminal poll reply.")?;
+                        self.apply_status(status);
                     }
+                    Ok(value) if status => self.apply_status(value),
+                    Err(_) => {
+                        self.focus_reporting = false;
+                        self.mouse_reporting = false;
+                        self.keypad_reporting = false;
+                    }
+                    Ok(_) => {}
                 }
                 reply
             }
@@ -745,8 +738,30 @@ impl RemoteSession {
                 self.mouse_reporting = false;
                 self.keypad_reporting = false;
                 self.keyboard_event_reporting = false;
+                self.poll_with_status = false;
                 self.input_uncertain |= input;
                 Err("SSH terminal connection ended.".into())
+            }
+        }
+    }
+
+    fn apply_status(&mut self, status: &mut Value) {
+        let instance = self.instance.as_deref();
+        self.focus_reporting = focus_capability(instance, status);
+        self.mouse_reporting = mouse_capability(instance, status);
+        self.keypad_reporting = keypad_capability(instance, status);
+        self.poll_with_status = instance.is_some_and(valid_identity)
+            && status.get("poll_with_status") == Some(&Value::Bool(true));
+        if let Some(status) = status.as_object_mut() {
+            status.insert("focus_reporting".into(), Value::Bool(self.focus_reporting));
+            status.insert("mouse_reporting".into(), Value::Bool(self.mouse_reporting));
+            status.insert(
+                "poll_with_status".into(),
+                Value::Bool(self.poll_with_status),
+            );
+            if !self.mouse_reporting {
+                status.remove("mouse");
+                status.remove("alternate_scroll");
             }
         }
     }
@@ -834,6 +849,7 @@ mod reload_tests {
                 mouse_reporting: false,
                 keypad_reporting: false,
                 keyboard_event_reporting: false,
+                poll_with_status: false,
             }),
         }
     }
@@ -904,6 +920,36 @@ mod reload_tests {
         }))
         .unwrap();
         assert!(!strip_unavailable_keypad(&mut center));
+    }
+
+    #[test]
+    fn batched_poll_requires_a_bound_host_with_an_explicit_capability() {
+        let mut terminal = terminal(Duration::ZERO);
+        let session = terminal.session.as_mut().unwrap();
+        session.apply_status(&mut json!({"poll_with_status":true}));
+        assert!(!session.poll_with_status);
+        session.instance = Some("a".repeat(32));
+        for mut status in [json!({}), json!({"poll_with_status":"true"})] {
+            session.apply_status(&mut status);
+            assert!(!session.poll_with_status);
+            assert_eq!(status["poll_with_status"], false);
+        }
+        session.apply_status(&mut json!({"poll_with_status":true}));
+        assert!(session.poll_with_status);
+
+        // A lost link retires the advertisement for this attachment.
+        let result = session.exchange(
+            Command::PollWithStatus {
+                owner: owner(),
+                ack_revision: None,
+            },
+            false,
+        );
+        assert!(result
+            .unwrap_err()
+            .contains("batched polling is unavailable"));
+        assert!(!session.poll_with_status);
+        assert!(!session.input_uncertain);
     }
 
     #[test]

@@ -58,6 +58,7 @@ let mouseView=null,hoveredLinkPoint=null;
 let state=null,epoch=null,owner=null,timer=null,polling=null,generation=0,transport=0,recovery=null;
 let sshSession=null,sshInputSuspended=false,detachedLocal=null,sshReloadNeeded=false,retainedLayoutBlocked=false;
 let sshFocusOwner=null,sshMouseOwner=null,sshKeyboardOwner=null;
+let sshPoll=null;
 const showSavedSsh=document.querySelector('#show-saved-ssh'),savedSshPanel=document.querySelector('#saved-ssh');
 const savedSshSelect=document.querySelector('#saved-ssh-shell'),resumeSavedSsh=document.querySelector('#resume-saved-ssh'),forgetSavedSsh=document.querySelector('#forget-saved-ssh');
 let savedSshShells=[],savedSshRequest=0;
@@ -231,7 +232,7 @@ const channelSnapshots=()=>typeof Channel==='function'?{frameVersion:CHANNEL_REN
 const acceptAttachedSnapshot=(frame,attachment,options)=>options.frameVersion===CHANNEL_RENDITION_VERSION
   ?acceptChannelFrame(null,frame,{...attachment,frameVersion:options.frameVersion},true):acceptFull(null,frame,attachment);
 let savedLayout=invoke?(threePanePreview?readThreePaneLayout():null)??readLocalShellLayout():null,protectSavedLayout=false;
-const sshCommands={poll_shell:'poll',ack_shell:'ack',shell_status:'status',history_shell:'history',recover_shell:'recover',detach_shell:'detach',close_shell:'close',write_shell:'write',key_shell:'key',key_event_shell:'key_event',text_shell:'text',paste_shell:'paste',resize_shell:'resize',focus_shell:'focus',mouse_shell:'mouse'};
+const sshCommands={poll_shell:'poll',poll_ssh_shell:'poll_with_status',ack_shell:'ack',shell_status:'status',history_shell:'history',recover_shell:'recover',detach_shell:'detach',close_shell:'close',write_shell:'write',key_shell:'key',key_event_shell:'key_event',text_shell:'text',paste_shell:'paste',resize_shell:'resize',focus_shell:'focus',mouse_shell:'mouse'};
 function setOpenDisabled(disabled) {
   open.disabled=openIntegrated.disabled=openSsh.disabled=sshHost.disabled=disabled||!invoke;
   sshConnect.disabled=openSsh.disabled;
@@ -841,6 +842,9 @@ function showShellStatus(info,mode){
     if(wasWritable)renderTerminalStage();
   }
   if (owner && owner.session === sshSession) {
+    if (info.poll_with_status === true && sshPoll?.owner !== owner) {
+      sshPoll = {owner, ackRevision: null};
+    }
     sshMouseOwner = info.mouse_reporting === true ? owner : null;
     const capable = info.focus_reporting === true ? owner : null;
     if (capable !== sshFocusOwner) {
@@ -862,6 +866,7 @@ function showShellStatus(info,mode){
 }
 function stopTransport(){
   inlineHistory.update(null,false);
+  sshPoll = null;
   mouseView = null;
   terminalMouse?.frameChanged();
   clearInterval(timer);
@@ -965,11 +970,26 @@ document.addEventListener?.('visibilitychange',()=>{if(document.hidden)ime.reset
 
 async function poll(){
   if(epoch===null||changingTab||localStream||localTransport==='recovery'||polling?.epoch===epoch)return;const current=epoch,attachment=owner,ticket={epoch,transport};polling=ticket;
-  try{const frame=await invokeAttached('poll_shell',{epoch:current},attachment);if(epoch!==current||ticket.transport!==transport)return;
-    if(frame){const next=acceptUpdate(state,frame,attachment);paintLiveFrame(next);state=next;describeCursor();await invokeAttached('ack_shell',{epoch:current,revision:next.revision},attachment);}
+  const batch=sshPoll?.owner===attachment?sshPoll:null;
+  try{
+    const reply=await (batch
+      ? invokeAttached('poll_ssh_shell',{epoch:current,ack_revision:batch.ackRevision},attachment)
+      : invokeAttached('poll_shell',{epoch:current},attachment));
     if(epoch!==current||ticket.transport!==transport)return;
-    const info=await invokeAttached('shell_status',{epoch:current},attachment);if(epoch!==current||ticket.transport!==transport)return;
-    validateShellStatus(info,current);showShellStatus(info,'poll');
+    if(batch&&(reply?.status?.poll_with_status!==true||
+        (reply.update!==null&&typeof reply.update!=='object')))throw new Error('invalid SSH terminal poll reply');
+    const update=batch?reply.update:reply;
+    if(update){
+      const next=acceptUpdate(state,update,attachment);
+      paintLiveFrame(next);state=next;describeCursor();
+      if(!batch)await invokeAttached('ack_shell',{epoch:current,revision:next.revision},attachment);
+    }
+    if(epoch!==current||ticket.transport!==transport)return;
+    const info=batch?reply.status:await invokeAttached('shell_status',{epoch:current},attachment);
+    if(epoch!==current||ticket.transport!==transport)return;
+    validateShellStatus(info,current);
+    if(batch)batch.ackRevision=update===null?null:state.revision;
+    showShellStatus(info,'poll');
     const target=observerTarget();
     if(target){
       try{
@@ -977,8 +997,8 @@ async function poll(){
         if(owner===attachment&&sameObservation(target,observerTarget())&&preview)paintPeer(validatePeerFrame(preview,target));
       }catch(error){if(owner===attachment&&sameObservation(target,observerTarget()))status.textContent=`Split pane unavailable: ${String(error?.message??error)}`;}
     }
-    // Continue bounded polling after child exit so trailing PTY bytes are drained.
-    if(info.drained&&!target)clearInterval(timer);
+    // Finish draining the PTY and acknowledge any last batched update.
+    if(info.drained&&!target&&(!batch||batch.ackRevision===null))clearInterval(timer);
 
   }catch(e){
     if(epoch!==current||ticket.transport!==transport)return;
@@ -1197,6 +1217,7 @@ async function openShell({destination=null,retained=null,fromRestore=false,confi
       throw new Error('Second local shell did not match the open response.');
     owner=opened;sshSession=destination===null?null:opened.session;
     sshKeyboardOwner=destination!==null&&result?.keyboard_event_reporting===true?opened:null;
+    sshPoll=destination!==null&&result?.poll_with_status===true?{owner:opened,ackRevision:null}:null;
     localTransport='channel';localInputSuspended=false;
     if(destination===null){detachedLocal=null;restoreLocalDraft(opened);rememberLocalTab(opened,configuration,paneId);}
     const previousEpoch=epoch;epoch=owner.epoch;updateSplitPair(previousEpoch);keyQueue={chain:Promise.resolve(),pending:0,locked:false};state=null;

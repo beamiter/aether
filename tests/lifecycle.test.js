@@ -992,6 +992,72 @@ test('SSH terminal recovers the same grid on a new generation and reattaches rea
  assert.equal(h.el('#open-ssh').disabled,false);
 });
 
+test('SSH batched polling acknowledges painted frames through the final drain',async()=>{
+ const owner={session:'a'.repeat(32),epoch:1,generation:1};
+ const frame={...JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8')),
+  session:owner.session,epoch:1,revision:1};
+ const delta={...frame,base_revision:1,revision:2,rows:[]};
+ const status={...channelHealth(1),poll_with_status:true};
+ const replies=[
+  {update:{kind:'snapshot',frame},status},
+  {update:{kind:'delta',frame:delta},status:{...status,exited:true,drained:true}},
+  {update:null,status:{...status,exited:true,drained:true}},
+ ];
+ const receipts=[],painted=[];
+ const h=harness(async(name,{action})=>{
+  assert.equal(name,'ssh_terminal');
+  if(action.operation==='open')return {owner,poll_with_status:true};
+  const command=action.command;
+  assert.equal(command.kind,'poll_with_status');
+  assert.equal(command.owner.generation,1);
+  assert.equal(command.ack_revision,painted.at(-1)??null);
+  receipts.push(command.ack_revision);
+  return replies.shift();
+ },undefined,undefined,(_canvas,frame)=>painted.push(frame.revision));
+ h.el('#ssh-terminal-host').value='lab';await h.submitSsh();
+ const poll=[...h.timers.values()][0];
+ assert.deepEqual(receipts,[null]);
+ await poll();
+ assert.equal(h.el('#input').disabled,true);
+ assert.equal(h.timers.size,1);
+ await poll();
+ assert.deepEqual(receipts,[null,1,2]);
+ assert.equal(h.timers.size,0);
+});
+
+test('SSH recovery retires the preceding generation’s batched frame and receipt',async()=>{
+ const old={session:'a'.repeat(32),epoch:1,generation:1},next={...old,generation:2};
+ const frame={...JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8')),
+  session:old.session,epoch:1,revision:1};
+ const status={...channelHealth(1),poll_with_status:true};
+ const obsolete=deferred(),commands=[],painted=[];
+ const h=harness(async(_name,{action})=>{
+  if(action.operation==='open')return {owner:old,poll_with_status:true};
+  const command=action.command;
+  commands.push([command.kind,command.owner.generation,command.ack_revision??command.revision]);
+  switch(command.kind){
+   case 'poll_with_status':
+    if(command.owner.generation===2)return {update:null,status};
+    return command.ack_revision===null?{update:{kind:'snapshot',frame},status}:obsolete.promise;
+   case 'recover':return {owner:next,frame:{...frame,revision:3},input_allowed:true};
+   case 'poll':case 'ack':return null;
+   case 'status':return status;
+   default:throw Error(command.kind);
+  }
+ },undefined,undefined,(_canvas,frame)=>painted.push(frame.revision));
+ h.el('#ssh-terminal-host').value='lab';await h.submitSsh();
+ const waiting=[...h.timers.values()][0]();await tick();
+ await h.click('#recover');
+ obsolete.resolve({update:{kind:'snapshot',frame:{...frame,revision:9}},status});
+ await waiting;await [...h.timers.values()][0]();
+ assert.deepEqual(commands,[
+  ['poll_with_status',1,undefined],['poll_with_status',1,1],['recover',1,undefined],
+  ['ack',2,3],['poll',2,undefined],['status',2,undefined],['poll_with_status',2,undefined],
+ ]);
+ assert.equal(painted.at(-1),3);
+ assert.ok(!painted.includes(9));
+});
+
 test('a fresh WebView selects a saved SSH shell explicitly and acknowledges it read-only',async()=>{
  const saved={id:'a'.repeat(32),destination:'remembered-host',created_ms:1};
  const owner={session:'b'.repeat(32),epoch:1,generation:4};
