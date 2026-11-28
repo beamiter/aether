@@ -73,6 +73,19 @@ enum SnapshotReceipt {
     Packed(Counter),
 }
 
+fn packed_poll_receipt(command: &Command) -> Option<SnapshotReceipt> {
+    if let Command::PollPacked {
+        ack_revision: Some(revision),
+        snapshot: false,
+        ..
+    } = command
+    {
+        Some(SnapshotReceipt::Packed(*revision))
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 pub(crate) enum SnapshotReply {
@@ -563,6 +576,8 @@ impl SshTerminal {
                     }
                     Command::PollWithStatus { .. } | Command::PollPacked { .. } => {
                         let packed = matches!(command, Command::PollPacked { .. });
+                        let snapshot_receipt = packed_poll_receipt(&command)
+                            .filter(|receipt| session.pending_snapshot == Some(*receipt));
                         let mut reply: RawPollReply = session
                             .exchange_with(command, false, Relay::call_frame)?
                             .ok_or("Invalid SSH terminal poll reply.")?;
@@ -571,6 +586,15 @@ impl SshTerminal {
                             let frame_bytes = reply.update.get().len();
                             if frame_bytes > MAX_ENCODED_FRAME_BYTES + MAX_ENCODED_IMAGE_BYTES {
                                 return Err("SSH terminal frame exceeds its byte limit.".into());
+                            }
+                            if let Some(receipt) = snapshot_receipt {
+                                if !session.poll_with_status
+                                    || reply.status["epoch"].as_u64()
+                                        != Some(u64::from(session.owner.epoch))
+                                {
+                                    return Err("Invalid SSH terminal poll reply.".into());
+                                }
+                                session.confirm_snapshot_receipt(receipt);
                             }
                             return Ok(Response::Packed {
                                 poll: reply,
@@ -871,11 +895,15 @@ impl RemoteSession {
             return Err("SSH terminal packed snapshot acknowledgment is unavailable.".into());
         }
         let result = self.exchange(command, false)?;
+        self.confirm_snapshot_receipt(receipt);
+        Ok(result)
+    }
+
+    fn confirm_snapshot_receipt(&mut self, receipt: SnapshotReceipt) {
         if self.pending_snapshot == Some(receipt) {
             self.pending_snapshot = None;
             self.recovered_from = None;
         }
-        Ok(result)
     }
 
     fn clear_capabilities(&mut self) {
@@ -957,7 +985,10 @@ impl RemoteSession {
             command,
             Command::PollWithStatus { .. } | Command::PollPacked { .. }
         );
-        if batched_poll && (!self.poll_with_status || self.pending_snapshot.is_some()) {
+        let snapshot_mismatch = self
+            .pending_snapshot
+            .is_some_and(|pending| packed_poll_receipt(&command) != Some(pending));
+        if batched_poll && (!self.poll_with_status || snapshot_mismatch) {
             return Err("SSH terminal batched polling is unavailable for this attachment.".into());
         }
         if let Command::PollPacked { frame_version, .. } = &command {
@@ -1169,6 +1200,19 @@ mod reload_tests {
             session.pending_snapshot,
             Some(SnapshotReceipt::Packed(revision))
         );
+        let poll = |ack_revision, snapshot| Command::PollPacked {
+            owner: session.owner.clone(),
+            ack_revision,
+            snapshot,
+            frame_version: Some(SSH_DENSE_FRAME_VERSION),
+        };
+        assert_eq!(packed_poll_receipt(&poll(Some(revision), true)), None);
+        assert_eq!(packed_poll_receipt(&poll(None, false)), None);
+        let accepted = packed_poll_receipt(&poll(Some(revision), false)).unwrap();
+        session.confirm_snapshot_receipt(SnapshotReceipt::Packed(Counter::new(1).unwrap()));
+        assert!(!session.input_allowed());
+        session.confirm_snapshot_receipt(accepted);
+        assert!(session.input_allowed());
     }
 
     #[test]

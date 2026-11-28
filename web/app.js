@@ -248,10 +248,25 @@ function acceptSshSnapshot(result,attachment){
   }
   return acceptFull(null,result.frame,attachment);
 }
-function sshPollAfterSnapshot(attachment,frame){
-  return frame.version===SSH_DENSE_FRAME_VERSION
-    ? {owner:attachment,ackRevision:null,frameVersion:frame.version}
-    : null;
+async function confirmSnapshot(attachment,frame,resumeInput=false){
+  if(attachment.session!==sshSession||frame.version!==SSH_DENSE_FRAME_VERSION){
+    await invokeAttached('ack_shell',{epoch:attachment.epoch,revision:frame.revision},attachment);
+    return {polling:false};
+  }
+  sshPoll={owner:attachment,ackRevision:frame.revision,frameVersion:frame.version};
+  keyQueue.locked=true;
+  input.disabled=send.disabled=resize.disabled=true;
+  const confirmed=await startTransport(info=>{
+    if(resumeInput&&!keyQueue.pending&&!info.exited&&!info.drained&&info.write_error===null){
+      keyQueue.locked=false;
+      input.disabled=send.disabled=resize.disabled=false;
+    }
+  });
+  if(!confirmed){
+    if(owner===attachment&&resumeInput&&!keyQueue.pending)sshInputSuspended=true;
+    return null;
+  }
+  return {polling:true};
 }
 function setOpenDisabled(disabled) {
   open.disabled=openIntegrated.disabled=openSsh.disabled=sshHost.disabled=disabled||!invoke;
@@ -972,7 +987,7 @@ function queueLocalStream(stream,event){
     void receiveLocalStream(stream,event);
   });
 }
-async function startTransport(){
+async function startTransport(onFirstPoll){
   if(!owner||localTransport==='recovery')return;
   let channel;
   if(owner.session!==sshSession&&localTransport!=='poll'&&typeof Channel==='function'){
@@ -984,7 +999,7 @@ async function startTransport(){
       suspendLocalOutput(new Error('local output Channel unavailable'));
       return;
     }
-    timer=setInterval(poll,50);await poll();return;
+    timer=setInterval(poll,50);return poll(onFirstPoll);
   }
   const stream={owner,channel,sequence:0n,frame:null,lastSeen:Date.now(),animation:null,observers:{multi:false,targets:[observerTarget(),null]},ready:false,adjusting:null};
   localStream=stream;
@@ -1003,7 +1018,7 @@ async function startTransport(){
 }
 document.addEventListener?.('visibilitychange',()=>{if(document.hidden)ime.reset();if(localStream)localStream.lastSeen=Date.now();});
 
-async function poll(){
+async function poll(onAccepted){
   if(epoch===null||changingTab||localStream||localTransport==='recovery'||polling?.epoch===epoch)return;const current=epoch,attachment=owner,ticket={epoch,transport};polling=ticket;
   const batch=sshPoll?.owner===attachment?sshPoll:null;
   const frameVersion=batch?.frameVersion,packed=frameVersion!=null;
@@ -1033,6 +1048,7 @@ async function poll(){
     if(epoch!==current||ticket.transport!==transport)return;
     validateShellStatus(info,current);
     if(batch)batch.ackRevision=update===null?null:state.revision;
+    onAccepted?.(info);
     showShellStatus(info,'poll');
     const target=observerTarget();
     if(target){
@@ -1043,6 +1059,7 @@ async function poll(){
     }
     // Finish draining the PTY and acknowledge any last batched update.
     if(info.drained&&!target&&(!batch||batch.ackRevision===null))clearInterval(timer);
+    return true;
 
   }catch(e){
     if(epoch!==current||ticket.transport!==transport)return;
@@ -1374,9 +1391,8 @@ async function reconnect(selected=null,saved=null){
     localTransport='channel';localInputSuspended=false;
     input.disabled=send.disabled=resize.disabled=true;close.disabled=detach.disabled=false;
     paintLiveFrame(next);state=next;describeCursor();
-    await invokeAttached('ack_shell',{epoch:nextOwner.epoch,revision:next.revision},nextOwner);
-    if(owner!==nextOwner)return;
-    if(remote)sshPoll=sshPollAfterSnapshot(nextOwner,next);
+    const confirmation=await confirmSnapshot(nextOwner,next);
+    if(owner!==nextOwner||!confirmation)return;
     status.textContent=saved?'Reconnected to the saved SSH shell on '+saved.destination+' in view-only mode.'
       :sshSession===null?'Reconnected to the existing shell in view-only mode.':'Reconnected to the SSH shell in view-only mode.';
     if(sshSession===null){
@@ -1386,7 +1402,7 @@ async function reconnect(selected=null,saved=null){
       if(selected!==null)showLocal.focus();
     }else renderTerminalStage();
     if(selected===null)focusTerminal();
-    await startTransport();
+    if(!confirmation.polling)await startTransport();
   }catch(e){if(generation===attempt)status.textContent=String(e?.message??e);}
   finally{if(generation===attempt&&epoch===null){setOpenDisabled(sshSession!==null);attach.disabled=false;button.disabled=sshSession!==null;}}
 }
@@ -1789,18 +1805,21 @@ async function recoverOutput(previousStatus=null){
     if(keyQueue.pending||(!keyQueue.locked&&input.disabled&&!restoringLocalLayout)){
       pasteReview.reset();keyQueue.locked=true;input.disabled=send.disabled=true;
     }
+    const resumeInput=!isLocal&&result.input_allowed===true&&!keyQueue.pending&&
+      (sshInputSuspended||(!input.disabled&&!keyQueue.locked));
     owner=nextOwner;
-    if(nextOwner.session!==sshSession)rememberLocalTab(nextOwner);
+    if(isLocal)rememberLocalTab(nextOwner);
+    else sshKeyboardOwner=result.input_allowed===true&&result.keyboard_event_reporting===true?nextOwner:null;
     paintLiveFrame(next);state=next;describeCursor();
-    await invokeAttached('ack_shell',{epoch:current,revision:next.revision});
-    if(epoch!==current||transport!==ticket)return;
-    if(nextOwner.session===sshSession){
-      sshPoll=sshPollAfterSnapshot(nextOwner,next);
-      sshKeyboardOwner=result.input_allowed===true&&result.keyboard_event_reporting===true?nextOwner:null;
-      if(result.input_allowed!==true){pasteReview.reset();keyQueue.locked=true;input.disabled=send.disabled=resize.disabled=true;}
-      else if(sshInputSuspended&&!keyQueue.pending){keyQueue.locked=false;input.disabled=send.disabled=resize.disabled=false;}
+    const confirmation=await confirmSnapshot(nextOwner,next,resumeInput);
+    if(epoch!==current||transport!==ticket||owner!==nextOwner||!confirmation)return;
+    if(!isLocal){
+      if(!confirmation.polling){
+        if(result.input_allowed!==true){pasteReview.reset();keyQueue.locked=true;input.disabled=send.disabled=resize.disabled=true;}
+        else if(sshInputSuspended&&!keyQueue.pending){keyQueue.locked=false;input.disabled=send.disabled=resize.disabled=false;}
+      }
       sshInputSuspended=false;
-      status.textContent=result.input_allowed===true?'SSH output snapshot recovered.':'SSH output snapshot recovered. Input remains disabled.';
+      status.textContent=input.disabled?'SSH output snapshot recovered. Input remains disabled.':'SSH output snapshot recovered.';
     }else if(localTransport==='recovery'){
       localTransport=options.frameVersion===CHANNEL_RENDITION_VERSION?'channel':'poll';
       localFrameRecovery=false;
@@ -1810,7 +1829,7 @@ async function recoverOutput(previousStatus=null){
       localInputSuspended=false;status.textContent=localTransport==='poll'
         ?'Local output recovered with compatibility polling.':'Local output snapshot recovered.';
     }else{status.textContent=previousStatus??'Output snapshot recovered. Existing input safety locks remain unchanged.';}
-    await startTransport();
+    if(!confirmation.polling)await startTransport();
   }catch(e){if(epoch===current&&transport===ticket)status.textContent=`Recovery failed: ${String(e?.message??e)}. Retry recovery or close.`;}
   finally{if(recovery===operation){recovery=null;if(epoch===current&&transport===ticket){detach.disabled=false;setLocalTools(true);renderLocalTabs();}}}
 }
@@ -1855,12 +1874,11 @@ async function claimSshReload(){
     keyQueue={chain:Promise.resolve(),pending:0,locked:true};input.disabled=send.disabled=resize.disabled=true;
     close.disabled=detach.disabled=false;
     paintLiveFrame(next);describeCursor();renderLocalTabs();
-    await invokeAttached('ack_shell',{epoch:nextOwner.epoch,revision:next.revision},nextOwner);
-    if(owner!==nextOwner)return;
-    sshPoll=sshPollAfterSnapshot(nextOwner,next);
-    if(result.input_allowed){keyQueue.locked=false;input.disabled=send.disabled=resize.disabled=false;}
-    status.textContent=result.input_allowed?'SSH output recovered in a fresh input view.':'SSH view recovered. Input remains disabled.';
-    await startTransport();
+    const confirmation=await confirmSnapshot(nextOwner,next,grant);
+    if(owner!==nextOwner||!confirmation)return;
+    if(!confirmation.polling&&grant){keyQueue.locked=false;input.disabled=send.disabled=resize.disabled=false;}
+    status.textContent=input.disabled?'SSH view recovered. Input remains disabled.':'SSH output recovered in a fresh input view.';
+    if(!confirmation.polling)await startTransport();
   }catch(error){
     keyQueue.locked=true;input.disabled=send.disabled=resize.disabled=true;
     if(owner?.session===sshSession&&grant&&!keyQueue.pending)sshInputSuspended=true;

@@ -1082,34 +1082,78 @@ function sshPackedSnapshot(owner,revision){
  return {owner,frame,frame_version:SSH_DENSE_FRAME_VERSION,frame_bytes:JSON.stringify(frame).length};
 }
 
-test('SSH continues from packed recovery and read-only snapshots after the exact acknowledgment',async()=>{
+test('SSH fetches the first delta with the packed recovery and read-only acknowledgment',async()=>{
  const first={session:'a'.repeat(32),epoch:1,generation:1},recovered={...first,generation:2};
  const reader={...first,generation:4},revision='9007199254740993';
+ const followup='9007199254740994',firstPoll=deferred();
+ const snapshot=sshPackedSnapshot(recovered,revision);
+ const update={kind:'delta',stamp:{...snapshot.frame.stamp,revision:followup},
+  base_revision:revision,rows:[{index:0,row:snapshot.frame.rows[0]}]};
+ const status={...channelHealth(1),poll_with_status:true,packed_frame_version:SSH_DENSE_FRAME_VERSION};
  const requests=[];
  const h=harness(async(_name,{action})=>{
   if(action.operation==='open')return {owner:first};
   if(action.operation==='attach')return sshPackedSnapshot(reader,revision);
   const command=action.command;
-  requests.push([command.kind,command.owner.generation,command.revision,command.snapshot]);
+  requests.push([command.kind,command.owner.generation,command.ack_revision,command.snapshot]);
   switch(command.kind){
-   case 'recover':return {...sshPackedSnapshot(recovered,revision),input_allowed:true};
-   case 'poll':case 'ack_packed':case 'detach':return null;
+   case 'recover':return {...snapshot,input_allowed:true};
+   case 'poll':case 'detach':return null;
    case 'status':return channelHealth(1);
-   case 'poll_packed':return {update:null,status:{...channelHealth(1),
-    poll_with_status:true,packed_frame_version:SSH_DENSE_FRAME_VERSION}};
+   case 'poll_packed':return command.owner.generation===2&&command.ack_revision===revision
+    ? firstPoll.promise : {update:null,status};
+   default:throw Error(command.kind);
+  }
+ });
+ h.el('#ssh-terminal-host').value='lab';await h.submitSsh();
+ const recovering=h.click('#recover');await tick();
+ assert.equal(h.el('#input').disabled,true);
+ assert.deepEqual(requests.at(-1),['poll_packed',2,revision,false]);
+ firstPoll.resolve({update,status,frame_bytes:JSON.stringify(update).length});
+ await recovering;
+ assert.equal(h.el('#input').disabled,false);
+ await [...h.timers.values()][0]();
+ await h.click('#detach');await h.click('#attach');
+ assert.equal(h.el('#input').disabled,true);
+ assert.deepEqual(requests,[
+  ['poll',1,undefined,undefined],['status',1,undefined,undefined],
+  ['recover',1,undefined,undefined],['poll_packed',2,revision,false],['poll_packed',2,followup,false],
+  ['detach',2,undefined,undefined],['poll_packed',4,revision,false],
+ ]);
+});
+
+test('SSH keeps input closed on a bad first delta and can recover a fresh view',async()=>{
+ const first={session:'a'.repeat(32),epoch:1,generation:1},revision='9';
+ const status={...channelHealth(1),poll_with_status:true,packed_frame_version:SSH_DENSE_FRAME_VERSION};
+ const h=harness(async(_name,{action})=>{
+  if(action.operation==='open')return {owner:first};
+  const command=action.command;
+  switch(command.kind){
+   case 'recover':return {...sshPackedSnapshot({...first,generation:command.owner.generation+1},revision),input_allowed:true};
+   case 'poll':return null;
+   case 'status':return channelHealth(1);
+   case 'poll_packed':{
+    assert.equal(command.ack_revision,revision);
+    assert.equal(command.snapshot,false);
+    if(command.owner.generation===4)return {update:null,status:{...status,exited:true,drained:true}};
+    if(command.owner.generation===3)return {update:null,status};
+    const snapshot=sshPackedSnapshot(command.owner,revision);
+    const update={kind:'delta',stamp:{...snapshot.frame.stamp,revision:'10'},base_revision:'8',rows:[]};
+    return {update,status,frame_bytes:JSON.stringify(update).length};
+   }
    default:throw Error(command.kind);
   }
  });
  h.el('#ssh-terminal-host').value='lab';await h.submitSsh();
  await h.click('#recover');
- assert.equal(h.el('#input').disabled,false);
- await h.click('#detach');await h.click('#attach');
  assert.equal(h.el('#input').disabled,true);
- assert.deepEqual(requests,[
-  ['poll',1,undefined,undefined],['status',1,undefined,undefined],
-  ['recover',1,undefined,undefined],['ack_packed',2,revision,undefined],['poll_packed',2,undefined,false],
-  ['detach',2,undefined,undefined],['ack_packed',4,revision,undefined],['poll_packed',4,undefined,false],
- ]);
+ assert.equal(h.timers.size,0);
+ assert.match(h.el('#status').textContent,/invalid Channel delta base/);
+ await h.click('#recover');
+ assert.equal(h.el('#input').disabled,false);
+ await h.click('#recover');
+ assert.equal(h.el('#input').disabled,true);
+ assert.equal(h.timers.size,0);
 });
 
 test('SSH polling rejects a delta from the wrong base',async()=>{
@@ -2474,11 +2518,12 @@ test(`composing SSH link loss uses one native reload ticket for ${packed?'packed
   if(c.kind==='poll'){if(lost)throw Error('owned SSH link lost');return null;}
   if(c.kind==='status')return {epoch:1,exited:false,drained:false,write_error:null,unsupported:'0',dropped_reply_bytes:'0'};
   if(c.kind==='text'){sent.push([c.owner,c.text]);return null;}
-  if(c.kind===(packed?'ack_packed':'ack')){
-   assert.equal(c.revision,packed?revision:frame.revision);
+  if(c.kind==='ack'&&!packed){
+   assert.equal(c.revision,frame.revision);
    return null;
   }
-  if(c.kind==='poll_packed'){
+  if(c.kind==='poll_packed'&&packed){
+   assert.equal(c.ack_revision,revision);
    assert.equal(c.snapshot,false);
    return {update:null,status:{...channelHealth(1),poll_with_status:true,packed_frame_version:SSH_DENSE_FRAME_VERSION}};
   }
