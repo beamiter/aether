@@ -3897,20 +3897,22 @@ def private_accessibility_address():
     return address.unpack()[0]
 
 
+def pty_size(identity):
+    """Query the same owned shell without writing input or changing focus."""
+    pid, stamp = identity
+    assert birth(pid) == stamp, "could not read size of the original owned shell"
+    fd = os.open(f"/proc/{pid}/fd/0", os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)
+    try:
+        rows, cols, _, _ = struct.unpack("HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, bytes(8)))
+        return rows, cols
+    finally:
+        os.close(fd)
+
+
 def exercise_three_restore_fit_x11(driver, owned, binary, tabs, parked, identities, parked_id):
     """Restart while fitted; read PTY sizes without changing pane focus."""
     def state():
         return driver.execute(READ)
-
-    def pty_size(identity):
-        pid, stamp = identity
-        assert birth(pid) == stamp, "fit fixture lost the owned shell"
-        fd = os.open(f"/proc/{pid}/fd/0", os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)
-        try:
-            rows, cols, _, _ = struct.unpack("HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, bytes(8)))
-            return rows, cols
-        finally:
-            os.close(fd)
 
     def fitted(previous=None):
         sizes = driver.execute("""
@@ -4138,17 +4140,25 @@ def exercise_three_shells(driver, owned, backend, binary):
                       "four_palette_directions": True, "visible_pty_identity_and_focus": True,
                       "parked_pty_retained": True}), flush=True)
     left, top, bottom = [f'#terminal-panes > [data-slot="{slot}"]' for slot in range(3)]
+    prior = [*identities, parked_id]
+    assert not driver.execute("return document.querySelector('#fit-size').checked;")
     before = state()
+    before_sizes = [pty_size(identity) for identity in prior]
+    assert before_sizes[2] == (12, 84) and before["cursor"].startswith("84 × 12 cells")
     set_split_balance_with_keys(driver, left, top, 61)
     set_split_balance_with_keys(driver, top, bottom, 40, control="#split-stack-balance", axis="height")
     after = state()
     assert after["current_tab"] == before["current_tab"] == tabs[2] and after["writable"]
-    assert after["draft"] == before["draft"] == "" and after["cursor"] == before["cursor"]
-    assert all(birth(pid) == stamp for pid, stamp in [*identities, parked_id])
+    assert after["draft"] == before["draft"] == ""
+    # The shell may finish painting its prompt after acknowledging the last
+    # write. Check the actual PTY grid, not the cursor position inside it.
+    assert after["cursor"].startswith("84 × 12 cells"), after["cursor"]
+    after_sizes = [pty_size(identity) for identity in prior]
+    assert after_sizes == before_sizes, {"before": before_sizes, "after": after_sizes}
     print(json.dumps({"case": "AETHER.THREE_PANES.KEYBOARD_BALANCE", "backend": backend,
-                      "left_share": 61, "top_right_share": 40, "owner_and_parked_retained": True}), flush=True)
+                      "left_share": 61, "top_right_share": 40, "owner_and_parked_retained": True,
+                      "owned_pty_grids_unchanged_with_fit_off": True}), flush=True)
 
-    prior = [*identities, parked_id]
     forbidden = owned / "three-restore-must-not-run"
     driver.type("#input", f"printf replayed > {shlex.quote(str(forbidden))}")
     driver.close()
