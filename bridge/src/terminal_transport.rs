@@ -2,7 +2,11 @@
 mod session_table;
 pub mod ssh;
 
-use crate::{live::LiveBridge, semantic::Attachment};
+use crate::{
+    live::{KeyEvent, LiveBridge, NativeKeyState},
+    semantic::Attachment,
+};
+use jterm_engine::input::KeyboardLocks;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use session_table::SessionTable;
@@ -84,6 +88,15 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         keypad: Option<crate::live::KeypadReport>,
     },
+    EnableKeyboardEvents {
+        owner: Attachment,
+    },
+    KeyEvent {
+        owner: Attachment,
+        event: KeyEvent,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        layout: Option<KeyboardLayout>,
+    },
     Mouse {
         owner: Attachment,
         report: crate::live::MouseReport,
@@ -108,6 +121,39 @@ pub enum Command {
     Close {
         owner: Attachment,
     },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyboardLayout {
+    base: Option<char>,
+    caps_lock: bool,
+    num_lock: bool,
+}
+
+impl From<NativeKeyState> for KeyboardLayout {
+    fn from(state: NativeKeyState) -> Self {
+        Self {
+            base: state.base,
+            caps_lock: state.locks.caps_lock,
+            num_lock: state.locks.num_lock,
+        }
+    }
+}
+
+impl KeyboardLayout {
+    fn into_native(self) -> Result<NativeKeyState, String> {
+        if self.base.is_some_and(char::is_control) {
+            return Err("invalid keyboard layout character".into());
+        }
+        Ok(NativeKeyState {
+            base: self.base,
+            locks: KeyboardLocks {
+                caps_lock: self.caps_lock,
+                num_lock: self.num_lock,
+            },
+        })
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -180,7 +226,10 @@ impl Host {
             Err("unsupported terminal transport version or request ID".into())
         } else if (matches!(
             &request.command,
-            Command::Focus { .. } | Command::Mouse { .. }
+            Command::Focus { .. }
+                | Command::Mouse { .. }
+                | Command::EnableKeyboardEvents { .. }
+                | Command::KeyEvent { .. }
         ) && request.host.as_ref() != Some(&self.identity))
             || request
                 .host
@@ -205,7 +254,7 @@ impl Host {
                 check_grid(rows, cols)?;
                 return self.sessions.admit(|| {
                     let mut bridge = LiveBridge::default();
-                    let epoch = bridge.open(rows, cols)?;
+                    let epoch = bridge.open_remote(rows, cols)?;
                     let owner = bridge.attachment(epoch)?;
                     let result = reply_value(&owner)?;
                     Ok((owner.session, bridge, result))
@@ -231,6 +280,8 @@ impl Host {
                 let input_allowed = bridge.recovered_input_allowed(&resume.owner);
                 let mut result = reply_value(resume)?;
                 result["input_allowed"] = Value::Bool(input_allowed);
+                result["keyboard_events_enabled"] =
+                    Value::Bool(bridge.remote_keyboard_events_enabled());
                 (owner.session, result)
             }
             Command::Detach { owner } => {
@@ -248,6 +299,7 @@ impl Host {
                 status["focus_reporting"] = Value::Bool(true);
                 status["mouse_reporting"] = Value::Bool(true);
                 status["keypad_reporting"] = Value::Bool(true);
+                status["keyboard_events_supported"] = Value::Bool(true);
                 if let Some(mouse) = bridge.mouse_view(epoch)? {
                     status["mouse"] = reply_value(mouse)?;
                 }
@@ -288,6 +340,20 @@ impl Host {
                     )?)
                 })?
             }
+            Command::EnableKeyboardEvents { owner } => {
+                self.attached(owner, true, |bridge, epoch| {
+                    bridge.enable_remote_keyboard_events(epoch)?;
+                    Ok(Value::Bool(true))
+                })?
+            }
+            Command::KeyEvent {
+                owner,
+                event,
+                layout,
+            } => self.attached(owner, true, |bridge, epoch| {
+                let native = layout.map(KeyboardLayout::into_native).transpose()?;
+                reply_value(bridge.key_event(epoch, &event, native)?)
+            })?,
             Command::Text { owner, text } => {
                 check_input(text.len())?;
                 self.attached(owner, true, |bridge, epoch| {
@@ -924,6 +990,71 @@ expect(b'.')
                 report: serde_json::from_value(report(&fresh, "press")).unwrap()
             })
             .is_err());
+        host.execute(Command::Close { owner: reader }).unwrap();
+    }
+
+    #[test]
+    fn remote_keyboard_opt_in_requires_a_bound_writer() {
+        let mut host = Host::new().unwrap();
+        let opened = host.execute(Command::Open { rows: 8, cols: 80 }).unwrap();
+        let owner = serde_json::from_value::<Attachment>(opened).unwrap();
+        let status = host
+            .execute(Command::Status {
+                owner: owner.clone(),
+            })
+            .unwrap();
+        assert_eq!(status["keyboard_events_supported"], true);
+        let send = |host: &mut Host, bound: bool, command| {
+            host.reply(Request {
+                protocol: VERSION,
+                request: 1,
+                host: bound.then(|| host.identity.clone()),
+                command,
+            })
+            .result
+        };
+        let enable = |owner: &Attachment| Command::EnableKeyboardEvents {
+            owner: owner.clone(),
+        };
+        let release = |owner: &Attachment| {
+            serde_json::from_value::<Command>(serde_json::json!({
+                "kind": "key_event", "owner": owner,
+                "event": {
+                    "phase": "release", "name": "F3", "code": "F3",
+                    "shift": false, "alt": false, "ctrl": false, "super_key": false,
+                    "caps_lock": false, "num_lock": false, "focus_generation": 0
+                }
+            }))
+            .unwrap()
+        };
+        assert!(send(&mut host, true, release(&owner)).is_err());
+        assert_eq!(
+            send(&mut host, false, enable(&owner)).unwrap_err(),
+            HOST_CHANGED
+        );
+        assert_eq!(send(&mut host, true, enable(&owner)).unwrap(), true);
+        assert_eq!(
+            send(&mut host, false, release(&owner)).unwrap_err(),
+            HOST_CHANGED
+        );
+        assert_eq!(send(&mut host, true, release(&owner)).unwrap(), false);
+
+        let recovered = host
+            .execute(Command::Recover {
+                owner: owner.clone(),
+            })
+            .unwrap();
+        assert_eq!(recovered["keyboard_events_enabled"], true);
+        assert!(send(&mut host, true, release(&owner)).is_err());
+        let reader = host
+            .execute(Command::AttachReadOnly {
+                session: owner.session,
+                epoch: owner.epoch,
+            })
+            .unwrap();
+        let reader = serde_json::from_value::<Attachment>(reader["owner"].clone()).unwrap();
+        assert!(send(&mut host, true, enable(&reader)).is_err());
+        assert!(send(&mut host, true, release(&reader)).is_err());
         host.execute(Command::Close { owner: reader }).unwrap();
     }
 

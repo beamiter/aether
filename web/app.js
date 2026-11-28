@@ -57,7 +57,7 @@ let changingTab=null,restoringLocalLayout=false;
 let mouseView=null,hoveredLinkPoint=null;
 let state=null,epoch=null,owner=null,timer=null,polling=null,generation=0,transport=0,recovery=null;
 let sshSession=null,sshInputSuspended=false,detachedLocal=null,sshReloadNeeded=false,retainedLayoutBlocked=false;
-let sshFocusOwner=null,sshMouseOwner=null;
+let sshFocusOwner=null,sshMouseOwner=null,sshKeyboardOwner=null;
 const showSavedSsh=document.querySelector('#show-saved-ssh'),savedSshPanel=document.querySelector('#saved-ssh');
 const savedSshSelect=document.querySelector('#saved-ssh-shell'),resumeSavedSsh=document.querySelector('#resume-saved-ssh'),forgetSavedSsh=document.querySelector('#forget-saved-ssh');
 let savedSshShells=[],savedSshRequest=0;
@@ -167,7 +167,7 @@ function sendTerminalText(text,attachment){
   enqueueLogical('text_shell',{text});
 }
 const terminalKeys=installTerminalKeys({
-  getOwner:()=>localView()===inputOwner()?inputOwner():null,
+  getOwner:()=>keyboardView()===inputOwner()?inputOwner():null,
   send:(event,receipt,permit)=>enqueueLogical('key_event_shell',{event},receipt,permit),
   sendText:sendTerminalText,
 });
@@ -231,7 +231,7 @@ const channelSnapshots=()=>typeof Channel==='function'?{frameVersion:CHANNEL_REN
 const acceptAttachedSnapshot=(frame,attachment,options)=>options.frameVersion===CHANNEL_RENDITION_VERSION
   ?acceptChannelFrame(null,frame,{...attachment,frameVersion:options.frameVersion},true):acceptFull(null,frame,attachment);
 let savedLayout=invoke?(threePanePreview?readThreePaneLayout():null)??readLocalShellLayout():null,protectSavedLayout=false;
-const sshCommands={poll_shell:'poll',ack_shell:'ack',shell_status:'status',history_shell:'history',recover_shell:'recover',detach_shell:'detach',close_shell:'close',write_shell:'write',key_shell:'key',text_shell:'text',paste_shell:'paste',resize_shell:'resize',focus_shell:'focus',mouse_shell:'mouse'};
+const sshCommands={poll_shell:'poll',ack_shell:'ack',shell_status:'status',history_shell:'history',recover_shell:'recover',detach_shell:'detach',close_shell:'close',write_shell:'write',key_shell:'key',key_event_shell:'key_event',text_shell:'text',paste_shell:'paste',resize_shell:'resize',focus_shell:'focus',mouse_shell:'mouse'};
 function setOpenDisabled(disabled) {
   open.disabled=openIntegrated.disabled=openSsh.disabled=sshHost.disabled=disabled||!invoke;
   sshConnect.disabled=openSsh.disabled;
@@ -707,6 +707,7 @@ const history=installHistory({older:document.querySelector('#history-older'),new
   cancel:document.querySelector('#history-find-cancel'),status:document.querySelector('#history-find-status'),
   enabled:attachment=>attachment.session!==sshSession&&!restoringLocalLayout&&!recovery}});
 const localView=()=>owner&&owner.session!==sshSession&&!changingTab&&!recovery&&!restoringLocalLayout?owner:null;
+const keyboardView=()=>localView()??(!recovery&&owner===sshKeyboardOwner?owner:null);
 const blocks=installCommandBlocks(document,{
   copyText:text=>invoke('copy_terminal_text',{text}),
   getOwner:localView,
@@ -1195,6 +1196,7 @@ async function openShell({destination=null,retained=null,fromRestore=false,confi
     if(retained&&(opened.epoch<=retained||opened.session===detachedLocal?.session||opened.generation!==1))
       throw new Error('Second local shell did not match the open response.');
     owner=opened;sshSession=destination===null?null:opened.session;
+    sshKeyboardOwner=destination!==null&&result?.keyboard_event_reporting===true?opened:null;
     localTransport='channel';localInputSuspended=false;
     if(destination===null){detachedLocal=null;restoreLocalDraft(opened);rememberLocalTab(opened,configuration,paneId);}
     const previousEpoch=epoch;epoch=owner.epoch;updateSplitPair(previousEpoch);keyQueue={chain:Promise.resolve(),pending:0,locked:false};state=null;
@@ -1407,7 +1409,7 @@ close.addEventListener('click',async()=>{
   status.textContent=result?.cleanup_pending===false?'Terminal closed; direct child reaped. Descendant containment is not provided.':
     'Terminal closed; direct-child cleanup handed to bounded supervisor and may still be pending. Descendant containment is not provided.';
   if(warning)status.textContent+=' '+warning;
-  state=null;clearTerminalPaint();sshSession=null;sshInputSuspended=false;
+  state=null;clearTerminalPaint();sshSession=null;sshInputSuspended=false;sshKeyboardOwner=null;
   setOpenDisabled(false);attach.disabled=button.disabled=false;renderLocalTabs();
   if(resume!==null){
     await startLocalTab(resume,{focusTerminal:true});
@@ -1617,7 +1619,7 @@ function enqueueLogical(command,payload,onReceipt,permit){
 function keydown(event){
   terminalKeys.clearText();
   // Respect an earlier control or capture handler that already owns this key.
-  if(event.defaultPrevented)return;
+  if(event.defaultPrevented||(sshSession!==null&&recovery))return;
   if(epoch===null||input.disabled||ime.isComposing()||event.isComposing||event.keyCode===229||event.getModifierState?.('AltGraph')||event.key==='Dead'||event.key==='Process')return;
   if(pasteReview.dismissFromOrigin(event))return;
   if(workflows.consumeEnterRepeat(event)){event.preventDefault();return;}
@@ -1632,7 +1634,7 @@ function keydown(event){
   // Linux browser paste must reach the same review path as Ctrl+V.
   // Preserve plain Insert and modified Insert combinations for terminal apps.
   if(event.key==='Insert'&&event.shiftKey&&!event.ctrlKey&&!event.altKey)return;
-  if(localView()){
+  if(keyboardView()){
     if(terminalKeys.down(event,event.currentTarget===imeInput))event.preventDefault();
     return;
   }
@@ -1721,6 +1723,7 @@ async function recoverOutput(previousStatus=null){
     await invokeAttached('ack_shell',{epoch:current,revision:next.revision});
     if(epoch!==current||transport!==ticket)return;
     if(nextOwner.session===sshSession){
+      sshKeyboardOwner=result.input_allowed===true&&result.keyboard_event_reporting===true?nextOwner:null;
       if(result.input_allowed!==true){pasteReview.reset();keyQueue.locked=true;input.disabled=send.disabled=resize.disabled=true;}
       else if(sshInputSuspended&&!keyQueue.pending){keyQueue.locked=false;input.disabled=send.disabled=resize.disabled=false;}
       sshInputSuspended=false;
@@ -1775,6 +1778,7 @@ async function claimSshReload(){
     const next=acceptFull(null,result.frame,nextOwner);
     restoreSshReloadView(view);
     owner=nextOwner;epoch=nextOwner.epoch;sshSession=nextOwner.session;state=next;
+    sshKeyboardOwner=grant&&result.keyboard_event_reporting===true?nextOwner:null;
     keyQueue={chain:Promise.resolve(),pending:0,locked:true};input.disabled=send.disabled=resize.disabled=true;
     close.disabled=detach.disabled=false;
     paintLiveFrame(next);describeCursor();renderLocalTabs();

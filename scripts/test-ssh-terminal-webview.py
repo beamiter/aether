@@ -263,6 +263,53 @@ def exercise(app, destination, helper, legacy_helper=False):
             wait(lambda: [line.strip() for line in clipboard().splitlines()] == lines,
                  "native WebView did not copy the recovered grid to X11")
 
+        def exercise_keyboard(events):
+            receipt = str(owned / "keyboard-bytes")
+            ready = b"\x1b[?1049h\x1b[2J\x1b[H"
+            if events:
+                ready += b"\x1b[>26u\x1b[?u"
+            ready += b"SSH_KEYBOARD_READY"
+            expected = (b"\x1b[?26u\x1b[13~\x1b[13;1:3~\x1b[97;;97u\x1b[97;1:3u"
+                        if events else b"\x1bORa")
+            source = f"""import os, select, sys, termios, tty
+mode = termios.tcgetattr(0)
+try:
+    tty.setraw(0)
+    os.write(1, {ready!r})
+    seen = bytearray()
+    while select.select([0], [], [], 10 if len(seen) < {len(expected)} else 0.3)[0]:
+        data = os.read(0, 256)
+        if not data or len(seen) >= 256:
+            break
+        seen.extend(data)
+    pending = sys.argv[1] + '.pending'
+    with open(pending, 'w') as output:
+        output.write(seen.hex())
+    os.replace(pending, sys.argv[1])
+finally:
+    os.write(1, b'\\x1b[?1049l\\x1b[10;1H\\x1b[2KSSH_KEYBOARD_DONE\\r\\n')
+    termios.tcsetattr(0, termios.TCSANOW, mode)
+"""
+            submit(shlex.join(["python3", "-c", f"exec({source.encode()!r})", receipt]))
+            wait(lambda: visible("SSH_KEYBOARD_READY"), "keyboard probe did not appear over SSH")
+            driver.click("#reveal-cursor")
+            focused_control("ime-input")
+            run("xdotool", "key", "F3", "a")
+            # Leave terminal focus in place until both key-up receipts clear.
+            actual = bytes.fromhex(probe["remote_python"](destination, """
+from pathlib import Path
+import sys, time
+receipt = Path(sys.argv[1])
+deadline = time.monotonic() + 11
+while not receipt.is_file():
+    assert time.monotonic() < deadline, 'missing SSH keyboard capture'
+    time.sleep(0.05)
+print(receipt.read_text())
+""", receipt))
+            assert actual == expected, (expected, actual)
+            wait(lambda: visible("SSH_KEYBOARD_DONE"), "keyboard probe did not return to the SSH shell")
+            return len(actual)
+
         snap("start")
         driver.type("#ssh-terminal-host", destination)
         driver.click("#open-ssh")
@@ -274,12 +321,14 @@ def exercise(app, destination, helper, legacy_helper=False):
             assert "Restart recovery requires a current SSH terminal helper" in state()["status"]
             submit("printf '%s%s\\r\\n' LEGACY_ WORKS")
             wait(lambda: visible("LEGACY_WORKS"), "the older helper did not carry shell input and output")
+            keyboard_bytes = exercise_keyboard(events=False)
             close_shell()
             driver.click("#show-saved-ssh")
             wait(lambda: state()["status"] == "No saved SSH shells.", "the older helper created a saved entry")
             stop_desktop()
             return dict(legacy_helper=True, shell_input_and_output=True,
-                        saved_catalog_remains_empty=True, artifacts=str(root))
+                        saved_catalog_remains_empty=True, keyboard_bytes_verified=keyboard_bytes,
+                        artifacts=str(root))
 
         submit("stty -echo; printf '\\033[1;1H\\033[48;2;22;63;91m%20s\\033[0m' ''; "
                "printf '\\033[2;1H\\033[2K%s\\r\\n' ECHO_DISABLED; "
@@ -323,6 +372,7 @@ def exercise(app, destination, helper, legacy_helper=False):
         wait(lambda: state()["writable"], "recovered view did not regain input rights")
         submit("printf '\\033[9;1H\\033[2K%s\\r\\n' \"$SENTINEL\"")
         wait(lambda: visible("WEBVIEW_PTY_SURVIVED"), "recovered shell lost its variable or input")
+        keyboard_bytes = exercise_keyboard(events=True)
 
         restart_gate = str(owned / "allow-restart-output")
         witness = str(owned / "restart-written")
@@ -459,6 +509,7 @@ def exercise(app, destination, helper, legacy_helper=False):
         return dict(
             native_webview=True, detached_content_recovered=True,
             native_remote_terminfo_profile=True,
+            native_kitty_key_events_after_recovery=True, keyboard_bytes_verified=keyboard_bytes,
             same_pty_input_resumed=True, read_only_grid=True, read_only_write_blocked=True,
             remote_pty_reaped=True, clean_native_exit=True, native_clipboard=True,
             native_remote_rgb_paint=True, detached_pty_bytes=DETACHED_WRITES * len(DETACHED_WRITE),

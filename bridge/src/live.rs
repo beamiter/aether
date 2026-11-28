@@ -130,6 +130,7 @@ pub struct LiveBridge {
     resize_repaint: Option<ResizeRepaint>,
     mouse: mouse::Mouse,
     keyboard: keyboard::Keyboard,
+    remote_keyboard_events: bool,
     focus_state: Option<(u32, bool)>,
     focus_retiring: bool,
     #[cfg(test)]
@@ -188,6 +189,33 @@ impl LiveBridge {
 
     pub fn open(&mut self, rows: usize, cols: usize) -> Result<u32, String> {
         self.open_with_window_pixels(rows, cols, false, None)
+    }
+
+    // Legacy SSH clients can encode disambiguated presses. Lift this limit
+    // when the writer has selected physical key events.
+    pub(crate) fn open_remote(&mut self, rows: usize, cols: usize) -> Result<u32, String> {
+        let epoch = self.open(rows, cols)?;
+        self.session
+            .as_mut()
+            .unwrap()
+            .enable_keyboard_disambiguation();
+        Ok(epoch)
+    }
+
+    pub(crate) fn enable_remote_keyboard_events(&mut self, epoch: u32) -> Result<(), String> {
+        self.check(epoch)?;
+        if !self.remote_keyboard_events {
+            self.session
+                .as_mut()
+                .unwrap()
+                .enable_native_keyboard_reporting();
+            self.remote_keyboard_events = true;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn remote_keyboard_events_enabled(&self) -> bool {
+        self.remote_keyboard_events
     }
 
     pub fn open_integrated(&mut self, rows: usize, cols: usize) -> Result<u32, String> {
@@ -267,6 +295,7 @@ impl LiveBridge {
         self.restored_commands = Default::default();
         self.raw = RawSuffix::default();
         self.keyboard.clear();
+        self.remote_keyboard_events = false;
         self.focus_state = None;
         self.focus_retiring = false;
         Ok(epoch)
@@ -1204,7 +1233,6 @@ impl LiveBridge {
     }
 
     /// Admit a physical key and return whether the caller should report its release.
-    /// Only the local desktop supplies the matching key phases.
     pub fn key_event(
         &mut self,
         epoch: u32,
@@ -1212,8 +1240,8 @@ impl LiveBridge {
         native: Option<NativeKeyState>,
     ) -> Result<bool, String> {
         self.check(epoch)?;
-        if !self.local_desktop || !self.input_attached {
-            return Err("physical keyboard reports require an attached local terminal".into());
+        if !(self.local_desktop || self.remote_keyboard_events) || !self.input_attached {
+            return Err("physical keyboard reporting is unavailable for this attachment".into());
         }
         let terminal = self.session.as_ref().unwrap().terminal();
         let mut prepared = self.keyboard.prepare(terminal, event, native)?;

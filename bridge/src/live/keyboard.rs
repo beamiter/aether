@@ -7,9 +7,9 @@ use jterm_engine::{
     },
     terminal::Terminal,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum KeyPhase {
     Press,
@@ -17,7 +17,7 @@ pub enum KeyPhase {
     Release,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeyEvent {
     pub phase: KeyPhase,
@@ -31,6 +31,7 @@ pub struct KeyEvent {
     pub num_lock: bool,
     pub focus_generation: u32,
     pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub native_time: Option<u64>,
 }
 

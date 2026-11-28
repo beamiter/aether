@@ -69,15 +69,28 @@ struct RemoteSession {
     focus_reporting: bool,
     mouse_reporting: bool,
     keypad_reporting: bool,
+    keyboard_event_reporting: bool,
 }
 
 #[tauri::command]
 pub(crate) async fn ssh_terminal<R: tauri::Runtime>(
     window: tauri::WebviewWindow<R>,
-    action: Action,
+    mut action: Action,
     terminal: tauri::State<'_, Arc<Mutex<SshTerminal>>>,
+    keyboard: tauri::State<'_, Arc<Mutex<super::native_keyboard::Samples>>>,
 ) -> Result<Value, String> {
     super::require_terminal_window(&window)?;
+    if let Action::Request {
+        command: Command::KeyEvent { event, layout, .. },
+    } = &mut action
+    {
+        *layout = keyboard
+            .lock()
+            .ok()
+            .and_then(|mut keyboard| keyboard.take(event))
+            .map(Into::into);
+        event.native_time = None;
+    }
     let label = window.label().to_owned();
     let store = window.path().app_data_dir().ok().map(Store::new);
     super::run_bridge(terminal.inner().clone(), move |terminal| {
@@ -196,7 +209,7 @@ impl SshTerminal {
                         Err("Restart recovery requires a current SSH terminal helper.".into())
                     }
                 };
-                self.session = Some(RemoteSession {
+                let mut session = RemoteSession {
                     endpoint,
                     instance,
                     saved_id: remembered.as_ref().ok().cloned(),
@@ -210,8 +223,16 @@ impl SshTerminal {
                     focus_reporting: false,
                     mouse_reporting: false,
                     keypad_reporting: false,
-                });
-                Ok(json!({"owner": opened, "save_warning": remembered.err()}))
+                    keyboard_event_reporting: false,
+                };
+                session.negotiate_keyboard_events();
+                let keyboard_event_reporting = session.keyboard_event_reporting;
+                self.session = Some(session);
+                Ok(json!({
+                    "owner": opened,
+                    "save_warning": remembered.err(),
+                    "keyboard_event_reporting": keyboard_event_reporting,
+                }))
             }
             Action::ListSaved => store.ok_or(NO_STORE)?.list(),
             Action::RestoreSaved { id } => self.restore_saved(&id, store.ok_or(NO_STORE)?),
@@ -276,6 +297,9 @@ impl SshTerminal {
                     Command::Identify | Command::Open { .. } | Command::AttachReadOnly { .. } => {
                         return Err("Use the SSH terminal's open or attach action.".into());
                     }
+                    Command::EnableKeyboardEvents { .. } => {
+                        return Err("The SSH desktop negotiates keyboard reporting on open.".into());
+                    }
                     Command::Recover { owner } => return session.recover(owner.clone()),
                     Command::Detach { owner }
                     | Command::Poll { owner }
@@ -286,6 +310,7 @@ impl SshTerminal {
                     | Command::Mouse { owner, .. }
                     | Command::Focus { owner, .. }
                     | Command::Key { owner, .. }
+                    | Command::KeyEvent { owner, .. }
                     | Command::Text { owner, .. }
                     | Command::Paste { owner, .. }
                     | Command::Resize { owner, .. }
@@ -516,6 +541,7 @@ impl SshTerminal {
             focus_reporting: false,
             mouse_reporting: false,
             keypad_reporting: false,
+            keyboard_event_reporting: false,
         });
         Ok(result)
     }
@@ -545,6 +571,26 @@ impl RemoteSession {
         !self.read_only && !self.input_uncertain && self.pending_snapshot.is_none()
     }
 
+    fn negotiate_keyboard_events(&mut self) {
+        if !self.instance.as_deref().is_some_and(valid_identity) {
+            return;
+        }
+        let owner = self.owner.clone();
+        let supported = self
+            .exchange(
+                Command::Status {
+                    owner: owner.clone(),
+                },
+                false,
+            )
+            .is_ok_and(|status| {
+                status.get("keyboard_events_supported") == Some(&Value::Bool(true))
+            });
+        self.keyboard_event_reporting = supported
+            && self.exchange(Command::EnableKeyboardEvents { owner }, false)
+                == Ok(Value::Bool(true));
+    }
+
     fn install_snapshot(&mut self, result: &Value, previous: &Attachment) -> Result<(), String> {
         let target = SessionSelector {
             session: previous.session.clone(),
@@ -558,6 +604,7 @@ impl RemoteSession {
         self.focus_reporting = false;
         self.mouse_reporting = false;
         self.keypad_reporting = false;
+        self.keyboard_event_reporting = false;
         self.pending_snapshot = Some(revision);
         Ok(())
     }
@@ -584,13 +631,18 @@ impl RemoteSession {
         self.install_snapshot(&result, &previous)?;
         self.recovered_from = Some(previous);
         self.input_uncertain |= !host_allowed;
-        result
+        let allowed = !self.read_only && !self.input_uncertain;
+        self.keyboard_event_reporting = allowed
+            && self.instance.as_deref().is_some_and(valid_identity)
+            && result.get("keyboard_events_enabled") == Some(&Value::Bool(true));
+        let receipt = result
             .as_object_mut()
-            .ok_or("Invalid SSH terminal recovery result.")?
-            .insert(
-                "input_allowed".into(),
-                Value::Bool(!self.read_only && !self.input_uncertain),
-            );
+            .ok_or("Invalid SSH terminal recovery result.")?;
+        receipt.insert("input_allowed".into(), Value::Bool(allowed));
+        receipt.insert(
+            "keyboard_event_reporting".into(),
+            Value::Bool(self.keyboard_event_reporting),
+        );
         Ok(result)
     }
 
@@ -599,9 +651,10 @@ impl RemoteSession {
             self.focus_reporting = false;
             self.mouse_reporting = false;
             self.keypad_reporting = false;
+            self.keyboard_event_reporting = false;
         }
-        // A new command must never be sent to an old helper. Capability is
-        // learned only from a normal Status on this bound link and attachment.
+        // Optional input commands require capability from this bound host
+        // and a current writer attachment.
         if matches!(command, Command::Focus { .. })
             && (!self.focus_reporting
                 || !self.input_allowed()
@@ -618,6 +671,10 @@ impl RemoteSession {
                 || !self.instance.as_deref().is_some_and(valid_identity))
         {
             return Err("SSH terminal mouse reporting is unavailable.".into());
+        }
+
+        if matches!(command, Command::KeyEvent { .. }) && !self.keyboard_event_reporting {
+            return Err("SSH terminal physical keyboard reporting is unavailable.".into());
         }
 
         if reconnect && self.relay.is_none() {
@@ -641,6 +698,7 @@ impl RemoteSession {
             self.focus_reporting = false;
             self.mouse_reporting = false;
             self.keypad_reporting = false;
+            self.keyboard_event_reporting = false;
         }
         match relay.call(command) {
             Ok(mut reply) => {
@@ -686,6 +744,7 @@ impl RemoteSession {
                 self.focus_reporting = false;
                 self.mouse_reporting = false;
                 self.keypad_reporting = false;
+                self.keyboard_event_reporting = false;
                 self.input_uncertain |= input;
                 Err("SSH terminal connection ended.".into())
             }
@@ -732,6 +791,7 @@ fn is_input(command: &Command) -> bool {
             | Command::Mouse { .. }
             | Command::Focus { .. }
             | Command::Key { .. }
+            | Command::KeyEvent { .. }
             | Command::Text { .. }
             | Command::Paste { .. }
             | Command::Resize { .. }
@@ -773,6 +833,7 @@ mod reload_tests {
                 focus_reporting: false,
                 mouse_reporting: false,
                 keypad_reporting: false,
+                keyboard_event_reporting: false,
             }),
         }
     }
