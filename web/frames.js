@@ -1,3 +1,4 @@
+import {admittedRows,cellSpanForBase,rowCell} from './channel-rows.js';
 import {cssColor,sameCellColor} from './cell-colors.js';
 import {createRasterCanvasCache} from './raster-canvas-cache.js';
 import {CELL_CONCEALED, CELL_OVERLINE, rowMoveForBase} from './frames-v4.js';
@@ -237,18 +238,22 @@ function appendCellDamage(damage, previous, frame, y, oldCursorRow, newCursorRow
   const before = previous.rows[y], after = frame.rows[y], cols = frame.cols;
   const oldCol = y === oldCursorRow ? previous.cursor_col : -1;
   const newCol = y === newCursorRow ? frame.cursor_col : -1;
-  const start = before !== after ? 0 : Math.min(oldCol < 0 ? cols : oldCol, newCol < 0 ? cols : newCol);
-  const end = before !== after ? cols : Math.max(oldCol, newCol) + 1;
+  const sameRow = before === after;
+  const span = sameRow ? undefined : cellSpanForBase(after,before);
+  const firstCell = sameRow ? cols : span?.first ?? 0;
+  const endCell = sameRow ? 0 : span?.last ?? cols;
+  const start = Math.min(firstCell, oldCol < 0 ? cols : oldCol, newCol < 0 ? cols : newCol);
+  const end = Math.max(endCell, oldCol+1, newCol+1);
   let first = -1, last = 0;
   for (let x = start; x < end;) {
-    if (x !== oldCol && x !== newCol && sameCellPaint(before[x], after[x])) {
+    if (x !== oldCol && x !== newCol && sameCellPaint(rowCell(before,x),rowCell(after,x))) {
       x++;
       continue;
     }
     // A boundary that bisects an old or new wide glyph cannot separate paints.
     let left = x, right = x + 1;
-    while (left > last && (before[left].width === 0 || after[left].width === 0)) left--;
-    while (right < cols && (before[right].width === 0 || after[right].width === 0)) right++;
+    while (left > last && (rowCell(before,left).width === 0 || rowCell(after,left).width === 0)) left--;
+    while (right < cols && (rowCell(before,right).width === 0 || rowCell(after,right).width === 0)) right++;
     // Amortize the extra Canvas operations over a sufficiently large unchanged gap.
     if (first === -1) first = left;
     else if (left - last >= MIN_CELL_DAMAGE_GAP) {
@@ -292,6 +297,9 @@ function paintBackgrounds(g, frame, damage, merge) {
 }
 
 export function paint(canvas, frame, deviceScale = globalThis.devicePixelRatio || 1) {
+  const sourceFrame = frame;
+  const rows = admittedRows(frame.rows);
+  if (rows !== frame.rows) frame = {...frame,rows};
   const cw = CELL_WIDTH, ch = CELL_HEIGHT;
   const {width, height, cssWidth, cssHeight, scale, mergeBackgrounds} =
     backingGeometry(frame.rows.length, frame.cols, deviceScale);
@@ -313,7 +321,7 @@ export function paint(canvas, frame, deviceScale = globalThis.devicePixelRatio |
   const newCursorRow = cursorMoved && frame.cursor_visible ? frame.cursor_row : -1;
   const canPaintCells = !full && !frame.selection && Number.isInteger(cellPixels);
   const move = !full && mergeBackgrounds && !frame.selection
-    ? rowMoveForBase(frame,previous.revision) : undefined;
+    ? rowMoveForBase(sourceFrame,previous.revision) : undefined;
   // Only an already-sized backing can have a matching row-copy base.
   const moveContext = move ? canvas.getContext('2d') : null;
   const canCopyRows = typeof moveContext?.drawImage === 'function';
@@ -347,6 +355,16 @@ export function paint(canvas, frame, deviceScale = globalThis.devicePixelRatio |
   // Canvas mutations after this point can fail partway. A recovery must
   // perform a full repaint even if it has the same grid and row references.
   painted.delete(canvas);
+  const admittedFrame = frame;
+  if (rows !== sourceFrame.rows && damage.length) {
+    // The drawing loops use indexed arrays. Only copy rows visited by a repaint.
+    const rasterRows = new Array(rows.length);
+    for (const {y} of damage) {
+      const row = rows[y];
+      rasterRows[y] ??= Array.isArray(row) ? row : Object.assign(row.slice(), {imageSlices:row.imageSlices});
+    }
+    frame = {...frame,rows:rasterRows};
+  }
   // Assigning a dimension clears and resets Canvas even if the value is unchanged.
   if (canvas.width !== width) canvas.width = width;
   if (canvas.height !== height) canvas.height = height;
@@ -403,5 +421,5 @@ export function paint(canvas, frame, deviceScale = globalThis.devicePixelRatio |
     else if(frame.cursor_shape==='underline')g.fillRect(x,y+ch-2,width,2);
     else g.strokeRect(x+.5,y+.5,width-1,ch-1);
   }
-  painted.set(canvas, {frame, scale});
+  painted.set(canvas, {frame:admittedFrame, scale});
 }

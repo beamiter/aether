@@ -307,6 +307,64 @@ test('binary dense delta spans merge immutable cells without splitting wide glyp
   }]}),expected),/dense Channel cell span/);
 });
 
+test('dense row views preserve array identity and repaint all edits when a paint skips a delta', () => {
+  const cols = 16;
+  const bytes = Uint8Array.of(1,2,3,4,5,6,0,1,1);
+  const original = Buffer.concat(Array(cols).fill(bytes)).toString('base64');
+  const row = text => ({wrapped:false,columns:cols,cell_bytes:original,text});
+  const expected = {...owner,frameVersion:SSH_DENSE_FRAME_VERSION};
+  const baseStamp = {...stamp,version:SSH_DENSE_FRAME_VERSION,cursor_row:0,cursor_col:14,cursor_visible:true};
+  const snapshot = {kind:'snapshot',stamp:baseStamp,cols,rows:[
+    row('abcdefghijklmnop'),row('0123456789ABCDEF'),row('QRSTUVWXYZ012345'),
+  ]};
+  const base = acceptChannelFrame(null,JSON.stringify(snapshot),expected);
+  const nextStamp = (previous,cursor_col) => ({...baseStamp,revision:String(BigInt(previous.revision)+1n),cursor_col});
+  function edit(previous, column, text, cursor) {
+    const frame = {kind:'delta',stamp:nextStamp(previous,cursor),base_revision:previous.revision,rows:[
+      {index:0,row:{wrapped:false,columns:cols,cell_bytes:null,text,cell_span:[column,1]}},
+    ]};
+    const packet = binaryChannelEvent({
+      kind:'update',frame,frame_bytes:Buffer.byteLength(JSON.stringify(frame)),cell_bytes:bytes.length,
+    },bytes);
+    return acceptChannelPayload(previous,decodeLocalChannelEvent(packet),expected);
+  }
+  const first = edit(base,1,'X',14);
+  const second = edit(first,12,'Y',15);
+  const clears = [], glyphs = [], copies = [];
+  const context = {
+    setTransform(){},save(){},restore(){},beginPath(){},rect(){},clip(){},fillRect(){},
+    clearRect(...rect){clears.push(rect);},
+    fillText(text){glyphs.push(text);},
+    drawImage(...rect){copies.push(rect);},
+  };
+  const canvas = {style:{},getContext:()=>context};
+  paint(canvas,base,1);
+  clears.length = 0;
+  glyphs.length = 0;
+  paint(canvas,second,1);
+  assert.deepEqual(clears,[[12,0,12,24],[144,0,48,24]]);
+  assert.ok(glyphs.includes('X') && glyphs.includes('Y'));
+
+  paint(canvas,first,1);
+  clears.length = 0;
+  glyphs.length = 0;
+  paint(canvas,second,1);
+  assert.deepEqual(clears,[[144,0,48,24]]);
+  assert.ok(glyphs.includes('Y') && !glyphs.includes('X'));
+
+  const moved = acceptChannelFrame(second,JSON.stringify({
+    kind:'delta',stamp:nextStamp(second,15),base_revision:second.revision,rows:[],moves:[{from:1,to:2,count:1}],
+  }),expected);
+  paint(canvas,moved,1);
+  assert.deepEqual(copies,[[canvas,0,24,192,24,0,48,192,24]]);
+  assert.equal(moved.rows[2],second.rows[1]);
+  assert.equal(second.rows[0][1],first.rows[0][1]);
+  assert.equal(base.rows[0][1].text,'b');
+  assert.equal(second.rows[0][12].text,'Y');
+  assert.ok(Array.isArray(second.rows[0]) && Object.isFrozen(second.rows[0]) && Object.isFrozen(second.rows[0][1]));
+  assert.throws(() => { second.rows[0][1] = base.rows[0][1]; },TypeError);
+});
+
 test('Channel row moves copy immutable base rows and retain images and links at their new positions', () => {
   const baseStamp = {...stamp,version:CHANNEL_FRAME_VERSION};
   const newest = {...second,cells:[{...cell,text:'Z'},cell]};

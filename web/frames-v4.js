@@ -1,3 +1,5 @@
+import {admittedRows,channelRowView,DenseChannelRow,markCellSpan,rowCell} from './channel-rows.js';
+
 export const CHANNEL_IMAGE_VERSION = 5;
 export const CHANNEL_FRAME_VERSION = 6;
 export const CHANNEL_PACKED_VERSION = 7;
@@ -283,7 +285,7 @@ function validateDenseRow(row, cols, links, referenced, supportsImages, binary, 
       throw new Error('invalid dense Channel cell span');
     first = start;
     last = start+count;
-    if (previous[first].width === 0 || previous[last]?.width === 0)
+    if (rowCell(previous,first).width === 0 || rowCell(previous,last)?.width === 0)
       throw new Error('dense Channel cell span splits a base wide glyph');
     base = previous;
   }
@@ -346,7 +348,7 @@ function validateDenseRow(row, cols, links, referenced, supportsImages, binary, 
     cells = base.slice();
     textBytes += base.textBytes;
     for (let column = first; column < last; column++) {
-      textBytes -= utf8Bytes(base[column].text);
+      textBytes -= utf8Bytes(rowCell(base,column).text);
       cells[column] = decoded[column-first];
     }
     if (base.links.length) {
@@ -362,7 +364,9 @@ function validateDenseRow(row, cols, links, referenced, supportsImages, binary, 
     }
   }
   const imageSlices = validateSlices(row.image_slices, cols, supportsImages);
-  return Object.freeze(Object.assign(cells, {wrapped,textBytes,links:Object.freeze([...rowLinks]),imageSlices}));
+  const admitted = new DenseChannelRow(cells, {wrapped,textBytes,links:Object.freeze([...rowLinks]),imageSlices});
+  if (base) markCellSpan(admitted,base,first,last);
+  return admitted;
 }
 
 function packedCell(text, width, {foreground,background,style,underline,underline_color,hyperlink_id}) {
@@ -511,7 +515,8 @@ export function acceptChannelUpdate(previous, update, expected, snapshotOnly, wi
         update.base_revision !== previous.revision || stamp.layout !== previous.layout || stamp.screen !== previous.screen ||
         stamp.version !== previous.version || update.rows.length > previous.rows.length) throw new Error('invalid Channel delta base');
     cols = previous.cols;
-    rows = previous.rows.slice();
+    const baseRows = admittedRows(previous.rows);
+    rows = baseRows.slice();
     const seen = new Set();
     for (const move of moves) {
       const {from, to, count} = move ?? {};
@@ -520,7 +525,7 @@ export function acceptChannelUpdate(previous, update, expected, snapshotOnly, wi
       for (let offset = 0; offset < count; offset++) {
         const index = to + offset;
         if (seen.has(index)) throw new Error('overlapping Channel row moves');
-        rows[index] = previous.rows[from + offset];
+        rows[index] = baseRows[from + offset];
         seen.add(index);
       }
     }
@@ -528,7 +533,7 @@ export function acceptChannelUpdate(previous, update, expected, snapshotOnly, wi
       const index = edit?.index;
       if (!Number.isInteger(index) || index < 0 || index >= rows.length || seen.has(index))
         throw new Error('invalid Channel row index');
-      rows[index] = validateRow(edit.row, cols, links, referenced, allowSlices, stamp.version,binary,previous.rows[index]);
+      rows[index] = validateRow(edit.row, cols, links, referenced, allowSlices, stamp.version,binary,baseRows[index]);
       seen.add(index);
     }
   }
@@ -555,7 +560,7 @@ export function acceptChannelUpdate(previous, update, expected, snapshotOnly, wi
     throw new Error('invalid Channel cursor');
   const images = resolveImages(rows, cols, newImages, imageBase);
   const frame = Object.freeze({version: stamp.version, session: stamp.session, epoch: expected.epoch,
-    revision: stamp.revision, layout: stamp.layout, screen: stamp.screen, cols, rows: Object.freeze(rows),
+    revision: stamp.revision, layout: stamp.layout, screen: stamp.screen, cols, rows: channelRowView(rows),
     hyperlinks:Object.freeze(hyperlinks), images, cursor_row, cursor_col, cursor_shape, cursor_visible, pending_wrap, cursor_color});
   if (moves.length === 1) {
     const {from,to,count} = moves[0];
