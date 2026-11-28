@@ -18,6 +18,7 @@ use tauri_terminal_frame_bridge::{
         ssh::{Endpoint, Relay},
         valid_identity, Command, RawPollReply, HOST_CHANGED,
     },
+    SSH_DENSE_FRAME_VERSION,
 };
 
 const NO_STORE: &str = "Saved SSH sessions are unavailable.";
@@ -86,7 +87,7 @@ struct RemoteSession {
     keypad_reporting: bool,
     keyboard_event_reporting: bool,
     poll_with_status: bool,
-    packed_frames: bool,
+    packed_frame_version: Option<u8>,
 }
 
 #[tauri::command]
@@ -242,7 +243,7 @@ impl SshTerminal {
                     keypad_reporting: false,
                     keyboard_event_reporting: false,
                     poll_with_status: false,
-                    packed_frames: false,
+                    packed_frame_version: None,
                 };
                 session.negotiate_capabilities();
                 let result = json!({
@@ -250,7 +251,7 @@ impl SshTerminal {
                     "save_warning": remembered.err(),
                     "keyboard_event_reporting": session.keyboard_event_reporting,
                     "poll_with_status": session.poll_with_status,
-                    "packed_frame_version": session.packed_frames.then_some(RENDITION_VERSION),
+                    "packed_frame_version": session.packed_frame_version,
                 });
                 self.session = Some(session);
                 Ok(result)
@@ -593,7 +594,7 @@ impl SshTerminal {
             keypad_reporting: false,
             keyboard_event_reporting: false,
             poll_with_status: false,
-            packed_frames: false,
+            packed_frame_version: None,
         });
         Ok(result)
     }
@@ -658,7 +659,7 @@ impl RemoteSession {
         self.keypad_reporting = false;
         self.keyboard_event_reporting = false;
         self.poll_with_status = false;
-        self.packed_frames = false;
+        self.packed_frame_version = None;
         self.pending_snapshot = Some(revision);
         Ok(())
     }
@@ -706,7 +707,7 @@ impl RemoteSession {
             .exchange_with(command, reconnect, Relay::call)?
             .unwrap_or(Value::Null);
         if status {
-            self.packed_frames = packed_frame_capability(self.instance.as_deref(), &reply);
+            self.packed_frame_version = packed_frame_capability(self.instance.as_deref(), &reply);
             self.apply_status(&mut reply);
         }
         Ok(reply)
@@ -724,7 +725,7 @@ impl RemoteSession {
             self.keypad_reporting = false;
             self.keyboard_event_reporting = false;
             self.poll_with_status = false;
-            self.packed_frames = false;
+            self.packed_frame_version = None;
         }
         // Optional input commands require capability from this bound host
         // and a current writer attachment.
@@ -757,8 +758,12 @@ impl RemoteSession {
         if batched_poll && (!self.poll_with_status || self.pending_snapshot.is_some()) {
             return Err("SSH terminal batched polling is unavailable for this attachment.".into());
         }
-        if matches!(command, Command::PollPacked { .. }) && !self.packed_frames {
-            return Err("SSH terminal packed frames are unavailable for this attachment.".into());
+        if let Command::PollPacked { frame_version, .. } = &command {
+            if self.packed_frame_version != Some(frame_version.unwrap_or(RENDITION_VERSION)) {
+                return Err(
+                    "SSH terminal packed frame version is unavailable for this attachment.".into(),
+                );
+            }
         }
 
         if reconnect && self.relay.is_none() {
@@ -783,7 +788,7 @@ impl RemoteSession {
             self.keypad_reporting = false;
             self.keyboard_event_reporting = false;
             self.poll_with_status = false;
-            self.packed_frames = false;
+            self.packed_frame_version = None;
         }
         match call(relay, command) {
             Ok(Ok(reply)) => Ok(Some(reply)),
@@ -800,7 +805,7 @@ impl RemoteSession {
                 self.keypad_reporting = false;
                 self.keyboard_event_reporting = false;
                 self.poll_with_status = false;
-                self.packed_frames = false;
+                self.packed_frame_version = None;
                 self.input_uncertain |= input;
                 Err("SSH terminal connection ended.".into())
             }
@@ -816,7 +821,11 @@ impl RemoteSession {
             && status.get("poll_with_status") == Some(&Value::Bool(true));
         if let Some(status) = status.as_object_mut() {
             status.remove("packed_frame_relay");
-            if !self.packed_frames || !self.poll_with_status {
+            status.remove("packed_frame_relay_version");
+            status.remove("dense_frame_version");
+            if let Some(version) = self.packed_frame_version.filter(|_| self.poll_with_status) {
+                status.insert("packed_frame_version".into(), version.into());
+            } else {
                 status.remove("packed_frame_version");
             }
             status.insert("focus_reporting".into(), Value::Bool(self.focus_reporting));
@@ -833,12 +842,26 @@ impl RemoteSession {
     }
 }
 
-fn packed_frame_capability(instance: Option<&str>, status: &Value) -> bool {
-    instance.is_some_and(valid_identity)
-        && status.get("poll_with_status") == Some(&Value::Bool(true))
-        && status.get("packed_frame_relay") == Some(&Value::Bool(true))
-        && status.get("packed_frame_version").and_then(Value::as_u64)
-            == Some(u64::from(RENDITION_VERSION))
+fn packed_frame_capability(instance: Option<&str>, status: &Value) -> Option<u8> {
+    if !instance.is_some_and(valid_identity)
+        || status.get("poll_with_status") != Some(&Value::Bool(true))
+        || status.get("packed_frame_relay") != Some(&Value::Bool(true))
+        || status.get("packed_frame_version").and_then(Value::as_u64)
+            != Some(u64::from(RENDITION_VERSION))
+    {
+        return None;
+    }
+    let dense = Some(u64::from(SSH_DENSE_FRAME_VERSION));
+    if status.get("dense_frame_version").and_then(Value::as_u64) == dense
+        && status
+            .get("packed_frame_relay_version")
+            .and_then(Value::as_u64)
+            == dense
+    {
+        Some(SSH_DENSE_FRAME_VERSION)
+    } else {
+        Some(RENDITION_VERSION)
+    }
 }
 
 fn keypad_capability(instance: Option<&str>, status: &Value) -> bool {
@@ -982,7 +1005,7 @@ mod reload_tests {
                 keypad_reporting: false,
                 keyboard_event_reporting: false,
                 poll_with_status: false,
-                packed_frames: false,
+                packed_frame_version: None,
             }),
         }
     }
@@ -1063,30 +1086,53 @@ mod reload_tests {
             "packed_frame_version": RENDITION_VERSION,
             "packed_frame_relay": true,
         });
-        assert!(packed_frame_capability(Some(&identity), &status));
-        assert!(!packed_frame_capability(None, &status));
+        assert_eq!(
+            packed_frame_capability(Some(&identity), &status),
+            Some(RENDITION_VERSION)
+        );
+        assert_eq!(packed_frame_capability(None, &status), None);
         let mut old_stdio = status.clone();
         old_stdio
             .as_object_mut()
             .unwrap()
             .remove("packed_frame_relay");
-        assert!(!packed_frame_capability(Some(&identity), &old_stdio));
+        assert_eq!(packed_frame_capability(Some(&identity), &old_stdio), None);
         let mut old_owner = status.clone();
         old_owner
             .as_object_mut()
             .unwrap()
             .remove("packed_frame_version");
-        assert!(!packed_frame_capability(Some(&identity), &old_owner));
+        assert_eq!(packed_frame_capability(Some(&identity), &old_owner), None);
         let mut unknown_version = status.clone();
         unknown_version["packed_frame_version"] = json!("8");
-        assert!(!packed_frame_capability(Some(&identity), &unknown_version));
+        assert_eq!(
+            packed_frame_capability(Some(&identity), &unknown_version),
+            None
+        );
+
+        let mut dense = status.clone();
+        dense["dense_frame_version"] = SSH_DENSE_FRAME_VERSION.into();
+        assert_eq!(
+            packed_frame_capability(Some(&identity), &dense),
+            Some(RENDITION_VERSION)
+        );
+        dense["packed_frame_relay_version"] = SSH_DENSE_FRAME_VERSION.into();
+        assert_eq!(
+            packed_frame_capability(Some(&identity), &dense),
+            Some(SSH_DENSE_FRAME_VERSION)
+        );
+        dense.as_object_mut().unwrap().remove("dense_frame_version");
+        assert_eq!(
+            packed_frame_capability(Some(&identity), &dense),
+            Some(RENDITION_VERSION)
+        );
 
         let mut terminal = terminal(Duration::ZERO);
         let session = terminal.session.as_mut().unwrap();
         session.instance = Some(identity);
         session.apply_status(&mut old_stdio);
         assert!(old_stdio.get("packed_frame_version").is_none());
-        session.packed_frames = true;
+        session.packed_frame_version = Some(RENDITION_VERSION);
         let mut negotiated = status;
         session.apply_status(&mut negotiated);
         assert_eq!(negotiated["packed_frame_version"], RENDITION_VERSION);

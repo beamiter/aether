@@ -2,6 +2,7 @@ export const CHANNEL_IMAGE_VERSION = 5;
 export const CHANNEL_FRAME_VERSION = 6;
 export const CHANNEL_PACKED_VERSION = 7;
 export const CHANNEL_RENDITION_VERSION = 8;
+export const SSH_DENSE_FRAME_VERSION = 9;
 // Decoded cells keep bit 2 available for the version-3 underline flag.
 export const CELL_CONCEALED = 256;
 export const CELL_OVERLINE = 128;
@@ -22,7 +23,8 @@ const underlines = new Set(['single','double','curly','dotted','dashed']);
 const colors = /^#[a-fA-F0-9]{6}$/;
 const invalidCellText = /[\x00-\x1f\x7f-\x9f\ud800-\udfff]/u;
 const supportsPackedRows = version => version === CHANNEL_PACKED_VERSION || version === CHANNEL_RENDITION_VERSION;
-const supportsRowMoves = version => version === CHANNEL_FRAME_VERSION || supportsPackedRows(version);
+const supportsRowMoves = version => version === CHANNEL_FRAME_VERSION ||
+  version === SSH_DENSE_FRAME_VERSION || supportsPackedRows(version);
 const supportsChannelImages = version => version === CHANNEL_IMAGE_VERSION || supportsRowMoves(version);
 const frameMoves = new WeakMap();
 
@@ -153,6 +155,62 @@ function decodedStyle(style, extended) {
   return extended && (style & 4) ? (style & ~4) | CELL_CONCEALED : style;
 }
 
+const hexByte = Array.from({length:256}, (_, value) => value.toString(16).padStart(2, '0'));
+
+function validateDenseRow(row, cols, links, referenced, supportsImages) {
+  const {wrapped, columns, cell_bytes, text, attributes = []} = row;
+  if (typeof wrapped !== 'boolean' || columns !== cols || row.cells !== undefined ||
+      row.styles !== undefined || row.runs !== undefined || typeof cell_bytes !== 'string' ||
+      cell_bytes.length !== cols * 12 || /[^a-zA-Z0-9+/]/.test(cell_bytes) ||
+      typeof text !== 'string' || text.length > cols * maxClusterBytes ||
+      !Array.isArray(attributes) || attributes.length > cols) throw new Error('invalid dense Channel row');
+  const bytes = atob(cell_bytes);
+  const styles = new Map();
+  for (const attribute of attributes) {
+    const {column, underline, underline_color, hyperlink_id} = attribute ?? {};
+    if (!Number.isInteger(column) || column < 0 || column >= cols || styles.has(column) ||
+        (underline === undefined && underline_color === undefined && hyperlink_id === undefined) ||
+        (underline !== undefined && !underlines.has(underline)) ||
+        (underline_color !== undefined && (typeof underline_color !== 'string' || !colors.test(underline_color))) ||
+        (hyperlink_id !== undefined && !links.has(hyperlink_id))) throw new Error('invalid dense Channel attributes');
+    styles.set(column, {underline,underline_color,hyperlink_id});
+  }
+  const cells = [], rowLinks = new Set();
+  let offset = 0, textBytes = 0, lead = false;
+  let previousBackground = -1, background;
+  for (let column = 0; column < cols; column++) {
+    const start = column * 9;
+    const r = bytes.charCodeAt(start), g = bytes.charCodeAt(start+1), b = bytes.charCodeAt(start+2);
+    const br = bytes.charCodeAt(start+3), bg = bytes.charCodeAt(start+4), bb = bytes.charCodeAt(start+5);
+    const foreground = '#' + hexByte[r] + hexByte[g] + hexByte[b];
+    const backgroundKey = (br << 16) | (bg << 8) | bb;
+    if (backgroundKey !== previousBackground) {
+      background = '#' + hexByte[br] + hexByte[bg] + hexByte[bb];
+      previousBackground = backgroundKey;
+    }
+    const style = decodedStyle(bytes.charCodeAt(start+6),true);
+    const width = bytes.charCodeAt(start+7), units = bytes.charCodeAt(start+8);
+    if (width > 2 || units === 0 || units > maxClusterBytes || offset + units > text.length)
+      throw new Error('invalid dense Channel cell');
+    const glyph = text.slice(offset,offset+units);
+    offset += units;
+    const size = utf8Bytes(glyph);
+    if (size > maxClusterBytes || invalidCellText.test(glyph)) throw new Error('invalid dense Channel text');
+    if (lead !== (width === 0) || (width === 0 && glyph !== ' ')) throw new Error('invalid Channel wide span');
+    lead = width === 2;
+    textBytes += size;
+    const {underline,underline_color,hyperlink_id} = styles.get(column) ?? {};
+    if (hyperlink_id !== undefined) {
+      rowLinks.add(hyperlink_id);
+      referenced.add(hyperlink_id);
+    }
+    cells.push(Object.freeze({text:glyph,width,style,foreground,background,underline,underline_color,hyperlink_id}));
+  }
+  if (lead || offset !== text.length) throw new Error('invalid dense Channel row width');
+  const imageSlices = validateSlices(row.image_slices, cols, supportsImages);
+  return Object.freeze(Object.assign(cells, {wrapped,textBytes,links:Object.freeze([...rowLinks]),imageSlices}));
+}
+
 function validatePackedRow(row, cols, links, referenced, supportsImages, extended) {
   if (!row || typeof row.wrapped !== 'boolean' || row.columns !== cols || row.cells !== undefined ||
       !Array.isArray(row.styles) || row.styles.length > cols || !Array.isArray(row.runs) || row.runs.length > cols)
@@ -198,7 +256,12 @@ function validatePackedRow(row, cols, links, referenced, supportsImages, extende
 }
 
 function validateRow(row, cols, links, referenced, supportsImages, version) {
-  const packed = supportsPackedRows(version), extended = version === CHANNEL_RENDITION_VERSION;
+  const dense = version === SSH_DENSE_FRAME_VERSION;
+  if (row?.cell_bytes !== undefined) {
+    if (!dense) throw new Error('dense Channel row version');
+    return validateDenseRow(row, cols, links, referenced, supportsImages);
+  }
+  const packed = dense || supportsPackedRows(version), extended = dense || version === CHANNEL_RENDITION_VERSION;
   if (packed && row?.cells === undefined) return validatePackedRow(row, cols, links, referenced, supportsImages, extended);
   if (packed && (row.styles !== undefined || row.runs !== undefined || row.columns !== undefined))
     throw new Error('mixed Channel row encodings');

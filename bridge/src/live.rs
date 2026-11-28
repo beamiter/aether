@@ -831,6 +831,30 @@ impl LiveBridge {
         let version = format
             .channel_version()
             .ok_or("terminal Channel version required")?;
+        self.poll_channel_with_version(epoch, snapshot, version, scratch)
+    }
+
+    pub(crate) fn poll_ssh_frame(
+        &mut self,
+        epoch: u32,
+        snapshot: bool,
+        version: u8,
+    ) -> Result<Option<(crate::protocol_v4::Counter, String)>, String> {
+        self.poll_channel_with_version(
+            epoch,
+            snapshot,
+            version,
+            crate::semantic_v4::FrameScratch::acquire(),
+        )
+    }
+
+    fn poll_channel_with_version(
+        &mut self,
+        epoch: u32,
+        snapshot: bool,
+        version: u8,
+        scratch: Option<crate::semantic_v4::FrameScratch>,
+    ) -> Result<Option<(crate::protocol_v4::Counter, String)>, String> {
         let Some(scratch) = scratch else {
             self.check(epoch)?;
             // Encoding is deferrable. Keep advancing the owner, including

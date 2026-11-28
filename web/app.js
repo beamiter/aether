@@ -17,7 +17,7 @@ import {installTerminalChat,validateChatStatus} from './terminal-chat.js';
 import {installWorkflows} from './workflows.js';
 import {plainLocalTab,readLocalShellLayout,saveLocalShellLayout,readThreePaneLayout,saveThreePaneLayout,validPaneId,MAX_LOCAL_SHELLS,validLocalGeometry,localSplitPair} from './local-layout.js';
 import {backingGeometry,acceptFull,acceptUpdate,clearPaint,paint} from './frames.js'; import {installIme} from './ime.js';
-import {acceptChannelFrame,acceptChannelUpdate,channelCounter,CHANNEL_RENDITION_VERSION} from './frames-v4.js';
+import {acceptChannelFrame,acceptChannelUpdate,channelCounter,CHANNEL_RENDITION_VERSION,SSH_DENSE_FRAME_VERSION} from './frames-v4.js';
 const canvas=document.querySelector('canvas'),status=document.querySelector('#status'),button=document.querySelector('#demo');
 const open=document.querySelector('#open'),attach=document.querySelector('#attach'),detach=document.querySelector('#detach'),close=document.querySelector('#close'),input=document.querySelector('#input'),send=document.querySelector('#send');
 const openIntegrated=document.querySelector('#open-integrated');
@@ -235,9 +235,10 @@ const acceptAttachedSnapshot=(frame,attachment,options)=>options.frameVersion===
 let savedLayout=invoke?(threePanePreview?readThreePaneLayout():null)??readLocalShellLayout():null,protectSavedLayout=false;
 const sshCommands={poll_shell:'poll',poll_ssh_shell:'poll_with_status',poll_packed_shell:'poll_packed',ack_shell:'ack',shell_status:'status',history_shell:'history',recover_shell:'recover',detach_shell:'detach',close_shell:'close',write_shell:'write',key_shell:'key',key_event_shell:'key_event',text_shell:'text',paste_shell:'paste',resize_shell:'resize',focus_shell:'focus',mouse_shell:'mouse'};
 function sshPollFor(attachment,info){
-  return info?.poll_with_status===true
-    ? {owner:attachment,ackRevision:null,packed:info.packed_frame_version===CHANNEL_RENDITION_VERSION}
-    : null;
+  if(info?.poll_with_status!==true)return null;
+  const version=info.packed_frame_version;
+  const frameVersion=version===CHANNEL_RENDITION_VERSION||version===SSH_DENSE_FRAME_VERSION?version:null;
+  return {owner:attachment,ackRevision:null,frameVersion};
 }
 function setOpenDisabled(disabled) {
   open.disabled=openIntegrated.disabled=openSsh.disabled=sshHost.disabled=disabled||!invoke;
@@ -977,22 +978,23 @@ document.addEventListener?.('visibilitychange',()=>{if(document.hidden)ime.reset
 async function poll(){
   if(epoch===null||changingTab||localStream||localTransport==='recovery'||polling?.epoch===epoch)return;const current=epoch,attachment=owner,ticket={epoch,transport};polling=ticket;
   const batch=sshPoll?.owner===attachment?sshPoll:null;
-  const packed=batch?.packed===true;
-  const previousPacked=packed&&state?.version===CHANNEL_RENDITION_VERSION?state:null;
+  const frameVersion=batch?.frameVersion,packed=frameVersion!=null;
+  const previousPacked=packed&&state?.version===frameVersion?state:null;
   try{
     const reply=await (batch
       ? invokeAttached(packed?'poll_packed_shell':'poll_ssh_shell',{
         epoch:current,ack_revision:batch.ackRevision,...(packed?{snapshot:previousPacked===null}:{}),
+        ...(frameVersion===SSH_DENSE_FRAME_VERSION?{frame_version:frameVersion}:{}),
       },attachment)
       : invokeAttached('poll_shell',{epoch:current},attachment));
     if(epoch!==current||ticket.transport!==transport)return;
     if(batch&&(reply?.status?.poll_with_status!==true||
-        (packed&&reply.status.packed_frame_version!==CHANNEL_RENDITION_VERSION)||
+        (packed&&reply.status.packed_frame_version!==frameVersion)||
         (reply.update!==null&&typeof reply.update!=='object')))throw new Error('invalid SSH terminal poll reply');
     const update=batch?reply.update:reply;
     if(update!=null){
       const next=packed
-        ? acceptChannelUpdate(previousPacked,update,{...attachment,frameVersion:CHANNEL_RENDITION_VERSION},
+        ? acceptChannelUpdate(previousPacked,update,{...attachment,frameVersion},
           previousPacked===null,reply.frame_bytes)
         : acceptUpdate(state,update,attachment);
       paintLiveFrame(next);state=next;describeCursor();

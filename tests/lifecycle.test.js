@@ -16,7 +16,7 @@ import {installTerminalChat,validateChatStatus} from '../web/terminal-chat.js';
 import {installWorkflows} from '../web/workflows.js';
 import {plainLocalTab,readLocalShellLayout,saveLocalShellLayout,readThreePaneLayout,saveThreePaneLayout,MAX_LOCAL_SHELLS,validLocalGeometry,localSplitPair} from '../web/local-layout.js';
 import {acceptFull,acceptUpdate,backingGeometry,clearPaint,paint as paintFrame} from '../web/frames.js'; import {installIme} from '../web/ime.js';
-import {acceptChannelFrame,acceptChannelUpdate,channelCounter,CHANNEL_RENDITION_VERSION} from '../web/frames-v4.js';
+import {acceptChannelFrame,acceptChannelUpdate,channelCounter,CHANNEL_RENDITION_VERSION,SSH_DENSE_FRAME_VERSION} from '../web/frames-v4.js';
 import {packedRow} from './fixtures/packed-channel.js';
 const tick=()=>new Promise(r=>setImmediate(r));
 const deferred=()=>{let resolve,reject;const promise=new Promise((a,b)=>{resolve=a;reject=b});return {promise,resolve,reject};};
@@ -59,7 +59,7 @@ function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsuppo
  const listen=events=>(name,fn)=>events.set(name,[...(events.get(name)??[]),fn]);
  const fire=(events,name)=>{for(const fn of events.get(name)??[])fn({target:document.activeElement});};
  const document={querySelector:el,querySelectorAll:()=>[],createElement:element,body:element(),activeElement:null,hidden:false,hasFocus:()=>true,addEventListener:listen(pageEvents)};
- const context={directionalPaneNeighbor,retainedPaneTree,makePassiveSurfaces,validateReloadView,retainedReloadView,saveReloadTicket,takeReloadTicket,installFilePreviewPanel:()=>({dismiss(){}}),document,addEventListener:listen(windowEvents),__TAURI__:{core:{invoke,Channel}},acceptFull,acceptUpdate,backingGeometry,clearPaint,acceptChannelFrame,acceptChannelUpdate,channelCounter,CHANNEL_RENDITION_VERSION,installIme,installTerminalKeys,modifierKey,installHistory,installCommandBlocks,installTerminalChat,installTerminalShell,installWorkflows,validateChatStatus,installPasteReview,installTerminalFocus,installTerminalMouse,installTerminalSelection,dimensions,resizeQueue,cursorTarget,terminalCellAt,viewportDimensions,windowPixelQueue,paint,TextEncoder:Encoder,TextDecoder,
+ const context={directionalPaneNeighbor,retainedPaneTree,makePassiveSurfaces,validateReloadView,retainedReloadView,saveReloadTicket,takeReloadTicket,installFilePreviewPanel:()=>({dismiss(){}}),document,addEventListener:listen(windowEvents),__TAURI__:{core:{invoke,Channel}},acceptFull,acceptUpdate,backingGeometry,clearPaint,acceptChannelFrame,acceptChannelUpdate,channelCounter,CHANNEL_RENDITION_VERSION,SSH_DENSE_FRAME_VERSION,installIme,installTerminalKeys,modifierKey,installHistory,installCommandBlocks,installTerminalChat,installTerminalShell,installWorkflows,validateChatStatus,installPasteReview,installTerminalFocus,installTerminalMouse,installTerminalSelection,dimensions,resizeQueue,cursorTarget,terminalCellAt,viewportDimensions,windowPixelQueue,paint,TextEncoder:Encoder,TextDecoder,
  installInlineHistory,
  plainLocalTab,MAX_LOCAL_SHELLS,validLocalGeometry,localSplitPair,readLocalShellLayout:()=>readLocalShellLayout(storage),saveLocalShellLayout:value=>saveLocalShellLayout(value,storage),readThreePaneLayout:()=>readThreePaneLayout(storage),saveThreePaneLayout:value=>saveThreePaneLayout(value,storage),
  setInterval(fn){timers.set(++id,fn);return id},clearInterval(i){timers.delete(i)},setTimeout,...animation};
@@ -1025,16 +1025,18 @@ test('SSH batched polling acknowledges painted frames through the final drain',a
  assert.equal(h.timers.size,0);
 });
 
-test('SSH packed polling restarts with a snapshot after acknowledging recovery',async()=>{
+for(const version of [CHANNEL_RENDITION_VERSION,SSH_DENSE_FRAME_VERSION]){
+test(`SSH v${version} polling restarts with a snapshot after acknowledging recovery`,async()=>{
  const first={session:'a'.repeat(32),epoch:1,generation:1},next={...first,generation:2};
  const compat={...JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8')),
   session:first.session,epoch:1,revision:3};
- const version=CHANNEL_RENDITION_VERSION;
  const status={...channelHealth(1),poll_with_status:true,packed_frame_version:version};
  const stamp=revision=>({version,session:first.session,epoch:'1',revision,layout:String(compat.layout),
   screen:'primary',resource_generation:'1',cursor_row:0,cursor_col:0,cursor_visible:true,
   cursor_shape:'block',pending_wrap:false});
- const row=(text,wrapped=false)=>packedRow({wrapped,cells:[{text,width:1,style:0,foreground:'#ffffff',background:'#000000'}]});
+ const row=(text,wrapped=false)=>version===SSH_DENSE_FRAME_VERSION
+  ? {wrapped,columns:1,cell_bytes:Buffer.from([255,255,255,0,0,0,0,1,1]).toString('base64'),text}
+  : packedRow({wrapped,cells:[{text,width:1,style:0,foreground:'#ffffff',background:'#000000'}]});
  const snapshot=(revision,text)=>({kind:'snapshot',stamp:stamp(revision),cols:1,rows:[row(text,true),row('Y')]});
  const delta={kind:'delta',stamp:stamp('2'),base_revision:'1',rows:[{index:0,row:row('B')}]};
  const commands=[],painted=[];
@@ -1044,6 +1046,7 @@ test('SSH packed polling restarts with a snapshot after acknowledging recovery',
   commands.push([command.kind,command.owner.generation,command.ack_revision??command.revision,command.snapshot]);
   switch(command.kind){
    case 'poll_packed':{
+    assert.equal(command.frame_version,version===SSH_DENSE_FRAME_VERSION?version:undefined);
     const frame=command.owner.generation===2?snapshot('3','C'):command.snapshot?snapshot('1','A'):delta;
     return {status,update:frame,frame_bytes:JSON.stringify(frame).length};
    }
@@ -1067,6 +1070,7 @@ test('SSH packed polling restarts with a snapshot after acknowledging recovery',
  assert.deepEqual([...new Set(painted)],['1','2',3,'3']);
  assert.equal(h.el('#input').disabled,false);
 });
+}
 
 test('SSH polling rejects a delta from the wrong base',async()=>{
  const owner={session:'a'.repeat(32),epoch:1,generation:1};

@@ -24,6 +24,9 @@ pub use jterm_protocol::terminal_v4 as protocol_v4;
 pub use protocol::{CursorShape as WireCursorShape, WireCell, WireFrame};
 pub use protocol_v4::{LocalSnapshot, SnapshotFormat, SnapshotRevision};
 
+/// SSH frame version with a byte-packed representation for dense rows.
+pub const SSH_DENSE_FRAME_VERSION: u8 = 9;
+
 pub fn snapshot_encoder(
     format: SnapshotFormat,
 ) -> impl FnOnce(&CellFrame, &str, u32) -> Result<LocalSnapshot, String> {

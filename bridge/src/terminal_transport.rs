@@ -7,7 +7,7 @@ use crate::{
     live::{HistorySnapshot, KeyEvent, LiveBridge, NativeKeyState},
     protocol_v4::{Counter, RENDITION_VERSION},
     semantic::{Attachment, Resume, Update},
-    SnapshotFormat,
+    SSH_DENSE_FRAME_VERSION,
 };
 use jterm_engine::input::KeyboardLocks;
 use reply_forward::{forward_reply, forward_status_reply};
@@ -79,6 +79,8 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ack_revision: Option<Counter>,
         snapshot: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame_version: Option<u8>,
     },
     Ack {
         owner: Attachment,
@@ -282,6 +284,7 @@ fn terminal_status(bridge: &LiveBridge, epoch: u32) -> Result<Value, String> {
     status["keyboard_events_supported"] = Value::Bool(true);
     status["poll_with_status"] = Value::Bool(true);
     status["packed_frame_version"] = RENDITION_VERSION.into();
+    status["dense_frame_version"] = SSH_DENSE_FRAME_VERSION.into();
     if let Some(mouse) = bridge.mouse_view(epoch)? {
         status["mouse"] = reply_value(mouse)?;
     }
@@ -455,12 +458,17 @@ impl Host {
                 owner,
                 ack_revision,
                 snapshot,
+                frame_version,
             } => self.attached(owner, false, |bridge, epoch| {
+                let version = frame_version.unwrap_or(RENDITION_VERSION);
+                if !matches!(version, RENDITION_VERSION | SSH_DENSE_FRAME_VERSION) {
+                    return Err("unsupported packed terminal frame version".into());
+                }
                 if let Some(revision) = ack_revision {
                     bridge.acknowledge_publication(epoch, revision.get())?;
                 }
                 let update = bridge
-                    .poll_channel_frame(epoch, snapshot, SnapshotFormat::ChannelRendition)?
+                    .poll_ssh_frame(epoch, snapshot, version)?
                     .map(|(_, frame)| frame);
                 let status = terminal_status(bridge, epoch)?;
                 Ok(HostReply::PollPacked(PollReply { update, status }))
@@ -1298,6 +1306,7 @@ expect(b'.')
                     owner: owner.clone(),
                     ack_revision,
                     snapshot,
+                    frame_version: None,
                 },
             })
             .result
@@ -1328,6 +1337,21 @@ expect(b'.')
             .iter()
             .any(|row| row.get("runs").is_some()));
         let revision: Counter = serde_json::from_value(frame["stamp"]["revision"].clone()).unwrap();
+        let unsupported = host.wire_reply(Request {
+            protocol: VERSION,
+            request: 1,
+            host: Some(host.identity.clone()),
+            command: Command::PollPacked {
+                owner: owner.clone(),
+                ack_revision: Some(revision),
+                snapshot: false,
+                frame_version: Some(SSH_DENSE_FRAME_VERSION + 1),
+            },
+        });
+        assert_eq!(
+            unsupported.result.unwrap_err(),
+            "unsupported packed terminal frame version"
+        );
         assert_eq!(
             poll(&mut host, true, false, None).unwrap()["update"],
             Value::Null

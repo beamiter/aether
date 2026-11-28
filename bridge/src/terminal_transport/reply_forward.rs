@@ -1,4 +1,5 @@
 use super::{decode_record, invalid, read_record, read_record_bytes, write_record, Reply, VERSION};
+use crate::SSH_DENSE_FRAME_VERSION;
 use serde::{
     de::{DeserializeOwned, MapAccess, SeqAccess, Visitor},
     Deserialize, Deserializer,
@@ -34,6 +35,10 @@ pub(super) fn forward_status_reply(
         // A current owner and an older stdio helper can share the same socket.
         // Advertise the command through a relay that can also decode it.
         status.insert("packed_frame_relay".into(), Value::Bool(true));
+        status.insert(
+            "packed_frame_relay_version".into(),
+            SSH_DENSE_FRAME_VERSION.into(),
+        );
     }
     write_record(writer, &reply, limit)
 }
@@ -133,6 +138,10 @@ mod tests {
         let status = reply.result.unwrap();
         assert_eq!(status["packed_frame_version"], 8);
         assert_eq!(status["packed_frame_relay"], true);
+        assert_eq!(
+            status["packed_frame_relay_version"],
+            SSH_DENSE_FRAME_VERSION
+        );
     }
 
     #[test]

@@ -1,6 +1,8 @@
 //! Convert immutable engine paint state to bounded Channel frames.
 
-use crate::{cell_width, cursor_shape, protocol_v4 as wire, semantic::validate_grid};
+use crate::{
+    cell_width, cursor_shape, protocol_v4 as wire, semantic::validate_grid, SSH_DENSE_FRAME_VERSION,
+};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use jterm_engine::{
     colors::ColorState,
@@ -50,7 +52,15 @@ impl FrameScratch {
         session: &str,
         version: u8,
     ) -> Result<(wire::Counter, String), String> {
-        if wire::supports_packed_rows(version) {
+        if version == SSH_DENSE_FRAME_VERSION {
+            encode_update(project_update(
+                previous,
+                frame,
+                session,
+                version,
+                pack_dense_row,
+            )?)
+        } else if wire::supports_packed_rows(version) {
             encode_update(project_update(previous, frame, session, version, pack_row)?)
         } else {
             encode_update(project_update(
@@ -259,10 +269,12 @@ fn project_update<'a, R>(
         cursor_color: colors.map(|colors| colors.effective_cursor().into()),
         pending_wrap: cursor.pending_wrap,
     };
+    let row_moves = version == SSH_DENSE_FRAME_VERSION || wire::supports_row_moves(version);
     let mut projection = Projection {
-        images_enabled: version == wire::IMAGE_VERSION || wire::supports_row_moves(version),
+        images_enabled: version == wire::IMAGE_VERSION || row_moves,
         colors,
-        extended_rendition: version == wire::RENDITION_VERSION,
+        extended_rendition: version == wire::RENDITION_VERSION
+            || version == SSH_DENSE_FRAME_VERSION,
         ..Projection::default()
     };
     if let Some((base, changed)) = previous
@@ -273,7 +285,7 @@ fn project_update<'a, R>(
                 .map(|changed| (base, changed))
         })
     {
-        let (rows, moves) = if wire::supports_row_moves(version) && changed.len() > 1 {
+        let (rows, moves) = if row_moves && changed.len() > 1 {
             split_row_moves(base, frame, changed)
         } else {
             (changed, Vec::new())
@@ -418,6 +430,85 @@ type EncodedCell<'a> = wire::CellData<EncodedText<'a>, RgbColor>;
 enum EncodedRow<'a> {
     Packed(wire::PackedRow<EncodedText<'a>, RgbColor>),
     Cells(wire::RowData<EncodedCell<'a>>),
+    Dense(DenseRow),
+}
+
+#[derive(serde::Serialize)]
+struct DenseRow {
+    wrapped: bool,
+    columns: u16,
+    cell_bytes: String,
+    text: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    attributes: Vec<DenseAttributes>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    image_slices: Vec<wire::ImageSlice>,
+}
+
+#[derive(serde::Serialize)]
+struct DenseAttributes {
+    column: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    underline: Option<wire::Underline>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    underline_color: Option<RgbColor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hyperlink_id: Option<u16>,
+}
+
+fn pack_dense_row(row: wire::RowData<EncodedCell<'_>>) -> EncodedRow<'_> {
+    let row = match pack_row(row) {
+        EncodedRow::Cells(row) => row,
+        packed => return packed,
+    };
+    let columns = row.cells.len();
+    let mut bytes = Vec::with_capacity(9 * columns);
+    let mut text = String::with_capacity(columns);
+    let mut attributes = Vec::new();
+    for (column, cell) in row.cells.into_iter().enumerate() {
+        let text_units = match cell.text {
+            EncodedText::Scalar(character) => {
+                text.push(character);
+                character.len_utf16()
+            }
+            EncodedText::Cluster(cluster) => {
+                text.push_str(cluster);
+                cluster.encode_utf16().count()
+            }
+        };
+        let RgbColor(fr, fg, fb) = cell.foreground;
+        let RgbColor(br, bg, bb) = cell.background;
+        // RGB foreground and background, rendition, width, and the number
+        // of UTF-16 code units in the cell's glyph.
+        bytes.extend_from_slice(&[
+            fr,
+            fg,
+            fb,
+            br,
+            bg,
+            bb,
+            cell.style,
+            cell.width,
+            text_units as u8,
+        ]);
+        if cell.underline.is_some() || cell.underline_color.is_some() || cell.hyperlink_id.is_some()
+        {
+            attributes.push(DenseAttributes {
+                column: column as u16,
+                underline: cell.underline,
+                underline_color: cell.underline_color,
+                hyperlink_id: cell.hyperlink_id,
+            });
+        }
+    }
+    EncodedRow::Dense(DenseRow {
+        wrapped: row.wrapped,
+        columns: columns as u16,
+        cell_bytes: STANDARD.encode(bytes),
+        text,
+        attributes,
+        image_slices: row.image_slices,
+    })
 }
 
 fn packed_style(cell: &EncodedCell<'_>) -> wire::PackedStyle<RgbColor> {
@@ -881,6 +972,70 @@ mod tests {
             let ordinary: serde_json::Value = serde_json::from_str(&encoded).unwrap();
             assert_eq!(ordinary["rows"][0]["cells"].as_array().unwrap().len(), 128);
         }
+    }
+
+    #[test]
+    fn dense_rows_preserve_glyph_boundaries_colors_and_attributes() {
+        let row = wire::RowData {
+            wrapped: true,
+            cells: vec![
+                EncodedCell {
+                    text: EncodedText::Cluster("🙂\u{301}"),
+                    foreground: RgbColor(1, 2, 3),
+                    background: RgbColor(4, 5, 6),
+                    width: 2,
+                    style: wire::STYLE_CONCEALED,
+                    underline: Some(wire::Underline::Curly),
+                    underline_color: Some(RgbColor(7, 8, 9)),
+                    hyperlink_id: Some(17),
+                },
+                EncodedCell {
+                    text: EncodedText::Scalar(' '),
+                    foreground: RgbColor(10, 11, 12),
+                    background: RgbColor(4, 5, 6),
+                    width: 0,
+                    style: 0,
+                    underline: None,
+                    underline_color: None,
+                    hyperlink_id: None,
+                },
+            ],
+            image_slices: Vec::new(),
+        };
+        let encoded = serde_json::to_value(pack_dense_row(row)).unwrap();
+        let bytes = STANDARD
+            .decode(encoded["cell_bytes"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            bytes,
+            [
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                wire::STYLE_CONCEALED,
+                2,
+                3,
+                10,
+                11,
+                12,
+                4,
+                5,
+                6,
+                0,
+                0,
+                1
+            ]
+        );
+        assert_eq!(encoded["text"], "🙂\u{301} ");
+        assert_eq!(encoded["wrapped"], true);
+        assert_eq!(encoded["columns"], 2);
+        assert_eq!(
+            encoded["attributes"],
+            serde_json::json!([{"column":0,"underline":"curly","underline_color":"#070809","hyperlink_id":17}])
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {acceptChannelFrame, acceptHistoryProjection, channelCounter, CHANNEL_FRAME_VERSION} from '../web/frames-v4.js';
+import {acceptChannelFrame, acceptHistoryProjection, channelCounter, CHANNEL_FRAME_VERSION,
+  CHANNEL_RENDITION_VERSION, CELL_CONCEALED, SSH_DENSE_FRAME_VERSION} from '../web/frames-v4.js';
 import {paint} from '../web/frames.js';
 
 const owner = {session:'isolated', epoch:7};
@@ -50,6 +51,35 @@ test('links resolve within the current resource generation and are reclaimed aft
   const next = accept(base,{...delta,hyperlinks:[],rows:[{index:0,row:{...changed,cells:[plain,first.cells[1]]}}]});
   assert.equal(next.hyperlinks[hyperlink_id],undefined);
   assert.equal(base.hyperlinks[hyperlink_id],hyperlinks[0].target);
+});
+
+test('dense rows preserve decorated wide glyphs and validate every cell boundary', () => {
+  const bytes = Buffer.from([1,2,3,4,5,6,4,2,3, 10,11,12,4,5,6,0,0,1]);
+  const row = {wrapped:true,columns:2,cell_bytes:bytes.toString('base64'),text:'🙂\u0301 ',
+    attributes:[{column:0,underline:'curly',underline_color:'#070809',hyperlink_id:22}]};
+  const denseSnapshot = {...snapshot,stamp:{...stamp,version:SSH_DENSE_FRAME_VERSION},rows:[row,second]};
+  const frame = accept(null,denseSnapshot);
+  assert.deepEqual(frame.rows[0][0], {
+    text:'🙂\u0301',width:2,style:CELL_CONCEALED,foreground:'#010203',background:'#040506',
+    underline:'curly',underline_color:'#070809',hyperlink_id:22,
+  });
+  assert.equal(frame.rows[0][1].width,0);
+  assert.equal(frame.rows[0].textBytes,7);
+  assert.equal(frame.rows[0].wrapped,true);
+  assert.equal(frame.hyperlinks[22],hyperlinks[0].target);
+
+  const applyRow = replacement => accept(null,{...denseSnapshot,rows:[replacement,second]});
+  assert.throws(() => applyRow({...row,cell_bytes:row.cell_bytes.slice(1)}),/dense Channel row/);
+  assert.throws(() => applyRow({...row,text:row.text+'a'}),/dense Channel row width/);
+  assert.throws(() => applyRow({...row,attributes:[...row.attributes,...row.attributes]}),/dense Channel attributes/);
+  assert.throws(() => applyRow({...row,runs:[]}),/dense Channel row/);
+  const splitSurrogate = Buffer.from(bytes);
+  splitSurrogate[8] = 1;
+  assert.throws(() => applyRow({...row,cell_bytes:splitSurrogate.toString('base64')}),/dense Channel text/);
+  const badContinuation = Buffer.from(bytes);
+  badContinuation[16] = 1;
+  assert.throws(() => applyRow({...row,cell_bytes:badContinuation.toString('base64')}),/wide span/);
+  assert.throws(() => accept(null,{...denseSnapshot,stamp:{...stamp,version:CHANNEL_RENDITION_VERSION}}),/dense Channel row version/);
 });
 
 test('encoded, cluster, geometry, and accumulated text budgets reject before replacing the frame', () => {
