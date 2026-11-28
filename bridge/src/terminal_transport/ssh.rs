@@ -1,7 +1,7 @@
 //! One authenticated OpenSSH relay, with an absolute deadline per RPC.
 use super::{
-    invalid, read_record, valid_identity, write_record, Command, Reply, Request, HOST_CHANGED,
-    MAX_REPLY, MAX_REQUEST, VERSION,
+    invalid, read_record, reply_forward::read_validated_reply, valid_identity, write_record,
+    Command, Reply, Request, HOST_CHANGED, MAX_REPLY, MAX_REQUEST, VERSION,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
@@ -199,11 +199,29 @@ impl Relay {
         self.exchange(command, MAX_REQUEST, MAX_REPLY)
     }
 
+    /// Receive a frame response with full JSON validation and a raw payload.
+    pub fn call_frame<T: DeserializeOwned>(
+        &mut self,
+        command: Command,
+    ) -> io::Result<Result<T, String>> {
+        self.exchange_with(command, MAX_REQUEST, MAX_REPLY, read_validated_reply)
+    }
+
     pub(crate) fn exchange<C: Serialize, T: DeserializeOwned>(
         &mut self,
         command: C,
         request_limit: usize,
         response_limit: usize,
+    ) -> io::Result<Result<T, String>> {
+        self.exchange_with(command, request_limit, response_limit, read_record)
+    }
+
+    fn exchange_with<C: Serialize, T>(
+        &mut self,
+        command: C,
+        request_limit: usize,
+        response_limit: usize,
+        read_reply: impl FnOnce(&mut BufReader<DeadlineStream>, usize) -> io::Result<Option<Reply<T>>>,
     ) -> io::Result<Result<T, String>> {
         let request = self.next_request;
         self.next_request = request
@@ -220,7 +238,7 @@ impl Relay {
             },
             request_limit,
         )?;
-        let reply: Reply<T> = read_record(&mut self.channel, response_limit)?.ok_or_else(|| {
+        let reply = read_reply(&mut self.channel, response_limit)?.ok_or_else(|| {
             io::Error::new(io::ErrorKind::UnexpectedEof, "SSH terminal relay closed")
         })?;
         if reply.protocol != VERSION || reply.request != request {

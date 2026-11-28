@@ -3,9 +3,10 @@ mod catalog;
 mod reload;
 
 use self::catalog::{SavedShell, Store};
-use serde::Deserialize;
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, value::RawValue, Value};
 use std::{
+    io,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -14,7 +15,7 @@ use tauri_terminal_frame_bridge::{
     semantic::{Attachment, SessionSelector},
     terminal_transport::{
         ssh::{Endpoint, Relay},
-        valid_identity, Command, HOST_CHANGED,
+        valid_identity, Command, RawPollReply, HOST_CHANGED,
     },
 };
 
@@ -48,6 +49,14 @@ pub(crate) enum Action {
     },
 }
 
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub(crate) enum Response {
+    Json(Value),
+    Frame(Box<RawValue>),
+    Polled(RawPollReply),
+}
+
 #[derive(Default)]
 pub(crate) struct SshTerminal {
     session: Option<RemoteSession>,
@@ -79,7 +88,7 @@ pub(crate) async fn ssh_terminal<R: tauri::Runtime>(
     mut action: Action,
     terminal: tauri::State<'_, Arc<Mutex<SshTerminal>>>,
     keyboard: tauri::State<'_, Arc<Mutex<super::native_keyboard::Samples>>>,
-) -> Result<Value, String> {
+) -> Result<Response, String> {
     super::require_terminal_window(&window)?;
     if let Action::Request {
         command: Command::KeyEvent { event, layout, .. },
@@ -95,7 +104,7 @@ pub(crate) async fn ssh_terminal<R: tauri::Runtime>(
     let label = window.label().to_owned();
     let store = window.path().app_data_dir().ok().map(Store::new);
     super::run_bridge(terminal.inner().clone(), move |terminal| {
-        terminal.execute(action, store.as_ref(), &label)
+        terminal.dispatch(action, store.as_ref(), &label)
     })
     .await
 }
@@ -147,12 +156,12 @@ fn validate_snapshot(
 }
 
 impl SshTerminal {
-    fn execute(
+    fn dispatch(
         &mut self,
         action: Action,
         store: Option<&Store>,
         window: &str,
-    ) -> Result<Value, String> {
+    ) -> Result<Response, String> {
         if self
             .pending_reload
             .as_ref()
@@ -167,15 +176,15 @@ impl SshTerminal {
             }
         }
         if let Action::ClaimReload { ticket } = action {
-            return self.claim_reload(&ticket, window);
+            return self.claim_reload(&ticket, window).map(Response::Json);
         }
         if matches!(action, Action::RecoverReloadLayout) {
-            return self.recover_reload_layout(window);
+            return self.recover_reload_layout(window).map(Response::Json);
         }
         if self.pending_reload.is_some() {
             return Err("The SSH writer is locked while its document is replaced.".into());
         }
-        match action {
+        let response = match action {
             Action::PrepareReload { owner, view } => self.prepare_reload(owner, view, window),
             Action::ClaimReload { .. } | Action::RecoverReloadLayout => unreachable!(),
             Action::Open { destination } => {
@@ -250,7 +259,7 @@ impl SshTerminal {
             }
             Action::Attach => {
                 let Some(session) = self.session.as_mut() else {
-                    return Ok(Value::Null);
+                    return Ok(Response::Json(Value::Null));
                 };
                 if !session.detached {
                     return Err("Detach the current SSH view first.".into());
@@ -268,17 +277,17 @@ impl SshTerminal {
                         self.session = None;
                         self.retained_reload = None;
                         if let Some(warning) = warning {
-                            return Ok(json!({"ended":true,"message":warning}));
+                            return Ok(Response::Json(json!({"ended":true,"message":warning})));
                         }
-                        return Ok(Value::Null);
+                        return Ok(Response::Json(Value::Null));
                     }
                     Err(reason) if reason == HOST_CHANGED => {
                         self.session = None;
                         self.retained_reload = None;
-                        return Ok(json!({
+                        return Ok(Response::Json(json!({
                             "ended": true,
                             "message": "The SSH terminal owner changed. Check the saved host before reconnecting.",
-                        }));
+                        })));
                     }
                     other => other?,
                 };
@@ -303,7 +312,9 @@ impl SshTerminal {
                     Command::EnableKeyboardEvents { .. } => {
                         return Err("The SSH desktop negotiates keyboard reporting on open.".into());
                     }
-                    Command::Recover { owner } => return session.recover(owner.clone()),
+                    Command::Recover { owner } => {
+                        return session.recover(owner.clone()).map(Response::Json)
+                    }
                     Command::Detach { owner }
                     | Command::Poll { owner }
                     | Command::PollWithStatus { owner, .. }
@@ -338,10 +349,10 @@ impl SshTerminal {
                             Err(reason) if reason == HOST_CHANGED => {
                                 self.session = None;
                                 self.retained_reload = None;
-                                return Ok(json!({
+                                return Ok(Response::Json(json!({
                                     "cleanup_pending": true,
                                     "save_warning": "The SSH terminal owner changed. Any saved entry was kept.",
-                                }));
+                                })));
                             }
                             Err(reason) if reason == SESSION_UNAVAILABLE => {
                                 json!({"cleanup_pending":true})
@@ -366,10 +377,24 @@ impl SshTerminal {
                         }
                         Ok(result)
                     }
+                    Command::Poll { .. } => {
+                        let frame = session
+                            .exchange_with(command, false, Relay::call_frame)?
+                            .ok_or("Invalid SSH terminal poll reply.")?;
+                        return Ok(Response::Frame(frame));
+                    }
+                    Command::PollWithStatus { .. } => {
+                        let mut reply: RawPollReply = session
+                            .exchange_with(command, false, Relay::call_frame)?
+                            .ok_or("Invalid SSH terminal poll reply.")?;
+                        session.apply_status(&mut reply.status);
+                        return Ok(Response::Polled(reply));
+                    }
                     other => session.exchange(other, false),
                 }
             }
-        }
+        };
+        response.map(Response::Json)
     }
 
     fn prepare_reload(
@@ -652,7 +677,23 @@ impl RemoteSession {
         Ok(result)
     }
 
-    fn exchange(&mut self, mut command: Command, reconnect: bool) -> Result<Value, String> {
+    fn exchange(&mut self, command: Command, reconnect: bool) -> Result<Value, String> {
+        let status = matches!(command, Command::Status { .. });
+        let mut reply = self
+            .exchange_with(command, reconnect, Relay::call)?
+            .unwrap_or(Value::Null);
+        if status {
+            self.apply_status(&mut reply);
+        }
+        Ok(reply)
+    }
+
+    fn exchange_with<T>(
+        &mut self,
+        mut command: Command,
+        reconnect: bool,
+        call: impl FnOnce(&mut Relay, Command) -> io::Result<Result<T, String>>,
+    ) -> Result<Option<T>, String> {
         if self.relay.is_none() {
             self.focus_reporting = false;
             self.mouse_reporting = false;
@@ -700,11 +741,10 @@ impl RemoteSession {
             .as_mut()
             .ok_or("SSH terminal connection ended.")?;
         if !self.keypad_reporting && !strip_unavailable_keypad(&mut command) {
-            return Ok(Value::Null);
+            return Ok(None);
         }
         let input =
             is_input(&command) && !matches!(command, Command::Focus { .. } | Command::Mouse { .. });
-        let status = matches!(command, Command::Status { .. });
         let retiring = matches!(command, Command::Recover { .. } | Command::Detach { .. });
         if retiring {
             self.focus_reporting = false;
@@ -713,24 +753,13 @@ impl RemoteSession {
             self.keyboard_event_reporting = false;
             self.poll_with_status = false;
         }
-        match relay.call(command) {
-            Ok(mut reply) => {
-                match &mut reply {
-                    Ok(value) if batched_poll => {
-                        let status = value
-                            .get_mut("status")
-                            .ok_or("Invalid SSH terminal poll reply.")?;
-                        self.apply_status(status);
-                    }
-                    Ok(value) if status => self.apply_status(value),
-                    Err(_) => {
-                        self.focus_reporting = false;
-                        self.mouse_reporting = false;
-                        self.keypad_reporting = false;
-                    }
-                    Ok(_) => {}
-                }
-                reply
+        match call(relay, command) {
+            Ok(Ok(reply)) => Ok(Some(reply)),
+            Ok(Err(error)) => {
+                self.focus_reporting = false;
+                self.mouse_reporting = false;
+                self.keypad_reporting = false;
+                Err(error)
             }
             Err(_) => {
                 self.relay = None;
@@ -816,6 +845,42 @@ fn is_input(command: &Command) -> bool {
 #[cfg(test)]
 mod reload_tests {
     use super::*;
+    use tauri::ipc::{InvokeResponseBody, IpcResponse};
+
+    impl SshTerminal {
+        fn execute(
+            &mut self,
+            action: Action,
+            store: Option<&Store>,
+            window: &str,
+        ) -> Result<Value, String> {
+            let reply = self.dispatch(action, store, window)?;
+            serde_json::to_value(reply).map_err(|error| error.to_string())
+        }
+    }
+
+    #[test]
+    fn polled_frames_remain_json_objects_at_the_webview_boundary() {
+        let frame = r#"{ "kind":"delta", "frame":{"revision":9,"row":"雪"} }"#;
+        let mut reply: RawPollReply =
+            serde_json::from_str(&format!(r#"{{"update":{frame},"status":{{"epoch":4}}}}"#))
+                .unwrap();
+        reply.status["poll_with_status"] = Value::Bool(true);
+        let InvokeResponseBody::Json(wire) = Response::Polled(reply).body().unwrap() else {
+            panic!("terminal IPC should return JSON");
+        };
+        assert!(wire.contains(frame));
+        let decoded: Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(decoded["update"]["frame"]["revision"], 9);
+        assert_eq!(decoded["status"]["poll_with_status"], true);
+
+        let null = serde_json::from_str("null").unwrap();
+        let InvokeResponseBody::Json(wire) = Response::Frame(null).body().unwrap() else {
+            panic!("terminal IPC should return JSON");
+        };
+        assert_eq!(wire, "null");
+    }
+
     use std::time::{Duration, Instant};
     fn owner() -> Attachment {
         Attachment {

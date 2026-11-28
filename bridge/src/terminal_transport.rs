@@ -10,7 +10,7 @@ use crate::{
 use jterm_engine::input::KeyboardLocks;
 use reply_forward::forward_reply;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{value::RawValue, Value};
 use session_table::SessionTable;
 use std::{
     fs::{self, File, OpenOptions},
@@ -172,16 +172,21 @@ pub struct Reply<T = Value> {
     pub result: Result<T, String>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PollReply<U> {
+    pub update: U,
+    pub status: Value,
+}
+
+pub type RawPollReply = PollReply<Box<RawValue>>;
+
 // Keep cell-heavy replies typed until they are written to the socket.
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum HostReply {
     Json(Value),
     Update(Option<Update>),
-    PollWithStatus {
-        update: Option<Update>,
-        status: Value,
-    },
+    PollWithStatus(PollReply<Option<Update>>),
     Attached(Option<Resume>),
     Recovered {
         #[serde(flatten)]
@@ -432,7 +437,7 @@ impl Host {
                 }
                 let update = bridge.poll_update(epoch)?;
                 let status = terminal_status(bridge, epoch)?;
-                Ok(HostReply::PollWithStatus { update, status })
+                Ok(HostReply::PollWithStatus(PollReply { update, status }))
             })?,
             Command::Ack { owner, revision } => self.attached(owner, false, |bridge, epoch| {
                 HostReply::json(bridge.acknowledge(epoch, revision)?)

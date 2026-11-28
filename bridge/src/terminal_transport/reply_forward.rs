@@ -1,6 +1,6 @@
 use super::{decode_record, invalid, read_record_bytes, Reply, VERSION};
 use serde::{
-    de::{MapAccess, SeqAccess, Visitor},
+    de::{DeserializeOwned, MapAccess, SeqAccess, Visitor},
     Deserialize, Deserializer,
 };
 use std::{
@@ -26,6 +26,19 @@ pub(super) fn forward_reply(
     }
     writer.write_all(&bytes)?;
     writer.flush()
+}
+
+/// Apply serde_json's string and nesting checks to the complete reply
+/// before retaining a raw JSON frame.
+pub(super) fn read_validated_reply<T: DeserializeOwned>(
+    reader: &mut impl BufRead,
+    limit: usize,
+) -> io::Result<Option<Reply<T>>> {
+    let Some(bytes) = read_record_bytes(reader, limit)? else {
+        return Ok(None);
+    };
+    let _: Reply<ValidatedJson> = decode_record(&bytes)?;
+    decode_record(&bytes).map(Some)
 }
 
 // Use serde_json's normal parsing at every level without allocating a tree.
@@ -83,7 +96,35 @@ impl<'de> Visitor<'de> for ValidatedJson {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal_transport::RawPollReply;
     use serde_json::Value;
+
+    #[test]
+    fn client_keeps_the_frame_fragment_after_validating_the_reply() {
+        let frame = r#"{ "kind":"snapshot", "frame":{"text":"雪\u0021","revision":8} }"#;
+        let packet = format!(
+            "{{\"protocol\":1,\"request\":7,\"result\":{{\"Ok\":{{\"update\":{frame},\"status\":{{\"epoch\":3}}}}}}}}\n"
+        );
+        let receipt: Reply<RawPollReply> =
+            read_validated_reply(&mut packet.as_bytes(), packet.len())
+                .unwrap()
+                .unwrap();
+        assert_eq!((receipt.protocol, receipt.request), (VERSION, 7));
+        let reply = receipt.result.unwrap();
+        assert_eq!(reply.update.get(), frame);
+        assert_eq!(reply.status["epoch"], 3);
+
+        let corrupt = packet.replace(r"雪\u0021", r"\ud800");
+        assert!(
+            read_validated_reply::<RawPollReply>(&mut corrupt.as_bytes(), packet.len()).is_err()
+        );
+        let missing_update =
+            b"{\"protocol\":1,\"request\":7,\"result\":{\"Ok\":{\"status\":{\"epoch\":3}}}}\n";
+        assert!(
+            read_validated_reply::<RawPollReply>(&mut missing_update.as_slice(), packet.len())
+                .is_err()
+        );
+    }
 
     #[test]
     fn forwards_the_validated_record_without_reencoding_it() {

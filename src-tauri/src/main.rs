@@ -15,13 +15,13 @@ mod companion;
 mod local_block_search;
 mod local_sessions;
 mod local_workflows;
+mod native_keyboard;
 mod notebook_panel;
 mod output_review;
 mod remote_desktop;
 mod ssh_files;
 mod ssh_terminal;
 mod vim9_workbench;
-mod native_keyboard;
 #[tauri::command]
 async fn demo_frame(bridge: tauri::State<'_, Arc<Mutex<DemoBridge>>>) -> Result<WireFrame, String> {
     run_bridge(bridge.inner().clone(), move |bridge| bridge.next_frame()).await
@@ -430,7 +430,10 @@ async fn key_event_shell<R: tauri::Runtime>(
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<bool, String> {
     require_terminal_window(&window)?;
-    let native = keyboard.lock().ok().and_then(|mut keyboard| keyboard.take(&event));
+    let native = keyboard
+        .lock()
+        .ok()
+        .and_then(|mut keyboard| keyboard.take(&event));
     run_input(bridge.inner().clone(), owner, move |bridge, epoch| {
         bridge.key_event(epoch, &event, native)
     })
@@ -761,7 +764,10 @@ fn main() {
     #[cfg(target_os = "linux")]
     let builder = builder.setup(|app| {
         if let Some(window) = app.get_webview_window("main") {
-            let keyboard = app.state::<Arc<Mutex<native_keyboard::Samples>>>().inner().clone();
+            let keyboard = app
+                .state::<Arc<Mutex<native_keyboard::Samples>>>()
+                .inner()
+                .clone();
             window.with_webview(move |platform| {
                 use webkit2gtk::{InputMethodContextExt, WebViewExt};
                 native_keyboard::install(&platform.inner(), keyboard);

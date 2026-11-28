@@ -176,7 +176,10 @@ pub async fn local_vim9<R: tauri::Runtime>(
         return super::run_bridge(state, move |host| host.open(path, snapshot)).await;
     }
     let native = match &request {
-        Request::KeyEvent { event, .. } => keyboard.lock().ok().and_then(|mut keyboard| keyboard.take(event)),
+        Request::KeyEvent { event, .. } => keyboard
+            .lock()
+            .ok()
+            .and_then(|mut keyboard| keyboard.take(event)),
         _ => None,
     };
     super::run_bridge(state, move |host| host.apply(request, native)).await
@@ -359,7 +362,10 @@ impl Workbench {
             }
             Request::KeyEvent { entry_id, event } => {
                 let epoch = editor.require_input(entry_id)?;
-                return editor.terminal.key_event(epoch, &event, native).map(Response::KeyReport);
+                return editor
+                    .terminal
+                    .key_event(epoch, &event, native)
+                    .map(Response::KeyReport);
             }
             Request::Text { entry_id, text } => {
                 let epoch = editor.require_input(entry_id)?;

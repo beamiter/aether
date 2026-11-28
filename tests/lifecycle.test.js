@@ -1025,6 +1025,29 @@ test('SSH batched polling acknowledges painted frames through the final drain',a
  assert.equal(h.timers.size,0);
 });
 
+test('SSH polling rejects a delta from the wrong base',async()=>{
+ const owner={session:'a'.repeat(32),epoch:1,generation:1};
+ const frame={...JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8')),
+  session:owner.session,epoch:1,revision:1};
+ const status={...channelHealth(1),poll_with_status:true};
+ const receipts=[],painted=[];
+ const h=harness(async(_name,{action})=>{
+  if(action.operation==='open')return {owner,poll_with_status:true};
+  assert.equal(action.command.kind,'poll_with_status');
+  receipts.push(action.command.ack_revision);
+  return receipts.length===1
+   ? {status,update:{kind:'snapshot',frame}}
+   : {status,update:{kind:'delta',frame:{...frame,base_revision:2,revision:3,rows:[]}}};
+ },undefined,undefined,(_canvas,frame)=>painted.push(frame.revision));
+ h.el('#ssh-terminal-host').value='lab';await h.submitSsh();
+ await [...h.timers.values()][0]();
+ assert.deepEqual(receipts,[null,1]);
+ assert.deepEqual([...new Set(painted)],[1]);
+ assert.equal(h.timers.size,0);
+ assert.equal(h.el('#input').disabled,true);
+ assert.match(h.el('#status').textContent,/delta base changed/);
+});
+
 test('SSH recovery retires the preceding generation’s batched frame and receipt',async()=>{
  const old={session:'a'.repeat(32),epoch:1,generation:1},next={...old,generation:2};
  const frame={...JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8')),
