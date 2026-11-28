@@ -27,6 +27,7 @@ use std::{
 const JSON_WORKSPACE_BYTES: usize = wire::MAX_ENCODED_FRAME_BYTES + wire::MAX_ENCODED_IMAGE_BYTES;
 const PROCESS_JSON_WORKSPACE_BYTES: usize = 4 * JSON_WORKSPACE_BYTES;
 const ENCODERS_BUSY: &str = "terminal channel encoders are temporarily busy";
+const DENSE_CELL_BYTES: usize = 9;
 
 /// Parts the native Channel can carry outside a frame's JSON.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -114,52 +115,29 @@ impl FrameScratch {
         version: u8,
         binary: BinaryChannelParts,
     ) -> Result<(wire::Counter, EncodedChannelFrame), String> {
-        if version == DENSE_FRAME_VERSION {
-            let mut cells = Vec::new();
-            let projected = project_update(
-                previous,
-                frame,
-                session,
-                version,
-                binary.rasters,
-                |row, delta| {
-                    pack_dense_row(row, binary.cells.then_some(&mut cells), || {
-                        let (base, index) = delta.filter(|_| binary.cell_spans)?;
-                        changed_cell_span(base, frame, index)
-                    })
-                },
-            )?;
-            encode_update(projected, cells)
-        } else if wire::supports_packed_rows(version) {
-            encode_update(
-                project_update(
-                    previous,
-                    frame,
-                    session,
-                    version,
-                    binary.rasters,
-                    |row, _| pack_row(row),
-                )?,
-                Vec::new(),
-            )
-        } else {
-            encode_update(
-                project_update(
-                    previous,
-                    frame,
-                    session,
-                    version,
-                    binary.rasters,
-                    |row, _| row,
-                )?,
-                Vec::new(),
-            )
-        }
+        let packed = version == DENSE_FRAME_VERSION || wire::supports_packed_rows(version);
+        let mut cells = Vec::new();
+        let projected = project_update(
+            previous,
+            frame,
+            session,
+            version,
+            binary,
+            &mut cells,
+            |row| {
+                if packed {
+                    pack_row(row)
+                } else {
+                    EncodedRow::Cells(row)
+                }
+            },
+        )?;
+        encode_update(projected, cells)
     }
 }
 
-fn encode_update<R: serde::Serialize>(
-    projected: ProjectedUpdate<'_, R>,
+fn encode_update(
+    projected: ProjectedUpdate<'_>,
     cells: Vec<u8>,
 ) -> Result<(wire::Counter, EncodedChannelFrame), String> {
     let ProjectedUpdate { update, rasters } = projected;
@@ -363,19 +341,20 @@ fn encode_history_rows<'a, R: serde::Serialize>(
     encode_json(&view, &view.images, wire::MAX_ENCODED_FRAME_BYTES)
 }
 
-struct ProjectedUpdate<'a, R> {
-    update: wire::UpdateRows<R>,
+struct ProjectedUpdate<'a> {
+    update: wire::UpdateRows<EncodedRow<'a>>,
     rasters: Vec<ProjectedRaster<'a>>,
 }
 
-fn project_update<'a, R>(
+fn project_update<'a>(
     previous: Option<&CellFrame>,
     frame: &'a CellFrame,
     session: &str,
     version: u8,
-    binary_rasters: bool,
-    mut encode_row: impl FnMut(wire::RowData<EncodedCell<'a>>, Option<(&CellFrame, usize)>) -> R,
-) -> Result<ProjectedUpdate<'a, R>, String> {
+    binary: BinaryChannelParts,
+    cells: &mut Vec<u8>,
+    mut prepare_row: impl FnMut(wire::RowData<EncodedCell<'a>>) -> EncodedRow<'a>,
+) -> Result<ProjectedUpdate<'a>, String> {
     validate_grid(frame)?;
     let engine_stamp = frame.stamp();
     let cursor = frame.cursor();
@@ -405,6 +384,16 @@ fn project_update<'a, R>(
         extended_rendition: version == wire::RENDITION_VERSION || version == DENSE_FRAME_VERSION,
         ..Projection::default()
     };
+    let dense = version == DENSE_FRAME_VERSION;
+    let cell_spans = dense && binary.cells && binary.cell_spans;
+    let mut encode_row = |row, span| {
+        if dense {
+            encode_dense_row(row, binary.cells.then_some(&mut *cells), span)
+        } else {
+            row
+        }
+    };
+    let mut full_delta_base = None;
     if let Some((base, changed)) = previous
         .filter(|base| same_cell_colors(base.paint_colors(), colors))
         .and_then(|base| {
@@ -424,24 +413,24 @@ fn project_update<'a, R>(
                     .iter()
                     .any(|&index| row_images(frame, index).next().is_some())
             {
-                projection.base_images = (0..base.rows().len())
-                    .flat_map(|index| row_images(base, index))
-                    .map(|(_, image, _)| image.id().get())
-                    .collect();
+                projection.base_images = frame_image_ids(base);
             }
             let rows = rows
                 .into_iter()
                 .map(|index| {
+                    let row = prepare_row(wire_row(frame, index, &mut projection)?);
+                    let span = if cell_spans && matches!(row, EncodedRow::Cells(_)) {
+                        changed_cell_span(base, frame, index)
+                    } else {
+                        None
+                    };
                     Ok(wire::ChangedRowWith {
                         index: index as u16,
-                        row: encode_row(
-                            wire_row(frame, index, &mut projection)?,
-                            Some((base, index)),
-                        ),
+                        row: encode_row(row, span),
                     })
                 })
                 .collect::<Result<_, String>>()?;
-            let (hyperlinks, images, rasters) = projection.into_update_resources(binary_rasters);
+            let (hyperlinks, images, rasters) = projection.into_update_resources(binary.rasters);
             return Ok(ProjectedUpdate {
                 update: wire::UpdateRows::Delta {
                     stamp,
@@ -454,21 +443,101 @@ fn project_update<'a, R>(
                 rasters,
             });
         }
+        full_delta_base = cell_spans.then_some(base);
     }
-    let rows = (0..frame.rows().len())
-        .map(|index| wire_row(frame, index, &mut projection).map(|row| encode_row(row, None)))
+
+    // Prepare the row encodings once. The exact base may still be cheaper
+    // even when every row changed, for example when only one column changed.
+    let rows: Vec<_> = (0..frame.rows().len())
+        .map(|index| {
+            let row = prepare_row(wire_row(frame, index, &mut projection)?);
+            Ok::<_, String>(if full_delta_base.is_some() {
+                row
+            } else {
+                encode_row(row, None)
+            })
+        })
         .collect::<Result<_, _>>()?;
-    let (hyperlinks, images, rasters) = projection.into_update_resources(binary_rasters);
-    Ok(ProjectedUpdate {
-        update: wire::UpdateRows::Snapshot {
+    let full_delta = full_delta_base.and_then(|base| {
+        full_delta_spans(base, frame, &rows, &mut projection)
+            .map(|spans| (base.stamp().revision, spans))
+    });
+    let (hyperlinks, images, rasters) = projection.into_update_resources(binary.rasters);
+    let update = if let Some((base_revision, spans)) = full_delta {
+        let rows = rows
+            .into_iter()
+            .zip(spans)
+            .enumerate()
+            .map(|(index, (row, span))| wire::ChangedRowWith {
+                index: index as u16,
+                row: encode_row(row, span),
+            })
+            .collect();
+        wire::UpdateRows::Delta {
+            stamp,
+            base_revision: counter(base_revision)?,
+            rows,
+            moves: Vec::new(),
+            hyperlinks,
+            images,
+        }
+    } else {
+        let rows = if full_delta_base.is_some() {
+            rows.into_iter().map(|row| encode_row(row, None)).collect()
+        } else {
+            rows
+        };
+        wire::UpdateRows::Snapshot {
             stamp,
             cols: frame.cols() as u16,
             rows,
             hyperlinks,
             images,
-        },
-        rasters,
-    })
+        }
+    };
+    Ok(ProjectedUpdate { update, rasters })
+}
+
+fn full_delta_spans(
+    base: &CellFrame,
+    frame: &CellFrame,
+    rows: &[EncodedRow<'_>],
+    projection: &mut Projection<'_>,
+) -> Option<Vec<Option<Range<usize>>>> {
+    // Bound the added JSON for base_revision and the row wrappers. Count
+    // only guaranteed byte savings; cropped text and attributes save more.
+    let row_wrapper = r#"{"index":127,"row":}"#.len();
+    let span_field = r#","cell_span":[255,256]"#.len();
+    let overhead = 64 + rows.len() * row_wrapper;
+    let mut saved = 0;
+    let spans = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            if !matches!(row, EncodedRow::Cells(_)) {
+                return None;
+            }
+            let span = changed_cell_span(base, frame, index)?;
+            saved += (frame.cols() - span.len()) * DENSE_CELL_BYTES - span_field;
+            Some(span)
+        })
+        .collect();
+    let retained = if projection.images.is_empty() {
+        BTreeSet::new()
+    } else {
+        frame_image_ids(base)
+    };
+    saved += projection
+        .images
+        .values()
+        .filter(|image| retained.contains(&image.metadata.id.get()))
+        .map(|image| image.rgba.len())
+        .sum::<usize>();
+    if saved <= overhead {
+        return None;
+    }
+    projection.images.retain(|id, _| !retained.contains(id));
+    Some(spans)
 }
 
 #[inline(never)]
@@ -629,22 +698,21 @@ fn changed_cell_span(base: &CellFrame, next: &CellFrame, row: usize) -> Option<R
     (end - first + 8 <= columns).then_some(first..end)
 }
 
-fn pack_dense_row<'a>(
-    row: wire::RowData<EncodedCell<'a>>,
+fn encode_dense_row<'a>(
+    row: EncodedRow<'a>,
     binary_cells: Option<&mut Vec<u8>>,
-    sparse_span: impl FnOnce() -> Option<Range<usize>>,
+    cell_span: Option<Range<usize>>,
 ) -> EncodedRow<'a> {
-    let row = match pack_row(row) {
-        EncodedRow::Cells(row) => row,
-        packed => return packed,
+    let EncodedRow::Cells(row) = row else {
+        return row;
     };
     let columns = row.cells.len();
     let binary = binary_cells.is_some();
-    let cell_span = if binary { sparse_span() } else { None };
+    debug_assert!(binary || cell_span.is_none());
     let span = cell_span.clone().unwrap_or(0..columns);
     let mut base64_input = Vec::new();
     let bytes = binary_cells.unwrap_or(&mut base64_input);
-    bytes.reserve(9 * span.len());
+    bytes.reserve(DENSE_CELL_BYTES * span.len());
     let mut text = String::with_capacity(span.len());
     let mut attributes = Vec::new();
     for (column, cell) in row
@@ -1022,6 +1090,13 @@ fn row_images(frame: &CellFrame, index: usize) -> impl Iterator<Item = (usize, &
     })
 }
 
+fn frame_image_ids(frame: &CellFrame) -> BTreeSet<u64> {
+    (0..frame.rows().len())
+        .flat_map(|index| row_images(frame, index))
+        .map(|(_, image, _)| image.id().get())
+        .collect()
+}
+
 fn wire_row<'a>(
     frame: &'a CellFrame,
     index: usize,
@@ -1093,7 +1168,15 @@ mod tests {
         session: &str,
         version: u8,
     ) -> Result<wire::Update, String> {
-        let projected = project_update(previous, frame, session, version, false, |row, _| row)?;
+        let projected = project_update(
+            previous,
+            frame,
+            session,
+            version,
+            BinaryChannelParts::default(),
+            &mut Vec::new(),
+            EncodedRow::Cells,
+        )?;
         let data = serde_json::to_vec(&projected.update).map_err(|error| error.to_string())?;
         serde_json::from_slice(&data).map_err(|error| error.to_string())
     }
@@ -1247,7 +1330,7 @@ mod tests {
             ],
             image_slices: Vec::new(),
         };
-        let encoded = serde_json::to_value(pack_dense_row(row(), None, || None)).unwrap();
+        let encoded = serde_json::to_value(encode_dense_row(pack_row(row()), None, None)).unwrap();
         let bytes = STANDARD
             .decode(encoded["cell_bytes"].as_str().unwrap())
             .unwrap();
@@ -1282,7 +1365,8 @@ mod tests {
             serde_json::json!([{"column":0,"underline":"curly","underline_color":"#070809","hyperlink_id":17}])
         );
         let mut raw = Vec::new();
-        let direct = serde_json::to_value(pack_dense_row(row(), Some(&mut raw), || None)).unwrap();
+        let direct =
+            serde_json::to_value(encode_dense_row(pack_row(row()), Some(&mut raw), None)).unwrap();
         assert_eq!(raw, bytes);
         let mut expected = encoded;
         expected["cell_bytes"] = serde_json::Value::Null;
@@ -1837,6 +1921,140 @@ mod tests {
         assert!(json["rows"][0]["row"].get("cell_span").is_none());
         assert!(json["rows"][0]["row"]["cell_bytes"].is_string());
         assert!(no_cells.is_empty());
+    }
+
+    #[test]
+    fn full_height_dense_edits_use_spans_when_they_save_wire_bytes() {
+        let budget = Arc::new(RetainedBytesBudget::new(JSON_WORKSPACE_BYTES));
+        let scratch = FrameScratch::reserve_from(&budget).unwrap();
+        let (rows, cols) = (4, 64);
+        let mut terminal = jterm_engine::terminal::Terminal::new(rows, cols).unwrap();
+        let fill = |glyph| {
+            let mut output = String::new();
+            for row in 1..=rows {
+                write!(output, "\x1b[{row};1H").unwrap();
+                for column in 0..cols {
+                    write!(output, "\x1b[38;2;{column};9;17m{glyph}").unwrap();
+                }
+            }
+            output
+        };
+        terminal.feed(fill('X').as_bytes()).unwrap();
+        let before = terminal.frame().unwrap();
+        let mut update = String::new();
+        for row in 1..=rows {
+            write!(update, "\x1b[{row};17H\x1b[38;2;16;9;17mY").unwrap();
+        }
+        terminal.feed(update.as_bytes()).unwrap();
+        let after = terminal.frame().unwrap();
+        assert_eq!(before.changed_row_indices(&after).unwrap().len(), rows);
+
+        let options = BinaryChannelParts {
+            cells: true,
+            cell_spans: true,
+            ..BinaryChannelParts::default()
+        };
+        let encode = |base, frame, binary| {
+            scratch
+                .encode_frame(base, frame, "test", DENSE_FRAME_VERSION, binary)
+                .unwrap()
+                .1
+        };
+        let snapshot = encode(None, &after, options);
+        let full = encode(
+            Some(&before),
+            &after,
+            BinaryChannelParts {
+                cell_spans: false,
+                ..options
+            },
+        );
+        assert_eq!(full.as_json(), snapshot.as_json());
+        assert_eq!(full.cell_bytes(), rows * cols * DENSE_CELL_BYTES);
+
+        let delta = encode(Some(&before), &after, options);
+        let metadata: serde_json::Value = serde_json::from_str(delta.as_json()).unwrap();
+        assert_eq!(metadata["kind"], "delta");
+        assert_eq!(
+            metadata["base_revision"],
+            before.stamp().revision.to_string()
+        );
+        assert_eq!(metadata["rows"].as_array().unwrap().len(), rows);
+        for (index, entry) in metadata["rows"].as_array().unwrap().iter().enumerate() {
+            assert_eq!(entry["index"], index);
+            assert_eq!(entry["row"]["cell_span"], serde_json::json!([16, 1]));
+            assert_eq!(entry["row"]["text"], "Y");
+        }
+        assert_eq!(delta.cell_bytes(), rows * DENSE_CELL_BYTES);
+        assert!(
+            delta.as_json().len() + delta.cell_bytes() < full.as_json().len() + full.cell_bytes()
+        );
+        let snapshot_cells = snapshot.into_binary_parts().0;
+        let delta_cells = delta.into_binary_parts().0;
+        for (row, chunk) in delta_cells.chunks_exact(DENSE_CELL_BYTES).enumerate() {
+            let start = (row * cols + 16) * DENSE_CELL_BYTES;
+            assert_eq!(chunk, &snapshot_cells[start..start + DENSE_CELL_BYTES]);
+        }
+
+        terminal.feed(fill('Z').as_bytes()).unwrap();
+        let redraw = terminal.frame().unwrap();
+        assert_eq!(after.changed_row_indices(&redraw).unwrap().len(), rows);
+        let output = encode(Some(&after), &redraw, options);
+        let cold = encode(None, &redraw, options);
+        assert_eq!(output.as_json(), cold.as_json());
+        assert_eq!(output.into_binary_parts(), cold.into_binary_parts());
+    }
+
+    #[test]
+    fn full_height_delta_retains_an_acknowledged_inline_raster() {
+        let budget = Arc::new(RetainedBytesBudget::new(JSON_WORKSPACE_BYTES));
+        let scratch = FrameScratch::reserve_from(&budget).unwrap();
+        let mut terminal = jterm_engine::terminal::Terminal::new(4, 24).unwrap();
+        terminal.enable_inline_graphics((12, 24), |_, _, _| None);
+        let pixels = STANDARD.encode(vec![0x81; 32 * 32 * 3]);
+        let command = format!("\x1b[1;20H\x1b_Ga=T,i=3,f=24,s=32,v=32,c=2,r=2,C=1;{pixels}\x1b\\");
+        assert_eq!(
+            terminal.feed(command.as_bytes()).unwrap(),
+            b"\x1b_Gi=3;OK\x1b\\"
+        );
+        let before = terminal.frame().unwrap();
+        terminal
+            .feed(b"\x1b[1;1HX\x1b[2;1HX\x1b[3;1HX\x1b[4;1HX")
+            .unwrap();
+        let after = terminal.frame().unwrap();
+        assert_eq!(before.changed_row_indices(&after).unwrap().len(), 4);
+
+        let options = BinaryChannelParts {
+            cells: true,
+            rasters: true,
+            cell_spans: true,
+        };
+        let encode = |base| {
+            scratch
+                .encode_frame(base, &after, "test", DENSE_FRAME_VERSION, options)
+                .unwrap()
+                .1
+        };
+        let snapshot = encode(None);
+        assert_eq!(snapshot.image_bytes(), 32 * 32 * 4);
+        let delta = encode(Some(&before));
+        assert_eq!(delta.image_bytes(), 0);
+        assert_eq!(
+            delta.cell_bytes(),
+            0,
+            "text rows fit in their packed palette"
+        );
+        let complete: serde_json::Value = serde_json::from_str(snapshot.as_json()).unwrap();
+        let metadata: serde_json::Value = serde_json::from_str(delta.as_json()).unwrap();
+        assert_eq!(metadata["kind"], "delta");
+        assert!(metadata.get("images").is_none());
+        assert_eq!(
+            metadata["rows"][0]["row"]["image_slices"][0]["id"],
+            complete["images"][0]["id"]
+        );
+        for (index, entry) in metadata["rows"].as_array().unwrap().iter().enumerate() {
+            assert_eq!(entry["row"], complete["rows"][index]);
+        }
     }
 
     #[test]
