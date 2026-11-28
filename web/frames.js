@@ -82,8 +82,12 @@ export function acceptUpdate(previous, update, expected = {session:'frame-demo',
 }
 const painted = new WeakMap();
 const rasterCanvas = createRasterCanvasCache(32 * 1024 * 1024);
+const glyphCanvases = new WeakMap();
 const MIN_CELL_DAMAGE_GAP = 4;
 const CELL_DECORATIONS = 4 | 8 | CELL_OVERLINE;
+const GLYPH_ATLAS_COLUMNS = 16;
+const GLYPH_ATLAS_MIN_DAMAGE = 512;
+const GLYPH_ATLAS_SAMPLE = 768;
 
 function paintImages(canvas, g, frame, damage, cw, ch) {
   for (const {y} of damage) for (const {id,column,slice} of frame.rows[y].imageSlices ?? []) {
@@ -125,6 +129,93 @@ function paintUnderline(g, cell, x, y, width) {
     g.fillRect(x,y,width,1);
     if (kind === 'double') g.fillRect(x,y+2,width,1);
   }
+}
+
+function paintCellInk(g, cell, x, y) {
+  if (cell.width === 0 || (cell.style & CELL_CONCEALED)) return;
+  const space = cell.text === ' ';
+  if (space && !(cell.style & CELL_DECORATIONS) && !cell.underline && !cell.hyperlink_id) return;
+  const width = CELL_WIDTH * cell.width;
+  g.save();
+  try {
+    g.beginPath();g.rect(x,y,width,CELL_HEIGHT);g.clip();
+    g.globalAlpha = cell.style & 16 ? 0.5 : 1;
+    g.fillStyle = cell.foreground;
+    if (!space) {
+      g.font = `${cell.style&2?'italic ':''}${cell.style&1?'bold ':''}18px monospace`;
+      g.fillText(cell.text,x,y+2);
+    }
+    if (cell.style & CELL_OVERLINE) g.fillRect(x,y+1,width,1);
+    if (cell.style & 8) g.fillRect(x,y+CELL_HEIGHT/2,width,1);
+    paintUnderline(g,cell,x,y+CELL_HEIGHT-3,width);
+  } finally {
+    g.restore();
+  }
+}
+
+function buildGlyphAtlas(canvas, g, frame, damage, scale) {
+  const document = canvas.ownerDocument;
+  if (!document || typeof g.drawImage !== 'function' ||
+      g.globalAlpha !== 1 || g.globalCompositeOperation !== 'source-over') return null;
+  let damagedCells = 0;
+  for (const {first,last} of damage) damagedCells += last - first;
+  if (damagedCells < GLYPH_ATLAS_MIN_DAMAGE) return null;
+
+  // Limit the raster to the size of a 16 by 16 atlas at 2x DPR.
+  const atlasRows = Math.floor(GLYPH_ATLAS_COLUMNS * 4 / (scale * scale));
+  const capacity = GLYPH_ATLAS_COLUMNS * atlasRows;
+  const slots = new Uint16Array(frame.cols * frame.rows.length);
+  const tiles = [], keys = new Map();
+  let sampled = 0, repeated = 0;
+  for (const {y,first,last} of damage) {
+    const row = frame.rows[y];
+    for (let x = first, limit = Math.min(last,row.length); x < limit; x++) {
+      if (sampled++ === GLYPH_ATLAS_SAMPLE && repeated < GLYPH_ATLAS_SAMPLE / 4) return null;
+      const cell = row[x];
+      // Each tile is opaque and owns one cell of width. Paint combining
+      // sequences, wide glyphs and decorations directly on the terminal.
+      if (cell.width !== 1 || (cell.style & ~(1 | 2 | 16)) || cell.underline || cell.hyperlink_id ||
+          cell.text.length !== 1 || cell.text < '!' || cell.text > '~') continue;
+      const key = `${cell.foreground}${cell.background}:${cell.style}:${cell.text}`;
+      let slot = keys.get(key);
+      if (slot !== undefined) repeated++;
+      else {
+        if (tiles.length === capacity) continue;
+        slot = tiles.length;
+        keys.set(key,slot);
+        tiles.push(cell);
+      }
+      slots[y*frame.cols+x] = slot+1;
+    }
+  }
+  if (repeated < sampled / 4) return null;
+
+  let source = glyphCanvases.get(document);
+  if (!source) {
+    source = document.createElement('canvas');
+    glyphCanvases.set(document,source);
+  }
+  const width = CELL_WIDTH * scale, height = CELL_HEIGHT * scale;
+  const textureWidth = GLYPH_ATLAS_COLUMNS * width;
+  const textureHeight = Math.ceil(tiles.length / GLYPH_ATLAS_COLUMNS) * height;
+  if (source.width !== textureWidth) source.width = textureWidth;
+  if (source.height !== textureHeight) source.height = textureHeight;
+  const language = canvas.closest?.('[lang]')?.lang ?? document.documentElement?.lang ?? '';
+  if (source.lang !== language) source.lang = language;
+  const texture = source.getContext('2d');
+  if (!texture) return null;
+  texture.setTransform(scale,0,0,scale,0,0);
+  texture.textBaseline = g.textBaseline;
+  texture.textAlign = g.textAlign;
+  texture.direction = g.direction;
+  for (const [slot,cell] of tiles.entries()) {
+    const x = slot % GLYPH_ATLAS_COLUMNS * CELL_WIDTH;
+    const y = Math.floor(slot / GLYPH_ATLAS_COLUMNS) * CELL_HEIGHT;
+    texture.fillStyle = cell.background;
+    texture.fillRect(x,y,CELL_WIDTH,CELL_HEIGHT);
+    paintCellInk(texture,cell,x,y);
+  }
+  return {source,slots,width,height};
 }
 
 function sameCellPaint(before, after) {
@@ -276,26 +367,20 @@ export function paint(canvas, frame, deviceScale = globalThis.devicePixelRatio |
       start = end;
     }
   }
+  // Integer backing pixels allow a pixel-for-pixel copy of an opaque tile.
+  const atlas = mergeBackgrounds ? buildGlyphAtlas(canvas,g,frame,damage,scale) : null;
   for (const {y,first,last} of damage) {
     const row = frame.rows[y];
     for (let x = first, limit = Math.min(last, row.length); x < limit; x++) {
-      const c = row[x];
-      if (c.width === 0 || (c.style & CELL_CONCEALED)) continue;
-      const space = c.text === ' ';
-      if (space && !(c.style & CELL_DECORATIONS) && !c.underline && !c.hyperlink_id) continue;
-      g.save();
-      try {
-        g.beginPath();g.rect(x*cw,y*ch,cw*c.width,ch);g.clip();
-        g.globalAlpha=c.style&16?0.5:1;g.fillStyle=c.foreground;
-        if (!space) {
-          g.font=`${c.style&2?'italic ':''}${c.style&1?'bold ':''}18px monospace`;
-          g.fillText(c.text,x*cw,y*ch+2);
-        }
-        if(c.style&CELL_OVERLINE)g.fillRect(x*cw,y*ch+1,cw*c.width,1);
-        if(c.style&8)g.fillRect(x*cw,y*ch+ch/2,cw*c.width,1);
-        paintUnderline(g,c,x*cw,y*ch+ch-3,cw*c.width);
-      } finally {
-        g.restore();
+      const index = atlas?.slots[y*frame.cols+x];
+      if (index) {
+        const {source,width,height} = atlas;
+        const slot = index-1;
+        const left = slot % GLYPH_ATLAS_COLUMNS * width;
+        const top = Math.floor(slot / GLYPH_ATLAS_COLUMNS) * height;
+        g.drawImage(source,left,top,width,height,x*cw,y*ch,cw,ch);
+      } else {
+        paintCellInk(g,row[x],x*cw,y*ch);
       }
     }
   }

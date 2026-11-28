@@ -142,6 +142,53 @@ test('failed paint unwinds the cell clip before a same-geometry full repaint',()
  assert.equal(h.draws.filter(op=>op[0]==='text').length,4);
 });
 
+test('dense ASCII reuses opaque glyphs by color and style with direct drawing for other cells',()=>{
+ const {canvas,g,draws}=observedCanvas();
+ const atlasBackgrounds=[],atlasGlyphs=[],copies=[];
+ const texture={
+  globalAlpha:1,
+  setTransform(){},save(){},beginPath(){},rect(){},clip(){},restore(){this.globalAlpha=1;},
+  fillRect(...area){atlasBackgrounds.push([this.fillStyle,...area]);},
+  fillText(...text){atlasGlyphs.push([this.font,this.globalAlpha,this.fillStyle,...text]);},
+ };
+ const source={getContext:()=>texture};
+ canvas.ownerDocument={createElement(tag){assert.equal(tag,'canvas');return source;}};
+ g.globalAlpha=1;
+ g.globalCompositeOperation='source-over';
+ g.drawImage=(...copy)=>copies.push(copy);
+ const raw=smallPaintFrame({cols:40,rows:16,cursor_visible:false});
+ const original=raw.rows[0][0];
+ const palette=[original,{...original,background:'#667788'},
+  {...original,style:17},{...original,foreground:'#ad4170'}];
+ const rows=raw.rows.map(row=>row.map((_,x)=>palette[x%palette.length]));
+ rows[0][5]={...original,text:'界',width:2};
+ rows[0][6]={...original,text:' ',width:0};
+ rows[0][8]={...original,text:'Y',style:4};
+ const frame=acceptFull(null,{...raw,rows});
+ paint(canvas,frame,1);
+ assert.deepEqual(atlasBackgrounds,[
+  ['#112233',0,0,12,24],['#667788',12,0,12,24],
+  ['#112233',24,0,12,24],['#112233',36,0,12,24],
+ ]);
+ assert.deepEqual(atlasGlyphs,[
+  ['18px monospace',1,'#ffffff','X',0,2],['18px monospace',1,'#ffffff','X',12,2],
+  ['bold 18px monospace',0.5,'#ffffff','X',24,2],['18px monospace',1,'#ad4170','X',36,2],
+ ]);
+ assert.equal(copies.length,637);
+ assert.deepEqual(copies.slice(0,4),palette.map((_,i)=>[source,i*12,0,12,24,i*12,0,12,24]));
+ assert.deepEqual(draws.filter(([kind])=>kind==='text').map(draw=>draw[3]),['界','Y']);
+
+ copies.length=0;
+ const changed=rows[0].map((cell,x)=>x===20?{...cell,text:'Z'}:cell);
+ g.clearRect=()=>{draws.length=0;};
+ const next=deltaFrom(frame,{rows:[{index:0,cells:changed}]});
+ paint(canvas,next,1);
+ assert.deepEqual(draws.filter(([kind])=>kind==='text').map(draw=>draw[3]),['Z']);
+ paint(canvas,next,1.25);
+ assert.equal(copies.length,0);
+ assert.equal(atlasGlyphs.length,4);
+});
+
 function paintCalls(frame,scale) {
  const backgrounds=[],glyphs=[],clears=[];
  let drawingText=false,transform=1;
