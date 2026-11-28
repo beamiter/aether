@@ -1,4 +1,4 @@
-//! Native SSH terminal adapter. The WebView receives the existing v3 cell records.
+//! Native SSH terminal adapter for compatibility and packed terminal frames.
 mod catalog;
 mod reload;
 
@@ -12,6 +12,7 @@ use std::{
 };
 use tauri::Manager;
 use tauri_terminal_frame_bridge::{
+    protocol_v4::{MAX_ENCODED_FRAME_BYTES, MAX_ENCODED_IMAGE_BYTES, RENDITION_VERSION},
     semantic::{Attachment, SessionSelector},
     terminal_transport::{
         ssh::{Endpoint, Relay},
@@ -55,6 +56,11 @@ pub(crate) enum Response {
     Json(Value),
     Frame(Box<RawValue>),
     Polled(RawPollReply),
+    Packed {
+        #[serde(flatten)]
+        poll: RawPollReply,
+        frame_bytes: usize,
+    },
 }
 
 #[derive(Default)]
@@ -80,6 +86,7 @@ struct RemoteSession {
     keypad_reporting: bool,
     keyboard_event_reporting: bool,
     poll_with_status: bool,
+    packed_frames: bool,
 }
 
 #[tauri::command]
@@ -235,6 +242,7 @@ impl SshTerminal {
                     keypad_reporting: false,
                     keyboard_event_reporting: false,
                     poll_with_status: false,
+                    packed_frames: false,
                 };
                 session.negotiate_capabilities();
                 let result = json!({
@@ -242,6 +250,7 @@ impl SshTerminal {
                     "save_warning": remembered.err(),
                     "keyboard_event_reporting": session.keyboard_event_reporting,
                     "poll_with_status": session.poll_with_status,
+                    "packed_frame_version": session.packed_frames.then_some(RENDITION_VERSION),
                 });
                 self.session = Some(session);
                 Ok(result)
@@ -318,6 +327,7 @@ impl SshTerminal {
                     Command::Detach { owner }
                     | Command::Poll { owner }
                     | Command::PollWithStatus { owner, .. }
+                    | Command::PollPacked { owner, .. }
                     | Command::Ack { owner, .. }
                     | Command::Status { owner }
                     | Command::History { owner, .. }
@@ -383,11 +393,22 @@ impl SshTerminal {
                             .ok_or("Invalid SSH terminal poll reply.")?;
                         return Ok(Response::Frame(frame));
                     }
-                    Command::PollWithStatus { .. } => {
+                    Command::PollWithStatus { .. } | Command::PollPacked { .. } => {
+                        let packed = matches!(command, Command::PollPacked { .. });
                         let mut reply: RawPollReply = session
                             .exchange_with(command, false, Relay::call_frame)?
                             .ok_or("Invalid SSH terminal poll reply.")?;
                         session.apply_status(&mut reply.status);
+                        if packed {
+                            let frame_bytes = reply.update.get().len();
+                            if frame_bytes > MAX_ENCODED_FRAME_BYTES + MAX_ENCODED_IMAGE_BYTES {
+                                return Err("SSH terminal frame exceeds its byte limit.".into());
+                            }
+                            return Ok(Response::Packed {
+                                poll: reply,
+                                frame_bytes,
+                            });
+                        }
                         return Ok(Response::Polled(reply));
                     }
                     other => session.exchange(other, false),
@@ -572,6 +593,7 @@ impl SshTerminal {
             keypad_reporting: false,
             keyboard_event_reporting: false,
             poll_with_status: false,
+            packed_frames: false,
         });
         Ok(result)
     }
@@ -636,6 +658,7 @@ impl RemoteSession {
         self.keypad_reporting = false;
         self.keyboard_event_reporting = false;
         self.poll_with_status = false;
+        self.packed_frames = false;
         self.pending_snapshot = Some(revision);
         Ok(())
     }
@@ -683,6 +706,7 @@ impl RemoteSession {
             .exchange_with(command, reconnect, Relay::call)?
             .unwrap_or(Value::Null);
         if status {
+            self.packed_frames = packed_frame_capability(self.instance.as_deref(), &reply);
             self.apply_status(&mut reply);
         }
         Ok(reply)
@@ -700,6 +724,7 @@ impl RemoteSession {
             self.keypad_reporting = false;
             self.keyboard_event_reporting = false;
             self.poll_with_status = false;
+            self.packed_frames = false;
         }
         // Optional input commands require capability from this bound host
         // and a current writer attachment.
@@ -725,9 +750,15 @@ impl RemoteSession {
             return Err("SSH terminal physical keyboard reporting is unavailable.".into());
         }
 
-        let batched_poll = matches!(command, Command::PollWithStatus { .. });
+        let batched_poll = matches!(
+            command,
+            Command::PollWithStatus { .. } | Command::PollPacked { .. }
+        );
         if batched_poll && (!self.poll_with_status || self.pending_snapshot.is_some()) {
             return Err("SSH terminal batched polling is unavailable for this attachment.".into());
+        }
+        if matches!(command, Command::PollPacked { .. }) && !self.packed_frames {
+            return Err("SSH terminal packed frames are unavailable for this attachment.".into());
         }
 
         if reconnect && self.relay.is_none() {
@@ -752,6 +783,7 @@ impl RemoteSession {
             self.keypad_reporting = false;
             self.keyboard_event_reporting = false;
             self.poll_with_status = false;
+            self.packed_frames = false;
         }
         match call(relay, command) {
             Ok(Ok(reply)) => Ok(Some(reply)),
@@ -768,6 +800,7 @@ impl RemoteSession {
                 self.keypad_reporting = false;
                 self.keyboard_event_reporting = false;
                 self.poll_with_status = false;
+                self.packed_frames = false;
                 self.input_uncertain |= input;
                 Err("SSH terminal connection ended.".into())
             }
@@ -782,6 +815,10 @@ impl RemoteSession {
         self.poll_with_status = instance.is_some_and(valid_identity)
             && status.get("poll_with_status") == Some(&Value::Bool(true));
         if let Some(status) = status.as_object_mut() {
+            status.remove("packed_frame_relay");
+            if !self.packed_frames || !self.poll_with_status {
+                status.remove("packed_frame_version");
+            }
             status.insert("focus_reporting".into(), Value::Bool(self.focus_reporting));
             status.insert("mouse_reporting".into(), Value::Bool(self.mouse_reporting));
             status.insert(
@@ -794,6 +831,14 @@ impl RemoteSession {
             }
         }
     }
+}
+
+fn packed_frame_capability(instance: Option<&str>, status: &Value) -> bool {
+    instance.is_some_and(valid_identity)
+        && status.get("poll_with_status") == Some(&Value::Bool(true))
+        && status.get("packed_frame_relay") == Some(&Value::Bool(true))
+        && status.get("packed_frame_version").and_then(Value::as_u64)
+            == Some(u64::from(RENDITION_VERSION))
 }
 
 fn keypad_capability(instance: Option<&str>, status: &Value) -> bool {
@@ -860,6 +905,28 @@ mod reload_tests {
     }
 
     #[test]
+    fn packed_ipc_contains_the_frame_object_and_its_byte_length() {
+        let frame = r#"{ "kind":"snapshot","stamp":{"revision":"8"},"sample":"雪" }"#;
+        let poll: RawPollReply = serde_json::from_str(&format!(
+            r#"{{"update":{frame},"status":{{"epoch":4,"packed_frame_version":8}}}}"#
+        ))
+        .unwrap();
+        let InvokeResponseBody::Json(wire) = (Response::Packed {
+            frame_bytes: poll.update.get().len(),
+            poll,
+        })
+        .body()
+        .unwrap() else {
+            panic!("terminal IPC should return JSON");
+        };
+        assert!(wire.contains(frame));
+        let reply: Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(reply["frame_bytes"], frame.len());
+        assert_eq!(reply["update"]["stamp"]["revision"], "8");
+        assert_eq!(reply["status"]["packed_frame_version"], RENDITION_VERSION);
+    }
+
+    #[test]
     fn polled_frames_remain_json_objects_at_the_webview_boundary() {
         let frame = r#"{ "kind":"delta", "frame":{"revision":9,"row":"雪"} }"#;
         let mut reply: RawPollReply =
@@ -915,6 +982,7 @@ mod reload_tests {
                 keypad_reporting: false,
                 keyboard_event_reporting: false,
                 poll_with_status: false,
+                packed_frames: false,
             }),
         }
     }
@@ -985,6 +1053,44 @@ mod reload_tests {
         }))
         .unwrap();
         assert!(!strip_unavailable_keypad(&mut center));
+    }
+
+    #[test]
+    fn packed_poll_requires_the_bound_owner_version_and_stdio_capability() {
+        let identity = "a".repeat(32);
+        let status = json!({
+            "poll_with_status": true,
+            "packed_frame_version": RENDITION_VERSION,
+            "packed_frame_relay": true,
+        });
+        assert!(packed_frame_capability(Some(&identity), &status));
+        assert!(!packed_frame_capability(None, &status));
+        let mut old_stdio = status.clone();
+        old_stdio
+            .as_object_mut()
+            .unwrap()
+            .remove("packed_frame_relay");
+        assert!(!packed_frame_capability(Some(&identity), &old_stdio));
+        let mut old_owner = status.clone();
+        old_owner
+            .as_object_mut()
+            .unwrap()
+            .remove("packed_frame_version");
+        assert!(!packed_frame_capability(Some(&identity), &old_owner));
+        let mut unknown_version = status.clone();
+        unknown_version["packed_frame_version"] = json!("8");
+        assert!(!packed_frame_capability(Some(&identity), &unknown_version));
+
+        let mut terminal = terminal(Duration::ZERO);
+        let session = terminal.session.as_mut().unwrap();
+        session.instance = Some(identity);
+        session.apply_status(&mut old_stdio);
+        assert!(old_stdio.get("packed_frame_version").is_none());
+        session.packed_frames = true;
+        let mut negotiated = status;
+        session.apply_status(&mut negotiated);
+        assert_eq!(negotiated["packed_frame_version"], RENDITION_VERSION);
+        assert!(negotiated.get("packed_frame_relay").is_none());
     }
 
     #[test]

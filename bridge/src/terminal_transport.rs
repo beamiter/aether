@@ -5,10 +5,12 @@ pub mod ssh;
 
 use crate::{
     live::{HistorySnapshot, KeyEvent, LiveBridge, NativeKeyState},
+    protocol_v4::{Counter, RENDITION_VERSION},
     semantic::{Attachment, Resume, Update},
+    SnapshotFormat,
 };
 use jterm_engine::input::KeyboardLocks;
-use reply_forward::forward_reply;
+use reply_forward::{forward_reply, forward_status_reply};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{value::RawValue, Value};
 use session_table::SessionTable;
@@ -71,6 +73,12 @@ pub enum Command {
         owner: Attachment,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ack_revision: Option<u32>,
+    },
+    PollPacked {
+        owner: Attachment,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ack_revision: Option<Counter>,
+        snapshot: bool,
     },
     Ack {
         owner: Attachment,
@@ -187,6 +195,8 @@ enum HostReply {
     Json(Value),
     Update(Option<Update>),
     PollWithStatus(PollReply<Option<Update>>),
+    #[serde(skip_serializing)]
+    PollPacked(PollReply<Option<String>>),
     Attached(Option<Resume>),
     Recovered {
         #[serde(flatten)]
@@ -271,6 +281,7 @@ fn terminal_status(bridge: &LiveBridge, epoch: u32) -> Result<Value, String> {
     status["keypad_reporting"] = Value::Bool(true);
     status["keyboard_events_supported"] = Value::Bool(true);
     status["poll_with_status"] = Value::Bool(true);
+    status["packed_frame_version"] = RENDITION_VERSION.into();
     if let Some(mouse) = bridge.mouse_view(epoch)? {
         status["mouse"] = reply_value(mouse)?;
     }
@@ -349,6 +360,7 @@ impl Host {
                 | Command::EnableKeyboardEvents { .. }
                 | Command::KeyEvent { .. }
                 | Command::PollWithStatus { .. }
+                | Command::PollPacked { .. }
         ) && request.host.as_ref() != Some(&self.identity))
             || request
                 .host
@@ -438,6 +450,20 @@ impl Host {
                 let update = bridge.poll_update(epoch)?;
                 let status = terminal_status(bridge, epoch)?;
                 Ok(HostReply::PollWithStatus(PollReply { update, status }))
+            })?,
+            Command::PollPacked {
+                owner,
+                ack_revision,
+                snapshot,
+            } => self.attached(owner, false, |bridge, epoch| {
+                if let Some(revision) = ack_revision {
+                    bridge.acknowledge_publication(epoch, revision.get())?;
+                }
+                let update = bridge
+                    .poll_channel_frame(epoch, snapshot, SnapshotFormat::ChannelRendition)?
+                    .map(|(_, frame)| frame);
+                let status = terminal_status(bridge, epoch)?;
+                Ok(HostReply::PollPacked(PollReply { update, status }))
             })?,
             Command::Ack { owner, revision } => self.attached(owner, false, |bridge, epoch| {
                 HostReply::json(bridge.acknowledge(epoch, revision)?)
@@ -583,6 +609,39 @@ pub(crate) fn write_record(
     }
     writer.write_all(&data)?;
     writer.write_all(b"\n")?;
+    writer.flush()
+}
+
+fn write_owner_reply(
+    writer: &mut impl Write,
+    reply: &Reply<HostReply>,
+    limit: usize,
+) -> io::Result<()> {
+    let Ok(HostReply::PollPacked(poll)) = &reply.result else {
+        return write_record(writer, reply, limit);
+    };
+    // The Channel encoder supplies bounded JSON. Write its bytes directly
+    // into the reply alongside the typed header and serialized status.
+    let header = format!(
+        r#"{{"protocol":{},"request":{},"result":{{"Ok":{{"update":"#,
+        reply.protocol, reply.request,
+    );
+    let frame = poll.update.as_deref().unwrap_or("null");
+    let status = serde_json::to_vec(&poll.status)
+        .map_err(|_| invalid("terminal transport serialization failed"))?;
+    let parts = [
+        header.as_bytes(),
+        frame.as_bytes(),
+        br#","status":"#.as_slice(),
+        &status,
+        b"}}}\n",
+    ];
+    if parts.iter().map(|part| part.len()).sum::<usize>() > limit {
+        return Err(invalid("terminal transport record exceeds byte limit"));
+    }
+    for part in parts {
+        writer.write_all(part)?;
+    }
     writer.flush()
 }
 
@@ -762,7 +821,7 @@ pub fn serve(socket: &Path) -> io::Result<()> {
                     if let Ok(Some(request)) = read_record(&mut BufReader::new(&peer), MAX_REQUEST)
                     {
                         let reply = host.reply(request);
-                        let _ = write_record(&mut peer, &reply, MAX_REPLY);
+                        let _ = write_owner_reply(&mut peer, &reply, MAX_REPLY);
                     }
                 }
             }
@@ -790,12 +849,12 @@ pub fn stdio(socket: &Path, mut reader: impl BufRead, mut writer: impl Write) ->
         let mut peer = UnixStream::connect(socket)?;
         limit_socket(&peer)?;
         write_record(&mut peer, &request, MAX_REQUEST)?;
-        forward_reply(
-            &mut BufReader::new(peer),
-            &mut writer,
-            request.request,
-            MAX_REPLY,
-        )?;
+        let mut owner = BufReader::new(peer);
+        if matches!(request.command, Command::Status { .. }) {
+            forward_status_reply(&mut owner, &mut writer, request.request, MAX_REPLY)?;
+        } else {
+            forward_reply(&mut owner, &mut writer, request.request, MAX_REPLY)?;
+        }
     }
     Ok(())
 }
@@ -811,7 +870,7 @@ mod tests {
 
         fn wire_reply(&mut self, request: Request) -> Reply<Value> {
             let mut bytes = Vec::new();
-            write_record(&mut bytes, &self.reply(request), MAX_REPLY).unwrap();
+            write_owner_reply(&mut bytes, &self.reply(request), MAX_REPLY).unwrap();
             read_record(&mut bytes.as_slice(), MAX_REPLY)
                 .unwrap()
                 .unwrap()
@@ -1198,6 +1257,120 @@ expect(b'.')
         assert!(host.bridge(&owner.session).unwrap().needs_write_retry());
         assert_eq!(host.next_deadline(), Some(host.retry_at.unwrap()));
         host.execute(Command::Close { owner }).unwrap();
+    }
+
+    #[test]
+    fn packed_owner_reply_writes_its_frame_as_bounded_json() {
+        let frame = r#"{ "kind":"snapshot", "rows":[] }"#;
+        let reply = Reply {
+            protocol: VERSION,
+            request: 7,
+            result: Ok(HostReply::PollPacked(PollReply {
+                update: Some(frame.into()),
+                status: serde_json::json!({"description":"Snow \"雪\""}),
+            })),
+        };
+        let mut record = Vec::new();
+        write_owner_reply(&mut record, &reply, 1024).unwrap();
+        let wire = std::str::from_utf8(&record).unwrap();
+        assert!(wire.contains(frame));
+        let received: Reply = decode_record(&record).unwrap();
+        let result = received.result.unwrap();
+        assert_eq!(result["update"]["kind"], "snapshot");
+        assert_eq!(result["status"]["description"], "Snow \"雪\"");
+        let mut oversized = Vec::new();
+        assert!(write_owner_reply(&mut oversized, &reply, record.len() - 1).is_err());
+        assert!(oversized.is_empty());
+    }
+
+    #[test]
+    fn packed_poll_keeps_the_publication_receipt_and_stops_at_a_retired_attachment() {
+        let mut host = Host::new().unwrap();
+        let owner: Attachment =
+            serde_json::from_value(host.execute(Command::Open { rows: 8, cols: 80 }).unwrap())
+                .unwrap();
+        let poll = |host: &mut Host, bound: bool, snapshot, ack_revision| {
+            host.wire_reply(Request {
+                protocol: VERSION,
+                request: 1,
+                host: bound.then(|| host.identity.clone()),
+                command: Command::PollPacked {
+                    owner: owner.clone(),
+                    ack_revision,
+                    snapshot,
+                },
+            })
+            .result
+        };
+        assert_eq!(
+            poll(&mut host, false, true, None).unwrap_err(),
+            HOST_CHANGED
+        );
+        let initial = host
+            .execute(Command::Poll {
+                owner: owner.clone(),
+            })
+            .unwrap();
+        let revision = serde_json::from_value(initial["frame"]["revision"].clone()).unwrap();
+        host.execute(Command::Ack {
+            owner: owner.clone(),
+            revision,
+        })
+        .unwrap();
+
+        let first = poll(&mut host, true, true, None).unwrap();
+        let frame = &first["update"];
+        assert_eq!(frame["kind"], "snapshot");
+        assert_eq!(frame["stamp"]["version"], RENDITION_VERSION);
+        assert!(frame["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row.get("runs").is_some()));
+        let revision: Counter = serde_json::from_value(frame["stamp"]["revision"].clone()).unwrap();
+        assert_eq!(
+            poll(&mut host, true, false, None).unwrap()["update"],
+            Value::Null
+        );
+        assert_eq!(
+            poll(&mut host, true, false, Counter::new(u64::MAX)).unwrap_err(),
+            "wrong frame ACK"
+        );
+
+        let command = b"printf '\\033[4;1HPACKED_POLL'\n";
+        assert_eq!(
+            host.execute(Command::Write {
+                owner: owner.clone(),
+                bytes: command.to_vec()
+            })
+            .unwrap(),
+            command.len()
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut receipt = Some(revision);
+        loop {
+            let reply = poll(&mut host, true, false, receipt.take()).unwrap();
+            if !reply["update"].is_null() {
+                let update = &reply["update"];
+                assert_eq!(update["kind"], "delta");
+                assert_eq!(update["base_revision"], frame["stamp"]["revision"]);
+                break;
+            }
+            assert!(Instant::now() < deadline, "packed delta did not arrive");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let recovered = host
+            .execute(Command::Recover {
+                owner: owner.clone(),
+            })
+            .unwrap();
+        assert_eq!(
+            poll(&mut host, true, true, None).unwrap_err(),
+            "stale terminal attachment"
+        );
+        let current = serde_json::from_value(recovered["owner"].clone()).unwrap();
+        host.execute(Command::Close { owner: current }).unwrap();
     }
 
     #[test]

@@ -16,7 +16,7 @@ import {installTerminalChat,validateChatStatus} from '../web/terminal-chat.js';
 import {installWorkflows} from '../web/workflows.js';
 import {plainLocalTab,readLocalShellLayout,saveLocalShellLayout,readThreePaneLayout,saveThreePaneLayout,MAX_LOCAL_SHELLS,validLocalGeometry,localSplitPair} from '../web/local-layout.js';
 import {acceptFull,acceptUpdate,backingGeometry,clearPaint,paint as paintFrame} from '../web/frames.js'; import {installIme} from '../web/ime.js';
-import {acceptChannelFrame,channelCounter,CHANNEL_RENDITION_VERSION} from '../web/frames-v4.js';
+import {acceptChannelFrame,acceptChannelUpdate,channelCounter,CHANNEL_RENDITION_VERSION} from '../web/frames-v4.js';
 import {packedRow} from './fixtures/packed-channel.js';
 const tick=()=>new Promise(r=>setImmediate(r));
 const deferred=()=>{let resolve,reject;const promise=new Promise((a,b)=>{resolve=a;reject=b});return {promise,resolve,reject};};
@@ -59,7 +59,7 @@ function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsuppo
  const listen=events=>(name,fn)=>events.set(name,[...(events.get(name)??[]),fn]);
  const fire=(events,name)=>{for(const fn of events.get(name)??[])fn({target:document.activeElement});};
  const document={querySelector:el,querySelectorAll:()=>[],createElement:element,body:element(),activeElement:null,hidden:false,hasFocus:()=>true,addEventListener:listen(pageEvents)};
- const context={directionalPaneNeighbor,retainedPaneTree,makePassiveSurfaces,validateReloadView,retainedReloadView,saveReloadTicket,takeReloadTicket,installFilePreviewPanel:()=>({dismiss(){}}),document,addEventListener:listen(windowEvents),__TAURI__:{core:{invoke,Channel}},acceptFull,acceptUpdate,backingGeometry,clearPaint,acceptChannelFrame,channelCounter,CHANNEL_RENDITION_VERSION,installIme,installTerminalKeys,modifierKey,installHistory,installCommandBlocks,installTerminalChat,installTerminalShell,installWorkflows,validateChatStatus,installPasteReview,installTerminalFocus,installTerminalMouse,installTerminalSelection,dimensions,resizeQueue,cursorTarget,terminalCellAt,viewportDimensions,windowPixelQueue,paint,TextEncoder:Encoder,TextDecoder,
+ const context={directionalPaneNeighbor,retainedPaneTree,makePassiveSurfaces,validateReloadView,retainedReloadView,saveReloadTicket,takeReloadTicket,installFilePreviewPanel:()=>({dismiss(){}}),document,addEventListener:listen(windowEvents),__TAURI__:{core:{invoke,Channel}},acceptFull,acceptUpdate,backingGeometry,clearPaint,acceptChannelFrame,acceptChannelUpdate,channelCounter,CHANNEL_RENDITION_VERSION,installIme,installTerminalKeys,modifierKey,installHistory,installCommandBlocks,installTerminalChat,installTerminalShell,installWorkflows,validateChatStatus,installPasteReview,installTerminalFocus,installTerminalMouse,installTerminalSelection,dimensions,resizeQueue,cursorTarget,terminalCellAt,viewportDimensions,windowPixelQueue,paint,TextEncoder:Encoder,TextDecoder,
  installInlineHistory,
  plainLocalTab,MAX_LOCAL_SHELLS,validLocalGeometry,localSplitPair,readLocalShellLayout:()=>readLocalShellLayout(storage),saveLocalShellLayout:value=>saveLocalShellLayout(value,storage),readThreePaneLayout:()=>readThreePaneLayout(storage),saveThreePaneLayout:value=>saveThreePaneLayout(value,storage),
  setInterval(fn){timers.set(++id,fn);return id},clearInterval(i){timers.delete(i)},setTimeout,...animation};
@@ -1023,6 +1023,49 @@ test('SSH batched polling acknowledges painted frames through the final drain',a
  await poll();
  assert.deepEqual(receipts,[null,1,2]);
  assert.equal(h.timers.size,0);
+});
+
+test('SSH packed polling restarts with a snapshot after acknowledging recovery',async()=>{
+ const first={session:'a'.repeat(32),epoch:1,generation:1},next={...first,generation:2};
+ const compat={...JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8')),
+  session:first.session,epoch:1,revision:3};
+ const version=CHANNEL_RENDITION_VERSION;
+ const status={...channelHealth(1),poll_with_status:true,packed_frame_version:version};
+ const stamp=revision=>({version,session:first.session,epoch:'1',revision,layout:String(compat.layout),
+  screen:'primary',resource_generation:'1',cursor_row:0,cursor_col:0,cursor_visible:true,
+  cursor_shape:'block',pending_wrap:false});
+ const row=(text,wrapped=false)=>packedRow({wrapped,cells:[{text,width:1,style:0,foreground:'#ffffff',background:'#000000'}]});
+ const snapshot=(revision,text)=>({kind:'snapshot',stamp:stamp(revision),cols:1,rows:[row(text,true),row('Y')]});
+ const delta={kind:'delta',stamp:stamp('2'),base_revision:'1',rows:[{index:0,row:row('B')}]};
+ const commands=[],painted=[];
+ const h=harness(async(_name,{action})=>{
+  if(action.operation==='open')return {owner:first,poll_with_status:true,packed_frame_version:version};
+  const command=action.command;
+  commands.push([command.kind,command.owner.generation,command.ack_revision??command.revision,command.snapshot]);
+  switch(command.kind){
+   case 'poll_packed':{
+    const frame=command.owner.generation===2?snapshot('3','C'):command.snapshot?snapshot('1','A'):delta;
+    return {status,update:frame,frame_bytes:JSON.stringify(frame).length};
+   }
+   case 'recover':return {owner:next,frame:compat,input_allowed:true};
+   case 'poll':case 'ack':return null;
+   case 'status':return status;
+   default:throw Error(command.kind);
+  }
+ },undefined,undefined,(_canvas,frame)=>painted.push(frame.revision));
+ h.el('#ssh-terminal-host').value='lab';await h.submitSsh();
+ await h.click('#copy-visible');
+ assert.equal(h.el('#history-output').value,'A\nY');
+ await [...h.timers.values()][0]();
+ await h.click('#recover');
+ await [...h.timers.values()][0]();
+ assert.deepEqual(commands,[
+  ['poll_packed',1,undefined,true],['poll_packed',1,'1',false],
+  ['recover',1,undefined,undefined],['ack',2,3,undefined],['poll',2,undefined,undefined],
+  ['status',2,undefined,undefined],['poll_packed',2,undefined,true],
+ ]);
+ assert.deepEqual([...new Set(painted)],['1','2',3,'3']);
+ assert.equal(h.el('#input').disabled,false);
 });
 
 test('SSH polling rejects a delta from the wrong base',async()=>{

@@ -33,11 +33,11 @@ function selectionRows(frame, range) {
   return {top, bottom, left, right};
 }
 
-function selectedText(frame, range) {
+function selectedText(frame, range, joinWrappedRows) {
   const {top, bottom, left, right} = selectionRows(frame, range);
   let text = '';
   for (let row = top; row <= bottom; row++) {
-    if (row > top && !(frame.row_wrapped?.[row - 1] ?? frame.rows[row - 1].wrapped)) text += '\n';
+    if (row > top && !(joinWrappedRows && (frame.row_wrapped?.[row - 1] ?? frame.rows[row - 1].wrapped))) text += '\n';
     const cells = frame.rows[row].slice(row === top ? left : 0, row === bottom ? right : frame.cols);
     for (const cell of cells) {
       if (cell.width !== 0) text += cell.text;
@@ -46,7 +46,7 @@ function selectedText(frame, range) {
   return text;
 }
 
-export function installTerminalSelection({canvas, overlay, document, onFrame, onSelection}) {
+export function installTerminalSelection({canvas, overlay, document, onFrame, onSelection, joinWrappedRows = () => true}) {
   let latest = null;
   let visible = null;
   let drag = null;
@@ -82,7 +82,7 @@ export function installTerminalSelection({canvas, overlay, document, onFrame, on
   function showLatest() {
     if (latest !== visible) {
       if (selection?.range && (!latest || !sameSurface(visible, latest) ||
-          selectedText(latest, selection.range) !== selection.text)) selection.range = null;
+          selectedText(latest, selection.range, joinWrappedRows(latest)) !== selection.text)) selection.range = null;
       visible = latest;
       onFrame(visible);
     }
@@ -96,7 +96,7 @@ export function installTerminalSelection({canvas, overlay, document, onFrame, on
     suppressClick = moved || cancelClick;
     if (canvas.hasPointerCapture(pointerId)) canvas.releasePointerCapture(pointerId);
     if (keep && moved) {
-      selection = {range, text: selectedText(visible, range), revision: visible.revision};
+      selection = {range, text: selectedText(visible, range, joinWrappedRows(visible)), revision: visible.revision};
       onSelection(true);
     }
     showLatest();

@@ -1,8 +1,9 @@
-use super::{decode_record, invalid, read_record_bytes, Reply, VERSION};
+use super::{decode_record, invalid, read_record, read_record_bytes, write_record, Reply, VERSION};
 use serde::{
     de::{DeserializeOwned, MapAccess, SeqAccess, Visitor},
     Deserialize, Deserializer,
 };
+use serde_json::Value;
 use std::{
     fmt,
     io::{self, BufRead, Write},
@@ -14,18 +15,41 @@ pub(super) fn forward_reply(
     request: u32,
     limit: usize,
 ) -> io::Result<()> {
-    let bytes = read_record_bytes(reader, limit)?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "terminal owner closed during request",
-        )
-    })?;
+    let bytes = read_record_bytes(reader, limit)?.ok_or_else(owner_closed)?;
     let reply: Reply<ValidatedJson> = decode_record(&bytes)?;
+    check_reply(&reply, request)?;
+    writer.write_all(&bytes)?;
+    writer.flush()
+}
+
+pub(super) fn forward_status_reply(
+    reader: &mut impl BufRead,
+    writer: &mut impl Write,
+    request: u32,
+    limit: usize,
+) -> io::Result<()> {
+    let mut reply: Reply = read_record(reader, limit)?.ok_or_else(owner_closed)?;
+    check_reply(&reply, request)?;
+    if let Ok(Value::Object(status)) = &mut reply.result {
+        // A current owner and an older stdio helper can share the same socket.
+        // Advertise the command through a relay that can also decode it.
+        status.insert("packed_frame_relay".into(), Value::Bool(true));
+    }
+    write_record(writer, &reply, limit)
+}
+
+fn owner_closed() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "terminal owner closed during request",
+    )
+}
+
+fn check_reply<T>(reply: &Reply<T>, request: u32) -> io::Result<()> {
     if reply.protocol != VERSION || reply.request != request {
         return Err(invalid("terminal owner reply does not match request"));
     }
-    writer.write_all(&bytes)?;
-    writer.flush()
+    Ok(())
 }
 
 /// Apply serde_json's string and nesting checks to the complete reply
@@ -98,6 +122,18 @@ mod tests {
     use super::*;
     use crate::terminal_transport::RawPollReply;
     use serde_json::Value;
+
+    #[test]
+    fn status_reply_advertises_the_stdio_helper_capability() {
+        let packet =
+            b"{\"protocol\":1,\"request\":7,\"result\":{\"Ok\":{\"packed_frame_version\":8}}}\n";
+        let mut forwarded = Vec::new();
+        forward_status_reply(&mut packet.as_slice(), &mut forwarded, 7, 1024).unwrap();
+        let reply: Reply = decode_record(&forwarded).unwrap();
+        let status = reply.result.unwrap();
+        assert_eq!(status["packed_frame_version"], 8);
+        assert_eq!(status["packed_frame_relay"], true);
+    }
 
     #[test]
     fn client_keeps_the_frame_fragment_after_validating_the_reply() {

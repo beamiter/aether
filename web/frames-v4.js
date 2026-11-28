@@ -233,7 +233,12 @@ export function acceptChannelFrame(previous, encoded, expected, snapshotOnly = f
   if (typeof encoded !== 'string' || encoded.length > limit) throw new Error('Channel frame byte limit');
   const wireBytes = utf8Bytes(encoded);
   if (wireBytes > limit) throw new Error('Channel frame byte limit');
-  const update = JSON.parse(encoded);
+  return acceptChannelUpdate(previous,JSON.parse(encoded),expected,snapshotOnly,wireBytes);
+}
+
+export function acceptChannelUpdate(previous, update, expected, snapshotOnly, wireBytes) {
+  if (!Number.isSafeInteger(wireBytes) || wireBytes < 1) throw new Error('Channel frame byte limit');
+  const expectedVersion = expected.frameVersion ?? previous?.version;
   const stamp = update?.stamp;
   if (!stamp || (stamp.version !== textChannelVersion && !supportsChannelImages(stamp.version)) ||
       (expectedVersion !== undefined && stamp.version !== expectedVersion) || stamp.session !== expected.session ||

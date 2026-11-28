@@ -17,7 +17,7 @@ import {installTerminalChat,validateChatStatus} from './terminal-chat.js';
 import {installWorkflows} from './workflows.js';
 import {plainLocalTab,readLocalShellLayout,saveLocalShellLayout,readThreePaneLayout,saveThreePaneLayout,validPaneId,MAX_LOCAL_SHELLS,validLocalGeometry,localSplitPair} from './local-layout.js';
 import {backingGeometry,acceptFull,acceptUpdate,clearPaint,paint} from './frames.js'; import {installIme} from './ime.js';
-import {acceptChannelFrame,channelCounter,CHANNEL_RENDITION_VERSION} from './frames-v4.js';
+import {acceptChannelFrame,acceptChannelUpdate,channelCounter,CHANNEL_RENDITION_VERSION} from './frames-v4.js';
 const canvas=document.querySelector('canvas'),status=document.querySelector('#status'),button=document.querySelector('#demo');
 const open=document.querySelector('#open'),attach=document.querySelector('#attach'),detach=document.querySelector('#detach'),close=document.querySelector('#close'),input=document.querySelector('#input'),send=document.querySelector('#send');
 const openIntegrated=document.querySelector('#open-integrated');
@@ -106,6 +106,7 @@ const copySelection = document.querySelector('#copy-selection');
 const liveSelection = selectionOverlay && typeof canvas.setPointerCapture === 'function'
   ? installTerminalSelection({
     canvas, overlay: selectionOverlay, document,
+    joinWrappedRows: frame => frame.session !== sshSession,
     onFrame(frame) {
       if (frame) paintTerminalFrame(frame);
       else clearPaint(canvas);
@@ -232,7 +233,12 @@ const channelSnapshots=()=>typeof Channel==='function'?{frameVersion:CHANNEL_REN
 const acceptAttachedSnapshot=(frame,attachment,options)=>options.frameVersion===CHANNEL_RENDITION_VERSION
   ?acceptChannelFrame(null,frame,{...attachment,frameVersion:options.frameVersion},true):acceptFull(null,frame,attachment);
 let savedLayout=invoke?(threePanePreview?readThreePaneLayout():null)??readLocalShellLayout():null,protectSavedLayout=false;
-const sshCommands={poll_shell:'poll',poll_ssh_shell:'poll_with_status',ack_shell:'ack',shell_status:'status',history_shell:'history',recover_shell:'recover',detach_shell:'detach',close_shell:'close',write_shell:'write',key_shell:'key',key_event_shell:'key_event',text_shell:'text',paste_shell:'paste',resize_shell:'resize',focus_shell:'focus',mouse_shell:'mouse'};
+const sshCommands={poll_shell:'poll',poll_ssh_shell:'poll_with_status',poll_packed_shell:'poll_packed',ack_shell:'ack',shell_status:'status',history_shell:'history',recover_shell:'recover',detach_shell:'detach',close_shell:'close',write_shell:'write',key_shell:'key',key_event_shell:'key_event',text_shell:'text',paste_shell:'paste',resize_shell:'resize',focus_shell:'focus',mouse_shell:'mouse'};
+function sshPollFor(attachment,info){
+  return info?.poll_with_status===true
+    ? {owner:attachment,ackRevision:null,packed:info.packed_frame_version===CHANNEL_RENDITION_VERSION}
+    : null;
+}
 function setOpenDisabled(disabled) {
   open.disabled=openIntegrated.disabled=openSsh.disabled=sshHost.disabled=disabled||!invoke;
   sshConnect.disabled=openSsh.disabled;
@@ -843,7 +849,7 @@ function showShellStatus(info,mode){
   }
   if (owner && owner.session === sshSession) {
     if (info.poll_with_status === true && sshPoll?.owner !== owner) {
-      sshPoll = {owner, ackRevision: null};
+      sshPoll = sshPollFor(owner,info);
     }
     sshMouseOwner = info.mouse_reporting === true ? owner : null;
     const capable = info.focus_reporting === true ? owner : null;
@@ -971,16 +977,24 @@ document.addEventListener?.('visibilitychange',()=>{if(document.hidden)ime.reset
 async function poll(){
   if(epoch===null||changingTab||localStream||localTransport==='recovery'||polling?.epoch===epoch)return;const current=epoch,attachment=owner,ticket={epoch,transport};polling=ticket;
   const batch=sshPoll?.owner===attachment?sshPoll:null;
+  const packed=batch?.packed===true;
+  const previousPacked=packed&&state?.version===CHANNEL_RENDITION_VERSION?state:null;
   try{
     const reply=await (batch
-      ? invokeAttached('poll_ssh_shell',{epoch:current,ack_revision:batch.ackRevision},attachment)
+      ? invokeAttached(packed?'poll_packed_shell':'poll_ssh_shell',{
+        epoch:current,ack_revision:batch.ackRevision,...(packed?{snapshot:previousPacked===null}:{}),
+      },attachment)
       : invokeAttached('poll_shell',{epoch:current},attachment));
     if(epoch!==current||ticket.transport!==transport)return;
     if(batch&&(reply?.status?.poll_with_status!==true||
+        (packed&&reply.status.packed_frame_version!==CHANNEL_RENDITION_VERSION)||
         (reply.update!==null&&typeof reply.update!=='object')))throw new Error('invalid SSH terminal poll reply');
     const update=batch?reply.update:reply;
-    if(update){
-      const next=acceptUpdate(state,update,attachment);
+    if(update!=null){
+      const next=packed
+        ? acceptChannelUpdate(previousPacked,update,{...attachment,frameVersion:CHANNEL_RENDITION_VERSION},
+          previousPacked===null,reply.frame_bytes)
+        : acceptUpdate(state,update,attachment);
       paintLiveFrame(next);state=next;describeCursor();
       if(!batch)await invokeAttached('ack_shell',{epoch:current,revision:next.revision},attachment);
     }
@@ -1217,7 +1231,7 @@ async function openShell({destination=null,retained=null,fromRestore=false,confi
       throw new Error('Second local shell did not match the open response.');
     owner=opened;sshSession=destination===null?null:opened.session;
     sshKeyboardOwner=destination!==null&&result?.keyboard_event_reporting===true?opened:null;
-    sshPoll=destination!==null&&result?.poll_with_status===true?{owner:opened,ackRevision:null}:null;
+    sshPoll=destination===null?null:sshPollFor(opened,result);
     localTransport='channel';localInputSuspended=false;
     if(destination===null){detachedLocal=null;restoreLocalDraft(opened);rememberLocalTab(opened,configuration,paneId);}
     const previousEpoch=epoch;epoch=owner.epoch;updateSplitPair(previousEpoch);keyQueue={chain:Promise.resolve(),pending:0,locked:false};state=null;
@@ -1534,7 +1548,8 @@ function describeCursor(frame=visibleLiveFrame()){
   document.querySelector('#cursor-status').textContent=`${frame.cols} × ${frame.rows.length} cells · cursor row ${frame.cursor_row+1}, column ${frame.cursor_col+1} · ${frame.cursor_shape}${frame.cursor_visible?'':' (hidden)'}${frame.pending_wrap?' · wrap pending':''}`;
 }
 function hyperlinkAt(event,frame=visibleLiveFrame()){
-  if(!owner||frame?.version!==CHANNEL_RENDITION_VERSION||frame.session!==owner.session||frame.epoch!==owner.epoch)return null;
+  if(!owner||owner.session===sshSession||frame?.version!==CHANNEL_RENDITION_VERSION||
+      frame.session!==owner.session||frame.epoch!==owner.epoch)return null;
   const point=terminalCellAt(frame,canvas,event.clientX,event.clientY);
   if(!point)return null;
   const cells=frame.rows[point.row];
@@ -1698,7 +1713,8 @@ document.querySelector('#copy-visible').addEventListener('click',()=>{
   // Unicode spaces such as NBSP or the wide ideographic space.
   output.value=frame.rows.map((row,index)=>{
     const text=row.filter(cell=>cell.width!==0).map(cell=>cell.text).join('');
-    return row.wrapped?text:text.replace(/ +$/,'')+(index+1<frame.rows.length?'\n':'');
+    return frame.session!==sshSession&&row.wrapped
+      ? text : text.replace(/ +$/,'')+(index+1<frame.rows.length?'\n':'');
   }).join('');
   document.querySelector('#history-label').textContent=`Visible grid snapshot ${frame.revision}. Select and copy normally.`;
 });

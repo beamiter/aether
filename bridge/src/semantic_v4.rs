@@ -457,7 +457,7 @@ fn pack_row(row: wire::RowData<EncodedCell<'_>>) -> EncodedRow<'_> {
     let columns = row.cells.len() as u16;
     // Dense true-color rows benefit less from a palette. Stop collecting
     // early and send the ordinary cell shape for such rows.
-    let max_styles = (row.cells.len() / 4).clamp(1, 32);
+    let max_styles = (row.cells.len() / 4).max(1);
     let mut styles = Vec::new();
     let mut last = None;
     // Validated rows fit in the stack buffer. The bounded palette also
@@ -881,6 +881,28 @@ mod tests {
             let ordinary: serde_json::Value = serde_json::from_str(&encoded).unwrap();
             assert_eq!(ordinary["rows"][0]["cells"].as_array().unwrap().len(), 128);
         }
+    }
+
+    #[test]
+    fn a_wide_row_can_pack_more_than_thirty_two_reused_styles() {
+        let mut terminal = jterm_engine::terminal::Terminal::new(2, 256).unwrap();
+        for green in 0..40 {
+            terminal
+                .feed(format!("\x1b[38;2;75;{green};123mABCDE").as_bytes())
+                .unwrap();
+        }
+        let (_, encoded) = encode(
+            None,
+            &terminal.frame().unwrap(),
+            "bands",
+            wire::RENDITION_VERSION,
+        )
+        .unwrap();
+        let packed: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        let row = &packed["rows"][0];
+        assert_eq!(row["styles"].as_array().unwrap().len(), 41);
+        assert_eq!(row["columns"], 256);
+        assert_eq!(row["runs"][39], serde_json::json!([39, "ABCDE"]));
     }
 
     #[test]
