@@ -80,6 +80,12 @@ fn local_v8_snapshot_recovery_and_attach_keep_exact_lease_and_receipt() {
 }
 
 fn assert_snapshot_recovery_and_attach_keep_exact_lease_and_receipt(frame_version: u8) {
+    // Run the protocol variants in turn so other Channel tests can share the
+    // process-wide encoder workspaces.
+    static RECOVERY_CASES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _case = RECOVERY_CASES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let app = super::application(tauri::test::mock_builder())
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
         .unwrap();
