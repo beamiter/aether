@@ -1078,6 +1078,25 @@ test('logical key events are serialized and never ANSI encoded in JS',async()=>{
  for(const key of ['ArrowUp','a'])h.el('canvas').handlers.keydown({key,shiftKey:false,altKey:false,ctrlKey:false,preventDefault(){}});
  await tick();assert.deepEqual(seen.map(x=>x.name),['ArrowUp','a']);assert.equal(seen[0].epoch,1);
 });
+test('keypad presses keep physical identity and Num Lock through local key input',async()=>{
+ const seen=[];const h=harness(async(name,args)=>{if(name==='open_shell')return 1;if(name==='key_shell'||name==='text_shell')seen.push([name,args]);return null;});
+ await h.click('#open');
+ const press=(key,code,locked)=>h.el('canvas').handlers.keydown({
+  key,code,shiftKey:false,altKey:false,ctrlKey:false,preventDefault(){},
+  getModifierState:modifier=>modifier==='NumLock'&&locked,
+ });
+ press('Enter','Enter',false);
+ press('Enter','NumpadEnter',false);
+ press('Home','Numpad7',false);
+ press('7','Numpad7',true);
+ press('Clear','Numpad5',false);
+ press('Clear','NumpadClear',false);
+ await tick();
+ assert.deepEqual(seen.map(([name,args])=>name+':'+args.name),['key_shell:Enter','key_shell:Enter','key_shell:Home','key_shell:7','key_shell:Clear']);
+ assert.deepEqual(seen.map(([,args])=>args.keypad?[args.keypad.code,args.keypad.num_locked]:null),[
+  null,['NumpadEnter',false],['Numpad7',false],['Numpad7',true],['Numpad5',false],
+ ]);
+});
 test('composition and browser paste shortcut are not double sent',async()=>{
  const seen=[];const h=harness(async(name,args)=>{if(name==='open_shell')return 1;if(name==='key_shell'||name==='paste_shell')seen.push([name,args]);return null;});await h.click('#open');
  h.el('canvas').handlers.keydown({key:'a',isComposing:true});h.el('canvas').handlers.keydown({key:'v',ctrlKey:true});

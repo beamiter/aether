@@ -1539,9 +1539,13 @@ function keydown(event){
   // Preserve plain Insert and modified Insert combinations for terminal apps.
   if(event.key==='Insert'&&event.shiftKey&&!event.ctrlKey&&!event.altKey)return;
   const named=/^(Arrow(Up|Down|Left|Right)|Home|End|Insert|Delete|PageUp|PageDown|F([1-9]|1[0-2])|Enter|Escape|Backspace|Tab)$/;
-  if(!named.test(event.key)&&[...event.key].length!==1)return;
-  if(event.currentTarget===imeInput&&!named.test(event.key)&&!event.ctrlKey&&!event.altKey)return;
-  event.preventDefault();enqueueLogical('key_shell',{name:event.key,shift:event.shiftKey,alt:event.altKey,ctrl:event.ctrlKey});
+  const keypad=/^Numpad([0-9]|Decimal|Divide|Multiply|Subtract|Add|Enter|Equal|Comma)$/.test(event.code)
+    ? {code:event.code,num_locked:event.getModifierState?.('NumLock')===true}
+    : null;
+  const namedKey=named.test(event.key)||keypad?.code==='Numpad5'&&event.key==='Clear';
+  if(!namedKey&&[...event.key].length!==1)return;
+  if(event.currentTarget===imeInput&&!namedKey&&!keypad&&!event.ctrlKey&&!event.altKey)return;
+  event.preventDefault();enqueueLogical('key_shell',{name:event.key,shift:event.shiftKey,alt:event.altKey,ctrl:event.ctrlKey,...(keypad?{keypad}:{})});
 }
 canvas.addEventListener('keydown',keydown);imeInput.addEventListener('keydown',keydown);
 function paste(event){

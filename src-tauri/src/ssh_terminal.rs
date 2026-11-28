@@ -68,6 +68,7 @@ struct RemoteSession {
     pending_snapshot: Option<u32>,
     focus_reporting: bool,
     mouse_reporting: bool,
+    keypad_reporting: bool,
 }
 
 #[tauri::command]
@@ -208,6 +209,7 @@ impl SshTerminal {
                     pending_snapshot: None,
                     focus_reporting: false,
                     mouse_reporting: false,
+                    keypad_reporting: false,
                 });
                 Ok(json!({"owner": opened, "save_warning": remembered.err()}))
             }
@@ -513,6 +515,7 @@ impl SshTerminal {
             pending_snapshot: Some(revision),
             focus_reporting: false,
             mouse_reporting: false,
+            keypad_reporting: false,
         });
         Ok(result)
     }
@@ -554,6 +557,7 @@ impl RemoteSession {
         self.owner = next;
         self.focus_reporting = false;
         self.mouse_reporting = false;
+        self.keypad_reporting = false;
         self.pending_snapshot = Some(revision);
         Ok(())
     }
@@ -590,10 +594,11 @@ impl RemoteSession {
         Ok(result)
     }
 
-    fn exchange(&mut self, command: Command, reconnect: bool) -> Result<Value, String> {
+    fn exchange(&mut self, mut command: Command, reconnect: bool) -> Result<Value, String> {
         if self.relay.is_none() {
             self.focus_reporting = false;
             self.mouse_reporting = false;
+            self.keypad_reporting = false;
         }
         // A new command must never be sent to an old helper. Capability is
         // learned only from a normal Status on this bound link and attachment.
@@ -618,12 +623,16 @@ impl RemoteSession {
         if reconnect && self.relay.is_none() {
             self.focus_reporting = false;
             self.mouse_reporting = false;
+            self.keypad_reporting = false;
             self.relay = Some(connect(&self.endpoint, self.instance.as_deref())?);
         }
         let relay = self
             .relay
             .as_mut()
             .ok_or("SSH terminal connection ended.")?;
+        if !self.keypad_reporting && !strip_unavailable_keypad(&mut command) {
+            return Ok(Value::Null);
+        }
         let input =
             is_input(&command) && !matches!(command, Command::Focus { .. } | Command::Mouse { .. });
         let status = matches!(command, Command::Status { .. });
@@ -631,12 +640,14 @@ impl RemoteSession {
         if retiring {
             self.focus_reporting = false;
             self.mouse_reporting = false;
+            self.keypad_reporting = false;
         }
         match relay.call(command) {
             Ok(mut reply) => {
                 if reply.is_err() {
                     self.focus_reporting = false;
                     self.mouse_reporting = false;
+                    self.keypad_reporting = false;
                 }
                 if status {
                     self.focus_reporting = reply
@@ -647,6 +658,10 @@ impl RemoteSession {
                         .as_ref()
                         .ok()
                         .is_some_and(|value| mouse_capability(self.instance.as_deref(), value));
+                    self.keypad_reporting = reply
+                        .as_ref()
+                        .ok()
+                        .is_some_and(|value| keypad_capability(self.instance.as_deref(), value));
                     if let Ok(value) = &mut reply {
                         if let Some(object) = value.as_object_mut() {
                             object.insert(
@@ -670,11 +685,25 @@ impl RemoteSession {
                 self.relay = None;
                 self.focus_reporting = false;
                 self.mouse_reporting = false;
+                self.keypad_reporting = false;
                 self.input_uncertain |= input;
                 Err("SSH terminal connection ended.".into())
             }
         }
     }
+}
+
+fn keypad_capability(instance: Option<&str>, status: &Value) -> bool {
+    instance.is_some_and(valid_identity)
+        && status.get("keypad_reporting") == Some(&Value::Bool(true))
+}
+
+fn strip_unavailable_keypad(command: &mut Command) -> bool {
+    if let Command::Key { name, keypad, .. } = command {
+        // The old logical-key path excludes the keypad center's Clear name.
+        return keypad.take().is_none() || name != "Clear";
+    }
+    true
 }
 
 fn mouse_capability(instance: Option<&str>, status: &Value) -> bool {
@@ -743,6 +772,7 @@ mod reload_tests {
                 pending_snapshot: None,
                 focus_reporting: false,
                 mouse_reporting: false,
+                keypad_reporting: false,
             }),
         }
     }
@@ -781,6 +811,38 @@ mod reload_tests {
         );
         assert!(t.session.as_ref().unwrap().relay.is_none());
         assert!(!t.session.as_ref().unwrap().input_uncertain);
+    }
+
+    #[test]
+    fn keypad_fields_are_sent_only_to_a_capable_bound_helper() {
+        let mut command: Command = serde_json::from_value(json!({
+            "kind": "key", "owner": owner(), "name": "Home",
+            "shift": false, "alt": false, "ctrl": false,
+            "keypad": {"code": "Numpad7", "num_locked": false}
+        }))
+        .unwrap();
+        assert!(!keypad_capability(None, &json!({"keypad_reporting":true})));
+        assert!(!keypad_capability(Some(&"a".repeat(32)), &json!({})));
+        assert!(keypad_capability(
+            Some(&"a".repeat(32)),
+            &json!({"keypad_reporting":true})
+        ));
+        assert!(serde_json::to_value(&command)
+            .unwrap()
+            .get("keypad")
+            .is_some());
+        assert!(strip_unavailable_keypad(&mut command));
+        let old_wire = serde_json::to_value(&command).unwrap();
+        assert_eq!(old_wire["name"], "Home");
+        assert!(old_wire.get("keypad").is_none());
+
+        let mut center: Command = serde_json::from_value(json!({
+            "kind": "key", "owner": owner(), "name": "Clear",
+            "shift": false, "alt": false, "ctrl": false,
+            "keypad": {"code": "Numpad5", "num_locked": false}
+        }))
+        .unwrap();
+        assert!(!strip_unavailable_keypad(&mut center));
     }
 
     #[test]

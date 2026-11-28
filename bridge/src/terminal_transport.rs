@@ -81,6 +81,8 @@ pub enum Command {
         shift: bool,
         alt: bool,
         ctrl: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keypad: Option<crate::live::KeypadReport>,
     },
     Mouse {
         owner: Attachment,
@@ -245,6 +247,7 @@ impl Host {
                 let mut status = reply_value(bridge.status(epoch)?)?;
                 status["focus_reporting"] = Value::Bool(true);
                 status["mouse_reporting"] = Value::Bool(true);
+                status["keypad_reporting"] = Value::Bool(true);
                 if let Some(mouse) = bridge.mouse_view(epoch)? {
                     status["mouse"] = reply_value(mouse)?;
                 }
@@ -271,10 +274,18 @@ impl Host {
                 shift,
                 alt,
                 ctrl,
+                keypad,
             } => {
                 check_input(name.len())?;
                 self.attached(owner, true, |bridge, epoch| {
-                    reply_value(bridge.key(epoch, &name, shift, alt, ctrl)?)
+                    reply_value(bridge.key_with_keypad(
+                        epoch,
+                        &name,
+                        shift,
+                        alt,
+                        ctrl,
+                        keypad.as_ref(),
+                    )?)
                 })?
             }
             Command::Text { owner, text } => {

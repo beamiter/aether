@@ -412,10 +412,11 @@ async fn key_shell(
     shift: bool,
     alt: bool,
     ctrl: bool,
+    keypad: Option<tauri_terminal_frame_bridge::live::KeypadReport>,
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<(), String> {
     run_input(bridge.inner().clone(), owner, move |bridge, epoch| {
-        bridge.key(epoch, &name, shift, alt, ctrl)
+        bridge.key_with_keypad(epoch, &name, shift, alt, ctrl, keypad.as_ref())
     })
     .await
 }

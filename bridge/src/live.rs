@@ -11,6 +11,7 @@ use jterm_engine::{
     frame::CellFrame,
     frame_retention::{process_frame_budget, RetainedCellFrame},
     history_reflow::HistoryAnchor,
+    input::{KeypadKey, Modifiers},
     native_window_ops::NativeWindowPixels,
     terminal::{HistoryPage, Terminal},
 };
@@ -34,6 +35,32 @@ use raw_suffix::RawSuffix;
 pub struct ViewportPixels {
     pub width: u32,
     pub height: u32,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeypadReport {
+    pub code: String,
+    pub num_locked: bool,
+}
+
+impl KeypadReport {
+    fn position(&self) -> Option<KeypadKey> {
+        Some(match self.code.strip_prefix("Numpad")? {
+            "Decimal" => KeypadKey::Decimal,
+            "Divide" => KeypadKey::Divide,
+            "Multiply" => KeypadKey::Multiply,
+            "Subtract" => KeypadKey::Subtract,
+            "Add" => KeypadKey::Add,
+            "Enter" => KeypadKey::Enter,
+            "Equal" => KeypadKey::Equal,
+            "Comma" => KeypadKey::Separator,
+            digit => match digit.as_bytes() {
+                [n @ b'0'..=b'9'] => KeypadKey::Digit(n - b'0'),
+                _ => return None,
+            },
+        })
+    }
 }
 
 impl ViewportPixels {
@@ -1131,13 +1158,36 @@ impl LiveBridge {
         alt: bool,
         ctrl: bool,
     ) -> Result<(), String> {
+        self.key_with_keypad(epoch, name, shift, alt, ctrl, None)
+    }
+
+    pub fn key_with_keypad(
+        &mut self,
+        epoch: u32,
+        name: &str,
+        shift: bool,
+        alt: bool,
+        ctrl: bool,
+        keypad: Option<&KeypadReport>,
+    ) -> Result<(), String> {
         self.check(epoch)?;
-        let bytes = self
-            .session
-            .as_ref()
-            .unwrap()
-            .terminal()
-            .encode_key(name, shift, alt, ctrl)?;
+        let terminal = self.session.as_ref().unwrap().terminal();
+        let bytes = if let Some(report) = keypad {
+            terminal.encode_key_with_keypad(
+                name,
+                None,
+                Modifiers {
+                    shift,
+                    alt,
+                    ctrl,
+                    super_key: false,
+                },
+                report.position().ok_or("invalid physical keypad code")?,
+                report.num_locked,
+            )?
+        } else {
+            terminal.encode_key(name, shift, alt, ctrl)?
+        };
         self.enqueue(epoch, bytes)
     }
     pub fn text(&mut self, epoch: u32, text: &str) -> Result<(), String> {
