@@ -631,7 +631,7 @@ test('three visible shells rotate a single writer and ACK a retired preview on t
  const a=own(1,1),b=own(2,2),c=own(3,3),aAgain=own(1,4),d=own(4,5);
  const raw=JSON.parse(fs.readFileSync(new URL('../web/demo-frame.json',import.meta.url),'utf8'));
  const frame=(owner,revision=raw.revision)=>channelSnapshot({...raw,session:owner.session,epoch:owner.epoch,revision});
- const events=[],layouts=[],painted=[],acks=[],writes=[];
+ const events=[],layouts=[],painted=[],acks=[],writes=[],preferences=[];
  const opening=[b,c,d];
  const h=harness(async(name,args)=>{
   switch(name){
@@ -652,13 +652,24 @@ test('three visible shells rotate a single writer and ACK a retired preview on t
    }
    default:throw Error('unexpected local IPC '+name);
   }
- },undefined,undefined,(canvas,next)=>painted.push({canvas,epoch:next.epoch,rev:next.revision}),{},testChannel(),{localStorage:{getItem:key=>key==='aether.preview-three-panes'?'1':null}});
+ },undefined,undefined,(canvas,next)=>painted.push({canvas,epoch:next.epoch,rev:next.revision}),{},testChannel(),{localStorage:{getItem:key=>key==='aether.preview-three-panes'?'1':null,setItem:(...args)=>preferences.push(args)}});
  const event=(owner,seq,preview,active=null)=>({owner,kind:'update',sequence:String(seq),frame:active,preview,status:channelHealth(owner.epoch)});
  await h.click('#open');await h.click('#new-local-tab');await h.click('#new-local-tab');
  assert.equal(h.el('#split-three-local').disabled,false);
  await h.click('#split-three-local');
  assert.equal(h.el('#terminal-panes').dataset.triple,'true');
  assert.equal(h.el('#active-pane').dataset.slot,'2');
+ const panes=h.el('#terminal-panes'), balance=h.el('#split-balance'), stack=h.el('#split-stack-balance');
+ const before=layouts.length;
+ assert.equal(h.el('#split-stack-control').hidden,false);
+ balance.value='61';balance.handlers.input();balance.handlers.change();
+ stack.value='40';stack.handlers.input();
+ assert.equal(panes.style['--first-pane-share'],'61fr');
+ assert.equal(panes.style['--top-stack-share'],'40fr');
+ assert.equal(stack.getAttribute('aria-valuetext'),'40% top right, 60% bottom right');
+ assert.equal(layouts.length,before);
+ assert.ok(!preferences.some(([key])=>key.startsWith('aether.split-share.')));
+ assert.deepEqual(writes,[]);
  const [slotA,slotB]=layouts.at(-1).targets;
  assert.deepEqual([slotA.epoch,slotB.epoch],[1,2]);
  const sendC=events.at(-1).handle;
@@ -666,7 +677,11 @@ test('three visible shells rotate a single writer and ACK a retired preview on t
  await sendC(event(c,2,{layout:slotB.layout,frame:frame(b,2)}));
  assert.deepEqual(painted.slice(-2).map(item=>[item.canvas===h.el('#preview-canvas-1')?1:2,item.epoch,item.rev]),[[1,1,'17'],[2,2,'2']]);
  h.el('#input').value='write only C';await h.submit();
- await h.click('#split-three-local');await h.click('#split-three-local');
+ await h.click('#split-three-local');
+ assert.equal(h.el('#split-stack-control').hidden,true);
+ assert.equal(stack.disabled,true);
+ await h.click('#split-three-local');
+ assert.equal(stack.value,'40');
  const newerA=layouts.at(-1).targets[0];
  assert.notEqual(newerA.layout,slotA.layout);
  const count=painted.length;
@@ -677,6 +692,8 @@ test('three visible shells rotate a single writer and ACK a retired preview on t
  await h.click('#focus-preview-pane-1');
  assert.equal(events.at(-1).epoch,1);
  assert.equal(h.el('#active-pane').dataset.slot,'0');
+ assert.equal(balance.value,'61');
+ assert.equal(stack.value,'40');
  assert.deepEqual(Array.from(layouts.at(-1).targets,target=>target.epoch),[2,3]);
  h.el('#input').value='write only A';await h.submit();
  await h.click('#new-local-tab');
@@ -769,6 +786,11 @@ test('directional palette actions move the single writer by visible layout, not 
  await choose('right',true);assert.equal(activations.at(-1),2);
  h.el('#input').value='write only to the selected pane';await h.submit();
  assert.deepEqual(writes,[4,2]);
+ await choose('left',true);assert.equal(activations.at(-1),1);
+ const stackBalance=h.el('#split-stack-balance');
+ stackBalance.value='40';stackBalance.handlers.input();
+ await choose('right',true);assert.equal(activations.at(-1),4,'longer actual shared edge now wins');
+ await choose('up',true);assert.equal(activations.at(-1),2);
  assert.equal(h.el('#terminal-panes').dataset.triple,'true');
  await h.click('#split-three-local'); // A non-split tab roster offers no directions.
  await choose('left',false);

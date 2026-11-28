@@ -490,23 +490,23 @@ def close_without_stale_presentation(driver, state, selected, peer, reap_label):
         optional_close_evidence(driver, CLOSE_EVIDENCE_STOP)
 
 
-def split_balance(driver, left, right):
+def split_balance(driver, left, right, *, control="#split-balance", axis="width"):
     return driver.execute("""
-        const range = document.querySelector('#split-balance');
-        const left = document.querySelector(arguments[0]).getBoundingClientRect().width;
-        const right = document.querySelector(arguments[1]).getBoundingClientRect().width;
+        const range = document.querySelector(arguments[2]);
+        const left = document.querySelector(arguments[0]).getBoundingClientRect()[arguments[3]];
+        const right = document.querySelector(arguments[1]).getBoundingClientRect()[arguments[3]];
         return {share: Number(range.value), geometry: 100 * left / (left + right)};
-    """, [left, right])
+    """, [left, right, control, axis])
 
 
-def set_split_balance_with_keys(driver, left, right, share):
+def set_split_balance_with_keys(driver, left, right, share, *, control="#split-balance", axis="width"):
     driver.execute("document.body.scrollTop = 0;")
-    driver.click("#split-balance")
-    assert driver.execute("return document.activeElement.id") == "split-balance"
+    driver.click(control)
+    assert driver.execute("return document.activeElement.id") == control[1:]
     keys = []
     # The click may set a value. Move one step away first so the native
     # keyboard must perform the last adjustment even if the click hit the requested share.
-    current = split_balance(driver, left, right)["share"]
+    current = split_balance(driver, left, right, control=control, axis=axis)["share"]
     if current == share:
         keys.append("\ue012")  # ArrowLeft
         current -= 1
@@ -516,7 +516,7 @@ def set_split_balance_with_keys(driver, left, right, share):
     driver.command("POST", "/actions", {"actions": [{"type": "key", "id": "split-balance-keys", "actions": actions}]})
 
     def resized_split():
-        value = split_balance(driver, left, right)
+        value = split_balance(driver, left, right, control=control, axis=axis)
         return value if value["share"] == share and abs(value["geometry"] - share) < 1 else None
 
     wait_for(resized_split, "native range keys did not resize both visible panes")
@@ -4126,6 +4126,17 @@ def exercise_three_shells(driver, owned, backend, binary):
     print(json.dumps({"case": "AETHER.THREE_PANES.DIRECTIONAL_FOCUS", "backend": backend,
                       "four_palette_directions": True, "visible_pty_identity_and_focus": True,
                       "parked_pty_retained": True}), flush=True)
+    left, top, bottom = [f'#terminal-panes > [data-slot="{slot}"]' for slot in range(3)]
+    before = state()
+    set_split_balance_with_keys(driver, left, top, 61)
+    set_split_balance_with_keys(driver, top, bottom, 40, control="#split-stack-balance", axis="height")
+    after = state()
+    assert after["current_tab"] == before["current_tab"] == tabs[2] and after["writable"]
+    assert after["draft"] == before["draft"] == "" and after["cursor"] == before["cursor"]
+    assert all(birth(pid) == stamp for pid, stamp in [*identities, parked_id])
+    print(json.dumps({"case": "AETHER.THREE_PANES.KEYBOARD_BALANCE", "backend": backend,
+                      "left_share": 61, "top_right_share": 40, "owner_and_parked_retained": True}), flush=True)
+
     prior = [*identities, parked_id]
     forbidden = owned / "three-restore-must-not-run"
     driver.type("#input", f"printf replayed > {shlex.quote(str(forbidden))}")

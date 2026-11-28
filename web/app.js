@@ -28,6 +28,10 @@ const splitToggle=document.querySelector('#split-local'),panes=document.querySel
 const splitBalanceControl=document.querySelector('#split-balance-control');
 const splitBalanceLabel=document.querySelector('#split-balance-label');
 const splitBalance=document.querySelector('#split-balance');
+const splitStackControl=document.querySelector('#split-stack-control');
+const splitStackBalance=document.querySelector('#split-stack-balance');
+// Preview-only ratios; never overwrite a saved two-pane preference.
+const tripleShares={columns:50,rows:50};
 
 const tripleToggle=document.querySelector('#split-three-local'),activePane=document.querySelector('#active-pane');
 const passivePanes=[1,2].map(index=>({
@@ -358,18 +362,21 @@ function renderSplit(){
   const first=splitEpochs[0]===epoch;
   panes.dataset.split=target?(splitAxis==='vertical'?(first?'top':'bottom'):(first?'left':'right')):'';
   peerPane.hidden=!target;
-  splitBalanceControl.hidden=!target;
-  splitBalance.disabled=!target||splitToggle.disabled;
-  if(target)renderSplitBalance();
+  const triple=tripleIsVisible();
+  splitBalanceControl.hidden=!target&&!triple;
+  splitBalance.disabled=splitBalanceControl.hidden||splitToggle.disabled;
+  splitStackControl.hidden=!triple;
+  splitStackBalance.disabled=!triple||splitToggle.disabled;
+  if(target||triple)renderSplitBalance(triple);
   focusPeer.disabled=splitToggle.disabled;
   if(target)focusPeer.textContent=`Focus Shell ${target.epoch}`;
   if(peerState&&peerState.epoch!==target?.epoch){
     peerState=null;clearPaint(peerCanvas);delete peerCanvas.dataset.geometry;
   }
 }
-function renderSplitBalance(){
-  const share=splitShares[splitAxis];
-  const rows=splitAxis==='vertical';
+function renderSplitBalance(triple=false){
+  const share=triple?tripleShares.columns:splitShares[splitAxis];
+  const rows=!triple&&splitAxis==='vertical';
   splitBalanceLabel.textContent=rows?'Top pane height':'Left pane width';
   splitBalance.value=String(share);
   splitBalance.setAttribute('aria-valuetext',rows
@@ -377,14 +384,31 @@ function renderSplitBalance(){
     : `${share}% left, ${100-share}% right`);
   panes.style.setProperty('--first-pane-share',`${share}fr`);
   panes.style.setProperty('--second-pane-share',`${100-share}fr`);
+  if(triple){
+    const top=tripleShares.rows;
+    splitStackBalance.value=String(top);
+    splitStackBalance.setAttribute('aria-valuetext',`${top}% top right, ${100-top}% bottom right`);
+    panes.style.setProperty('--top-stack-share',`${top}fr`);
+    panes.style.setProperty('--bottom-stack-share',`${100-top}fr`);
+  }
 }
 splitBalance.addEventListener('input',()=>{
-  if(splitBalance.disabled||!observerTarget())return;
+  const triple=tripleIsVisible();
+  if(splitBalance.disabled||(!triple&&!observerTarget()))return;
   const share=splitShareValue(splitBalance.value);
   if(share===null)return;
-  splitShares[splitAxis]=share;
-  renderSplitBalance();
+  if(triple)tripleShares.columns=share;
+  else splitShares[splitAxis]=share;
+  renderSplitBalance(triple);
   // The existing viewport observer fits only the current writable PTY.
+});
+splitStackBalance.addEventListener('input',()=>{
+  if(splitStackBalance.disabled||!tripleIsVisible())return;
+  const share=splitShareValue(splitStackBalance.value);
+  if(share===null)return;
+  tripleShares.rows=share;
+  renderSplitBalance(true);
+  // Update geometry but do not recreate observers or switch the input owner.
 });
 splitBalance.addEventListener('change',()=>{
   // A drag may generate many input events. Persist only the committed value.
@@ -1873,6 +1897,10 @@ function directionalPane(direction){
   const three=tripleIsVisible();
   if(!three&&!observerTarget())return null;
   const tree=retainedPaneTree(three?tripleEpochs:splitEpochs,splitAxis,three);
+  if(tree&&three){
+    tree.share=tripleShares.columns*10;
+    tree.second.share=tripleShares.rows*10;
+  }
   return directionalPaneNeighbor(tree,epoch,direction);
 }
 const directionalPaneActions=['left','right','up','down'].map(direction=>({
