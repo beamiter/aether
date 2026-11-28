@@ -189,6 +189,40 @@ test('dense ASCII reuses opaque glyphs by color and style with direct drawing fo
  assert.equal(atlasGlyphs.length,4);
 });
 
+test('a failed truecolor pixel probe keeps drawing through Canvas2D without repeating calibration',()=>{
+ const {canvas,g,draws}=observedCanvas();
+ let probes=0;
+ const texture={
+  setTransform(){},save(){},beginPath(){},rect(){},clip(){},restore(){},
+  fillRect(){},fillText(){},
+  getImageData(x,y,width,height){
+   probes++;
+   return {data:new Uint8ClampedArray(width*height*4)};
+  },
+ };
+ canvas.ownerDocument={createElement:()=>({getContext:()=>texture})};
+ g.globalAlpha=1;
+ g.globalCompositeOperation='source-over';
+ g.direction='ltr';
+ g.textAlign='start';
+ g.createImageData=()=>assert.fail('an incompatible raster allocated a band');
+ g.putImageData=()=>assert.fail('an incompatible raster wrote pixels');
+ g.drawImage=()=>assert.fail('these color pairs do not repeat');
+ const raw=smallPaintFrame({cols:80,rows:24,cursor_visible:false});
+ const blank=acceptFull(null,{...raw,rows:raw.rows.map(row=>row.map(cell=>({...cell,text:' '})))});
+ paint(canvas,blank,1);
+ assert.equal(probes,0);
+
+ const rows=raw.rows.map((row,y)=>row.map((cell,x)=>({
+  ...cell,background:'#'+(y*raw.cols+x).toString(16).padStart(6,'0'),
+ })));
+ for (let revision=2;revision<=3;revision++) {
+  paint(canvas,acceptFull(null,{...raw,rows,revision,layout:revision}),1);
+  assert.equal(draws.filter(([kind])=>kind==='text').length,raw.cols*rows.length);
+  assert.equal(probes,1);
+ }
+});
+
 function paintCalls(frame,scale) {
  const backgrounds=[],glyphs=[],clears=[];
  let drawingText=false,transform=1;

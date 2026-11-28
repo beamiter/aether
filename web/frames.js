@@ -1,5 +1,6 @@
 import {createRasterCanvasCache} from './raster-canvas-cache.js';
 import {CELL_CONCEALED, CELL_OVERLINE, rowMoveForBase} from './frames-v4.js';
+import {canRasterizeInk, createTruecolorPainter} from './truecolor-raster.js';
 
 export const CELL_WIDTH = 12, CELL_HEIGHT = 24;
 
@@ -88,6 +89,8 @@ const CELL_DECORATIONS = 4 | 8 | CELL_OVERLINE;
 const GLYPH_ATLAS_COLUMNS = 16;
 const GLYPH_ATLAS_MIN_DAMAGE = 512;
 const GLYPH_ATLAS_SAMPLE = 768;
+const CELL_TEXT_TOP = 2;
+const paintTruecolor = createTruecolorPainter(CELL_WIDTH,CELL_HEIGHT,CELL_TEXT_TOP);
 
 function paintImages(canvas, g, frame, damage, cw, ch) {
   for (const {y} of damage) for (const {id,column,slice} of frame.rows[y].imageSlices ?? []) {
@@ -143,7 +146,7 @@ function paintCellInk(g, cell, x, y) {
     g.fillStyle = cell.foreground;
     if (!space) {
       g.font = `${cell.style&2?'italic ':''}${cell.style&1?'bold ':''}18px monospace`;
-      g.fillText(cell.text,x,y+2);
+      g.fillText(cell.text,x,y+CELL_TEXT_TOP);
     }
     if (cell.style & CELL_OVERLINE) g.fillRect(x,y+1,width,1);
     if (cell.style & 8) g.fillRect(x,y+CELL_HEIGHT/2,width,1);
@@ -271,6 +274,22 @@ export function backingGeometry(rows, cols, scale = globalThis.devicePixelRatio 
   return {width, height, cssWidth, cssHeight, scale, mergeBackgrounds};
 }
 
+function paintBackgrounds(g, frame, damage, merge) {
+  const cw = CELL_WIDTH, ch = CELL_HEIGHT;
+  for (const {y,first,last} of damage) {
+    const row = frame.rows[y];
+    const limit = Math.min(last,row.length);
+    for (let start=first; start<limit;) {
+      const background = row[start].background;
+      let end = start+1;
+      if (merge) while (end<limit && row[end].background === background) end++;
+      g.fillStyle = background;
+      g.fillRect(start*cw,y*ch,(end-start)*cw,ch);
+      start = end;
+    }
+  }
+}
+
 export function paint(canvas, frame, deviceScale = globalThis.devicePixelRatio || 1) {
   const cw = CELL_WIDTH, ch = CELL_HEIGHT;
   const {width, height, cssWidth, cssHeight, scale, mergeBackgrounds} =
@@ -347,28 +366,11 @@ export function paint(canvas, frame, deviceScale = globalThis.devicePixelRatio |
   }
   g.setTransform(scale, 0, 0, scale, 0, 0);
   g.font = '18px monospace'; g.textBaseline = 'top';
-  // All backgrounds first: a wide glyph must not be erased by its trailing cell.
-  for (const {y,first,last} of damage) {
-    const row = frame.rows[y];
-    const limit = Math.min(last, row.length);
-    if (!mergeBackgrounds) {
-      for (let x = first; x < limit; x++) {
-        g.fillStyle = row[x].background;
-        g.fillRect(x*cw, y*ch, cw, ch);
-      }
-      continue;
-    }
-    for (let start = first; start < limit;) {
-      const background = row[start].background;
-      let end = start + 1;
-      while (end < limit && row[end].background === background) end++;
-      g.fillStyle = background;
-      g.fillRect(start*cw, y*ch, (end-start)*cw, ch);
-      start = end;
-    }
-  }
   // Integer backing pixels allow a pixel-for-pixel copy of an opaque tile.
   const atlas = mergeBackgrounds ? buildGlyphAtlas(canvas,g,frame,damage,scale) : null;
+  const rasterized = mergeBackgrounds && !atlas && paintTruecolor(canvas,g,frame,damage,scale);
+  // A wide glyph can cover its trailing cell, so its background goes down first.
+  if (!rasterized) paintBackgrounds(g,frame,damage,mergeBackgrounds);
   for (const {y,first,last} of damage) {
     const row = frame.rows[y];
     for (let x = first, limit = Math.min(last, row.length); x < limit; x++) {
@@ -379,7 +381,7 @@ export function paint(canvas, frame, deviceScale = globalThis.devicePixelRatio |
         const left = slot % GLYPH_ATLAS_COLUMNS * width;
         const top = Math.floor(slot / GLYPH_ATLAS_COLUMNS) * height;
         g.drawImage(source,left,top,width,height,x*cw,y*ch,cw,ch);
-      } else {
+      } else if (!rasterized || !canRasterizeInk(row[x])) {
         paintCellInk(g,row[x],x*cw,y*ch);
       }
     }
