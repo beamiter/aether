@@ -490,6 +490,25 @@ def close_without_stale_presentation(driver, state, selected, peer, reap_label):
         optional_close_evidence(driver, CLOSE_EVIDENCE_STOP)
 
 
+def drag_pane_divider(driver, selector, points, *, rows=False):
+    x, y, span = driver.execute("""
+      const r = document.querySelector(arguments[0]).getBoundingClientRect();
+      const box = document.querySelector('#terminal-panes').getBoundingClientRect();
+      return [Math.round(r.left + r.width/2), Math.round(r.top + r.height/2), box[arguments[1]] - 6];
+    """, [selector, "height" if rows else "width"])
+    distance = round(span * points / 100)
+    driver.command("POST", "/actions", {"actions": [{
+        "type": "pointer", "id": "pane-divider", "parameters": {"pointerType": "mouse"},
+        "actions": [
+            {"type": "pointerMove", "duration": 0, "x": x, "y": y},
+            {"type": "pointerDown", "button": 0},
+            {"type": "pointerMove", "duration": 160,
+             "x": x if rows else x + distance, "y": y + distance if rows else y},
+            {"type": "pointerUp", "button": 0},
+        ],
+    }]})
+
+
 def split_balance(driver, left, right, *, control="#split-balance", axis="width"):
     return driver.execute("""
         const range = document.querySelector(arguments[2]);
@@ -765,21 +784,7 @@ def exercise(driver, owned):
     # Drag the actual divider without changing the writable shell or its
     # draft. Keep the keyboard slider case below as a separate assertion.
     driver.execute("document.body.scrollTop = 0;")
-    x, y, distance = driver.execute("""
-      const handle = document.querySelector('#pane-divider');
-      const r = handle.getBoundingClientRect();
-      const w = document.querySelector('#terminal-panes').getBoundingClientRect().width;
-      return [Math.round(r.left + r.width/2), Math.round(r.top + r.height/2), Math.round((w-6)*.12)];
-    """)
-    driver.command("POST", "/actions", {"actions": [{
-        "type": "pointer", "id": "pane-divider", "parameters": {"pointerType": "mouse"},
-        "actions": [
-            {"type": "pointerMove", "duration": 0, "x": x, "y": y},
-            {"type": "pointerDown", "button": 0},
-            {"type": "pointerMove", "duration": 160, "x": x + distance, "y": y},
-            {"type": "pointerUp", "button": 0},
-        ],
-    }]})
+    drag_pane_divider(driver, "#pane-divider", 12)
     dragged = split_balance(driver, "#peer-pane", "#active-pane")
     assert dragged["share"] == 62 and abs(dragged["geometry"] - 62) < 1, dragged
     assert state()["current_tab"] == b_tab and state()["draft"] == draft_b and state()["writable"]
@@ -4233,6 +4238,21 @@ def exercise_three_shells(driver, owned, backend, binary):
     print(json.dumps({"case": "AETHER.THREE_PANES.KEYBOARD_BALANCE", "backend": backend,
                       "left_share": 61, "top_right_share": 40, "owner_and_parked_retained": True,
                       "owned_pty_grids_unchanged_with_fit_off": True}), flush=True)
+
+    driver.execute("document.body.scrollTop = 0;")
+    for points, expected_left, expected_top in ((5, 66, 45), (-5, 61, 40)):
+        drag_pane_divider(driver, "#pane-divider", points)
+        left_pointer = split_balance(driver, left, top)
+        assert left_pointer["share"] == expected_left and abs(left_pointer["geometry"] - expected_left) < 1
+        drag_pane_divider(driver, "#pane-stack-divider", points, rows=True)
+        top_pointer = split_balance(driver, top, bottom, control="#split-stack-balance", axis="height")
+        assert top_pointer["share"] == expected_top and abs(top_pointer["geometry"] - expected_top) < 1
+        assert split_balance(driver, left, top) == left_pointer
+        assert state()["current_tab"] == tabs[2] and state()["writable"]
+        assert [pty_size(identity) for identity in prior] == before_sizes
+    print(json.dumps({"case": "AETHER.THREE_PANES.POINTER_DIVIDERS", "backend": backend,
+                      "measured_left_and_top_from": [61, 40], "to": [66, 45],
+                      "back": [61, 40], "all_four_pty_grids_and_writer_retained": True}), flush=True)
 
     def visible_pane_boxes():
         return driver.execute("""

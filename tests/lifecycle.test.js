@@ -641,7 +641,7 @@ test('split observations paint the inactive shell and cannot claim live input',a
  divider.releasePointerCapture=()=>{captured=null;};
  assert.equal(divider.hidden,false);
  assert.equal(divider.dataset.axis,'columns');
- const drag=(phase,x,id=4)=>divider.handlers[phase]({pointerId:id,clientX:x,clientY:10,
+ const drag=(phase,x,id=4)=>divider.handlers[phase]({currentTarget:divider,pointerId:id,clientX:x,clientY:10,
   isPrimary:true,button:0,preventDefault(){}});
  drag('pointerdown',290);
  drag('pointermove',325,8);
@@ -773,6 +773,34 @@ test('three visible shells rotate a single writer and ACK a retired preview on t
  assert.equal(preferences.length,persistBefore);
  assert.equal(events.length,streamCount);
  assert.equal(layouts.length,before);
+ const columnHandle=h.el('#pane-divider'), rowHandle=h.el('#pane-stack-divider');
+ panes.getBoundingClientRect=()=>({width:506,height:306});
+ for(const [handle,other,x,y,dx,dy,key,control,beforeShare,afterShare] of [
+  [columnHandle,rowHandle,300,80,10,0,'columns',balance,'61','63'],
+  [rowHandle,columnHandle,450,120,0,9,'rows',stack,'40','43'],
+ ]){
+  let held=null;
+  handle.setPointerCapture=id=>{held=id;};
+  handle.hasPointerCapture=id=>held===id;
+  handle.releasePointerCapture=()=>{held=null;};
+  const gesture=(element,phase,clientX,clientY)=>element.handlers[phase]({currentTarget:element,
+   pointerId:4,isPrimary:true,button:0,clientX,clientY,preventDefault(){}});
+  const saved='aether.three-pane-share.'+key+'.v1';
+  assert.equal(handle.hidden,false);
+  gesture(handle,'pointerdown',x,y);
+  gesture(other,'pointerup',x+dx,y+dy);
+  gesture(handle,'pointermove',x+dx,y+dy);
+  assert.equal(control.value,afterShare);
+  assert.equal(prefs.get(saved),beforeShare);
+  gesture(handle,'pointerup',x+dx,y+dy);
+  assert.equal(prefs.get(saved),afterShare);
+  assert.equal(held,null);
+ }
+ assert.equal(balance.value,'63');
+ assert.equal(stack.value,'43');
+ assert.equal(prefs.get('aether.split-share.columns.v1'),'68');
+ assert.equal(events.length,streamCount);
+ assert.equal(layouts.length,before);
  const [slotA,slotB]=layouts.at(-1).targets;
  assert.deepEqual([slotA.epoch,slotB.epoch],[1,2]);
  const sendC=events.at(-1).handle;
@@ -784,7 +812,7 @@ test('three visible shells rotate a single writer and ACK a retired preview on t
  assert.equal(h.el('#split-stack-control').hidden,true);
  assert.equal(stack.disabled,true);
  await h.click('#split-three-local');
- assert.equal(stack.value,'40');
+ assert.equal(stack.value,'43');
  const newerA=layouts.at(-1).targets[0];
  assert.notEqual(newerA.layout,slotA.layout);
  const count=painted.length;
@@ -795,8 +823,8 @@ test('three visible shells rotate a single writer and ACK a retired preview on t
  await h.click('#focus-preview-pane-1');
  assert.equal(events.at(-1).epoch,1);
  assert.equal(h.el('#active-pane').dataset.slot,'0');
- assert.equal(balance.value,'61');
- assert.equal(stack.value,'40');
+ assert.equal(balance.value,'63');
+ assert.equal(stack.value,'43');
  assert.deepEqual(Array.from(layouts.at(-1).targets,target=>target.epoch),[2,3]);
  h.el('#input').value='write only A';await h.submit();
  await h.click('#new-local-tab');

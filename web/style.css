@@ -266,20 +266,24 @@ kbd {color: var(--muted); font: 11px monospace; white-space: nowrap;}
   gap: 6px;
 }
 /* Mouse/touch handle only; the labeled range remains the keyboard control. */
-#pane-divider {
+.pane-divider {
   position: absolute;
   touch-action: none;
   z-index: 1;
 }
-#pane-divider[data-axis="columns"] {
+.pane-divider[data-axis="columns"] {
   top: 0; bottom: 0; left: var(--pane-divider-offset);
   width: 6px; transform: translateX(-50%); cursor: col-resize;
 }
-#pane-divider[data-axis="rows"] {
+.pane-divider[data-axis="rows"] {
   left: 0; right: 0; top: var(--pane-divider-offset);
   height: 6px; transform: translateY(-50%); cursor: row-resize;
 }
-#pane-divider:hover, #pane-divider[data-dragging="true"] {background: var(--accent);}
+.pane-divider:hover, .pane-divider[data-dragging="true"] {background: var(--accent);}
+#pane-stack-divider[data-axis="rows"] {
+  left: calc(var(--pane-divider-offset) + 3px);
+  top: var(--pane-stack-divider-offset);
+}
 #terminal-panes[data-split="left"], #terminal-panes[data-split="right"] {
   grid-template-columns: minmax(0, var(--first-pane-share, 1fr)) minmax(0, var(--second-pane-share, 1fr));
 }
