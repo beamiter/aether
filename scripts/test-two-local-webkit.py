@@ -499,6 +499,29 @@ def split_balance(driver, left, right):
     """, [left, right])
 
 
+def set_split_balance_with_keys(driver, left, right, share):
+    driver.execute("document.body.scrollTop = 0;")
+    driver.click("#split-balance")
+    assert driver.execute("return document.activeElement.id") == "split-balance"
+    keys = []
+    # The click may set a value. Move one step away first so the native
+    # keyboard must perform the last adjustment even if the click hit the requested share.
+    current = split_balance(driver, left, right)["share"]
+    if current == share:
+        keys.append("\ue012")  # ArrowLeft
+        current -= 1
+    key = "\ue014" if current < share else "\ue012"
+    keys.extend([key] * abs(current - share))
+    actions = [{"type": kind, "value": key} for key in keys for kind in ("keyDown", "keyUp")]
+    driver.command("POST", "/actions", {"actions": [{"type": "key", "id": "split-balance-keys", "actions": actions}]})
+
+    def resized_split():
+        value = split_balance(driver, left, right)
+        return value if value["share"] == share and abs(value["geometry"] - share) < 1 else None
+
+    wait_for(resized_split, "native range keys did not resize both visible panes")
+
+
 def exercise(driver, owned):
     def state():
         return driver.execute(READ)
@@ -739,25 +762,7 @@ def exercise(driver, owned):
     wait_for(split_with_b_active, "two native panes did not show their separate canvases")
     balance = split_balance(driver, "#peer-pane", "#active-pane")
     assert balance["share"] == 50 and abs(balance["geometry"] - 50) < 1, balance
-    driver.click("#split-balance")
-    assert driver.execute("return document.activeElement.id") == "split-balance"
-    keys = []
-    # The click may set a value. Move one step away first so the native
-    # keyboard must perform the last adjustment even if the click hit 62.
-    current = split_balance(driver, "#peer-pane", "#active-pane")["share"]
-    if current == 62:
-        keys.append("\ue012")  # ArrowLeft
-        current -= 1
-    key = "\ue014" if current < 62 else "\ue012"
-    keys.extend([key] * abs(current - 62))
-    actions = [{"type": kind, "value": key} for key in keys for kind in ("keyDown", "keyUp")]
-    driver.command("POST", "/actions", {"actions": [{"type": "key", "id": "split-balance-keys", "actions": actions}]})
-
-    def resized_split():
-        value = split_balance(driver, "#peer-pane", "#active-pane")
-        return value if value["share"] == 62 and abs(value["geometry"] - 62) < 1 else None
-
-    wait_for(resized_split, "native range keys did not resize both visible panes")
+    set_split_balance_with_keys(driver, "#peer-pane", "#active-pane", 62)
     assert state()["current_tab"] == b_tab and state()["writable"]
     assert state()["draft"] == draft_b and state()["peer_geometry"] == "80x24"
     assert state()["peer_fifth_row_pixel"] != green
@@ -1599,6 +1604,7 @@ def exercise_restart(driver, owned, binary, integrated=False):
     driver.type("#input", f"printf replayed > {shlex.quote(str(forbidden))}")
     driver.click("#new-jsh-tab" if integrated else "#new-local-tab")
     wait_for(lambda: state()["writable"] and len(state()["tabs"]) == 2, "restart fixture's second shell did not open")
+    second = state()["current_tab"]
     second_before = write_from_current_tab(driver, owned / "before-restart-b.pid")
     wait_for(lambda: state()["writable"] and state()["draft"] == "", "second restart fixture write is pending")
     if integrated:
@@ -1606,6 +1612,13 @@ def exercise_restart(driver, owned, binary, integrated=False):
         wait_for(chat_prompt, "the new jsh tab did not offer Terminal Chat and workflows")
     driver.click("#split-local")
     wait_for(lambda: state()["split"] == "right" and state()["peer_geometry"] == "80x24", "restart fixture split was not visible")
+    # X11 and Wayland use separate profiles. Each has to set its own
+    # nondefault share, not inherit an earlier test's chosen balance.
+    saved_share = 61
+    set_split_balance_with_keys(driver, "#peer-pane", "#active-pane", saved_share)
+    after_keys = state()
+    assert after_keys["current_tab"] == second and after_keys["writable"]
+    assert after_keys["draft"] == "" and after_keys["peer_geometry"] == "80x24"
     click_tab(driver, first)
     assert "replayed" in state()["draft"]
 
@@ -1624,7 +1637,7 @@ def exercise_restart(driver, owned, binary, integrated=False):
     assert driver.execute("return !document.querySelector('#command').hidden;"), "the plain tab inherited Terminal Chat"
     wait_for(lambda: state()["split"] == "left" and state()["peer_geometry"] == "80x24", "saved split layout was lost")
     balance = split_balance(driver, "#active-pane", "#peer-pane")
-    assert balance["share"] == 62 and abs(balance["geometry"] - 62) < 1, balance
+    assert balance["share"] == saved_share and abs(balance["geometry"] - saved_share) < 1, balance
     assert restored["draft"] == "" and not forbidden.exists(), "old command draft survived restart"
     first_after = write_from_current_tab(driver, owned / "after-restart-a.pid")
     wait_for(lambda: state()["writable"] and state()["draft"] == "", "first restored shell write is pending")
