@@ -21,6 +21,7 @@ mod remote_desktop;
 mod ssh_files;
 mod ssh_terminal;
 mod vim9_workbench;
+mod native_keyboard;
 #[tauri::command]
 async fn demo_frame(bridge: tauri::State<'_, Arc<Mutex<DemoBridge>>>) -> Result<WireFrame, String> {
     run_bridge(bridge.inner().clone(), move |bridge| bridge.next_frame()).await
@@ -421,6 +422,21 @@ async fn key_shell(
     .await
 }
 #[tauri::command]
+async fn key_event_shell<R: tauri::Runtime>(
+    window: tauri::WebviewWindow<R>,
+    owner: Attachment,
+    event: tauri_terminal_frame_bridge::live::KeyEvent,
+    keyboard: tauri::State<'_, Arc<Mutex<native_keyboard::Samples>>>,
+    bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
+) -> Result<bool, String> {
+    require_terminal_window(&window)?;
+    let native = keyboard.lock().ok().and_then(|mut keyboard| keyboard.take(&event));
+    run_input(bridge.inner().clone(), owner, move |bridge, epoch| {
+        bridge.key_event(epoch, &event, native)
+    })
+    .await
+}
+#[tauri::command]
 async fn focus_shell<R: tauri::Runtime>(
     window: tauri::WebviewWindow<R>,
     owner: Attachment,
@@ -637,6 +653,7 @@ fn application<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<
         .manage(agent_workspace::Workspace::default())
         .manage(Arc::new(Mutex::new(DemoBridge::default())))
         .manage(Arc::new(Mutex::new(LocalSessions::default())))
+        .manage(Arc::new(Mutex::new(native_keyboard::Samples::default())))
         .manage(Arc::new(Mutex::new(
             local_workflows::LocalWorkflows::default(),
         )))
@@ -702,6 +719,7 @@ fn application<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<
             resize_shell,
             set_shell_window_pixels,
             key_shell,
+            key_event_shell,
             mouse_shell,
             focus_shell,
             submit_local_chat,
@@ -743,8 +761,10 @@ fn main() {
     #[cfg(target_os = "linux")]
     let builder = builder.setup(|app| {
         if let Some(window) = app.get_webview_window("main") {
-            window.with_webview(|platform| {
+            let keyboard = app.state::<Arc<Mutex<native_keyboard::Samples>>>().inner().clone();
+            window.with_webview(move |platform| {
                 use webkit2gtk::{InputMethodContextExt, WebViewExt};
+                native_keyboard::install(&platform.inner(), keyboard);
                 if let Some(context) = platform.inner().input_method_context() {
                     // Wry disables preedit for generic popup positioning.
                     // Terminal composition needs native start/update events to

@@ -1,3 +1,4 @@
+import {installTerminalKeys,modifierKey} from '../web/terminal-keys.js';
 import {directionalPaneNeighbor,retainedPaneTree} from '../web/pane-geometry.js';
 import {makePassiveSurfaces} from '../web/passive-surfaces.js';
 import {validateReloadView,retainedReloadView,saveReloadTicket,takeReloadTicket} from '../web/ssh-reload.js';
@@ -58,7 +59,7 @@ function harness(rawInvoke, health=args=>({epoch:args.epoch,exited:false,unsuppo
  const listen=events=>(name,fn)=>events.set(name,[...(events.get(name)??[]),fn]);
  const fire=(events,name)=>{for(const fn of events.get(name)??[])fn({target:document.activeElement});};
  const document={querySelector:el,querySelectorAll:()=>[],createElement:element,body:element(),activeElement:null,hidden:false,hasFocus:()=>true,addEventListener:listen(pageEvents)};
- const context={directionalPaneNeighbor,retainedPaneTree,makePassiveSurfaces,validateReloadView,retainedReloadView,saveReloadTicket,takeReloadTicket,installFilePreviewPanel:()=>({dismiss(){}}),document,addEventListener:listen(windowEvents),__TAURI__:{core:{invoke,Channel}},acceptFull,acceptUpdate,backingGeometry,clearPaint,acceptChannelFrame,channelCounter,CHANNEL_RENDITION_VERSION,installIme,installHistory,installCommandBlocks,installTerminalChat,installTerminalShell,installWorkflows,validateChatStatus,installPasteReview,installTerminalFocus,installTerminalMouse,installTerminalSelection,dimensions,resizeQueue,cursorTarget,terminalCellAt,viewportDimensions,windowPixelQueue,paint,TextEncoder:Encoder,TextDecoder,
+ const context={directionalPaneNeighbor,retainedPaneTree,makePassiveSurfaces,validateReloadView,retainedReloadView,saveReloadTicket,takeReloadTicket,installFilePreviewPanel:()=>({dismiss(){}}),document,addEventListener:listen(windowEvents),__TAURI__:{core:{invoke,Channel}},acceptFull,acceptUpdate,backingGeometry,clearPaint,acceptChannelFrame,channelCounter,CHANNEL_RENDITION_VERSION,installIme,installTerminalKeys,modifierKey,installHistory,installCommandBlocks,installTerminalChat,installTerminalShell,installWorkflows,validateChatStatus,installPasteReview,installTerminalFocus,installTerminalMouse,installTerminalSelection,dimensions,resizeQueue,cursorTarget,terminalCellAt,viewportDimensions,windowPixelQueue,paint,TextEncoder:Encoder,TextDecoder,
  installInlineHistory,
  plainLocalTab,MAX_LOCAL_SHELLS,validLocalGeometry,localSplitPair,readLocalShellLayout:()=>readLocalShellLayout(storage),saveLocalShellLayout:value=>saveLocalShellLayout(value,storage),readThreePaneLayout:()=>readThreePaneLayout(storage),saveThreePaneLayout:value=>saveThreePaneLayout(value,storage),
  setInterval(fn){timers.set(++id,fn);return id},clearInterval(i){timers.delete(i)},setTimeout,...animation};
@@ -822,9 +823,9 @@ test('directional palette stays blocked until both accepted terminal key receipt
    activations.push(target);
    return {Ok:{owner,frame:channelSnapshot({...raw,session:owner.session,epoch:target}),input_allowed:true}};
   }
-  if(name==='key_shell'){
-   keys.push([args.epoch,args.name]);
-   return args.name==='a'?first.promise:second.promise;
+  if(name==='key_event_shell'){
+   keys.push([args.epoch,args.event.name]);
+   return args.event.name==='a'?first.promise:second.promise;
   }
   return null;
  },undefined,undefined,undefined,{},testChannel());
@@ -1134,16 +1135,16 @@ test('detach and reconnect restores the same shell only as a view',async()=>{
  assert.equal(h.el('#input').disabled,true);assert.equal(h.el('#resize').disabled,true);
  h.el('canvas').handlers.keydown({key:'a'});await tick();
  assert.ok(seen.includes('detach_shell')&&seen.includes('ack_shell'));
- assert.ok(!seen.includes('key_shell')&&!seen.includes('close_shell'));
+ assert.ok(!seen.includes('key_event_shell')&&!seen.includes('close_shell'));
 });
 
 test('logical key events are serialized and never ANSI encoded in JS',async()=>{
- const seen=[];const h=harness(async(name,args)=>{if(name==='open_shell')return 1;if(name==='key_shell')seen.push(args);return null;});await h.click('#open');
+ const seen=[];const h=harness(async(name,args)=>{if(name==='open_shell')return 1;if(name==='key_event_shell')seen.push(args);return null;});await h.click('#open');
  for(const key of ['ArrowUp','a'])h.el('canvas').handlers.keydown({key,shiftKey:false,altKey:false,ctrlKey:false,preventDefault(){}});
- await tick();assert.deepEqual(seen.map(x=>x.name),['ArrowUp','a']);assert.equal(seen[0].epoch,1);
+ await tick();assert.deepEqual(seen.map(x=>x.event.name),['ArrowUp','a']);assert.equal(seen[0].epoch,1);
 });
 test('keypad presses keep physical identity and Num Lock through local key input',async()=>{
- const seen=[];const h=harness(async(name,args)=>{if(name==='open_shell')return 1;if(name==='key_shell'||name==='text_shell')seen.push([name,args]);return null;});
+ const seen=[];const h=harness(async(name,args)=>{if(name==='open_shell')return 1;if(name==='key_event_shell'||name==='text_shell')seen.push([name,args]);return null;});
  await h.click('#open');
  const press=(key,code,locked)=>h.el('canvas').handlers.keydown({
   key,code,shiftKey:false,altKey:false,ctrlKey:false,preventDefault(){},
@@ -1156,25 +1157,25 @@ test('keypad presses keep physical identity and Num Lock through local key input
  press('Clear','Numpad5',false);
  press('Clear','NumpadClear',false);
  await tick();
- assert.deepEqual(seen.map(([name,args])=>name+':'+args.name),['key_shell:Enter','key_shell:Enter','key_shell:Home','key_shell:7','key_shell:Clear']);
- assert.deepEqual(seen.map(([,args])=>args.keypad?[args.keypad.code,args.keypad.num_locked]:null),[
-  null,['NumpadEnter',false],['Numpad7',false],['Numpad7',true],['Numpad5',false],
+ assert.deepEqual(seen.map(([name,args])=>name+':'+args.event.name),['key_event_shell:Enter','key_event_shell:Enter','key_event_shell:Home','key_event_shell:7','key_event_shell:Clear']);
+ assert.deepEqual(seen.map(([,args])=>[args.event.code,args.event.num_lock]),[
+  ['Enter',false],['NumpadEnter',false],['Numpad7',false],['Numpad7',true],['Numpad5',false],
  ]);
 });
 test('composition and browser paste shortcut are not double sent',async()=>{
- const seen=[];const h=harness(async(name,args)=>{if(name==='open_shell')return 1;if(name==='key_shell'||name==='paste_shell')seen.push([name,args]);return null;});await h.click('#open');
+ const seen=[];const h=harness(async(name,args)=>{if(name==='open_shell')return 1;if(name==='key_event_shell'||name==='paste_shell')seen.push([name,args]);return null;});await h.click('#open');
  h.el('canvas').handlers.keydown({key:'a',isComposing:true});h.el('canvas').handlers.keydown({key:'v',ctrlKey:true});
  h.el('canvas').handlers.paste({clipboardData:{getData:()=> 'hello'},preventDefault(){}});await tick();assert.equal(seen.length,1);assert.equal(seen[0][0],'paste_shell');assert.equal(seen[0][1].text,'hello');
 });
 test('a stuck old keyboard queue does not block a new session',async()=>{
- let epoch=0;const old=deferred(),seen=[];const h=harness(async(name,args)=>{if(name==='open_shell')return ++epoch;if(name==='key_shell'){seen.push(args.epoch);if(args.epoch===1)return old.promise;}return null;});
+ let epoch=0;const old=deferred(),seen=[];const h=harness(async(name,args)=>{if(name==='open_shell')return ++epoch;if(name==='key_event_shell'){seen.push(args.epoch);if(args.epoch===1)return old.promise;}return null;});
  const key=()=>h.el('canvas').handlers.keydown({key:'a',preventDefault(){}});
  await h.click('#open');key();await tick();await h.click('#close');await h.click('#open');key();await tick();assert.deepEqual(seen,[1,2]);old.resolve();await tick();assert.equal(h.el('#input').disabled,false);
 });
 
 test('line submit waits for previously accepted keys without dropping them',async()=>{
  const first=deferred(),seen=[];let keys=0;
- const h=harness(async(name,args)=>{if(name==='open_shell')return 1;if(name==='key_shell'){seen.push(args.name);if(++keys===1)return first.promise;}if(name==='write_shell'){seen.push('command');return args.bytes.length;}return null;});await h.click('#open');
+ const h=harness(async(name,args)=>{if(name==='open_shell')return 1;if(name==='key_event_shell'){seen.push(args.event.name);if(++keys===1)return first.promise;}if(name==='write_shell'){seen.push('command');return args.bytes.length;}return null;});await h.click('#open');
  const key=name=>h.el('canvas').handlers.keydown({key:name,preventDefault(){}});key('a');await tick();key('b');h.el('#input').value='echo';const submit=h.submit();await tick();assert.deepEqual(seen,['a']);first.resolve();await submit;assert.deepEqual(seen,['a','b','command']);
 });
 test('composition commit reaches text IPC once and stale close commit is dropped',async()=>{
@@ -1340,7 +1341,7 @@ test('current command success still clears draft after exact accepted suffixes',
 
 test('Shift+Insert leaves browser paste available and multiline text still needs review',async()=>{
  const seen=[];let prevented=0;
- const h=harness(async(name,args)=>{if(name==='open_shell')return 1;if(name==='key_shell'||name==='paste_shell')seen.push([name,args]);return null;});
+ const h=harness(async(name,args)=>{if(name==='open_shell')return 1;if(name==='key_event_shell'||name==='paste_shell')seen.push([name,args]);return null;});
  await h.click('#open');
  for(const selector of ['canvas','#ime-input']){
   h.el(selector).handlers.keydown({key:'Insert',shiftKey:true,ctrlKey:false,altKey:false,preventDefault(){prevented++;}});
@@ -1356,11 +1357,11 @@ test('Shift+Insert leaves browser paste available and multiline text still needs
 
 test('plain Insert and modified non-paste Insert keep terminal key semantics',async()=>{
  const seen=[];let prevented=0;
- const h=harness(async(name,args)=>{if(name==='open_shell')return 1;if(name==='key_shell')seen.push(args);return null;});await h.click('#open');
+ const h=harness(async(name,args)=>{if(name==='open_shell')return 1;if(name==='key_event_shell')seen.push(args);return null;});await h.click('#open');
  for(const modifiers of [{shiftKey:false,ctrlKey:false,altKey:false},{shiftKey:true,ctrlKey:true,altKey:false},{shiftKey:true,ctrlKey:false,altKey:true}]){
   h.el('canvas').handlers.keydown({key:'Insert',...modifiers,preventDefault(){prevented++;}});
  }
- await tick();assert.equal(prevented,3);assert.equal(seen.length,3);assert.deepEqual(seen.map(x=>[x.name,x.shift,x.ctrl,x.alt]),[['Insert',false,false,false],['Insert',true,true,false],['Insert',true,false,true]]);
+ await tick();assert.equal(prevented,3);assert.equal(seen.length,3);assert.deepEqual(seen.map(({event})=>[event.name,event.shift,event.ctrl,event.alt]),[['Insert',false,false,false],['Insert',true,true,false],['Insert',true,false,true]]);
 });
 
 test('paste review dismissal returns focus through the production paste event origin',async()=>{
@@ -1375,19 +1376,19 @@ test('paste review dismissal returns focus through the production paste event or
 });
 test('review Escape at canvas or IME origin cancels rather than reaching shell',async()=>{
  for(const selector of ['canvas','#ime-input']){
-  const seen=[];const h=harness(async(name,args)=>{if(name==='open_shell')return 1;if(name==='key_shell'||name==='paste_shell')seen.push([name,args]);return null;});await h.click('#open');
+  const seen=[];const h=harness(async(name,args)=>{if(name==='open_shell')return 1;if(name==='key_event_shell'||name==='paste_shell')seen.push([name,args]);return null;});await h.click('#open');
   const origin=h.el(selector),panel=h.el('#paste-review');panel.ownerDocument={activeElement:origin};
   origin.handlers.paste({currentTarget:origin,clipboardData:{getData:()=> 'echo a\necho b'},preventDefault(){}});
   let prevented=0;origin.handlers.keydown({key:'Escape',target:origin,currentTarget:origin,preventDefault(){prevented++;},stopPropagation(){}});
   await tick();assert.equal(panel.hidden,true);assert.equal(prevented,1);assert.deepEqual(seen,[]);
   h.click('#paste-confirm');await tick();assert.deepEqual(seen,[]);
   origin.handlers.keydown({key:'Escape',target:origin,currentTarget:origin,preventDefault(){}});
-  await tick();assert.equal(seen.length,1);assert.equal(seen[0][0],'key_shell');assert.equal(seen[0][1].name,'Escape');
+  await tick();assert.equal(seen.length,1);assert.equal(seen[0][0],'key_event_shell');assert.equal(seen[0][1].event.name,'Escape');
  }
 });
 test('already consumed terminal keys never reach shell or dismiss paste review',async()=>{
  for(const selector of ['canvas','#ime-input']){
-  const sent=[];const h=harness(async(name,args)=>{if(name==='open_shell')return 1;if(name==='key_shell')sent.push(args);return null;});await h.click('#open');
+  const sent=[];const h=harness(async(name,args)=>{if(name==='open_shell')return 1;if(name==='key_event_shell')sent.push(args);return null;});await h.click('#open');
   const origin=h.el(selector),panel=h.el('#paste-review');panel.ownerDocument={activeElement:origin};
   origin.handlers.paste({currentTarget:origin,clipboardData:{getData:()=> 'review\n'},preventDefault(){}});
   for(const key of ['Escape','Enter','ArrowUp','c'])origin.handlers.keydown({key,ctrlKey:key==='c',defaultPrevented:true,currentTarget:origin,target:origin,preventDefault(){},stopPropagation(){}});
@@ -1811,7 +1812,7 @@ test('explicit preview restore brings back ordered visible slots and leaves the 
  const observers=calls.findLast(([name])=>name==='set_local_observers')[1].observers;
  assert.deepEqual(Array.from(observers,target=>target.epoch),[13,12]);
  assert.equal(h.el('#input').disabled,false);
- assert.ok(!calls.some(([name])=>['write_shell','key_shell','text_shell','paste_shell'].includes(name)));
+ assert.ok(!calls.some(([name])=>['write_shell','key_event_shell','text_shell','paste_shell'].includes(name)));
  assert.deepEqual(readThreePaneLayout(storage),layout);
  assert.deepEqual(readLocalShellLayout(storage),legacy);
 });
@@ -1845,7 +1846,7 @@ test('restore creates fresh tabs with their saved shell and presentation, then s
  assert.match(h.el('#status').textContent,/two fresh shells/);
  assert.deepEqual(calls.filter(([name])=>name==='activate_local_tab').map(([,args])=>args.targetEpoch),[null,first.epoch]);
  assert.deepEqual(calls.filter(([name])=>name==='activate_local_tab').map(([,args])=>args.integrated),[true,undefined]);
- assert(!calls.some(([name])=>name==='write_shell'||name==='key_shell'||name==='text_shell'));
+ assert(!calls.some(([name])=>name==='write_shell'||name==='key_event_shell'||name==='text_shell'));
  const withGeometry={...layout,tabs:layout.tabs.map(tab=>({...tab,geometry:{rows:frame.rows.length,cols:frame.cols}})),panes:[]};
  assert.deepEqual(readLocalShellLayout(storage),withGeometry);
  h.el('#local-tab-list').options.find(tab=>tab.dataset.epoch==='8').handlers.click();await tick();
@@ -2191,7 +2192,7 @@ test('public restore opens three fresh tabs, confirms each size, preserves split
  assert.equal(h.el('#terminal-panes').dataset.split,'right');
  assert.deepEqual(calls.filter(([name])=>name==='resize_shell').map(([,args])=>({rows:args.rows,cols:args.cols})),sizes);
  assert.deepEqual(calls.filter(([name])=>name==='activate_local_tab').map(([,args])=>args.targetEpoch),[null,null,102]);
- assert(!calls.some(([name])=>['write_shell','key_shell','text_shell','paste_shell'].includes(name)));
+ assert(!calls.some(([name])=>['write_shell','key_event_shell','text_shell','paste_shell'].includes(name)));
  await [...h.timers.values()][0]();
  assert.equal(h.el('#peer-canvas').dataset.geometry,'71x17');
  assert.deepEqual(readLocalShellLayout(storage),layout);

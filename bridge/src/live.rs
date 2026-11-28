@@ -21,12 +21,14 @@ use std::{
     time::{Duration, Instant},
 };
 mod command_blocks;
+mod keyboard;
 mod mouse;
 mod raw_suffix;
 pub use crate::protocol::{CloseStatus, HistorySnapshot, SessionStatus};
 pub use command_blocks::{
     BlockSelection, CommandActivity, CommandBlockSnapshot, CompletedPaneHistory, RetainedBlock,
 };
+pub use keyboard::{KeyEvent, KeyPhase, NativeKeyState};
 pub use mouse::{AlternateScrollView, MouseReport, MouseView};
 use raw_suffix::RawSuffix;
 
@@ -46,7 +48,11 @@ pub struct KeypadReport {
 
 impl KeypadReport {
     fn position(&self) -> Option<KeypadKey> {
-        Some(match self.code.strip_prefix("Numpad")? {
+        Self::position_from_code(&self.code)
+    }
+
+    fn position_from_code(code: &str) -> Option<KeypadKey> {
+        Some(match code.strip_prefix("Numpad")? {
             "Decimal" => KeypadKey::Decimal,
             "Divide" => KeypadKey::Divide,
             "Multiply" => KeypadKey::Multiply,
@@ -123,6 +129,7 @@ pub struct LiveBridge {
     stable: Option<RetainedCellFrame>,
     resize_repaint: Option<ResizeRepaint>,
     mouse: mouse::Mouse,
+    keyboard: keyboard::Keyboard,
     focus_state: Option<(u32, bool)>,
     focus_retiring: bool,
     #[cfg(test)]
@@ -234,7 +241,7 @@ impl LiveBridge {
             session.enable_underline_colors();
             session.enable_grapheme_clusters();
             session.enable_pixel_mouse();
-            session.enable_keyboard_disambiguation();
+            session.enable_native_keyboard_reporting();
             session.enable_history_preserving_resize();
         }
         if self.inline_graphics {
@@ -259,6 +266,7 @@ impl LiveBridge {
         self.command_source_stream = command_source_stream;
         self.restored_commands = Default::default();
         self.raw = RawSuffix::default();
+        self.keyboard.clear();
         self.focus_state = None;
         self.focus_retiring = false;
         Ok(epoch)
@@ -1089,6 +1097,7 @@ impl LiveBridge {
     /// Retire the old viewer's advisory focus before rotating its writer lease.
     /// A partial raw event or failed writer cannot safely accept another event.
     fn retire_focus(&mut self) {
+        self.keyboard.clear();
         let was_focused = self.focus_state.take() == Some((self.generation, true));
         if !was_focused || !self.raw.is_idle() {
             return;
@@ -1133,6 +1142,9 @@ impl LiveBridge {
         let session = self.session.as_ref().unwrap();
         if !self.input_attached || session.is_exited() || session.write_error().is_some() {
             return Err("terminal input is closed".into());
+        }
+        if !focused {
+            self.keyboard.clear();
         }
         if self.focus_state == Some((self.generation, focused)) {
             return Ok(false);
@@ -1189,6 +1201,29 @@ impl LiveBridge {
             terminal.encode_key(name, shift, alt, ctrl)?
         };
         self.enqueue(epoch, bytes)
+    }
+
+    /// Admit a physical key and return whether the caller should report its release.
+    /// Only the local desktop supplies the matching key phases.
+    pub fn key_event(
+        &mut self,
+        epoch: u32,
+        event: &KeyEvent,
+        native: Option<NativeKeyState>,
+    ) -> Result<bool, String> {
+        self.check(epoch)?;
+        if !self.local_desktop || !self.input_attached {
+            return Err("physical keyboard reports require an attached local terminal".into());
+        }
+        let terminal = self.session.as_ref().unwrap().terminal();
+        let mut prepared = self.keyboard.prepare(terminal, event, native)?;
+        if prepared.bytes.is_empty() {
+            return Ok(false);
+        }
+        self.enqueue(epoch, std::mem::take(&mut prepared.bytes))?;
+        let tracks_release = prepared.tracks_release;
+        self.keyboard.admit(prepared);
+        Ok(tracks_release)
     }
     pub fn text(&mut self, epoch: u32, text: &str) -> Result<(), String> {
         self.check(epoch)?;

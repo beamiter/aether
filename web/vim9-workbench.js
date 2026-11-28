@@ -1,3 +1,4 @@
+import { installTerminalKeys } from './terminal-keys.js';
 import {acceptChannelFrame, channelCounter} from './frames-v4.js';
 import {clearPaint, paint} from './frames.js';
 import {installIme} from './ime.js';
@@ -7,7 +8,6 @@ import {installProjectTools} from './vim9-project.js';
 
 const POLL_MS = 96;
 const utf8 = new TextEncoder();
-const namedKey = /^(Arrow(Up|Down|Left|Right)|Home|End|Insert|Delete|PageUp|PageDown|F([1-9]|1[0-2])|Enter|Escape|Backspace|Tab)$/;
 
 function installVim9(document, invoke) {
   const byId = id => document.getElementById(id);
@@ -35,12 +35,23 @@ function installVim9(document, invoke) {
     return command(name, fields);
   });
   const error = message => { byId('vim9-error').textContent = message; };
+  function sendText(text,entryId) {
+    if (text.length > 4096 || utf8.encode(text).length > 4096) {
+      error('Vim input exceeds 4096 bytes.');
+      return;
+    }
+    enqueue('text',{text},entryId);
+  }
+  const keyboard = installTerminalKeys({
+    getOwner: inputEntry,
+    send: (event,receipt,permit) => enqueue('keyEvent',{event},inputEntry(),receipt,permit),
+    sendText,
+  });
   const ime = installIme(input, {
     getEpoch: inputEntry,
-    commit: (text, entryId) => {
-      if (text.length > 4096 || utf8.encode(text).length > 4096) { error('Vim input exceeds 4096 bytes.'); return; }
-      enqueue('text', {text}, entryId);
-    },
+    commit: sendText,
+    typed: keyboard.text,
+    onCompose: keyboard.clearText,
     preedit: text => { preedit.textContent = text; preedit.hidden = !text; },
     afterEnd: callback => setTimeout(callback, 0),
     canCommit: () => document.activeElement === input,
@@ -51,15 +62,18 @@ function installVim9(document, invoke) {
     getEpoch: inputEntry, send: (text, entryId) => enqueue('paste', {text}, entryId), onError: error,
   });
 
-  function enqueue(action, fields, entryId = inputEntry()) {
+  function enqueue(action, fields, entryId = inputEntry(), receipt, permit) {
     if (!entryId || inputEntry() !== entryId) return;
     if (inputPending >= 64) { error('Vim input queue is full.'); return; }
     inputPending++;
     inputQueue = inputQueue.then(async () => {
-      if (inputEntry() === entryId) await command(action, {entryId, ...fields});
+      if (inputEntry() !== entryId || (permit && !permit())) return;
+      const result = await command(action, {entryId, ...fields});
+      receipt?.(result.kind === 'keyReport' && result.value === true);
     }).catch(reason => {
       if (inputEntry() === entryId) error(String(reason));
     }).finally(() => { inputPending--; });
+    return inputQueue;
   }
 
   function controls() {
@@ -106,6 +120,7 @@ function installVim9(document, invoke) {
       paintedRender = null;
       fallback.checked = false;
       ime.reset();
+      keyboard.reset();
       paste.reset();
       clearPaint(terminalCanvas);
       guiCanvas.hidden = true;
@@ -167,15 +182,18 @@ function installVim9(document, invoke) {
   fallback.addEventListener('change', paintView);
   terminalCanvas.addEventListener('click', () => { if (inputEntry()) input.focus(); });
   input.addEventListener('keydown', event => {
+    keyboard.clearText();
     if (event.defaultPrevented || !inputEntry() || ime.isComposing() || event.isComposing || event.keyCode === 229 ||
-        event.getModifierState?.('AltGraph') || event.metaKey || event.key === 'Dead' || event.key === 'Process' ||
+        event.getModifierState?.('AltGraph') || event.key === 'Dead' || event.key === 'Process' ||
         paste.dismissFromOrigin(event)) return;
     // Ctrl+V is Vim's block-visual key. The desktop paste shortcut is distinct.
-    if (event.key === 'Insert' && event.shiftKey && !event.ctrlKey && !event.altKey) return;
-    if (!namedKey.test(event.key) && (!((event.ctrlKey || event.altKey) && [...event.key].length === 1))) return;
-    event.preventDefault();
-    enqueue('key', {name: event.key, shift: event.shiftKey, alt: event.altKey, ctrl: event.ctrlKey});
+    if ((event.key === 'Insert' && event.shiftKey && !event.ctrlKey && !event.altKey) ||
+        (event.metaKey && event.key.toLowerCase() === 'v')) return;
+    if (keyboard.down(event,true)) event.preventDefault();
   });
+  input.addEventListener('keyup',keyboard.up);
+  input.addEventListener('blur',keyboard.reset);
+  globalThis.addEventListener?.('blur',keyboard.reset);
   input.addEventListener('paste', event => {
     if (!inputEntry()) return;
     event.preventDefault();

@@ -1,5 +1,5 @@
 // Desktop composition ordering adapter. Preedit stays in the view.
-export function installIme(element,{getEpoch,commit,preedit=()=>{},afterEnd=callback=>callback(),canCommit=()=>true}){
+export function installIme(element,{getEpoch,commit,typed=commit,onCompose=()=>{},preedit=()=>{},afterEnd=callback=>callback(),canCommit=()=>true}){
  let active=false,owner=null,duplicate=null,discard=false,pending=null;
  const clear=()=>{element.value='';};
  const flush=()=>{
@@ -8,7 +8,7 @@ export function installIme(element,{getEpoch,commit,preedit=()=>{},afterEnd=call
  };
  const reset=()=>{active=false;owner=null;duplicate=null;discard=true;pending=null;clear();preedit('');};
  element.addEventListener('compositionstart',()=>{
-   flush();active=true;owner=getEpoch();duplicate=null;discard=false;preedit('');
+   flush();onCompose();active=true;owner=getEpoch();duplicate=null;discard=false;preedit('');
  });
  element.addEventListener('compositionupdate',event=>{
    const text=event.data??'';
@@ -48,7 +48,7 @@ export function installIme(element,{getEpoch,commit,preedit=()=>{},afterEnd=call
    if(event.inputType!=='insertText')return;
    if(duplicate!==null){const previous=duplicate;duplicate=null;if(text===previous)return;}
    flush();
-   const epoch=getEpoch();if(epoch!==null&&text)commit(text,epoch);
+   const epoch=getEpoch();if(epoch!==null&&text)typed(text,epoch);
  });
  element.addEventListener('blur',reset);
  return {reset,isComposing:()=>active,isSettled:()=>!active&&pending===null};

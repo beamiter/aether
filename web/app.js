@@ -1,3 +1,4 @@
+import { installTerminalKeys, modifierKey } from './terminal-keys.js';
 import {directionalPaneNeighbor,retainedPaneTree} from './pane-geometry.js';
 import {makePassiveSurfaces} from './passive-surfaces.js';
 import {installTerminalMouse} from './terminal-mouse.js';
@@ -158,6 +159,18 @@ const terminalMouse = typeof canvas.setPointerCapture === 'function'
 const terminalChatSend=document.querySelector('#terminal-chat-send');
 const inputOwner=()=>!input.disabled?owner:null;
 function refreshTerminalControls(){terminalChat.updateOwner();workflows.updateOwner();}
+function sendTerminalText(text,attachment){
+  if(attachment!==owner)return;
+  if(text.length>4096||new TextEncoder().encode(text).length>4096){
+    status.textContent='Committed text exceeds 4096-byte limit; nothing sent.';return;
+  }
+  enqueueLogical('text_shell',{text});
+}
+const terminalKeys=installTerminalKeys({
+  getOwner:()=>localView()===inputOwner()?inputOwner():null,
+  send:(event,receipt,permit)=>enqueueLogical('key_event_shell',{event},receipt,permit),
+  sendText:sendTerminalText,
+});
 const ime=installIme(imeInput,{getEpoch:inputOwner,
 canCommit:()=>!document.hidden&&(document.activeElement??imeInput)===imeInput,
 afterEnd:callback=>{
@@ -166,7 +179,7 @@ afterEnd:callback=>{
 },preedit:text=>{
   terminalPreedit.textContent=text;terminalPreedit.hidden=text==='';
   void Promise.resolve().then(refreshTerminalControls);
-},commit:(text,attachment)=>{if(attachment!==owner)return;if(text.length>4096||new TextEncoder().encode(text).length>4096){status.textContent='Committed text exceeds 4096-byte limit; nothing sent.';return;}enqueueLogical('text_shell',{text});}});
+},onCompose:terminalKeys.clearText,typed:terminalKeys.text,commit:sendTerminalText});
 // WebKit can emit compositionend with the uncommitted preedit while the
 // browser moves focus, before the text element receives its blur event.
 document.addEventListener?.('pointerdown',event=>{
@@ -177,7 +190,10 @@ terminalChatSend.addEventListener('mousedown',event=>event.preventDefault());
 document.addEventListener?.('keydown',event=>{
   if(event.key==='Tab'&&!event.isComposing&&event.keyCode!==229&&ime.isComposing())ime.reset();
 },true);
-globalThis.addEventListener?.('blur',()=>ime.reset());
+globalThis.addEventListener?.('blur',()=>{ime.reset();terminalKeys.reset();});
+imeInput.addEventListener('blur',terminalKeys.reset);
+canvas.addEventListener('blur',terminalKeys.reset);
+document.addEventListener?.('visibilitychange',()=>{if(document.hidden)terminalKeys.reset();});
 canvas.addEventListener('click',event=>{if(!event.defaultPrevented&&!event.ctrlKey)imeInput.focus();});
 const resize=document.querySelector('#resize');
 const invoke=globalThis.__TAURI__?.core?.invoke;
@@ -1573,17 +1589,19 @@ function enqueueFocus(attachment, focused) {
   });
   return true;
 }
-function enqueueLogical(command,payload,onReceipt){
+function enqueueLogical(command,payload,onReceipt,permit){
   if(epoch===null||input.disabled)return;
   const queue=keyQueue;
   const mouse=command==='mouse_shell';
-  if(!mouse)inlineHistory.reset();
+  const advisoryKey=command==='key_event_shell' &&
+    (payload.event.phase==='release'||modifierKey(payload.event.name));
+  if(!mouse&&!advisoryKey)inlineHistory.reset();
   if (mouse && (!canReportMouse(owner) || queue.pending >= (payload.report.kind === 'release' ? 128 : 126))) return;
   if(queue.pending>=128){pasteReview.reset();queue.locked=true;status.textContent='Keyboard queue full; input locked. Close/reopen before retrying.';input.disabled=send.disabled=true;return;}
   const current=epoch,attachment=owner;queue.pending++;
   if(queue.pending===1)commandPalette.refreshAvailability();
   queue.chain=queue.chain.then(async()=>{
-    if(!ownsInput(attachment,queue)||queue.locked||mouse&&!canReportMouse(attachment))return;
+    if(!ownsInput(attachment,queue)||queue.locked||mouse&&!canReportMouse(attachment)||permit&&!permit())return;
     try{
       const result=await invokeAttached(command,{epoch:current,...payload},attachment);
       if(ownsInput(attachment,queue))onReceipt?.(result);
@@ -1597,9 +1615,10 @@ function enqueueLogical(command,payload,onReceipt){
   return queue.chain;
 }
 function keydown(event){
+  terminalKeys.clearText();
   // Respect an earlier control or capture handler that already owns this key.
   if(event.defaultPrevented)return;
-  if(epoch===null||input.disabled||ime.isComposing()||event.isComposing||event.keyCode===229||event.getModifierState?.('AltGraph')||event.metaKey||event.key==='Dead'||event.key==='Process')return;
+  if(epoch===null||input.disabled||ime.isComposing()||event.isComposing||event.keyCode===229||event.getModifierState?.('AltGraph')||event.key==='Dead'||event.key==='Process')return;
   if(pasteReview.dismissFromOrigin(event))return;
   if(workflows.consumeEnterRepeat(event)){event.preventDefault();return;}
   if(inlineHistory.page(event)){event.preventDefault();return;}
@@ -1613,6 +1632,11 @@ function keydown(event){
   // Linux browser paste must reach the same review path as Ctrl+V.
   // Preserve plain Insert and modified Insert combinations for terminal apps.
   if(event.key==='Insert'&&event.shiftKey&&!event.ctrlKey&&!event.altKey)return;
+  if(localView()){
+    if(terminalKeys.down(event,event.currentTarget===imeInput))event.preventDefault();
+    return;
+  }
+  if(event.metaKey)return;
   const named=/^(Arrow(Up|Down|Left|Right)|Home|End|Insert|Delete|PageUp|PageDown|F([1-9]|1[0-2])|Enter|Escape|Backspace|Tab)$/;
   const keypad=/^Numpad([0-9]|Decimal|Divide|Multiply|Subtract|Add|Enter|Equal|Comma)$/.test(event.code)
     ? {code:event.code,num_locked:event.getModifierState?.('NumLock')===true}
@@ -1623,6 +1647,7 @@ function keydown(event){
   event.preventDefault();enqueueLogical('key_shell',{name:event.key,shift:event.shiftKey,alt:event.altKey,ctrl:event.ctrlKey,...(keypad?{keypad}:{})});
 }
 canvas.addEventListener('keydown',keydown);imeInput.addEventListener('keydown',keydown);
+canvas.addEventListener('keyup',terminalKeys.up);imeInput.addEventListener('keyup',terminalKeys.up);
 function paste(event){
   if(epoch===null||input.disabled)return;
   event.preventDefault();const text=event.clipboardData?.getData('text/plain')||'';

@@ -1375,19 +1375,27 @@ def exercise_renderer_reload(driver, owned):
                       "native_renderer_reload_recovers_detached_output_read_only": True}), flush=True)
 
 
-def exercise_keyboard(driver, owned):
-    probe = owned / "keyboard-probe.py"
-    receipt = owned / "keyboard-bytes"
-    probe.write_text('''import os, select, sys, termios, tty
+def exercise_keyboard(driver, owned, events=False):
+    flags = 26 if events else 1
+    last = b"\x1b[97;1:3u" if events else b"q"
+    sequence = (b"\x1b[13~\x1b[13;1:3~\x1b[97;;97u\x1b[97;1:3u"
+                if events else b"\x1b[13;2u\x1b[27u\x1b[105;5uq")
+    expected = f"\x1b[?{flags}u".encode() + sequence
+    ready = f"\x1b[?1049h\x1b[>{flags}u\x1b[?u\x1b[2J\x1b[HAETHER-KEYBOARD-READY".encode()
+    probe = owned / f"keyboard-probe-{flags}.py"
+    receipt = owned / f"keyboard-bytes-{flags}"
+    probe.write_text(f'''import os, select, sys, termios, tty
 mode = termios.tcgetattr(0)
 try:
     tty.setraw(0)
-    os.write(1, b"\\x1b[?1049h\\x1b[>31u\\x1b[?u\\x1b[2J\\x1b[HAETHER-KEYBOARD-READY")
+    os.write(1, {ready!r})
+    seen = bytearray()
     with open(sys.argv[1], "wb", buffering=0) as output:
         while select.select([0], [], [], 10)[0]:
             data = os.read(0, 256)
             output.write(data)
-            if not data or data.endswith(b"q"):
+            seen.extend(data)
+            if not data or seen.endswith({last!r}):
                 break
 finally:
     os.write(1, b"\\x1b[?1049l\\r\\nAETHER-KEYBOARD-FINISHED\\r\\n")
@@ -1409,19 +1417,22 @@ finally:
         return document.activeElement === document.querySelector('#ime-input') ||
                document.activeElement === document.querySelector('main canvas');
     """), "keyboard fixture did not focus the native input surface")
-    actions = []
-    for keys in (("\ue008", "\ue007"), ("\ue00c",), ("\ue009", "i"), ("q",)):
-        actions.extend({"type": "keyDown", "value": key} for key in keys)
-        actions.extend({"type": "keyUp", "value": key} for key in reversed(keys))
-    driver.command("POST", "/actions", {"actions": [{"type": "key", "id": "terminal-keys", "actions": actions}]})
-    driver.command("DELETE", "/actions")
+    if events:
+        subprocess.run(["xdotool", "key", "F3", "a"], check=True, timeout=5)
+    else:
+        actions = []
+        for keys in (("\ue008", "\ue007"), ("\ue00c",), ("\ue009", "i"), ("q",)):
+            actions.extend({"type": "keyDown", "value": key} for key in keys)
+            actions.extend({"type": "keyUp", "value": key} for key in reversed(keys))
+        driver.command("POST", "/actions", {"actions": [{"type": "key", "id": "terminal-keys", "actions": actions}]})
+        driver.command("DELETE", "/actions")
     wait_for(lambda: painted("AETHER-KEYBOARD-FINISHED"), "keyboard probe did not return to the shell")
-    expected = b"\x1b[?1u\x1b[13;2u\x1b[27u\x1b[105;5uq"
     actual = receipt.read_bytes()
     assert actual == expected, (expected, actual)
     driver.click("#close")
     wait_for(lambda: driver.execute(READ)["status"].startswith("Terminal closed"), "keyboard shell did not close")
-    print(json.dumps({"native_kitty_disambiguation": True, "pty_bytes_verified": len(actual)}), flush=True)
+    proof = "native_kitty_key_events" if events else "native_kitty_disambiguation"
+    print(json.dumps({proof: True, "pty_bytes_verified": len(actual)}), flush=True)
 
 
 def exercise_terminal_shell(driver, owned):
@@ -4312,6 +4323,7 @@ def run(binary, jsh, workspace, api, native, notebook=False, output_review=False
                 exercise(driver, owned)
                 exercise_hyperlinks(driver, owned)
                 exercise_keyboard(driver, owned)
+                exercise_keyboard(driver, owned, events=True)
                 exercise_height_shrink(driver)
                 exercise_renderer_reload(driver, owned)
                 exercise_restart(driver, owned, binary, integrated=jsh is not None)

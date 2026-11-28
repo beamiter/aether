@@ -90,6 +90,10 @@ pub enum Request {
         alt: bool,
         ctrl: bool,
     },
+    KeyEvent {
+        entry_id: Uuid,
+        event: tauri_terminal_frame_bridge::live::KeyEvent,
+    },
     Text {
         entry_id: Uuid,
         text: String,
@@ -115,6 +119,7 @@ pub enum Response {
     Idle,
     State(Box<EditorView>),
     Accepted,
+    KeyReport(bool),
     Choices(project::Choices),
 }
 
@@ -150,6 +155,7 @@ pub struct RenderView {
 pub async fn local_vim9<R: tauri::Runtime>(
     window: WebviewWindow<R>,
     state: tauri::State<'_, Arc<Mutex<Workbench>>>,
+    keyboard: tauri::State<'_, Arc<Mutex<super::native_keyboard::Samples>>>,
     request: Request,
 ) -> Result<Response, String> {
     super::require_terminal_window(&window)?;
@@ -169,7 +175,11 @@ pub async fn local_vim9<R: tauri::Runtime>(
         };
         return super::run_bridge(state, move |host| host.open(path, snapshot)).await;
     }
-    super::run_bridge(state, move |host| host.apply(request)).await
+    let native = match &request {
+        Request::KeyEvent { event, .. } => keyboard.lock().ok().and_then(|mut keyboard| keyboard.take(event)),
+        _ => None,
+    };
+    super::run_bridge(state, move |host| host.apply(request, native)).await
 }
 
 /// Prevent overlapping native dialogs across asynchronous WebView requests.
@@ -275,7 +285,11 @@ impl Workbench {
         Ok(Response::State(Box::new(view)))
     }
 
-    fn apply(&mut self, request: Request) -> Result<Response, String> {
+    fn apply(
+        &mut self,
+        request: Request,
+        native: Option<tauri_terminal_frame_bridge::live::NativeKeyState>,
+    ) -> Result<Response, String> {
         if matches!(request, Request::Inspect) {
             return match &self.editor {
                 Some(editor) => Ok(Response::State(Box::new(
@@ -342,6 +356,10 @@ impl Workbench {
             } => {
                 let epoch = editor.require_input(entry_id)?;
                 editor.terminal.key(epoch, &name, shift, alt, ctrl)?;
+            }
+            Request::KeyEvent { entry_id, event } => {
+                let epoch = editor.require_input(entry_id)?;
+                return editor.terminal.key_event(epoch, &event, native).map(Response::KeyReport);
             }
             Request::Text { entry_id, text } => {
                 let epoch = editor.require_input(entry_id)?;
