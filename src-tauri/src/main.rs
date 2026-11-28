@@ -188,6 +188,7 @@ async fn subscribe_local_shell<R: tauri::Runtime>(
     stream: Channel<local_sessions::StreamEvent>,
     observer: Option<local_sessions::ObserverTarget>,
     frame_version: u8,
+    direct_frames: Option<bool>,
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<(), String> {
     require_terminal_window(&window)?;
@@ -198,7 +199,14 @@ async fn subscribe_local_shell<R: tauri::Runtime>(
     let shared = bridge.inner().clone();
     let weak = Arc::downgrade(&shared);
     run_bridge(shared, move |bridge| {
-        bridge.subscribe(owner, stream, observer, format, weak)
+        bridge.subscribe(
+            owner,
+            stream,
+            observer,
+            format,
+            direct_frames.unwrap_or(false),
+            weak,
+        )
     })
     .await
 }

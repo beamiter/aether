@@ -1,27 +1,107 @@
 //! A single delivery credit for the active local view. The PTY keeps draining
 //! while the WebView validates, paints and acknowledges the current envelope.
 use super::LocalShellStatus;
+use serde::Serialize;
 use std::{
+    fmt::Write as _,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
     time::{Duration, Instant},
 };
-use tauri::ipc::Channel;
+use tauri::ipc::{Channel, InvokeResponseBody, IpcResponse};
 pub(crate) use tauri_terminal_frame_bridge::protocol::ObserverTarget;
-pub(crate) use tauri_terminal_frame_bridge::protocol_v4::{Counter, PeerUpdate, Receipt};
+pub(crate) use tauri_terminal_frame_bridge::protocol_v4::{Counter, Receipt};
 use tauri_terminal_frame_bridge::{
-    live::LiveBridge, protocol_v4, semantic::Attachment, LiveFrameFormat,
+    live::LiveBridge, protocol_v4, semantic::Attachment, EncodedChannelFrame, LiveFrameFormat,
 };
 
-pub(crate) type StreamEvent = protocol_v4::StreamEvent<LocalShellStatus>;
+type QuotedEvent = protocol_v4::StreamEvent<LocalShellStatus>;
+pub(crate) struct StreamEvent(StreamBody);
+
+enum StreamBody {
+    Quoted(QuotedEvent),
+    Direct(DirectUpdate),
+}
+
+struct DirectUpdate {
+    owner: Attachment,
+    sequence: Counter,
+    frame: Option<EncodedChannelFrame>,
+    preview: Option<(u32, EncodedChannelFrame)>,
+    status: LocalShellStatus,
+}
+
+#[derive(Serialize)]
+struct DirectHeader<'a> {
+    kind: &'static str,
+    owner: &'a Attachment,
+    sequence: Counter,
+    status: &'a LocalShellStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frame_bytes: Option<usize>,
+}
+
+impl DirectUpdate {
+    fn into_json(self) -> serde_json::Result<String> {
+        let active = self
+            .frame
+            .as_ref()
+            .map_or("null", EncodedChannelFrame::as_json);
+        let mut json = serde_json::to_string(&DirectHeader {
+            kind: "update",
+            owner: &self.owner,
+            sequence: self.sequence,
+            status: &self.status,
+            frame_bytes: self.frame.as_ref().map(|frame| frame.as_json().len()),
+        })?;
+        json.reserve_exact(
+            active.len()
+                + self
+                    .preview
+                    .as_ref()
+                    .map_or(0, |(_, frame)| frame.as_json().len())
+                + 80,
+        );
+        // The header is a serialized object. Append only JSON from the
+        // bounded frame encoder and numeric preview metadata.
+        json.pop();
+        json.push_str(",\"frame\":");
+        json.push_str(active);
+        if let Some((layout, frame)) = self.preview {
+            let frame = frame.as_json();
+            write!(
+                json,
+                ",\"preview\":{{\"layout\":{layout},\"frame_bytes\":{},\"frame\":",
+                frame.len()
+            )
+            .expect("writing numbers to a String succeeds");
+            json.push_str(frame);
+            json.push('}');
+        }
+        json.push('}');
+        Ok(json)
+    }
+}
+
+impl IpcResponse for StreamEvent {
+    fn body(self) -> tauri::Result<InvokeResponseBody> {
+        match self.0 {
+            StreamBody::Quoted(event) => event.body(),
+            StreamBody::Direct(update) => update
+                .into_json()
+                .map(InvokeResponseBody::Json)
+                .map_err(Into::into),
+        }
+    }
+}
 
 const HEARTBEAT: Duration = Duration::from_secs(2);
 pub(super) const MAX_OBSERVERS: usize = 2;
 
 type ObserverCursor = (ObserverTarget, Option<Counter>);
-pub(super) type Preview = (ObserverTarget, Counter, PeerUpdate);
+pub(super) type Preview = (ObserverTarget, Counter, EncodedChannelFrame);
 
 #[derive(Default)]
 struct Observers {
@@ -84,6 +164,7 @@ impl Delivery {
 pub(super) struct LocalStream {
     pub(super) owner: Attachment,
     pub(super) format: LiveFrameFormat,
+    direct_frames: bool,
     sink: Channel<StreamEvent>,
     failed: Arc<AtomicBool>,
     sequence: u64,
@@ -101,10 +182,12 @@ impl LocalStream {
         owner: Attachment,
         sink: Channel<StreamEvent>,
         format: LiveFrameFormat,
+        direct_frames: bool,
     ) -> Self {
         Self {
             owner,
             format,
+            direct_frames,
             sink,
             failed: Arc::new(AtomicBool::new(false)),
             sequence: 0,
@@ -191,7 +274,8 @@ impl LocalStream {
         bridge: &mut LiveBridge,
         preview: Option<Preview>,
     ) -> Result<(bool, Option<Delivery>), String> {
-        let frame = bridge.poll_channel_frame(self.owner.epoch, self.sequence == 0, self.format)?;
+        let frame =
+            bridge.poll_encoded_channel_frame(self.owner.epoch, self.sequence == 0, self.format)?;
         // An initial publication can be deferred under encoder pressure. Do
         // not let a status-only update consume the sequence for the full base.
         if self.sequence == 0 && frame.is_none() {
@@ -222,26 +306,44 @@ impl LocalStream {
         if let Some((target, revision, _)) = &preview {
             self.observers.published(*target, *revision);
         }
-        Ok((
-            ready,
-            Some(self.delivery(StreamEvent::Update {
-                owner: self.owner.clone(),
+        let owner = self.owner.clone();
+        let frame = frame.map(|(_, frame)| frame);
+        let preview = preview.map(|(target, _, frame)| (target.layout, frame));
+        let body = if self.direct_frames {
+            StreamBody::Direct(DirectUpdate {
+                owner,
                 sequence,
-                frame: frame.map(|(_, frame)| frame),
-                preview: preview.map(|(_, _, frame)| Box::new(frame)),
+                frame,
+                preview,
                 status,
-            })),
-        ))
+            })
+        } else {
+            StreamBody::Quoted(QuotedEvent::Update {
+                owner,
+                sequence,
+                frame: frame.map(EncodedChannelFrame::into_json),
+                preview: preview.map(|(layout, frame)| {
+                    Box::new(protocol_v4::PeerUpdate {
+                        layout,
+                        frame: frame.into_json(),
+                    })
+                }),
+                status,
+            })
+        };
+        Ok((ready, Some(self.delivery(StreamEvent(body)))))
     }
 
     fn stop(&mut self, message: String) -> (bool, Option<Delivery>) {
         self.stopped = true;
         (
             true,
-            Some(self.delivery(StreamEvent::Stopped {
-                owner: self.owner.clone(),
-                message,
-            })),
+            Some(
+                self.delivery(StreamEvent(StreamBody::Quoted(QuotedEvent::Stopped {
+                    owner: self.owner.clone(),
+                    message,
+                }))),
+            ),
         )
     }
 
@@ -260,7 +362,6 @@ mod tests {
     use crate::local_sessions::{LocalSessions, TabActivation};
     use serde_json::Value;
     use std::sync::{mpsc, Mutex};
-    use tauri::ipc::InvokeResponseBody;
     use tauri_terminal_frame_bridge::SnapshotFormat;
 
     #[test]
@@ -301,6 +402,34 @@ mod tests {
 
     #[test]
     fn two_retained_ptys_share_one_delivery_credit_and_never_gain_input() {
+        exercise_retained_ptys(false);
+    }
+
+    #[test]
+    fn structured_frames_share_one_delivery_credit_for_active_and_passive_ptys() {
+        exercise_retained_ptys(true);
+    }
+
+    fn exercise_retained_ptys(direct_frames: bool) {
+        let format = if direct_frames {
+            LiveFrameFormat::Dense
+        } else {
+            SnapshotFormat::Channel.into()
+        };
+        let decode = |packet: &Value| -> Value {
+            if direct_frames {
+                let frame = &packet["frame"];
+                assert!(frame.is_object());
+                assert_eq!(
+                    packet["frame_bytes"],
+                    serde_json::to_string(frame).unwrap().len()
+                );
+                frame.clone()
+            } else {
+                assert!(packet.get("frame_bytes").is_none());
+                serde_json::from_str(packet["frame"].as_str().unwrap()).unwrap()
+            }
+        };
         let local = Arc::new(Mutex::new(LocalSessions::default()));
         let shared = Arc::downgrade(&local);
         let mut sessions = local.lock().unwrap();
@@ -359,13 +488,7 @@ mod tests {
         });
         let id = channel.id();
         sessions
-            .subscribe(
-                active.clone(),
-                channel,
-                None,
-                SnapshotFormat::Channel.into(),
-                shared,
-            )
+            .subscribe(active.clone(), channel, None, format, direct_frames, shared)
             .unwrap();
         sessions
             .set_observers(&active, id, &[first_target, second_target])
@@ -399,10 +522,10 @@ mod tests {
             let event = receive.recv_timeout(Duration::from_secs(5)).unwrap();
             assert_eq!(event["owner"]["epoch"], active.epoch);
             assert_eq!(event["sequence"], sequence.to_string());
-            if let Some(preview) = event["preview"].as_object() {
+            if event["preview"].is_object() {
+                let preview = &event["preview"];
                 let layout = preview["layout"].as_u64().unwrap();
-                let frame: Value =
-                    serde_json::from_str(preview["frame"].as_str().unwrap()).unwrap();
+                let frame = decode(preview);
                 let expected = if layout == 71 {
                     &first
                 } else {
@@ -411,6 +534,7 @@ mod tests {
                 };
                 assert_eq!(frame["stamp"]["epoch"], expected.epoch.to_string());
                 assert_eq!(frame["stamp"]["session"], expected.session);
+                assert_eq!(frame["stamp"]["version"], format.channel_version().unwrap());
                 if !seen.contains(&layout) {
                     seen.push(layout);
                 }
@@ -419,11 +543,14 @@ mod tests {
                 receive.recv_timeout(Duration::from_millis(35)).is_err(),
                 "second envelope before acknowledgement"
             );
-            let revision = event["frame"].as_str().map(|raw| {
-                serde_json::from_str::<protocol_v4::Update>(raw)
-                    .unwrap()
-                    .revision()
-            });
+            let revision = if event["frame"].is_null() {
+                assert!(event.get("frame_bytes").is_none());
+                None
+            } else {
+                let frame = decode(&event);
+                assert_eq!(frame["stamp"]["version"], format.channel_version().unwrap());
+                Some(serde_json::from_value(frame["stamp"]["revision"].clone()).unwrap())
+            };
             local
                 .lock()
                 .unwrap()
@@ -477,6 +604,7 @@ mod tests {
                 channel,
                 None,
                 SnapshotFormat::Channel.into(),
+                false,
                 Arc::downgrade(&local),
             )
             .unwrap();

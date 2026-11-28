@@ -344,6 +344,12 @@ export function acceptChannelFrame(previous, encoded, expected, snapshotOnly = f
   return acceptChannelUpdate(previous,JSON.parse(encoded),expected,snapshotOnly,wireBytes);
 }
 
+export function acceptChannelPayload(previous, {frame,frame_bytes}, expected, snapshotOnly = false) {
+  return typeof frame === 'string'
+    ? acceptChannelFrame(previous,frame,expected,snapshotOnly)
+    : acceptChannelUpdate(previous,frame,expected,snapshotOnly,frame_bytes);
+}
+
 export function acceptChannelUpdate(previous, update, expected, snapshotOnly, wireBytes) {
   if (!Number.isSafeInteger(wireBytes) || wireBytes < 1) throw new Error('Channel frame byte limit');
   const expectedVersion = expected.frameVersion ?? previous?.version;

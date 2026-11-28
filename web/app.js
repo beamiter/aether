@@ -18,7 +18,7 @@ import {installTerminalChat,validateChatStatus} from './terminal-chat.js';
 import {installWorkflows} from './workflows.js';
 import {plainLocalTab,readLocalShellLayout,saveLocalShellLayout,readThreePaneLayout,saveThreePaneLayout,validPaneId,MAX_LOCAL_SHELLS,validLocalGeometry,localSplitPair} from './local-layout.js';
 import {backingGeometry,acceptFull,acceptUpdate,clearPaint,paint} from './frames.js'; import {installIme} from './ime.js';
-import {acceptChannelFrame,acceptChannelUpdate,channelCounter,CHANNEL_DENSE_VERSION,supportsChannelRendition} from './frames-v4.js';
+import {acceptChannelFrame,acceptChannelPayload,acceptChannelUpdate,channelCounter,CHANNEL_DENSE_VERSION,supportsChannelRendition} from './frames-v4.js';
 const canvas=document.querySelector('canvas'),status=document.querySelector('#status'),button=document.querySelector('#demo');
 const open=document.querySelector('#open'),attach=document.querySelector('#attach'),detach=document.querySelector('#detach'),close=document.querySelector('#close'),input=document.querySelector('#input'),send=document.querySelector('#send');
 const openIntegrated=document.querySelector('#open-integrated');
@@ -549,10 +549,10 @@ function validatePeerFrame(frame,target){
   const next=acceptFull(null,frame,{session,epoch:target.epoch});
   return peerState?.epoch===next.epoch&&peerState.revision>=next.revision?null:next;
 }
-function validateChannelPeer(frame,target,frameVersion){
+function validateChannelPeer(preview,target,frameVersion){
   const session=localTabOwners.get(target.epoch)?.session;
   if(typeof session!=='string'||!/^[a-f0-9]{32}$/.test(session))throw new Error('invalid inactive shell');
-  const next=acceptChannelFrame(null,frame,{session,epoch:target.epoch,frameVersion},true);
+  const next=acceptChannelPayload(null,preview,{session,epoch:target.epoch,frameVersion},true);
   return peerState?.epoch===next.epoch&&BigInt(peerState.revision)>=BigInt(next.revision)?null:next;
 }
 function paintPeer(frame){
@@ -976,11 +976,11 @@ async function receiveLocalStream(stream,event){
     validateShellStatus(event.status,attachment.epoch);
     const target=observerTarget();
     recoverFrame=true;
-    const peer=target&&event.preview?.layout===target.layout?validateChannelPeer(event.preview.frame,target,stream.frameVersion):null;
+    const peer=target&&event.preview?.layout===target.layout?validateChannelPeer(event.preview,target,stream.frameVersion):null;
     const commitPassive=tripleIsVisible()?passiveSurfaces.prepare(event.preview,stream.frameVersion):null;
     let revision=null;
     if(event.frame!==null){
-      const next=acceptChannelFrame(stream.frame,event.frame,{...attachment,frameVersion:stream.frameVersion});
+      const next=acceptChannelPayload(stream.frame,event,{...attachment,frameVersion:stream.frameVersion});
       paintLiveFrame(next);state=next;stream.frame=next;revision=next.revision;describeCursor();
     }
     paintPeer(peer);
@@ -1030,7 +1030,8 @@ async function startTransport(onFirstPoll){
     if(localStream===stream&&!document.hidden&&Date.now()-stream.lastSeen>10000)
       failLocalStream(stream,new Error('no local output heartbeat'));
   },1000);
-  try{await invoke('subscribe_local_shell',{owner:stream.owner,stream:stream.channel,observer:stream.observers.targets[0],frameVersion:stream.frameVersion});}
+  try{await invoke('subscribe_local_shell',{owner:stream.owner,stream:stream.channel,observer:stream.observers.targets[0],
+    frameVersion:stream.frameVersion,directFrames:true});}
   catch(error){failLocalStream(stream,error);}
   if(localStream===stream){
     stream.ready=true;renderSplit();

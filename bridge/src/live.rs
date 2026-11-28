@@ -5,7 +5,7 @@ use crate::{
     protocol::MAX_HISTORY_SNAPSHOT_BYTES,
     protocol_v4::{HistorySource, MAX_PROJECTED_HISTORY_ROWS},
     semantic::{self, Attachment, Resume, SessionSelector, Update},
-    LiveFrameFormat, SnapshotFormat, WireFrame,
+    EncodedChannelFrame, LiveFrameFormat, SnapshotFormat, WireFrame,
 };
 use jterm_engine::{
     frame::CellFrame,
@@ -823,6 +823,16 @@ impl LiveBridge {
         snapshot: bool,
         format: impl Into<LiveFrameFormat>,
     ) -> Result<Option<(crate::protocol_v4::Counter, String)>, String> {
+        self.poll_encoded_channel_frame(epoch, snapshot, format)
+            .map(|update| update.map(|(revision, frame)| (revision, frame.into_json())))
+    }
+
+    pub fn poll_encoded_channel_frame(
+        &mut self,
+        epoch: u32,
+        snapshot: bool,
+        format: impl Into<LiveFrameFormat>,
+    ) -> Result<Option<(crate::protocol_v4::Counter, EncodedChannelFrame)>, String> {
         self.poll_channel_with_scratch(
             epoch,
             snapshot,
@@ -837,7 +847,7 @@ impl LiveBridge {
         snapshot: bool,
         format: impl Into<LiveFrameFormat>,
         scratch: Option<crate::semantic_v4::FrameScratch>,
-    ) -> Result<Option<(crate::protocol_v4::Counter, String)>, String> {
+    ) -> Result<Option<(crate::protocol_v4::Counter, EncodedChannelFrame)>, String> {
         let version = format
             .into()
             .channel_version()
@@ -857,6 +867,7 @@ impl LiveBridge {
             version,
             crate::semantic_v4::FrameScratch::acquire(),
         )
+        .map(|update| update.map(|(revision, frame)| (revision, frame.into_json())))
     }
 
     fn poll_channel_with_version(
@@ -865,7 +876,7 @@ impl LiveBridge {
         snapshot: bool,
         version: u8,
         scratch: Option<crate::semantic_v4::FrameScratch>,
-    ) -> Result<Option<(crate::protocol_v4::Counter, String)>, String> {
+    ) -> Result<Option<(crate::protocol_v4::Counter, EncodedChannelFrame)>, String> {
         let Some(scratch) = scratch else {
             self.check(epoch)?;
             // Encoding is deferrable. Keep advancing the owner, including
@@ -885,7 +896,7 @@ impl LiveBridge {
         } else {
             self.accepted.as_deref()
         };
-        let update = scratch.encode(previous, &frame, &self.id, version)?;
+        let update = scratch.encode_frame(previous, &frame, &self.id, version)?;
         self.publish(frame);
         Ok(Some(update))
     }
@@ -930,6 +941,16 @@ impl LiveBridge {
         revision: Option<crate::protocol_v4::Counter>,
         format: impl Into<LiveFrameFormat>,
     ) -> Result<Option<(crate::protocol_v4::Counter, String)>, String> {
+        self.observe_encoded_channel_frame(epoch, revision, format)
+            .map(|update| update.map(|(revision, frame)| (revision, frame.into_json())))
+    }
+
+    pub fn observe_encoded_channel_frame(
+        &self,
+        epoch: u32,
+        revision: Option<crate::protocol_v4::Counter>,
+        format: impl Into<LiveFrameFormat>,
+    ) -> Result<Option<(crate::protocol_v4::Counter, EncodedChannelFrame)>, String> {
         let version = format
             .into()
             .channel_version()
@@ -942,7 +963,9 @@ impl LiveBridge {
         if revision.is_some_and(|revision| revision.get() >= frame.stamp().revision) {
             return Ok(None);
         }
-        scratch.encode(None, &frame, &self.id, version).map(Some)
+        scratch
+            .encode_frame(None, &frame, &self.id, version)
+            .map(Some)
     }
 
     fn current_snapshot(&self) -> Result<CellFrame, String> {

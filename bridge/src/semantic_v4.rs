@@ -27,6 +27,21 @@ const JSON_WORKSPACE_BYTES: usize = wire::MAX_ENCODED_FRAME_BYTES + wire::MAX_EN
 const PROCESS_JSON_WORKSPACE_BYTES: usize = 4 * JSON_WORKSPACE_BYTES;
 const ENCODERS_BUSY: &str = "terminal channel encoders are temporarily busy";
 
+/// A bounded JSON frame produced by the encoder. Its contents can be
+/// embedded in another JSON value without escaping or re-parsing them.
+#[derive(Debug)]
+pub struct EncodedChannelFrame(String);
+
+impl EncodedChannelFrame {
+    pub fn as_json(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_json(self) -> String {
+        self.0
+    }
+}
+
 pub(crate) struct FrameScratch {
     _reservation: RetainedBytes,
 }
@@ -52,6 +67,17 @@ impl FrameScratch {
         session: &str,
         version: u8,
     ) -> Result<(wire::Counter, String), String> {
+        self.encode_frame(previous, frame, session, version)
+            .map(|(revision, frame)| (revision, frame.into_json()))
+    }
+
+    pub(crate) fn encode_frame(
+        &self,
+        previous: Option<&CellFrame>,
+        frame: &CellFrame,
+        session: &str,
+        version: u8,
+    ) -> Result<(wire::Counter, EncodedChannelFrame), String> {
         if version == DENSE_FRAME_VERSION {
             encode_update(project_update(
                 previous,
@@ -76,13 +102,16 @@ impl FrameScratch {
 
 fn encode_update<R: serde::Serialize>(
     update: wire::UpdateRows<R>,
-) -> Result<(wire::Counter, String), String> {
+) -> Result<(wire::Counter, EncodedChannelFrame), String> {
     let images = match &update {
         wire::UpdateRows::Snapshot { images, .. } | wire::UpdateRows::Delta { images, .. } => {
             images
         }
     };
-    Ok((update.revision(), encode_json(&update, images)?))
+    Ok((
+        update.revision(),
+        EncodedChannelFrame(encode_json(&update, images)?),
+    ))
 }
 
 pub(crate) fn encode(

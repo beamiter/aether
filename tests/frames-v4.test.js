@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {acceptChannelFrame, acceptHistoryProjection, channelCounter, CHANNEL_FRAME_VERSION,
+import {acceptChannelFrame, acceptChannelPayload, acceptHistoryProjection, channelCounter, CHANNEL_FRAME_VERSION,
   CHANNEL_RENDITION_VERSION, CELL_CONCEALED, SSH_DENSE_FRAME_VERSION} from '../web/frames-v4.js';
 import {paint} from '../web/frames.js';
 
@@ -97,6 +97,17 @@ test('encoded, cluster, geometry, and accumulated text budgets reject before rep
   const base = accept(null,{...snapshot,cols:256,rows:[...Array(32).fill(longRow),extra],hyperlinks:[]});
   assert.throws(() => accept(base,{...delta,rows:[{index:0,row:extra}],hyperlinks:[]}),/text byte limit/);
   assert.equal(full.rows[0][0].underline,'double');
+});
+
+test('structured Channel payloads require a bounded native frame length', () => {
+  const encoded = JSON.stringify(snapshot);
+  const expected = acceptChannelFrame(null,encoded,owner);
+  assert.deepEqual(acceptChannelPayload(null,{frame:encoded},owner),expected);
+  const payload = {frame:snapshot,frame_bytes:Buffer.byteLength(encoded)};
+  assert.deepEqual(acceptChannelPayload(null,payload,owner),expected);
+  for (const frame_bytes of [undefined,0,-1,'11',8*1024*1024+1]) {
+    assert.throws(() => acceptChannelPayload(null,{...payload,frame_bytes},owner),/frame byte limit/);
+  }
 });
 
 test('the wire byte limit counts an astral glyph across a scanning boundary as four bytes', () => {

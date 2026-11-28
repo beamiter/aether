@@ -23,6 +23,7 @@ pub use jterm_protocol::terminal as protocol;
 pub use jterm_protocol::terminal_v4 as protocol_v4;
 pub use protocol::{CursorShape as WireCursorShape, WireCell, WireFrame};
 pub use protocol_v4::{LocalSnapshot, SnapshotFormat, SnapshotRevision};
+pub use semantic_v4::EncodedChannelFrame;
 
 /// Live Channel frame version with a byte-packed representation for dense rows.
 pub const DENSE_FRAME_VERSION: u8 = 9;
