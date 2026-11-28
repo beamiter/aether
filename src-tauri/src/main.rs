@@ -5,7 +5,7 @@ use tauri_terminal_frame_bridge::{
     history_search::{HistorySearchRequest, HistorySearchResponse},
     live::{LiveBridge, ViewportPixels},
     semantic::{Attachment, Resume, SessionSelector, Update},
-    DemoBridge, LocalSnapshot, SnapshotFormat, SnapshotRevision, WireFrame,
+    DemoBridge, LiveFrameFormat, LocalSnapshot, SnapshotFormat, SnapshotRevision, WireFrame,
 };
 
 use jterm_remote_client as jwm_remote_session;
@@ -48,7 +48,7 @@ async fn open_shell<R: tauri::Runtime>(
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<local_sessions::OpenedShell, String> {
     require_terminal_window(&window)?;
-    let format = SnapshotFormat::negotiate(frame_version)?;
+    let format = LiveFrameFormat::negotiate(frame_version)?;
     let integrated = integrated.unwrap_or(false);
     let history = HistoryRequest::new(
         integrated,
@@ -72,7 +72,7 @@ async fn open_second_local_shell<R: tauri::Runtime>(
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<Attachment, String> {
     require_terminal_window(&window)?;
-    let format = SnapshotFormat::negotiate(frame_version)?;
+    let format = LiveFrameFormat::negotiate(frame_version)?;
     let shared = bridge.inner().clone();
     let weak = Arc::downgrade(&shared);
     run_bridge(shared, move |bridge| {
@@ -103,7 +103,7 @@ async fn activate_local_tab<R: tauri::Runtime>(
     window_pixels: Option<ViewportPixels>,
 ) -> Result<Result<local_sessions::AttachedView, String>, String> {
     require_terminal_window(&window)?;
-    let format = SnapshotFormat::negotiate(frame_version)?;
+    let format = LiveFrameFormat::negotiate(frame_version)?;
     let integrated = integrated.unwrap_or(false);
     let history = HistoryRequest::new(
         integrated,
@@ -141,7 +141,7 @@ async fn attach_selected_local_shell<R: tauri::Runtime>(
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<Option<Resume<LocalSnapshot>>, String> {
     require_terminal_window(&window)?;
-    let format = SnapshotFormat::negotiate(frame_version)?;
+    let format = LiveFrameFormat::negotiate(frame_version)?;
     run_bridge(bridge.inner().clone(), move |bridge| {
         bridge.attach_selected(epoch, format)
     })
@@ -156,7 +156,7 @@ async fn attach_shell<R: tauri::Runtime>(
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<Option<Resume<LocalSnapshot>>, String> {
     require_terminal_window(&window)?;
-    let format = SnapshotFormat::negotiate(frame_version)?;
+    let format = LiveFrameFormat::negotiate(frame_version)?;
     run_bridge(bridge.inner().clone(), move |bridge| {
         bridge.attach(target.as_ref(), format)
     })
@@ -191,7 +191,7 @@ async fn subscribe_local_shell<R: tauri::Runtime>(
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<(), String> {
     require_terminal_window(&window)?;
-    let format = SnapshotFormat::negotiate(Some(frame_version))?;
+    let format = LiveFrameFormat::negotiate(Some(frame_version))?;
     if format.channel_version().is_none() {
         return Err("unsupported terminal Channel version".into());
     }
@@ -601,7 +601,7 @@ async fn recover_shell(
     frame_version: Option<u8>,
     bridge: tauri::State<'_, Arc<Mutex<LocalSessions>>>,
 ) -> Result<local_sessions::AttachedView, String> {
-    let format = SnapshotFormat::negotiate(frame_version)?;
+    let format = LiveFrameFormat::negotiate(frame_version)?;
     run_bridge(bridge.inner().clone(), move |bridge| {
         bridge.recover(&owner, format)
     })

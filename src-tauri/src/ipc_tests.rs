@@ -79,6 +79,13 @@ fn local_v8_snapshot_recovery_and_attach_keep_exact_lease_and_receipt() {
     );
 }
 
+#[test]
+fn local_v9_snapshot_recovery_and_attach_keep_exact_lease_and_receipt() {
+    assert_snapshot_recovery_and_attach_keep_exact_lease_and_receipt(
+        tauri_terminal_frame_bridge::DENSE_FRAME_VERSION,
+    );
+}
+
 fn assert_snapshot_recovery_and_attach_keep_exact_lease_and_receipt(frame_version: u8) {
     // Run the protocol variants in turn so other Channel tests can share the
     // process-wide encoder workspaces.
@@ -105,7 +112,9 @@ fn assert_snapshot_recovery_and_attach_keep_exact_lease_and_receipt(frame_versio
     let current = &recovered["owner"];
     assert_eq!(frame["kind"], "snapshot");
     assert_eq!(frame["stamp"]["version"], frame_version);
-    if tauri_terminal_frame_bridge::protocol_v4::supports_packed_rows(frame_version) {
+    if frame_version == tauri_terminal_frame_bridge::DENSE_FRAME_VERSION
+        || tauri_terminal_frame_bridge::protocol_v4::supports_packed_rows(frame_version)
+    {
         assert_eq!(frame["rows"][0]["columns"], frame["cols"]);
         assert!(frame["rows"][0]["styles"].is_array());
         assert!(frame["rows"][0]["runs"].is_array());
@@ -207,7 +216,7 @@ fn local_tab_activation_rotates_the_lease_after_an_ack_and_retries_exactly() {
                 super::TabActivation {
                     preserve_input: true,
                     integrated: false,
-                    format: super::SnapshotFormat::Compatibility,
+                    format: super::SnapshotFormat::Compatibility.into(),
                     history: None,
                     window_pixels: None,
                 },

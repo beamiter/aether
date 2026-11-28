@@ -1,7 +1,7 @@
 //! Convert immutable engine paint state to bounded Channel frames.
 
 use crate::{
-    cell_width, cursor_shape, protocol_v4 as wire, semantic::validate_grid, SSH_DENSE_FRAME_VERSION,
+    cell_width, cursor_shape, protocol_v4 as wire, semantic::validate_grid, DENSE_FRAME_VERSION,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use jterm_engine::{
@@ -52,7 +52,7 @@ impl FrameScratch {
         session: &str,
         version: u8,
     ) -> Result<(wire::Counter, String), String> {
-        if version == SSH_DENSE_FRAME_VERSION {
+        if version == DENSE_FRAME_VERSION {
             encode_update(project_update(
                 previous,
                 frame,
@@ -269,12 +269,11 @@ fn project_update<'a, R>(
         cursor_color: colors.map(|colors| colors.effective_cursor().into()),
         pending_wrap: cursor.pending_wrap,
     };
-    let row_moves = version == SSH_DENSE_FRAME_VERSION || wire::supports_row_moves(version);
+    let row_moves = version == DENSE_FRAME_VERSION || wire::supports_row_moves(version);
     let mut projection = Projection {
         images_enabled: version == wire::IMAGE_VERSION || row_moves,
         colors,
-        extended_rendition: version == wire::RENDITION_VERSION
-            || version == SSH_DENSE_FRAME_VERSION,
+        extended_rendition: version == wire::RENDITION_VERSION || version == DENSE_FRAME_VERSION,
         ..Projection::default()
     };
     if let Some((base, changed)) = previous

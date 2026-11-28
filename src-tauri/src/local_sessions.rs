@@ -16,7 +16,7 @@ use tauri::ipc::Channel;
 use tauri_terminal_frame_bridge::{
     live::{CloseStatus, LiveBridge, ViewportPixels},
     semantic::{Attachment, Resume, SessionSelector, Update},
-    snapshot_encoder, LocalSnapshot, SnapshotFormat, WireFrame,
+    snapshot_encoder, LiveFrameFormat, LocalSnapshot, WireFrame,
 };
 use worker::LocalWorker;
 
@@ -148,7 +148,7 @@ struct OwnedLocalPty {
 pub(crate) struct TabActivation {
     pub(crate) preserve_input: bool,
     pub(crate) integrated: bool,
-    pub(crate) format: SnapshotFormat,
+    pub(crate) format: LiveFrameFormat,
     pub(crate) history: Option<HistoryRequest>,
     pub(crate) window_pixels: Option<ViewportPixels>,
 }
@@ -212,7 +212,7 @@ impl LocalSessions {
     pub(crate) fn open(
         &mut self,
         integrated: bool,
-        format: SnapshotFormat,
+        format: LiveFrameFormat,
         history: Option<HistoryRequest>,
         window_pixels: Option<ViewportPixels>,
         shared: Weak<Mutex<Self>>,
@@ -235,7 +235,7 @@ impl LocalSessions {
     pub(crate) fn open_second(
         &mut self,
         retained_epoch: u32,
-        format: SnapshotFormat,
+        format: LiveFrameFormat,
         window_pixels: Option<ViewportPixels>,
         shared: Weak<Mutex<Self>>,
     ) -> Result<Attachment, String> {
@@ -271,7 +271,7 @@ impl LocalSessions {
     pub(crate) fn attach_selected(
         &mut self,
         epoch: u32,
-        format: SnapshotFormat,
+        format: LiveFrameFormat,
     ) -> Result<Option<Resume<LocalSnapshot>>, String> {
         let target = self.target_for_epoch(epoch)?;
         self.attach(Some(&target), format)
@@ -280,7 +280,7 @@ impl LocalSessions {
     fn open_fresh(
         &mut self,
         integrated: bool,
-        format: SnapshotFormat,
+        format: LiveFrameFormat,
         history: Option<HistoryRequest>,
         window_pixels: Option<ViewportPixels>,
         shared: Weak<Mutex<Self>>,
@@ -308,7 +308,7 @@ impl LocalSessions {
     fn spawn(
         prev_epoch: u32,
         integrated: bool,
-        format: SnapshotFormat,
+        format: LiveFrameFormat,
         history: Option<HistoryRequest>,
         window_pixels: Option<ViewportPixels>,
         worker: &LocalWorker,
@@ -477,7 +477,7 @@ impl LocalSessions {
     pub(crate) fn attach(
         &mut self,
         target: Option<&SessionSelector>,
-        format: SnapshotFormat,
+        format: LiveFrameFormat,
     ) -> Result<Option<Resume<LocalSnapshot>>, String> {
         let attached =
             self.registry
@@ -589,7 +589,7 @@ impl LocalSessions {
         owner: Attachment,
         sink: Channel<StreamEvent>,
         observer: Option<ObserverTarget>,
-        format: SnapshotFormat,
+        format: LiveFrameFormat,
         shared: Weak<Mutex<Self>>,
     ) -> Result<(), String> {
         let bridge = &self.registry.reader(&owner.session)?.bridge;
@@ -792,7 +792,7 @@ impl LocalSessions {
     pub(crate) fn recover(
         &mut self,
         owner: &Attachment,
-        format: SnapshotFormat,
+        format: LiveFrameFormat,
     ) -> Result<AttachedView, String> {
         // Keep LiveBridge's idempotent previous-generation recovery rules.
         let owned = self.registry.reader(&owner.session)?;

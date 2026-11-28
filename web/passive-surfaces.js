@@ -35,12 +35,11 @@ export function makePassiveSurfaces({paint, clear, allocate}) {
     return [slots[0]?.target ?? null, slots[1]?.target ?? null];
   }
 
-  function prepare(preview) {
+  function prepare(preview, frameVersion = CHANNEL_RENDITION_VERSION) {
     const current = slots.find(slot => slot.target.layout === preview?.layout);
     if (!current) return null;
     const {canvas, epoch, session, frame:previous} = current;
-    const frame = acceptChannelFrame(null, preview.frame,
-      {session, epoch, frameVersion:CHANNEL_RENDITION_VERSION}, true);
+    const frame = acceptChannelFrame(null, preview.frame, {session, epoch, frameVersion}, true);
     if (previous && channelCounter(previous.revision) >= channelCounter(frame.revision)) return null;
     return () => {
       if (!slots.includes(current) || current.frame !== previous) return false;

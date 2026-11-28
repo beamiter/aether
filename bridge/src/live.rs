@@ -5,7 +5,7 @@ use crate::{
     protocol::MAX_HISTORY_SNAPSHOT_BYTES,
     protocol_v4::{HistorySource, MAX_PROJECTED_HISTORY_ROWS},
     semantic::{self, Attachment, Resume, SessionSelector, Update},
-    SnapshotFormat, WireFrame,
+    LiveFrameFormat, SnapshotFormat, WireFrame,
 };
 use jterm_engine::{
     frame::CellFrame,
@@ -173,8 +173,8 @@ impl LiveBridge {
         self.hyperlink_policy = Some(policy);
     }
 
-    pub fn enable_inline_graphics(&mut self, format: SnapshotFormat) {
-        if !self.local_desktop || !format.supports_images() || self.inline_graphics {
+    pub fn enable_inline_graphics(&mut self, format: impl Into<LiveFrameFormat>) {
+        if !self.local_desktop || !format.into().supports_images() || self.inline_graphics {
             return;
         }
         self.inline_graphics = true;
@@ -821,7 +821,7 @@ impl LiveBridge {
         &mut self,
         epoch: u32,
         snapshot: bool,
-        format: SnapshotFormat,
+        format: impl Into<LiveFrameFormat>,
     ) -> Result<Option<(crate::protocol_v4::Counter, String)>, String> {
         self.poll_channel_with_scratch(
             epoch,
@@ -835,10 +835,11 @@ impl LiveBridge {
         &mut self,
         epoch: u32,
         snapshot: bool,
-        format: SnapshotFormat,
+        format: impl Into<LiveFrameFormat>,
         scratch: Option<crate::semantic_v4::FrameScratch>,
     ) -> Result<Option<(crate::protocol_v4::Counter, String)>, String> {
         let version = format
+            .into()
             .channel_version()
             .ok_or("terminal Channel version required")?;
         self.poll_channel_with_version(epoch, snapshot, version, scratch)
@@ -927,9 +928,10 @@ impl LiveBridge {
         &self,
         epoch: u32,
         revision: Option<crate::protocol_v4::Counter>,
-        format: SnapshotFormat,
+        format: impl Into<LiveFrameFormat>,
     ) -> Result<Option<(crate::protocol_v4::Counter, String)>, String> {
         let version = format
+            .into()
             .channel_version()
             .ok_or("terminal Channel version required")?;
         self.check(epoch)?;

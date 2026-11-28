@@ -2,7 +2,8 @@ export const CHANNEL_IMAGE_VERSION = 5;
 export const CHANNEL_FRAME_VERSION = 6;
 export const CHANNEL_PACKED_VERSION = 7;
 export const CHANNEL_RENDITION_VERSION = 8;
-export const SSH_DENSE_FRAME_VERSION = 9;
+export const CHANNEL_DENSE_VERSION = 9;
+export const SSH_DENSE_FRAME_VERSION = CHANNEL_DENSE_VERSION;
 // Decoded cells keep bit 2 available for the version-3 underline flag.
 export const CELL_CONCEALED = 256;
 export const CELL_OVERLINE = 128;
@@ -26,8 +27,9 @@ const nonAscii = /[^\x00-\x7f]/;
 const wireBlockUnits = 8192;
 const supportsPackedRows = version => version === CHANNEL_PACKED_VERSION || version === CHANNEL_RENDITION_VERSION;
 const supportsRowMoves = version => version === CHANNEL_FRAME_VERSION ||
-  version === SSH_DENSE_FRAME_VERSION || supportsPackedRows(version);
+  version === CHANNEL_DENSE_VERSION || supportsPackedRows(version);
 const supportsChannelImages = version => version === CHANNEL_IMAGE_VERSION || supportsRowMoves(version);
+export const supportsChannelRendition = version => version === CHANNEL_RENDITION_VERSION || version === CHANNEL_DENSE_VERSION;
 const frameMoves = new WeakMap();
 
 export function rowMoveForBase(frame, revision) {
@@ -299,12 +301,12 @@ function validatePackedRow(row, cols, links, referenced, supportsImages, extende
 }
 
 function validateRow(row, cols, links, referenced, supportsImages, version) {
-  const dense = version === SSH_DENSE_FRAME_VERSION;
+  const dense = version === CHANNEL_DENSE_VERSION;
   if (row?.cell_bytes !== undefined) {
     if (!dense) throw new Error('dense Channel row version');
     return validateDenseRow(row, cols, links, referenced, supportsImages);
   }
-  const packed = dense || supportsPackedRows(version), extended = dense || version === CHANNEL_RENDITION_VERSION;
+  const packed = dense || supportsPackedRows(version), extended = supportsChannelRendition(version);
   if (packed && row?.cells === undefined) return validatePackedRow(row, cols, links, referenced, supportsImages, extended);
   if (packed && (row.styles !== undefined || row.runs !== undefined || row.columns !== undefined))
     throw new Error('mixed Channel row encodings');

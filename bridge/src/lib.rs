@@ -24,25 +24,54 @@ pub use jterm_protocol::terminal_v4 as protocol_v4;
 pub use protocol::{CursorShape as WireCursorShape, WireCell, WireFrame};
 pub use protocol_v4::{LocalSnapshot, SnapshotFormat, SnapshotRevision};
 
-/// SSH frame version with a byte-packed representation for dense rows.
-pub const SSH_DENSE_FRAME_VERSION: u8 = 9;
+/// Live Channel frame version with a byte-packed representation for dense rows.
+pub const DENSE_FRAME_VERSION: u8 = 9;
+pub use self::DENSE_FRAME_VERSION as SSH_DENSE_FRAME_VERSION;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiveFrameFormat {
+    Shared(SnapshotFormat),
+    Dense,
+}
+
+impl LiveFrameFormat {
+    pub fn negotiate(version: Option<u8>) -> Result<Self, &'static str> {
+        if version == Some(DENSE_FRAME_VERSION) {
+            Ok(Self::Dense)
+        } else {
+            SnapshotFormat::negotiate(version).map(Self::Shared)
+        }
+    }
+
+    pub fn channel_version(self) -> Option<u8> {
+        match self {
+            Self::Shared(format) => format.channel_version(),
+            Self::Dense => Some(DENSE_FRAME_VERSION),
+        }
+    }
+
+    fn supports_images(self) -> bool {
+        match self {
+            Self::Shared(format) => format.supports_images(),
+            Self::Dense => true,
+        }
+    }
+}
+
+impl From<SnapshotFormat> for LiveFrameFormat {
+    fn from(format: SnapshotFormat) -> Self {
+        Self::Shared(format)
+    }
+}
 
 pub fn snapshot_encoder(
-    format: SnapshotFormat,
+    format: impl Into<LiveFrameFormat>,
 ) -> impl FnOnce(&CellFrame, &str, u32) -> Result<LocalSnapshot, String> {
-    move |frame, session, epoch| match format {
-        SnapshotFormat::Compatibility => {
-            from_engine(frame, session, epoch).map(LocalSnapshot::Compatibility)
-        }
-        SnapshotFormat::Channel
-        | SnapshotFormat::ChannelImages
-        | SnapshotFormat::ChannelRowMoves
-        | SnapshotFormat::ChannelPacked
-        | SnapshotFormat::ChannelRendition => {
-            let version = format.channel_version().expect("Channel format");
-            semantic_v4::encode(None, frame, session, version)
-                .map(|(_, data)| LocalSnapshot::Channel(data))
-        }
+    let version = format.into().channel_version();
+    move |frame, session, epoch| match version {
+        None => from_engine(frame, session, epoch).map(LocalSnapshot::Compatibility),
+        Some(version) => semantic_v4::encode(None, frame, session, version)
+            .map(|(_, data)| LocalSnapshot::Channel(data)),
     }
 }
 

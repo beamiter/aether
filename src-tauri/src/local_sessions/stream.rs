@@ -12,7 +12,7 @@ use tauri::ipc::Channel;
 pub(crate) use tauri_terminal_frame_bridge::protocol::ObserverTarget;
 pub(crate) use tauri_terminal_frame_bridge::protocol_v4::{Counter, PeerUpdate, Receipt};
 use tauri_terminal_frame_bridge::{
-    live::LiveBridge, protocol_v4, semantic::Attachment, SnapshotFormat,
+    live::LiveBridge, protocol_v4, semantic::Attachment, LiveFrameFormat,
 };
 
 pub(crate) type StreamEvent = protocol_v4::StreamEvent<LocalShellStatus>;
@@ -83,7 +83,7 @@ impl Delivery {
 
 pub(super) struct LocalStream {
     pub(super) owner: Attachment,
-    pub(super) format: SnapshotFormat,
+    pub(super) format: LiveFrameFormat,
     sink: Channel<StreamEvent>,
     failed: Arc<AtomicBool>,
     sequence: u64,
@@ -100,7 +100,7 @@ impl LocalStream {
     pub(super) fn new(
         owner: Attachment,
         sink: Channel<StreamEvent>,
-        format: SnapshotFormat,
+        format: LiveFrameFormat,
     ) -> Self {
         Self {
             owner,
@@ -261,6 +261,7 @@ mod tests {
     use serde_json::Value;
     use std::sync::{mpsc, Mutex};
     use tauri::ipc::InvokeResponseBody;
+    use tauri_terminal_frame_bridge::SnapshotFormat;
 
     #[test]
     fn observers_rotate_fairly_and_keep_independent_publication_revisions() {
@@ -304,7 +305,13 @@ mod tests {
         let shared = Arc::downgrade(&local);
         let mut sessions = local.lock().unwrap();
         let first = sessions
-            .open(false, SnapshotFormat::Channel, None, None, shared.clone())
+            .open(
+                false,
+                SnapshotFormat::Channel.into(),
+                None,
+                None,
+                shared.clone(),
+            )
             .unwrap()
             .owner;
         let mut add_tab = |owner: &Attachment| {
@@ -315,7 +322,7 @@ mod tests {
                     TabActivation {
                         preserve_input: true,
                         integrated: false,
-                        format: SnapshotFormat::Channel,
+                        format: SnapshotFormat::Channel.into(),
                         history: None,
                         window_pixels: None,
                     },
@@ -356,7 +363,7 @@ mod tests {
                 active.clone(),
                 channel,
                 None,
-                SnapshotFormat::Channel,
+                SnapshotFormat::Channel.into(),
                 shared,
             )
             .unwrap();
@@ -446,7 +453,7 @@ mod tests {
             .unwrap()
             .open(
                 false,
-                SnapshotFormat::Channel,
+                SnapshotFormat::Channel.into(),
                 None,
                 None,
                 Arc::downgrade(&local),
@@ -469,7 +476,7 @@ mod tests {
                 owner.clone(),
                 channel,
                 None,
-                SnapshotFormat::Channel,
+                SnapshotFormat::Channel.into(),
                 Arc::downgrade(&local),
             )
             .unwrap();
@@ -560,7 +567,10 @@ mod tests {
         }));
         let mut local = local.lock().unwrap();
         let recovered = local
-            .recover(&owner, tauri_terminal_frame_bridge::SnapshotFormat::Channel)
+            .recover(
+                &owner,
+                tauri_terminal_frame_bridge::SnapshotFormat::Channel.into(),
+            )
             .unwrap();
         let target = recovered.view.owner;
         assert_ne!(target.generation, owner.generation);

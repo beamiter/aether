@@ -18,7 +18,7 @@ import {installTerminalChat,validateChatStatus} from './terminal-chat.js';
 import {installWorkflows} from './workflows.js';
 import {plainLocalTab,readLocalShellLayout,saveLocalShellLayout,readThreePaneLayout,saveThreePaneLayout,validPaneId,MAX_LOCAL_SHELLS,validLocalGeometry,localSplitPair} from './local-layout.js';
 import {backingGeometry,acceptFull,acceptUpdate,clearPaint,paint} from './frames.js'; import {installIme} from './ime.js';
-import {acceptChannelFrame,acceptChannelUpdate,channelCounter,CHANNEL_RENDITION_VERSION,SSH_DENSE_FRAME_VERSION} from './frames-v4.js';
+import {acceptChannelFrame,acceptChannelUpdate,channelCounter,CHANNEL_DENSE_VERSION,supportsChannelRendition} from './frames-v4.js';
 const canvas=document.querySelector('canvas'),status=document.querySelector('#status'),button=document.querySelector('#demo');
 const open=document.querySelector('#open'),attach=document.querySelector('#attach'),detach=document.querySelector('#detach'),close=document.querySelector('#close'),input=document.querySelector('#input'),send=document.querySelector('#send');
 const openIntegrated=document.querySelector('#open-integrated');
@@ -232,26 +232,26 @@ function windowPixels(rows, cols) {
 function initialWindowPixels() { return windowPixels(24, 80); }
 
 
-const channelSnapshots=()=>typeof Channel==='function'?{frameVersion:CHANNEL_RENDITION_VERSION}:{};
-const acceptAttachedSnapshot=(frame,attachment,options)=>options.frameVersion===CHANNEL_RENDITION_VERSION
+const channelSnapshots=()=>typeof Channel==='function'?{frameVersion:CHANNEL_DENSE_VERSION}:{};
+const acceptAttachedSnapshot=(frame,attachment,options)=>options.frameVersion
   ?acceptChannelFrame(null,frame,{...attachment,frameVersion:options.frameVersion},true):acceptFull(null,frame,attachment);
 let savedLayout=invoke?(threePanePreview?readThreePaneLayout():null)??readLocalShellLayout():null,protectSavedLayout=false;
 const sshCommands={poll_shell:'poll',poll_ssh_shell:'poll_with_status',poll_packed_shell:'poll_packed',ack_shell:'ack',shell_status:'status',history_shell:'history',recover_shell:'recover',detach_shell:'detach',close_shell:'close',write_shell:'write',key_shell:'key',key_event_shell:'key_event',text_shell:'text',paste_shell:'paste',resize_shell:'resize',focus_shell:'focus',mouse_shell:'mouse'};
 function sshPollFor(attachment,info){
   if(info?.poll_with_status!==true)return null;
   const version=info.packed_frame_version;
-  const frameVersion=version===CHANNEL_RENDITION_VERSION||version===SSH_DENSE_FRAME_VERSION?version:null;
+  const frameVersion=supportsChannelRendition(version)?version:null;
   return {owner:attachment,ackRevision:null,frameVersion};
 }
 function acceptSshSnapshot(result,attachment){
-  if(result.frame_version===SSH_DENSE_FRAME_VERSION){
-    return acceptChannelUpdate(null,result.frame,{...attachment,frameVersion:SSH_DENSE_FRAME_VERSION},
+  if(result.frame_version===CHANNEL_DENSE_VERSION){
+    return acceptChannelUpdate(null,result.frame,{...attachment,frameVersion:CHANNEL_DENSE_VERSION},
       true,result.frame_bytes);
   }
   return acceptFull(null,result.frame,attachment);
 }
 async function confirmSnapshot(attachment,frame,resumeInput=false){
-  if(attachment.session!==sshSession||frame.version!==SSH_DENSE_FRAME_VERSION){
+  if(attachment.session!==sshSession||frame.version!==CHANNEL_DENSE_VERSION){
     await invokeAttached('ack_shell',{epoch:attachment.epoch,revision:frame.revision},attachment);
     return {polling:false};
   }
@@ -549,10 +549,10 @@ function validatePeerFrame(frame,target){
   const next=acceptFull(null,frame,{session,epoch:target.epoch});
   return peerState?.epoch===next.epoch&&peerState.revision>=next.revision?null:next;
 }
-function validateChannelPeer(frame,target){
+function validateChannelPeer(frame,target,frameVersion){
   const session=localTabOwners.get(target.epoch)?.session;
   if(typeof session!=='string'||!/^[a-f0-9]{32}$/.test(session))throw new Error('invalid inactive shell');
-  const next=acceptChannelFrame(null,frame,{session,epoch:target.epoch,frameVersion:CHANNEL_RENDITION_VERSION},true);
+  const next=acceptChannelFrame(null,frame,{session,epoch:target.epoch,frameVersion},true);
   return peerState?.epoch===next.epoch&&BigInt(peerState.revision)>=BigInt(next.revision)?null:next;
 }
 function paintPeer(frame){
@@ -976,11 +976,11 @@ async function receiveLocalStream(stream,event){
     validateShellStatus(event.status,attachment.epoch);
     const target=observerTarget();
     recoverFrame=true;
-    const peer=target&&event.preview?.layout===target.layout?validateChannelPeer(event.preview.frame,target):null;
-    const commitPassive=tripleIsVisible()?passiveSurfaces.prepare(event.preview):null;
+    const peer=target&&event.preview?.layout===target.layout?validateChannelPeer(event.preview.frame,target,stream.frameVersion):null;
+    const commitPassive=tripleIsVisible()?passiveSurfaces.prepare(event.preview,stream.frameVersion):null;
     let revision=null;
     if(event.frame!==null){
-      const next=acceptChannelFrame(stream.frame,event.frame,{...attachment,frameVersion:CHANNEL_RENDITION_VERSION});
+      const next=acceptChannelFrame(stream.frame,event.frame,{...attachment,frameVersion:stream.frameVersion});
       paintLiveFrame(next);state=next;stream.frame=next;revision=next.revision;describeCursor();
     }
     paintPeer(peer);
@@ -1017,20 +1017,20 @@ async function startTransport(onFirstPoll){
   }
   if(!channel){
     if(tripleEpochs.length&&owner.session!==sshSession){tripleEpochs=[];renderSplit();}
-    if(owner.session!==sshSession&&state?.version===CHANNEL_RENDITION_VERSION){
+    if(owner.session!==sshSession&&supportsChannelRendition(state?.version)){
       suspendLocalOutput(new Error('local output Channel unavailable'));
       return;
     }
     timer=setInterval(poll,50);return poll(onFirstPoll);
   }
-  const stream={owner,channel,sequence:0n,frame:null,lastSeen:Date.now(),animation:null,observers:{multi:false,targets:[observerTarget(),null]},ready:false,adjusting:null};
+  const stream={owner,channel,frameVersion:CHANNEL_DENSE_VERSION,sequence:0n,frame:null,lastSeen:Date.now(),animation:null,observers:{multi:false,targets:[observerTarget(),null]},ready:false,adjusting:null};
   localStream=stream;
   stream.channel.onmessage=event=>queueLocalStream(stream,event);
   timer=setInterval(()=>{
     if(localStream===stream&&!document.hidden&&Date.now()-stream.lastSeen>10000)
       failLocalStream(stream,new Error('no local output heartbeat'));
   },1000);
-  try{await invoke('subscribe_local_shell',{owner:stream.owner,stream:stream.channel,observer:stream.observers.targets[0],frameVersion:CHANNEL_RENDITION_VERSION});}
+  try{await invoke('subscribe_local_shell',{owner:stream.owner,stream:stream.channel,observer:stream.observers.targets[0],frameVersion:stream.frameVersion});}
   catch(error){failLocalStream(stream,error);}
   if(localStream===stream){
     stream.ready=true;renderSplit();
@@ -1049,7 +1049,7 @@ async function poll(onAccepted){
     const reply=await (batch
       ? invokeAttached(packed?'poll_packed_shell':'poll_ssh_shell',{
         epoch:current,ack_revision:batch.ackRevision,...(packed?{snapshot:previousPacked===null}:{}),
-        ...(frameVersion===SSH_DENSE_FRAME_VERSION?{frame_version:frameVersion}:{}),
+        ...(frameVersion===CHANNEL_DENSE_VERSION?{frame_version:frameVersion}:{}),
       },attachment)
       : invokeAttached('poll_shell',{epoch:current},attachment));
     if(epoch!==current||ticket.transport!==transport)return;
@@ -1619,7 +1619,7 @@ function describeCursor(frame=visibleLiveFrame()){
   document.querySelector('#cursor-status').textContent=`${frame.cols} × ${frame.rows.length} cells · cursor row ${frame.cursor_row+1}, column ${frame.cursor_col+1} · ${frame.cursor_shape}${frame.cursor_visible?'':' (hidden)'}${frame.pending_wrap?' · wrap pending':''}`;
 }
 function hyperlinkAt(event,frame=visibleLiveFrame()){
-  if(!owner||owner.session===sshSession||frame?.version!==CHANNEL_RENDITION_VERSION||
+  if(!owner||owner.session===sshSession||!supportsChannelRendition(frame?.version)||
       frame.session!==owner.session||frame.epoch!==owner.epoch)return null;
   const point=terminalCellAt(frame,canvas,event.clientX,event.clientY);
   if(!point)return null;
@@ -1843,7 +1843,7 @@ async function recoverOutput(previousStatus=null){
       sshInputSuspended=false;
       status.textContent=input.disabled?'SSH output snapshot recovered. Input remains disabled.':'SSH output snapshot recovered.';
     }else if(localTransport==='recovery'){
-      localTransport=options.frameVersion===CHANNEL_RENDITION_VERSION?'channel':'poll';
+      localTransport=options.frameVersion?'channel':'poll';
       localFrameRecovery=false;
       if(localInputSuspended&&result.input_allowed===true&&!keyQueue.pending){
         keyQueue.locked=false;input.disabled=send.disabled=resize.disabled=restoringLocalLayout;
